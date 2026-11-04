@@ -15,6 +15,10 @@ mod lua_ast;
 pub mod memory_cap;
 mod message_queue;
 mod multimap;
+// Shared by upcoming cloud test, staging release and asset sync commands;
+// until those land nothing outside its tests calls it.
+#[allow(dead_code)]
+mod open_cloud;
 mod path_serializer;
 mod project;
 mod resolution;
