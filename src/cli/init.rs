@@ -96,6 +96,7 @@ impl InitCommand {
         }
 
         write_if_not_exists(&base_path.join("ROJO_AGENT.md"), super::doc::AGENT_GUIDE)?;
+        write_if_not_exists(&base_path.join("AGENTS.md"), super::doc::AGENTS_POINTER)?;
 
         if !self.skip_git && should_git_init(&base_path) {
             log::debug!("Initializing Git repository...");
@@ -244,6 +245,10 @@ fn init_ships_agent_guide_without_replacing_existing_instructions() {
         assert_eq!(
             fs::read_to_string(dir.path().join("ROJO_AGENT.md")).unwrap(),
             super::doc::AGENT_GUIDE
+        );
+        assert_eq!(
+            fs::read_to_string(dir.path().join("AGENTS.md")).unwrap(),
+            super::doc::AGENTS_POINTER
         );
         let preserved = dir.path().join("custom");
         fs::create_dir(&preserved).unwrap();
