@@ -409,6 +409,17 @@ impl TestReport {
         {
             report.status = Status::Failed;
         }
+        // A filter that matches nothing, or specs without tests, would
+        // otherwise pass a CI job that tested nothing.
+        if report.status == Status::Passed && report.passed == 0 && report.failed == 0 {
+            report.status = Status::Error;
+            report.error.get_or_insert_with(|| {
+                format!(
+                    "No tests ran ({} skipped). Check --filter and --root.",
+                    report.skipped
+                )
+            });
+        }
         Ok(report)
     }
 
@@ -958,6 +969,24 @@ mod tests {
         assert_eq!(
             report.render(),
             "PASSED: 2 passed, 0 failed, 0 skipped in 0.25s (testez, 1 spec module)\n"
+        );
+    }
+
+    #[test]
+    fn a_run_without_tests_fails() {
+        let report = TestReport::from_runner(&json!({
+            "framework": "testez", "status": "passed", "passed": 0, "skipped": 4,
+            "modules": 1, "failures": [], "loadErrors": [], "durationSeconds": 0.1,
+        }))
+        .unwrap();
+        assert_eq!(report.status, Status::Error);
+        assert_eq!(report.exit_code(), 1);
+        assert!(
+            report
+                .render()
+                .contains("Test run failed: No tests ran (4 skipped)"),
+            "{}",
+            report.render()
         );
     }
 

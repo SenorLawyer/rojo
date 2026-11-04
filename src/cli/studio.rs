@@ -493,7 +493,10 @@ fn follow_lines(page: &LogPage, json: bool) -> anyhow::Result<Vec<FollowLine>> {
                         .filter(|kind| !kind.is_empty())
                         .unwrap_or(kind)
                 ),
+                // Continuation lines are indented, so a message cannot print
+                // a line that looks like another entry.
                 escape_controls(entry["message"].as_str().unwrap_or_default())
+                    .replace('\n', "\n    ")
             )
         }));
     }
@@ -828,7 +831,7 @@ mod tests {
                         .into()
                 ),
                 FollowLine::Out("[5] Output: hello".into()),
-                FollowLine::Out("[6] Error: line\nbreak".into()),
+                FollowLine::Out("[6] Error: line\n    break".into()),
             ]
         );
 
@@ -862,7 +865,7 @@ mod tests {
             follow_lines(&page, false).unwrap(),
             vec![FollowLine::Out(
                 r"[1] Output\u{9b}: \u{1b}]52;c;aGk=\u{7}\u{1b}[2Jcarriage\u{d}return".to_owned()
-                    + "\ttab\nnext "
+                    + "\ttab\n    next "
                     + r"\u{7f}é"
             )]
         );

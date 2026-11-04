@@ -78,7 +78,7 @@ A spec module that fails to load (a syntax error, or an error while it is requir
 | Code | Meaning |
 | --- | --- |
 | 0 | Every test passed. |
-| 1 | A test failed, a module failed to load, or the run could not finish: no TestEZ was found, no specs were found, the specs did not finish within `--timeout`, Studio was not in Edit mode, or Studio did not answer in time. |
+| 1 | A test failed, a module failed to load, no test ran (for example a `--filter` that matches nothing, which TestEZ reports as skipped), or the run could not finish: no TestEZ was found, no specs were found, the specs did not finish within `--timeout`, Studio was not in Edit mode, or Studio did not answer in time. |
 | 2 | `rojo test` could not reach Studio or was used incorrectly: the bridge is not running or refused the token, no session or several sessions are connected without `--session`, or an option is invalid, such as a root that does not start with `game/` or has an empty name like `game/`, more than 32 roots or a filter longer than 256 bytes. A root that does not exist is only found in Studio, so it exits with 1. |
 
 ### JSON report
