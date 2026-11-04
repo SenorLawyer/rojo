@@ -48,7 +48,7 @@ rojo test --token-file <private-token-file>
 
 With one Studio session connected, `rojo test` uses it. With several, it lists them and asks for `--session <id>`.
 
-By default the specs are searched for in ReplicatedFirst, ReplicatedStorage, ServerScriptService, ServerStorage, StarterGui, StarterPack and StarterPlayer. Specs inside `_Index` (Wally) and `.pesde` folders belong to dependencies and are skipped, as is anything inside the TestEZ module.
+By default the specs are searched for in ReplicatedFirst, ReplicatedStorage, ServerScriptService, ServerStorage, StarterGui, StarterPack and StarterPlayer. Specs inside `_Index` (Wally) and `.pesde` folders belong to dependencies and are skipped, as is anything inside the TestEZ module. Roblox's default `PlayerModule` under StarterPlayerScripts is skipped too: Roblox inserts it at run time and its internal specs do not load outside Roblox's own tests.
 
 | Option | Meaning |
 | --- | --- |

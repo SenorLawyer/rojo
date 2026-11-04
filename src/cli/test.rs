@@ -424,6 +424,8 @@ fn without_runner_frames(message: &str) -> String {
             || line.contains("__RojoBridgeSpec_")
             || line.starts_with("SpecRunner:")
             || line.contains(".SpecRunner:")
+            // The standalone runner that cloud runs execute.
+            || line.starts_with("TaskScript:")
     };
     let mut lines = message.lines();
     let mut kept: Vec<&str> = lines.next().into_iter().collect();
@@ -678,6 +680,7 @@ mod tests {
             "ReplicatedStorage.Packages.TestEZ.Expectation:47 function equal",
             "ReplicatedStorage.Shared.Math.spec:11",
             "ServerScriptService.__RojoBridgeSpec_x.SpecRunner:554 function runTestEZ",
+            "TaskScript:555 function runTestEZ",
         ]
         .join(
             "

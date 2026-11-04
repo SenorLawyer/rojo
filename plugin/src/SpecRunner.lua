@@ -59,6 +59,14 @@ SpecRunner.FRAMEWORK_SERVICES = { "ReplicatedStorage", "ServerStorage", "ServerS
 -- cannot fix, so they are skipped unless a root points inside them.
 local VENDORED = { ["_Index"] = true, [".pesde"] = true }
 
+-- Roblox inserts its default player scripts at run time when a place does not
+-- provide its own, and PlayerModule ships internal `*.spec` modules that only
+-- load inside Roblox's own test setup. They are skipped the same way.
+local function isRobloxDefaultScripts(instance)
+	local parent = instance.Parent
+	return instance.Name == "PlayerModule" and parent ~= nil and parent.Name == "StarterPlayerScripts"
+end
+
 local REPLACEMENT_CHARACTER = utf8.char(0xFFFD)
 
 -- Cut on a codepoint boundary so truncating cannot split a multibyte character.
@@ -260,7 +268,7 @@ end
 local function isVendored(instance, root)
 	local current = instance.Parent
 	while current and current ~= root do
-		if VENDORED[current.Name] then
+		if VENDORED[current.Name] or isRobloxDefaultScripts(current) then
 			return true
 		end
 		current = current.Parent

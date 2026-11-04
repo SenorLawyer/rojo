@@ -149,6 +149,20 @@ return function()
 			expect(prepared.specs[1].instance).to.equal(mathSpec)
 		end)
 
+		it("skips the specs inside Roblox's default PlayerModule", function()
+			module("TestEZ", fixture)
+			local scripts = folder("StarterPlayerScripts", fixture)
+			local playerModule = folder("PlayerModule", scripts)
+			module("CameraWrapper.spec", playerModule)
+			local own = module("Controls.spec", scripts)
+			local prepared = SpecRunner.prepare(
+				SpecRunner.normalizeOptions({ roots = { fixturePath }, module = fixturePath .. "/TestEZ" }),
+				game
+			)
+			expect(#prepared.specs).to.equal(1)
+			expect(prepared.specs[1].instance).to.equal(own)
+		end)
+
 		it("runs vendored specs when a root points inside the package folder", function()
 			local index = folder("_Index", fixture)
 			local dependency = module("Dependency.spec", index)
