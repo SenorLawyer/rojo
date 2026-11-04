@@ -4956,7 +4956,10 @@ mod tests {
         assert_eq!(record["release_target"], "123:456");
         assert_eq!(record["smoke"]["logs"][0]["message"], "smoke ran");
         // The returned values are kept as JSON, not as JSON text.
-        assert_eq!(record["smoke"]["results"], serde_json::json!([{"ok": true}]));
+        assert_eq!(
+            record["smoke"]["results"],
+            serde_json::json!([{"ok": true}])
+        );
         assert_eq!(record["smoke"]["results_truncated"], false);
         // The smoke check runs against the version that staging just created.
         assert_eq!(requests.len(), 2);
