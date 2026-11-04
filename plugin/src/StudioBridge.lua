@@ -18,9 +18,14 @@ local RbxDom = require(Packages.RbxDom)
 local ReflectionDatabase = require(Packages.RbxDom.database)
 local Settings = require(script.Parent.Settings)
 local SpecRunner = require(script.Parent.SpecRunner)
+local StreamRequest = require(Packages.Http.StreamRequest)
+local StreamBudget = require(Packages.Http.StreamBudget)
 
 local MAX_MODEL_BYTES = 5 * 1024 * 1024
 local MAX_BODY_BYTES = 8 * 1024 * 1024
+-- The stream stops buffering a response past this, a little above
+-- MAX_BODY_BYTES so an oversized body is still reported as such.
+local MAX_STREAM_BYTES = 12 * 1024 * 1024
 -- The server holds every /api/studio request for up to 15 seconds while Git
 -- holds its locks (GIT_WAIT_LIMIT in src/web/studio.rs), and then holds a
 -- poll for up to 2 more seconds. 30 covers both with room for Studio's own
@@ -42,20 +47,46 @@ local REPLACEMENT_CHARACTER = utf8.char(0xFFFD)
 
 local StudioBridge = {}
 StudioBridge.__index = StudioBridge
---[[
-	Sends one bridge request. Replaced by tests.
+-- One request at a time, on the stream slot the budget holds back for the
+-- bridge, so agent traffic never waits behind sync or delays it.
+-- Replaced by tests.
+StudioBridge.bridgeStream = StreamRequest.new(nil, nil, StreamBudget.Priority.Bridge)
 
-	The bridge uses RequestAsync, never an HTTP stream. Studio caps how many
-	stream clients a plugin can have open, and what happens past that cap is
-	undocumented, so Rojo stays under it. Sync's WebSocket and requests need
-	those clients, and the bridge is optional, so it takes none. RequestAsync is
-	never queued behind sync either, so agent traffic still cannot delay
-	sync. It cannot be cancelled, but a bridge request ends within about 17
-	seconds (up to 15 waiting for Git, then up to 2 for a poll), so a request
-	still running when the bridge stops ends soon after.
+--[[
+	Sends one bridge request and returns its response. Replaced by tests.
+
+	Requests go over an HTTP stream, not RequestAsync. Once a plugin uses
+	RequestAsync for requests that the server holds open, as a poll is,
+	Studio delays that plugin's later RequestAsync calls more and more until
+	it reloads, so a polling bridge fell behind until its session expired.
+	Streams are not affected and can be closed when the bridge stops. The
+	bodies are JSON, which never contains the NUL bytes a raw stream cuts
+	at. Only when no stream slot is free, which needs another Rojo session in
+	the same plugin, does a request fall back to RequestAsync.
+
+	`onCancel` registers a function that closes the stream if the caller
+	gives up.
 ]]
-function StudioBridge.requestAsync(options)
-	return HttpService:RequestAsync(options)
+function StudioBridge.requestAsync(options, onCancel)
+	local pending = StudioBridge.bridgeStream(options, {
+		timeout = REQUEST_TIMEOUT,
+		queueTimeout = REQUEST_TIMEOUT,
+		maxBytes = MAX_STREAM_BYTES,
+	})
+	if onCancel then
+		onCancel(function()
+			pending:cancel()
+		end)
+	end
+	local ok, response = pending:await()
+	if not ok then
+		error(response, 0)
+	end
+	if response == StreamRequest.BudgetExhausted then
+		Log.debug("No stream slot is free for the Studio bridge; using RequestAsync")
+		return HttpService:RequestAsync(options)
+	end
+	return response
 end
 
 -- How the test runner's insert and removal are kept in undo history. See
@@ -504,11 +535,12 @@ function StudioBridge:__requestWithRetry(route, value)
 end
 
 function StudioBridge:__requestAsync(options, token)
-	local request = Promise.new(function(resolve, reject)
+	local request = Promise.new(function(resolve, reject, onCancel)
 		-- Cancelling a promise closes its executor thread, so the request runs
-		-- on its own thread rather than being closed while Studio sends it.
+		-- on its own thread rather than being closed while Studio sends it,
+		-- and cancelling closes its stream instead.
 		task.spawn(function()
-			local ok, response = pcall(StudioBridge.requestAsync, options)
+			local ok, response = pcall(StudioBridge.requestAsync, options, onCancel)
 			if ok then
 				resolve(response)
 			else

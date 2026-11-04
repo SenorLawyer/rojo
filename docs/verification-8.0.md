@@ -81,7 +81,7 @@ Roblox itself truncates a `StringValue.Value` at an embedded NUL, including a di
 | --- | --- |
 | S1/T1: version ownership guarded only the agent entry point | Fixed in the shared session-start path; both controller orders tested. |
 | S2/T2: a five-second Git-lock deadline could reject a valid pending write | Fixed by waiting for unlock and rechecking identity; real HTTP write regression passed. |
-| S3/T3: shared HTTP queue let bridge polling or update checks delay normal sync | Separate bridge/sync queues at the time; external update requests use their own path. Later PR #2 commits replaced this: there is one HTTP stream queue, and the bridge always uses RequestAsync. |
+| S3/T3: shared HTTP queue let bridge polling or update checks delay normal sync | Separate bridge/sync queues at the time; external update requests use their own path. Later PR #2 commits replaced this: there is one HTTP stream queue, and the bridge used RequestAsync until #4 gave it its own stream slot. |
 | S4/T4: filesystem-parent batching could miss independent project mappings | Coalescing now follows DOM ancestry; overlapping-mapping regression passed. |
 | Final extraction recovery delta | Settled paths are rescanned once; repeated live package installs passed. |
 

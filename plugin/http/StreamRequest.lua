@@ -61,7 +61,8 @@ StreamRequest.BudgetExhausted = setmetatable({}, {
 	plugin. A custom `createClient` does not create Studio clients, so it gets
 	a budget of its own unless one is passed.
 ]]
-function StreamRequest.new(createClient, budget)
+function StreamRequest.new(createClient, budget, priority)
+	priority = priority or StreamBudget.Priority.Request
 	if budget == nil then
 		budget = if createClient then StreamBudget.new() else StreamBudget.shared
 	end
@@ -172,7 +173,7 @@ function StreamRequest.new(createClient, budget)
 		if not job then
 			return
 		end
-		local releaseSlot = budget:tryAcquire(StreamBudget.Priority.Request)
+		local releaseSlot = budget:tryAcquire(priority)
 		if not releaseSlot then
 			-- Rojo's stream budget is used up, so no client is created: what
 			-- Studio does past its own limit is undocumented. The job ends

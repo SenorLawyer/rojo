@@ -189,24 +189,113 @@ return function()
 		expect(intentional).never.to.equal(true)
 	end)
 
-	it("sends bridge requests with RequestAsync and takes no stream client", function()
-		local StreamBudget = require(script.Parent.Parent.Packages.Http.StreamBudget)
-		local previous = StudioBridge.requestAsync
-		local seen
-		local liveDuringRequest
-		StudioBridge.requestAsync = function(options)
-			seen = options
-			liveDuringRequest = StreamBudget.shared:liveCount()
-			return { Success = true, StatusCode = 200, Body = '{"commands":[]}' }
+	describe("stream transport", function()
+		local Http = script.Parent.Parent.Packages.Http
+		local StreamBudget = require(Http.StreamBudget)
+		local StreamRequest = require(Http.StreamRequest)
+		local previousStream
+
+		-- A stand-in stream client. `respond` runs once it has been created.
+		local function fakeClient(respond)
+			local created = {}
+			local function create(options)
+				local opened = Instance.new("BindableEvent")
+				local message = Instance.new("BindableEvent")
+				local closed = Instance.new("BindableEvent")
+				local errored = Instance.new("BindableEvent")
+				local client = {
+					options = options,
+					closedByCaller = false,
+					Opened = opened.Event,
+					MessageReceived = message.Event,
+					Closed = closed.Event,
+					Error = errored.Event,
+				}
+				function client:Close()
+					self.closedByCaller = true
+				end
+				table.insert(created, client)
+				task.defer(function()
+					respond(client, opened, message, closed, errored)
+				end)
+				return client
+			end
+			return create, created
 		end
-		local before = StreamBudget.shared:liveCount()
-		local ok, response = pcall(bridge.__requestAsync, bridge, { Url = "poll" })
-		StudioBridge.requestAsync = previous
-		expect(ok).to.equal(true)
-		expect(response.Body).to.equal('{"commands":[]}')
-		expect(seen.Url).to.equal("poll")
-		expect(liveDuringRequest).to.equal(before)
-		expect(next(bridge.transports)).to.equal(nil)
+
+		beforeEach(function()
+			previousStream = StudioBridge.bridgeStream
+		end)
+
+		afterEach(function()
+			StudioBridge.bridgeStream = previousStream
+		end)
+
+		it("sends bridge requests on the bridge's own stream slot", function()
+			local budget = StreamBudget.new()
+			local liveDuringRequest
+			local create, created = fakeClient(function(_, opened, message, closed)
+				liveDuringRequest = budget:liveCount()
+				opened:Fire(200, "content-type: application/json\r\n")
+				message:Fire('{"commands":[]}')
+				closed:Fire()
+			end)
+			StudioBridge.bridgeStream = StreamRequest.new(create, budget, StreamBudget.Priority.Bridge)
+			-- Sync's socket and one request already hold their slots.
+			local releaseSocket = budget:tryAcquire(StreamBudget.Priority.Socket)
+			local releaseRequest = budget:tryAcquire(StreamBudget.Priority.Request)
+			expect(releaseRequest).to.be.ok()
+			local ok, response = pcall(bridge.__requestAsync, bridge, { Url = "poll", Method = "POST", Body = "{}" })
+			expect(ok).to.equal(true)
+			expect(response.StatusCode).to.equal(200)
+			expect(response.Body).to.equal('{"commands":[]}')
+			expect(created[1].options.Url).to.equal("poll")
+			expect(liveDuringRequest).to.equal(3)
+			expect(budget:liveCount()).to.equal(2)
+			expect(next(bridge.transports)).to.equal(nil)
+			releaseSocket()
+			releaseRequest()
+		end)
+
+		it("closes the stream when the bridge gives up on a request", function()
+			local budget = StreamBudget.new()
+			local create, created = fakeClient(function() end)
+			StudioBridge.bridgeStream = StreamRequest.new(create, budget, StreamBudget.Priority.Bridge)
+			local finished = false
+			task.spawn(function()
+				pcall(bridge.__requestAsync, bridge, { Url = "poll", Method = "POST", Body = "{}" })
+				finished = true
+			end)
+			task.wait()
+			task.wait()
+			expect(#created).to.equal(1)
+			for transport in table.clone(bridge.transports) do
+				transport:cancel()
+			end
+			task.wait()
+			task.wait()
+			expect(created[1].closedByCaller).to.equal(true)
+			expect(finished).to.equal(true)
+			expect(budget:liveCount()).to.equal(0)
+		end)
+
+		it("falls back to RequestAsync only when no stream slot is free", function()
+			local budget = StreamBudget.new(1, 0, 0)
+			local release = budget:tryAcquire(StreamBudget.Priority.Socket)
+			local create, created = fakeClient(function() end)
+			StudioBridge.bridgeStream = StreamRequest.new(create, budget, StreamBudget.Priority.Bridge)
+			-- Port 9 refuses connections, so the fallback fails without
+			-- sending anything anywhere.
+			local ok, err = pcall(bridge.__requestAsync, bridge, {
+				Url = "http://127.0.0.1:9/api/studio/poll",
+				Method = "POST",
+				Body = "{}",
+			})
+			release()
+			expect(#created).to.equal(0)
+			expect(ok).to.equal(false)
+			expect(err).to.be.ok()
+		end)
 	end)
 
 	it("stops polling once the server answers with a conflict", function()
