@@ -9,9 +9,12 @@ rojo typecheck [PROJECT] [--definitions PATH]... [--luau-lsp PATH] [-- LUAU_LSP_
 The command:
 
 1. Loads the project like `rojo build` does. `PROJECT` defaults to the current directory.
-2. Writes a sourcemap of the whole project, including non-script instances, to a temporary file, so `require(script.Parent.Module)` and `workspace.SpawnLocation` resolve.
-3. Runs `luau-lsp analyze --sourcemap=<temporary file>` on every `.lua` and `.luau` file behind a Script, LocalScript or ModuleScript in the project. Modules generated from `.json`, `.toml` or `.data.csv` files have no Luau file and are not checked.
-4. Exits with status 1 when luau-lsp reports a problem, and 0 when it does not.
+2. Writes a sourcemap of the whole project, including non-script instances, to a temporary folder, so `require(script.Parent.Module)` and `workspace.SpawnLocation` resolve.
+3. Writes the Luau that Rojo generates for each [data module](data-modules.md) into the same temporary folder, and points the sourcemap at it, because luau-lsp cannot read `.data.csv` files. Scripts that require a data module, or use its `Row` type, are checked against the generated code.
+4. Runs `luau-lsp analyze --sourcemap=<temporary file>` on every `.lua` and `.luau` file behind a Script, LocalScript or ModuleScript in the project. The generated data module code is not on that list, so luau-lsp does not report problems in it. Modules generated from `.json`, `.toml` and `.yaml` files are left to luau-lsp, which reads those files itself.
+5. Exits with status 1 when luau-lsp reports a problem, and 0 when it does not.
+
+The temporary folder is removed when the command finishes. If the command is stopped with Ctrl+C, the folder (named `rojo-typecheck-*`, in the system's temporary directory) can be left behind.
 
 luau-lsp runs in the project's folder. On a very large project, the files are split across several luau-lsp runs to stay under the Windows command line limit.
 
