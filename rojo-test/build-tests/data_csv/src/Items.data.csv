@@ -1,0 +1,4 @@
+id,name,cost,stackable
+sword,Sword,100,false
+iron-shield,Iron Shield,75.5,FALSE
+potion,"Potion, small",10,true

@@ -36,6 +36,7 @@ gen_build_tests! {
     csv_bug_145,
     csv_bug_147,
     csv_in_folder,
+    data_csv,
     deep_nesting,
     gitkeep,
     ignore_glob_inner,

@@ -137,6 +137,7 @@ Making a new release? Simply add the new header with the version and date undern
 * The plugin keeps at most two HTTP streams open at once, staying well under Studio's limit, and saves one for the sync connection. Requests that find no free stream use RequestAsync instead, and the Studio bridge always uses RequestAsync and stops as soon as sync disconnects. ([fork#2])
 * The Studio bridge waits up to 30 seconds per request and tries each poll or result up to three times when it is lost or the server is unavailable, so long Git operations no longer stop it, and Connect waits 30 seconds. Local reads too large for an HTTP stream, or queued behind a stream that never opens, are sent with RequestAsync instead of failing. ([fork#2])
 * Studio now shows the Rojo server's error reason, such as a changed Git checkout, instead of the raw MessagePack bytes of the error response. ([fork#2])
+* Added data modules: a `.data.csv` file, or `init.data.csv` in a directory, becomes a ModuleScript that returns its rows as Luau tables with an exported `Row` type. Numbers, booleans and empty cells are converted, and a column named `id` turns the rows into a dictionary. Ragged rows and duplicate ids fail with the file and line. Two-way sync and syncback leave the CSV file as it is. See `docs/data-modules.md`. ([fork#3])
 * LocalizationTables no longer report as changed when nothing changes. ([#1333])
 * Sounds now preloaded correctly. The warning "*ContentId: rbxassetid://203785492 failed due to: Asset type does not match requested type*" is fixed. ([#1351])
 

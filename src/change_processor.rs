@@ -561,7 +561,19 @@ impl JobThreadContext {
                     }
 
                     for (key, changed_value) in &update.changed_properties {
-                        if key == "Source" {
+                        if key == "Source"
+                            && matches!(
+                                instance.metadata().middleware,
+                                Some(Middleware::DataCsv | Middleware::DataCsvDir)
+                            )
+                        {
+                            // Writing the edited Luau over the spreadsheet
+                            // would destroy it.
+                            log::warn!(
+                                "Cannot write Source of {:?}, it is generated from a data CSV file",
+                                id
+                            );
+                        } else if key == "Source" {
                             if let Some(instigating_source) =
                                 &instance.metadata().instigating_source
                             {

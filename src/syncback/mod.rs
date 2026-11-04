@@ -205,7 +205,11 @@ pub fn syncback_loop(
             snapshot.path.display()
         );
 
-        if matches!(middleware, Middleware::Json | Middleware::Toml) {
+        // Modules generated from data files keep their source file as it is.
+        if matches!(
+            middleware,
+            Middleware::Json | Middleware::Toml | Middleware::DataCsv | Middleware::DataCsvDir
+        ) {
             log::warn!("Cannot syncback {middleware:?} at {inst_path}, skipping");
             continue;
         }

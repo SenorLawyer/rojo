@@ -18,6 +18,7 @@ metadata:
     - /foo/init.plugin.lua
     - /foo/init.plugin.luau
     - /foo/init.csv
+    - /foo/init.data.csv
     - /foo/init.meta.json
     - /foo/init.meta.jsonc
   context:
@@ -45,6 +46,7 @@ children:
         - /foo/Child/init.plugin.lua
         - /foo/Child/init.plugin.luau
         - /foo/Child/init.csv
+        - /foo/Child/init.data.csv
         - /foo/Child/init.meta.json
         - /foo/Child/init.meta.jsonc
       context:
