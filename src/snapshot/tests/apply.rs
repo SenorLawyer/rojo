@@ -204,7 +204,42 @@ fn removing_ref_target_clears_pointer() {
     assert_eq!(applied_patch_set.updated.len(), 1);
     let update = &applied_patch_set.updated[0];
     assert_eq!(update.id, pointer_id);
-    assert_eq!(update.changed_properties.get(&ustr("Value")), Some(&None));
+    // The plugin cannot see a msgpack nil inside a table, so the cleared ref
+    // is reported as an explicit null Ref.
+    assert_eq!(
+        update.changed_properties.get(&ustr("Value")),
+        Some(&Some(Variant::Ref(Ref::none())))
+    );
+}
+
+#[test]
+fn removing_ref_target_ignores_refs_without_pointer_attributes() {
+    let (mut tree, target_id, _pointer_id) = tree_with_pointer();
+    let root_id = tree.get_root_id();
+
+    // A ref that did not come from a `Rojo_Target_*` attribute belongs to the
+    // same model as its target and is updated when that model is
+    // re-snapshotted, so the repair pass leaves it alone.
+    let plain_id = tree.insert_instance(
+        root_id,
+        InstanceSnapshot::new()
+            .name("plain")
+            .class_name("ObjectValue")
+            .property(ustr("Value"), Variant::Ref(target_id)),
+    );
+
+    let applied_patch_set = apply_patch_set(
+        &mut tree,
+        PatchSet {
+            removed_instances: vec![target_id],
+            ..Default::default()
+        },
+    );
+
+    assert!(applied_patch_set
+        .updated
+        .iter()
+        .all(|update| update.id != plain_id));
 }
 
 #[test]

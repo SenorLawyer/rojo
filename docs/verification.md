@@ -33,7 +33,7 @@ A cold-font measurement was initially suspected. The suspended coroutine showed 
 
 ## Review and remaining scope
 
-GPT-6.1 Sol High reviewed the combined diff independently through sol-loop. The artifact-location nit was fixed. An optimized stress run later exposed a directory-event race that unit tests had missed. The invalid event filter was removed, effective reference metadata was normalized, and regression tests now cover the coalesced event. The release suite and repeated optimized stress tests were rerun. The final review and GitHub CI verdict are recorded in the PR. Windows CI runs the release-profile suite and Git/package stress script; other platform failures cannot cancel that job.
+The combined diff went through an AI-assisted review. The artifact-location nit it found was fixed. An optimized stress run later exposed a directory-event race that unit tests had missed. The invalid event filter was removed, effective reference metadata was normalized, and regression tests now cover the coalesced event. The release suite and repeated optimized stress tests were rerun. The final review and GitHub CI verdict are recorded in the PR. Windows CI runs the release-profile suite and Git/package stress script; other platform failures cannot cancel that job.
 
 The [issue inventory](upstream-issues.md) includes all 196 open upstream issues, and the [PR review](upstream-pull-requests.md) includes all 27 open PRs with authors and reviewed heads. Deferred entries are not solved. Cloud upload migration, multiple paths, child patterns, custom metadata names and a third-party plugin API require more design and testing.
 

@@ -1,6 +1,5 @@
 use std::{
     fs,
-    io::{BufWriter, Write},
     path::{Path, PathBuf},
 };
 
@@ -82,25 +81,12 @@ fn install_plugin(plugins_dir: &Path) -> anyhow::Result<()> {
     let tree = session.tree();
     fs::create_dir_all(plugins_dir)?;
     let destination = plugins_dir.join(PLUGIN_FILE_NAME);
-    // Studio may see this directory while installing. Only replace the old
-    // plugin after a complete model has been serialized and flushed.
-    let mut staged = tempfile::NamedTempFile::new_in(plugins_dir)?;
-    {
-        let mut writer = BufWriter::new(staged.as_file_mut());
-        rbx_binary::to_writer(&mut writer, tree.inner(), &[tree.get_root_id()])?;
-        writer.flush()?;
-    }
-    // Temporary files are created owner-only (0600) on Unix. A plugin file
-    // created directly would be world-readable, so match that before it
-    // replaces the old plugin.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        staged
-            .as_file()
-            .set_permissions(fs::Permissions::from_mode(0o644))?;
-    }
-    staged.persist(&destination)?;
+    // Studio may see this directory while installing, so the old plugin is
+    // only replaced once a complete model has been serialized and flushed.
+    super::build::write_file_atomically(&destination, |writer| {
+        rbx_binary::to_writer(writer, tree.inner(), &[tree.get_root_id()])?;
+        Ok(())
+    })?;
     println!("Installed plugin to {}", destination.display());
     Ok(())
 }
@@ -141,7 +127,7 @@ fn installs_and_replaces_a_complete_plugin() {
 
 #[cfg(unix)]
 #[test]
-fn installed_plugin_is_world_readable() {
+fn new_plugin_is_world_readable() {
     use std::os::unix::fs::PermissionsExt;
 
     let dir = tempfile::tempdir().unwrap();
@@ -151,6 +137,20 @@ fn installed_plugin_is_world_readable() {
         .permissions()
         .mode();
     assert_eq!(mode & 0o777, 0o644);
+}
+
+#[cfg(unix)]
+#[test]
+fn reinstalled_plugin_keeps_existing_permissions() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let destination = dir.path().join(PLUGIN_FILE_NAME);
+    fs::write(&destination, b"old plugin").unwrap();
+    fs::set_permissions(&destination, fs::Permissions::from_mode(0o600)).unwrap();
+    install_plugin(dir.path()).unwrap();
+    let mode = fs::metadata(destination).unwrap().permissions().mode();
+    assert_eq!(mode & 0o777, 0o600);
 }
 
 #[test]
