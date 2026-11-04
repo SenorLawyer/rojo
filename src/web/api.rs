@@ -5,7 +5,7 @@ use std::{collections::HashMap, fs, net::SocketAddr, path::PathBuf, str::FromStr
 
 use futures::{sink::SinkExt, stream::StreamExt};
 use hyper::{
-    body::{self, Bytes},
+    body::{Bytes, HttpBody},
     Body, Method, Request, Response, StatusCode,
 };
 use hyper_tungstenite::{
@@ -488,13 +488,27 @@ impl ApiService {
     }
 }
 
-async fn read_request_body(body: Body) -> Result<Bytes, Box<Response<Body>>> {
-    body::to_bytes(body).await.map_err(|err| {
-        Box::new(msgpack(
-            ErrorResponse::bad_request(format!("Failed to read request body: {}", err)),
-            StatusCode::BAD_REQUEST,
-        ))
-    })
+/// Requests larger than this are rejected rather than buffered in memory.
+const MAX_REQUEST_BODY: usize = 64 * 1024 * 1024;
+
+async fn read_request_body(mut body: Body) -> Result<Bytes, Box<Response<Body>>> {
+    let mut bytes = Vec::new();
+    while let Some(chunk) = body.data().await {
+        let chunk = chunk.map_err(|err| {
+            Box::new(msgpack(
+                ErrorResponse::bad_request(format!("Failed to read request body: {}", err)),
+                StatusCode::BAD_REQUEST,
+            ))
+        })?;
+        if bytes.len() + chunk.len() > MAX_REQUEST_BODY {
+            return Err(Box::new(msgpack(
+                ErrorResponse::bad_request("Request body exceeds 64 MiB"),
+                StatusCode::PAYLOAD_TOO_LARGE,
+            )));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(Bytes::from(bytes))
 }
 
 /// If this instance is represented by a script, try to find the correct .lua or .luau
@@ -720,6 +734,7 @@ fn percent_decode(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hyper::body;
 
     #[test]
     fn percent_decode_handles_encoded_session_ids() {
@@ -746,6 +761,14 @@ mod tests {
         let body = read_request_body(Body::from("hello")).await.unwrap();
 
         assert_eq!(body, Bytes::from_static(b"hello"));
+    }
+
+    #[tokio::test]
+    async fn read_request_body_rejects_oversized_bodies() {
+        let response = read_request_body(Body::from(vec![0; MAX_REQUEST_BODY + 1]))
+            .await
+            .unwrap_err();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 
     #[tokio::test]

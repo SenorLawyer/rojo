@@ -13,3 +13,10 @@ To profile initial sync or file churn, build with `cargo build --release --locke
 For generated projects, use `rojo build -o place.rbxl` for a place or `rojo build -o model.rbxm` for a model. Binary output supports `--compress lz4`, `--compress zstd` and `--compress none`. XML output rejects compression flags.
 
 Windows x64 is the primary supported target. Windows ARM is excluded from CI and release artifacts. Linux and macOS retain their existing CI coverage.
+
+## Compatibility
+
+Use this fork's Studio plugin (7.7.2-fork.1 or later) with this fork's server. Mixing it with the upstream plugin has these known issues:
+
+- When the target of a `Rojo_Target_*` attribute is removed, the server clears the referencing property by sending a null reference. The upstream plugin treats it as a failed change. With sync fallback enabled, it replaces the referencing instance. Otherwise it logs the change as unapplied. Before this fork, the upstream plugin kept the stale reference without reporting it.
+- The upstream plugin does not send a session ID when it subscribes. After the server restarts, a subscription from an older session is only rejected when its message cursor is beyond the new server's queue. Otherwise the server accepts it, and the upstream plugin then ignores the packets because they come from a different session. This also happens with upstream Rojo. Reconnect after restarting the server.

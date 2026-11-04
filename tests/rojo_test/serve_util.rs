@@ -192,6 +192,14 @@ impl TestServeSession {
 
         let (mut socket, _response) = connect(url)?;
 
+        // Without a read timeout, `read` blocks until the server sends
+        // something, so the deadline below could never fire.
+        if let hyper_tungstenite::tungstenite::stream::MaybeTlsStream::Plain(stream) =
+            socket.get_ref()
+        {
+            stream.set_read_timeout(Some(Duration::from_millis(100)))?;
+        }
+
         // Wait for messages with a timeout
         let timeout = Duration::from_secs(10);
         let start = std::time::Instant::now();
@@ -219,8 +227,12 @@ impl TestServeSession {
                     // Ignore other message types (ping, pong, text)
                     continue;
                 }
+                // A read timeout is reported as `TimedOut` on Windows.
                 Err(hyper_tungstenite::tungstenite::Error::Io(e))
-                    if e.kind() == std::io::ErrorKind::WouldBlock =>
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
                 {
                     // No data available yet, sleep a bit and try again
                     thread::sleep(Duration::from_millis(100));

@@ -63,6 +63,11 @@ impl<'a> SubscribeMessage<'a> {
     /// know about, but reports updates to them as unapplied, which can trigger
     /// its sync fallback for those IDs; `/api/serialize` then leaves out the
     /// IDs that no longer exist.
+    ///
+    /// The exception is an instance whose addition was skipped in this batch:
+    /// the client never hears of it, so updates and removals of it are
+    /// dropped too instead of making the plugin fall back for nothing.
+    /// Instances the client received earlier are not affected.
     pub(crate) fn from_patch_updates(
         tree: &'a RojoTree,
         patches: impl IntoIterator<Item = AppliedPatchSet>,
@@ -71,10 +76,11 @@ impl<'a> SubscribeMessage<'a> {
         // their current descendants, so a descendant that was itself added by a
         // later patch in this batch has already been sent and can be skipped.
         let mut sent = HashSet::new();
+        let mut skipped = HashSet::new();
 
         patches
             .into_iter()
-            .map(|patch| Self::from_patch_update_inner(tree, patch, &mut sent))
+            .map(|patch| Self::from_patch_update_inner(tree, patch, &mut sent, &mut skipped))
             .collect()
     }
 
@@ -82,9 +88,8 @@ impl<'a> SubscribeMessage<'a> {
         tree: &'a RojoTree,
         patch: AppliedPatchSet,
         sent: &mut HashSet<Ref>,
+        skipped: &mut HashSet<Ref>,
     ) -> Self {
-        let removed = patch.removed;
-
         let mut added = HashMap::new();
         for id in patch.added {
             if sent.contains(&id) {
@@ -95,6 +100,9 @@ impl<'a> SubscribeMessage<'a> {
                 log::debug!(
                     "Skipping addition of instance {id} because it was removed by a later patch"
                 );
+                // Every descendant of a skipped addition is listed in the
+                // patch too, and is gone as well, so each ends up here.
+                skipped.insert(id);
                 continue;
             };
 
@@ -108,9 +116,18 @@ impl<'a> SubscribeMessage<'a> {
             }
         }
 
+        // An addition is always applied before any update or removal of the
+        // same instance, so `skipped` is complete for those by now.
+        let removed = patch
+            .removed
+            .into_iter()
+            .filter(|id| !skipped.contains(id))
+            .collect();
+
         let updated = patch
             .updated
             .into_iter()
+            .filter(|update| !skipped.contains(&update.id))
             .map(|update| {
                 let changed_metadata =
                     update
@@ -447,8 +464,8 @@ mod tests {
     }
 
     /// An instance created and then deleted before the websocket task reads
-    /// the tree cannot be serialized; it is skipped because its removal is
-    /// delivered by a later message.
+    /// the tree cannot be serialized, so it is skipped, and so is its removal
+    /// since the client never heard of it.
     #[test]
     fn add_then_remove_in_one_batch_skips_addition() {
         let mut tree = empty_tree();
@@ -475,7 +492,55 @@ mod tests {
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0].added.len(), 1);
         assert!(messages[0].added.contains_key(&kept));
-        assert_eq!(messages[1].removed, vec![gone]);
+        assert!(messages[1].is_empty());
+    }
+
+    /// Updates and removals of an instance whose addition was skipped would
+    /// only make the plugin report them as unapplied and fall back, so they
+    /// are dropped. Changes to instances the client already has still go out.
+    #[test]
+    fn add_update_remove_in_one_batch_sends_nothing_for_instance() {
+        let mut tree = empty_tree();
+        let known = tree.insert_instance(tree.get_root_id(), folder("Known"));
+        let gone = tree.insert_instance(tree.get_root_id(), folder("Gone"));
+        let gone_child = tree.insert_instance(gone, folder("GoneChild"));
+        tree.remove(gone);
+        tree.remove(known);
+
+        let rename = |id| {
+            let mut update = AppliedPatchUpdate::new(id);
+            update.changed_name = Some("Renamed".to_owned());
+            update
+        };
+
+        let messages = SubscribeMessage::from_patch_updates(
+            &tree,
+            [
+                AppliedPatchSet {
+                    removed: Vec::new(),
+                    added: vec![gone, gone_child],
+                    updated: Vec::new(),
+                },
+                AppliedPatchSet {
+                    removed: Vec::new(),
+                    added: Vec::new(),
+                    updated: vec![rename(gone), rename(gone_child), rename(known)],
+                },
+                AppliedPatchSet {
+                    removed: vec![gone, known],
+                    added: Vec::new(),
+                    updated: Vec::new(),
+                },
+            ],
+        );
+
+        assert_eq!(messages.len(), 3);
+        assert!(messages[0].is_empty());
+        // `known` was sent to the client by an earlier batch, so its update
+        // and removal are forwarded even though it is gone from the tree.
+        assert_eq!(messages[1].updated.len(), 1);
+        assert_eq!(messages[1].updated[0].id, known);
+        assert_eq!(messages[2].removed, vec![known]);
     }
 
     /// Additions are serialized with their current descendants, so a

@@ -274,6 +274,90 @@ fn replacing_ref_target_in_one_patch_repoints_pointer() {
     );
 }
 
+#[test]
+fn re_adding_ref_target_in_later_patch_restores_pointer() {
+    let (mut tree, target_id, pointer_id) = tree_with_pointer();
+    let root_id = tree.get_root_id();
+
+    // Branch switches and package reinstalls can deliver the removal and the
+    // re-creation of a target as separate patches.
+    apply_patch_set(
+        &mut tree,
+        PatchSet {
+            removed_instances: vec![target_id],
+            ..Default::default()
+        },
+    );
+    let pointer = tree.get_instance(pointer_id).unwrap();
+    assert!(!pointer.properties().contains_key(&ustr("Value")));
+
+    let applied_patch_set = apply_patch_set(
+        &mut tree,
+        PatchSet {
+            added_instances: vec![crate::snapshot::PatchAdd {
+                parent_id: root_id,
+                instance: target("the target"),
+            }],
+            ..Default::default()
+        },
+    );
+
+    let new_target_id = applied_patch_set.added[0];
+    let pointer = tree.get_instance(pointer_id).unwrap();
+    assert_eq!(
+        pointer.properties().get(&ustr("Value")),
+        Some(&Variant::Ref(new_target_id))
+    );
+
+    assert_eq!(applied_patch_set.updated.len(), 1);
+    let update = &applied_patch_set.updated[0];
+    assert_eq!(update.id, pointer_id);
+    assert_eq!(
+        update.changed_properties.get(&ustr("Value")),
+        Some(&Some(Variant::Ref(new_target_id)))
+    );
+}
+
+#[test]
+fn adding_unrelated_specified_id_leaves_pointers_alone() {
+    let (mut tree, target_id, pointer_id) = tree_with_pointer();
+    let root_id = tree.get_root_id();
+
+    let applied_patch_set = apply_patch_set(
+        &mut tree,
+        PatchSet {
+            added_instances: vec![crate::snapshot::PatchAdd {
+                parent_id: root_id,
+                instance: target("another target"),
+            }],
+            ..Default::default()
+        },
+    );
+
+    assert!(applied_patch_set.updated.is_empty());
+    let pointer = tree.get_instance(pointer_id).unwrap();
+    assert_eq!(
+        pointer.properties().get(&ustr("Value")),
+        Some(&Variant::Ref(target_id))
+    );
+}
+
+#[test]
+fn removed_pointer_holders_are_forgotten() {
+    let (mut tree, _target_id, pointer_id) = tree_with_pointer();
+    assert_eq!(tree.ref_pointer_holders(), vec![pointer_id]);
+
+    apply_patch_set(
+        &mut tree,
+        PatchSet {
+            removed_instances: vec![pointer_id],
+            ..Default::default()
+        },
+    );
+
+    assert!(tree.ref_pointer_holders().is_empty());
+}
+
 fn empty_tree() -> RojoTree {
     RojoTree::new(InstanceSnapshot::new().name("ROOT").class_name("ROOT"))
 }
