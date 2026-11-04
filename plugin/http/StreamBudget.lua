@@ -2,14 +2,19 @@
 	Counts the stream clients Rojo holds from HttpService:CreateWebStreamClient.
 
 	Studio caps how many stream clients can be open at once, and what happens
-	past that cap is not documented. Rojo therefore stays well under the cap
-	and leaves the rest for other plugins: everything that
+	past that cap is not documented. Rojo therefore stays under the cap, which
+	Studio applies to each plugin separately: everything that
 	creates a stream client takes a slot from here first and does not create
 	one when no slot is free.
 
 	The sync WebSocket is what keeps Studio in sync, so one slot is held back
-	for it. HTTP requests may use the other slots and fall back to
-	RequestAsync, which takes no stream client, when none is free.
+	for it. The agent bridge long-polls the server, so it has a slot of its
+	own as well: RequestAsync slows down for the rest of a plugin's life once
+	it is used for requests the server holds open, which made the bridge
+	fall further behind until its session expired. HTTP requests may use
+	the remaining slot and fall back to RequestAsync, which takes no stream
+	client, when none is free. Neither can take a slot held back for the
+	other two.
 ]]
 
 local StreamBudget = {}
@@ -17,18 +22,23 @@ StreamBudget.__index = StreamBudget
 
 StreamBudget.Priority = {
 	Socket = "Socket",
+	Bridge = "Bridge",
 	Request = "Request",
 }
 
-StreamBudget.DEFAULT_LIMIT = 2
+-- Studio allows four stream clients per plugin; Rojo uses at most three.
+StreamBudget.DEFAULT_LIMIT = 3
 StreamBudget.DEFAULT_SOCKET_RESERVE = 1
+StreamBudget.DEFAULT_BRIDGE_RESERVE = 1
 
-function StreamBudget.new(limit: number?, socketReserve: number?)
+function StreamBudget.new(limit: number?, socketReserve: number?, bridgeReserve: number?)
 	return setmetatable({
 		limit = limit or StreamBudget.DEFAULT_LIMIT,
 		socketReserve = socketReserve or StreamBudget.DEFAULT_SOCKET_RESERVE,
+		bridgeReserve = bridgeReserve or StreamBudget.DEFAULT_BRIDGE_RESERVE,
 		live = 0,
 		liveSockets = 0,
+		liveBridges = 0,
 	}, StreamBudget)
 end
 
@@ -40,21 +50,25 @@ end
 ]]
 function StreamBudget:tryAcquire(priority: string): (() -> ())?
 	local isSocket = priority == StreamBudget.Priority.Socket
-	if isSocket then
-		if self.live >= self.limit then
-			return nil
-		end
-	else
-		-- Requests may not use the reserved slots a socket is not using yet.
-		local unusedReserve = math.max(0, self.socketReserve - self.liveSockets)
-		if self.live + unusedReserve >= self.limit then
-			return nil
-		end
+	local isBridge = priority == StreamBudget.Priority.Bridge
+	-- A client may not use slots held back for the other kinds that they are
+	-- not using yet.
+	local heldBack = 0
+	if not isSocket then
+		heldBack += math.max(0, self.socketReserve - self.liveSockets)
+	end
+	if not isBridge then
+		heldBack += math.max(0, self.bridgeReserve - self.liveBridges)
+	end
+	if self.live + heldBack >= self.limit then
+		return nil
 	end
 
 	self.live += 1
 	if isSocket then
 		self.liveSockets += 1
+	elseif isBridge then
+		self.liveBridges += 1
 	end
 	local released = false
 	return function()
@@ -65,6 +79,8 @@ function StreamBudget:tryAcquire(priority: string): (() -> ())?
 		self.live -= 1
 		if isSocket then
 			self.liveSockets -= 1
+		elseif isBridge then
+			self.liveBridges -= 1
 		end
 	end
 end

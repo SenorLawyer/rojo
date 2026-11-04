@@ -1,0 +1,27 @@
+{
+  "name": "content_properties_object",
+  "tree": {
+    "$className": "DataModel",
+    "ReplicatedStorage": {
+      "$path": "src"
+    },
+    "ServerStorage": {
+      "Label": {
+        "$className": "ImageLabel",
+        "$properties": {
+          "BackgroundTransparency": 0.25,
+          "Image": "rbxassetid://7"
+        }
+      },
+      "LabelNew": {
+        "$className": "ImageLabel",
+        "$properties": {
+          "ImageContent": "rbxassetid://8"
+        }
+      }
+    },
+    "Lighting": {
+      "$path": "unchanged.project.json"
+    }
+  }
+}

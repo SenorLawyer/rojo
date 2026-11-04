@@ -1,0 +1,10 @@
+---
+source: tests/tests/syncback.rs
+expression: src/Added.model.json
+---
+{
+  "className": "Sky",
+  "properties": {
+    "SkyboxBackContent": "rbxassetid://6"
+  }
+}

@@ -80,11 +80,14 @@ Supported actions:
   pending confirmation ID and changed-instance count, and bridge health.
 * `connect`: starts the normal connection flow. It does not skip confirmation.
 * `confirm`: use the current `confirmationId` and a `decision`. `"Abort"` is
-  always allowed. `"Accept"` and `"Reject"` are refused unless the user turned
-  on **Agent Can Skip Confirmation** (`agentControlCanChangeConfirmation`) in
-  the plugin settings; otherwise ask the user to answer in Studio. Review the
-  proposed sync and the mapped project first, and only accept changes the user
-  authorized. A stale confirmation is rejected.
+  always allowed. `"Accept"` and `"Reject"` require **Agent Can Skip Confirmation**
+  (`agentControlCanChangeConfirmation`), which is on by default. Existing saved
+  preferences are preserved, including an off setting. Plugins before 8.0.0-dev.6
+  saved the old default (off) even if it was never changed, so upgraded installs
+  usually keep it off until it is turned on in Rojo's settings. When it is off,
+  ask the user to answer in Studio. Review the proposed sync and the mapped
+  project first, and only accept changes the user authorized. A stale
+  confirmation is rejected.
 * `disconnect`: cancels connecting, confirmation or active sync.
 * `settings.get`: reads supported preferences. `capabilities` lists types and choices.
 * `settings.set`: supplies `name` and `value`. Disconnect first. Unsupported

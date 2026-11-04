@@ -1,0 +1,18 @@
+{
+  "name": "unchanged",
+  "tree": {
+    "$className": "Lighting",
+    "Sound": {
+      "$className": "Sound",
+      "$properties": {
+        "SoundId": "rbxassetid://1"
+      }
+    },
+    "Mesh": {
+      "$className": "CharacterMesh",
+      "$properties": {
+        "MeshId": 123
+      }
+    }
+  }
+}

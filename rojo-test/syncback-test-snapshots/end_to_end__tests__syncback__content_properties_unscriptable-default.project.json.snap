@@ -1,0 +1,33 @@
+---
+source: tests/tests/syncback.rs
+expression: default.project.json
+---
+{
+  "name": "content_properties_unscriptable",
+  "tree": {
+    "$className": "DataModel",
+    "ServerStorage": {
+      "Changed": {
+        "$className": "Sound",
+        "$properties": {
+          "Volume": 0.25
+        }
+      },
+      "Kept": {
+        "$className": "SurfaceAppearance",
+        "$properties": {
+          "TexturePack": "rbxassetid://5"
+        }
+      },
+      "KeptNew": {
+        "$className": "SurfaceAppearance",
+        "$properties": {
+          "TexturePackContent": "rbxassetid://5"
+        }
+      }
+    }
+  },
+  "syncbackRules": {
+    "syncUnscriptable": false
+  }
+}

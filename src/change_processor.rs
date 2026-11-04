@@ -1,7 +1,10 @@
 use crossbeam_channel::{select, Receiver, RecvError, Sender};
 use jod_thread::JoinHandle;
 use memofs::{IoResultExt, Vfs, VfsEvent};
-use rbx_dom_weak::types::{Ref, Variant};
+use rbx_dom_weak::{
+    types::{Ref, Variant},
+    ustr,
+};
 use std::cell::Cell;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -13,7 +16,8 @@ use std::{
 use crate::{
     message_queue::{MessageQueue, MessageWeight},
     snapshot::{
-        apply_patch_set, compute_patch_set, AppliedPatchSet, InstigatingSource, PatchSet, RojoTree,
+        apply_patch_set, compute_patch_set, AppliedPatchSet, AppliedPatchUpdate, InstigatingSource,
+        PatchSet, RojoTree,
     },
     snapshot_middleware::{
         canonicalize_existing_ancestor, get_dir_middleware, snapshot_from_vfs,
@@ -506,11 +510,14 @@ impl JobThreadContext {
         settle_paths
     }
 
-    fn handle_tree_event(&self, patch_set: PatchSet) {
+    fn handle_tree_event(&self, mut patch_set: PatchSet) {
         log::trace!("Applying PatchSet from client: {:#?}", patch_set);
 
         {
             let mut tree = self.tree.lock().unwrap();
+            // Data modules whose Source edit was refused. Their Source stays
+            // as generated from the CSV, in the tree and in Studio.
+            let mut generated_sources = Vec::new();
 
             for &id in &patch_set.removed_instances {
                 if let Some(instance) = tree.get_instance(id) {
@@ -561,7 +568,20 @@ impl JobThreadContext {
                     }
 
                     for (key, changed_value) in &update.changed_properties {
-                        if key == "Source" {
+                        if key == "Source"
+                            && matches!(
+                                instance.metadata().middleware,
+                                Some(Middleware::DataCsv | Middleware::DataCsvDir)
+                            )
+                        {
+                            // Writing the edited Luau over the spreadsheet
+                            // would destroy it.
+                            log::warn!(
+                                "Cannot write Source of {:?}, it is generated from a data CSV file",
+                                id
+                            );
+                            generated_sources.push(id);
+                        } else if key == "Source" {
                             if let Some(instigating_source) =
                                 &instance.metadata().instigating_source
                             {
@@ -621,7 +641,36 @@ impl JobThreadContext {
                 }
             }
 
-            let applied_patch = apply_patch_set(&mut tree, patch_set);
+            for update in &mut patch_set.updated_instances {
+                if generated_sources.contains(&update.id) {
+                    update.changed_properties.remove(&ustr("Source"));
+                }
+            }
+
+            let mut applied_patch = apply_patch_set(&mut tree, patch_set);
+
+            // Studio already shows the refused edit, so send the generated
+            // Source back to put it right.
+            for id in generated_sources {
+                let Some(source) = tree
+                    .get_instance(id)
+                    .and_then(|instance| instance.properties().get(&ustr("Source")).cloned())
+                else {
+                    continue;
+                };
+                let position = applied_patch
+                    .updated
+                    .iter()
+                    .position(|update| update.id == id)
+                    .unwrap_or_else(|| {
+                        applied_patch.updated.push(AppliedPatchUpdate::new(id));
+                        applied_patch.updated.len() - 1
+                    });
+                applied_patch.updated[position]
+                    .changed_properties
+                    .insert(ustr("Source"), Some(source));
+            }
+
             if !applied_patch.is_empty() {
                 let message = PublishedPatch::new(&tree, applied_patch);
                 self.message_queue.push_messages(&[message]);
@@ -808,7 +857,7 @@ fn compute_and_apply_changes(
 mod test {
     use super::*;
     use crate::snapshot::{InstanceContext, InstanceSnapshot, PatchUpdate};
-    use rbx_dom_weak::{ustr, UstrMap};
+    use rbx_dom_weak::UstrMap;
 
     fn context(path: &Path) -> JobThreadContext {
         context_with_vfs(Vfs::new_default_without_watch(), path)
@@ -1545,6 +1594,82 @@ mod test {
         });
         assert_eq!(fs::read_to_string(&init).unwrap(), "return 2");
         assert!(folder.join("child.luau").is_file());
+    }
+
+    #[test]
+    fn two_way_sync_does_not_write_luau_over_data_csv_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dunce::canonicalize(dir.path()).unwrap();
+        let items = root.join("Items.data.csv");
+        fs::write(&items, "id,cost\nsword,100\n").unwrap();
+        let levels = root.join("Levels");
+        fs::create_dir(&levels).unwrap();
+        let levels_init = levels.join("init.data.csv");
+        fs::write(&levels_init, "id,music\n1,calm\n").unwrap();
+        fs::write(levels.join("Helper.luau"), "return 1").unwrap();
+        let task = context(&root);
+
+        for (index, (path, file)) in [(&items, &items), (&levels, &levels_init)]
+            .into_iter()
+            .enumerate()
+        {
+            let before = fs::read(file).unwrap();
+            let id = task.tree.lock().unwrap().get_ids_at_path(path)[0];
+            let generated = task
+                .tree
+                .lock()
+                .unwrap()
+                .get_instance(id)
+                .unwrap()
+                .properties()[&ustr("Source")]
+                .clone();
+            let mut properties = UstrMap::default();
+            properties.insert(
+                ustr("Source"),
+                Some(Variant::String("return 'edited in Studio'".into())),
+            );
+            task.handle_tree_event(PatchSet {
+                updated_instances: vec![PatchUpdate {
+                    id,
+                    changed_name: None,
+                    changed_class_name: None,
+                    changed_properties: properties,
+                    changed_metadata: None,
+                }],
+                ..PatchSet::new()
+            });
+            assert_eq!(fs::read(file).unwrap(), before, "{}", file.display());
+
+            // The served tree keeps the Source generated from the CSV...
+            let tree = task.tree.lock().unwrap();
+            assert_eq!(
+                tree.get_instance(id).unwrap().properties()[&ustr("Source")],
+                generated,
+                "{}",
+                file.display()
+            );
+            drop(tree);
+
+            // ...and clients are sent it to undo the edit in Studio.
+            let (_, messages) = task
+                .message_queue
+                .subscribe(index as u32)
+                .unwrap()
+                .try_recv()
+                .unwrap()
+                .unwrap();
+            assert_eq!(messages.len(), 1);
+            let update = &messages[0].patch.updated[0];
+            assert_eq!(update.id, id);
+            assert_eq!(
+                update.changed_properties[&ustr("Source")].as_ref(),
+                Some(&generated)
+            );
+        }
+
+        // Nothing else was written next to them, such as an init.luau.
+        assert!(!levels.join("init.luau").exists());
+        assert_eq!(fs::read_dir(&levels).unwrap().count(), 2);
     }
 
     #[test]

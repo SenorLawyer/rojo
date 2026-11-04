@@ -117,4 +117,46 @@ A successful response records the returned Roblox version number. The version is
 
 Connecting must succeed within 30 seconds. The whole upload may take 120 seconds plus one second per 256 KiB of place data, about 36 minutes for a 512 MiB place. `release list` reports local receipts and does not claim that existing servers run that version.
 
+## Stage, smoke check and promote
+
+To try a release on a test place before players get it, stage it there first and promote it once it passes:
+
+```powershell
+rojo release stage v1 --staging 900:901 --smoke smoke.luau --smoke-timeout 60
+rojo release promote v1 --confirm-target 123:456
+```
+
+`release stage` publishes the release's exact archived bytes to the staging place, through the same lock, journal and checks as `release publish`. The staging place must be a different place from the release's target; giving the release's own place ID, under any universe ID, is refused before anything is uploaded, and so is a place that another release targets or that Rojo has published live. The staging place must also be in a universe that no release targets and Rojo has not published to, including the release's own. Places in one universe share its DataStores and other universe-wide data, so a smoke script run there reads and writes that game's live player data, and players can teleport into the staging place. `--allow-live-universe` accepts such a staging place anyway; use it only when the smoke script leaves shared data alone. These checks read every release manifest and `live` record, and `last-publication.json`; if one cannot be read, staging is refused and the error names the file to repair, since it could be the record of the place being staged to.
+
+Rojo can only protect the places it knows about. Unlike `release publish`, `release stage` has no `--confirm-target`, so a mistyped `--staging` ID that no release or `live` record names publishes to whatever place the API key can write, including a live game Rojo does not track. Check the ID before running, and use an Open Cloud key that can only write to your test places where you can. Staging writes no `live` record and does not change `last-publication.json`, and its journal entry has `purpose: "staging"`. An unconfirmed staging upload keeps `publication.lock` like any other and is settled with `rojo release resolve`, which for a staging attempt writes no `live` record either. A resolved staging attempt never ran its smoke check, so stage the release again before promoting it.
+
+With `--smoke`, Rojo then runs the script with Open Cloud Luau Execution against the version that staging just created, in a server Roblox starts for it. The key needs the `universe.place.luau-execution-session:write` scope as well as `universe-places:write`. `--smoke-timeout` is how long the script may run, from 1 to 300 seconds (60 by default); the task can wait in Roblox's queue for up to two minutes longer before Rojo gives up polling. The script passes only when it completes and its first return value is `true` or a table whose `ok` field is `true`:
+
+```lua
+local ok = workspace:FindFirstChild("SpawnLocation") ~= nil
+return { ok = ok, message = if ok then "spawn found" else "no SpawnLocation" }
+```
+
+Everything else fails: a script error, running past the timeout, returning nothing or `nil`, `false`, `{ ok = false }`, a table without `ok = true`, and any other value such as a string or number. Requiring an explicit `true` means a script that forgets to report a result never counts as a pass. A `message` string in the returned table is shown when the check fails. When Open Cloud itself fails, for example the task cannot be created or is still running when polling stops, the result is `error`, which also blocks promotion. Scripts are read before anything is uploaded and may be up to 4,000,000 bytes, counted after JSON escaping, so a script with many quotes, backslashes or control characters must be smaller on disk.
+
+Each stage writes `rojo-state/staging/<attempt>.json` with the release, place hash, staging target, staged version number, status (`passed`, `failed`, `error`, or `staged` when no smoke script was given), the smoke result with the task path, reason, return values and the last 50 log messages, `staged_unix`, and `staging_seq`. Each staging upload takes the next `staging_seq` while it holds `publication.lock`, and its journal entry records the same number. Promote decides which stage is latest by this number rather than by time, so a clock that moves backward between two stages cannot rank a later failure below an earlier pass. Numbering reads every staging record and `publication-attempts` entry, so when one cannot be read, the stage releases the lock and uploads nothing. A smoke check that does not pass is recorded and the command exits with an error; the staging place keeps the new version and the live place is not touched. `rojo release list` shows these records under `staging`.
+
+`release promote` checks the release's latest staging record and only then performs the same live publication as `release publish`: the same `--confirm-target`, lock, journal, receipt and `live` record, with `purpose: "promote"` and the staging attempt in `promoted_from_staging`. It refuses, uploading nothing, when:
+
+- the release has no staging record;
+- the latest record is for different place bytes than the release has now;
+- the latest record did not pass. Only the latest counts, so a failed stage after a passing one blocks promotion until a later stage passes;
+- the release was uploaded to staging again after the stage the latest record describes, for example by a stage whose smoke check was interrupted or is still running, or whose upload was settled with `release resolve`. Only the newest upload counts. A rejected upload, or one resolved with `--not-published`, created no version and does not count;
+- the latest record was made while the release had a different target;
+- the latest record has no `staging_seq`, or one that differs from its journal entry's, as records from earlier development builds do. Stage again;
+- the latest record is dated more than five minutes in the future, which means the clock was wrong when it was written and its age cannot be trusted. Once the clock is right, stage again;
+- the latest record ran no smoke check, unless you pass `--allow-unsmoked`;
+- the record is older than `--max-age-hours` (24 by default);
+- a staging record cannot be read, since it could be the latest failure. Fix or remove that file;
+- an entry in `publication-attempts` cannot be read, since it could be a newer staging upload. Repair it, or move it out of `publication-attempts`; if Roblox version history shows a version from it, stage the release again before promoting, since that upload's smoke check is unknown.
+
+Promote runs these checks once before it takes `publication.lock` and again once it holds it, so a `release stage` that uploads in between is not missed. When the second check refuses, promote releases the lock and uploads nothing.
+
+Staging proves that this version loaded on the test place and that the script's checks passed there. It does not prove the game works for players, and the test place's own settings, data stores and assets may differ from the live place's. Rojo state records, including staging records and journal entries, are refused when larger than 1 MiB, and the fields a smoke record copies from Roblox are shortened to keep them small.
+
 Lifecycle commands always return structured JSON on success; `--json` is accepted explicitly. Errors return a nonzero exit status. These commands do not change your primary project unless you explicitly run `workspace apply` there.

@@ -1,0 +1,17 @@
+{
+  "name": "content_properties",
+  "tree": {
+    "$className": "DataModel",
+    "Workspace": {
+      "LegacySound": { "$className": "Sound", "$properties": { "SoundId": "rbxassetid://111" } },
+      "NewSound": { "$className": "Sound", "$properties": { "AudioContent": "rbxassetid://222" } },
+      "BothSound": { "$className": "Sound", "$properties": { "SoundId": "rbxassetid://333", "AudioContent": "rbxassetid://444" } },
+      "EmptyNew": { "$className": "Sound", "$properties": { "AudioContent": "" } },
+      "LegacyChar": { "$className": "CharacterMesh", "$properties": { "MeshId": 123 } },
+      "NewChar": { "$className": "CharacterMesh", "$properties": { "MeshContent": "rbxassetid://9" } },
+      "LegacyOverride": { "$path": "models/Override.rbxmx", "$properties": { "SoundId": "rbxassetid://2" } },
+      "NewOverride": { "$path": "models/Override.rbxmx", "$properties": { "AudioContent": "rbxassetid://3" } },
+      "Src": { "$path": "src" }
+    }
+  }
+}

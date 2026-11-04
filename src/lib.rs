@@ -15,6 +15,7 @@ mod lua_ast;
 pub mod memory_cap;
 mod message_queue;
 mod multimap;
+mod open_cloud;
 mod path_serializer;
 mod project;
 mod resolution;

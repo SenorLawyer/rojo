@@ -22,6 +22,10 @@ use serde_json::{json, Map, Value};
 const MAX_LINE_BYTES: usize = 64 * 1024;
 const MAX_OUTPUT_BYTES: usize = 256 * 1024;
 const MAX_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
+// A result carries a native command's JSON twice: escaped as text, where each
+// byte of compact JSON becomes at most two, and parsed as structuredContent.
+// So output within the stream limit always fits one response.
+const _: () = assert!(3 * MAX_OUTPUT_BYTES + 4096 < MAX_RESPONSE_BYTES);
 /// Outlasts the Studio CLI's own HTTP timeout (65 s), so a slow Studio command
 /// reports its own error instead of being killed first.
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(70);
@@ -256,7 +260,7 @@ impl Server {
             self.initialized = true;
             return Some(result(
                 id,
-                json!({"protocolVersion":self.protocol,"capabilities":{"tools":{"listChanged":false}},"serverInfo":{"name":"rojo","version":env!("CARGO_PKG_VERSION")},"instructions":"Choose an exact Studio session from studio_sessions. Tools use the fixed project and never run arbitrary commands or publish a place. studio_test executes existing trusted place scripts for a bounded simulation."}),
+                json!({"protocolVersion":self.protocol,"capabilities":{"tools":{"listChanged":false}},"serverInfo":{"name":"rojo","version":env!("CARGO_PKG_VERSION")},"instructions":"Choose an exact Studio session from studio_sessions. Tools use the fixed project and never run arbitrary commands or publish a place. studio_test and run_tests execute existing trusted place scripts in Run mode; run_tests reports their TestEZ or Jest-Lua results."}),
             ));
         }
         if !self.ready {
@@ -336,6 +340,16 @@ struct Cancellable {
     request: String,
 }
 
+/// A native command ready to run for a tool call.
+struct Prepared {
+    command: Command,
+    cancellable: Option<Cancellable>,
+    timeout: Duration,
+    /// The command exits with 1 after printing a JSON report of failed work
+    /// (`rojo test` when tests fail), which is a result rather than an error.
+    reports_failure: bool,
+}
+
 fn call_tool(
     options: &McpCommand,
     name: &str,
@@ -343,8 +357,14 @@ fn call_tool(
     cancel: &AtomicBool,
     structured: bool,
 ) -> Value {
-    let outcome = command(options, name, arguments).and_then(|(command, cancellable)| {
-        let outcome = run_command(command, cancel);
+    let outcome = command(options, name, arguments).and_then(|prepared| {
+        let Prepared {
+            command,
+            cancellable,
+            timeout,
+            reports_failure,
+        } = prepared;
+        let outcome = run_command_for(command, cancel, timeout, reports_failure);
         // Any failure may leave the command queued for Studio: the child may
         // have been killed, timed out waiting for the server, or lost its
         // connection. Killing the child does not stop a queued command, so
@@ -360,7 +380,7 @@ fn call_tool(
         Err(error) => (format!("{error:#}"), true),
     };
     let mut content = vec![json!({"type":"text","text":text})];
-    if name.starts_with("studio_") {
+    if name.starts_with("studio_") || name == "run_tests" {
         content.push(json!({"type":"text","text":STUDIO_CONTENT_NOTE}));
     }
     let mut response = json!({"content":content,"isError":is_error});
@@ -387,16 +407,18 @@ fn cancel_studio_command(options: &McpCommand, cancellable: &Cancellable) {
         .arg(format!("--session={}", cancellable.session))
         .arg(format!("--request={}", cancellable.request));
     // Best effort: the command may already have finished or expired.
-    let _ = run_command_for(command, &AtomicBool::new(false), CANCEL_TIMEOUT);
+    let _ = run_command_for(command, &AtomicBool::new(false), CANCEL_TIMEOUT, false);
 }
 
 fn command(
     options: &McpCommand,
     name: &str,
     arguments: &Map<String, Value>,
-) -> anyhow::Result<(Command, Option<Cancellable>)> {
+) -> anyhow::Result<Prepared> {
     let mut command = Command::new(std::env::current_exe()?);
     let mut cancellable = None;
+    let mut timeout = COMMAND_TIMEOUT;
+    let mut reports_failure = false;
     let directory = if options.project.is_dir() {
         options.project.as_path()
     } else {
@@ -425,6 +447,45 @@ fn command(
                 ])
                 .arg(format!("--project={}", options.project.display()));
         }
+        "run_tests" => {
+            let token = options.token_file.as_ref().context(
+                "Studio tools require --token-file matching rojo serve --studio-token-file",
+            )?;
+            command
+                .arg("test")
+                .arg(format!("--address={}", options.address))
+                .arg(format!("--token-file={}", token.display()))
+                .arg("--json")
+                // A long list of failures is still a result: have the CLI cut
+                // the report to fit the stream limit, counting what it left
+                // out, rather than exceeding it and losing the whole report.
+                .arg(format!("--max-report-bytes={MAX_OUTPUT_BYTES}"));
+            if let Some(session) = canonical_session(arguments) {
+                let request = uuid::Uuid::new_v4().to_string();
+                command
+                    .arg(format!("--session={session}"))
+                    .arg(format!("--request-id={request}"));
+                cancellable = Some(Cancellable { session, request });
+            }
+            if let Some(roots) = arguments.get("roots").and_then(Value::as_array) {
+                for root in roots {
+                    command.arg(format!("--root={}", root.as_str().unwrap()));
+                }
+            }
+            for key in ["filter", "framework", "module"] {
+                if let Some(value) = arguments.get(key).and_then(Value::as_str) {
+                    command.arg(format!("--{key}={value}"));
+                }
+            }
+            let seconds = arguments
+                .get("timeout")
+                .and_then(Value::as_u64)
+                .unwrap_or(crate::web::studio::DEFAULT_SPEC_SECONDS);
+            command.arg(format!("--timeout={seconds}"));
+            // Outlast the CLI's own wait, which scales with the run's timeout.
+            timeout = test_timeout(seconds);
+            reports_failure = true;
+        }
         _ => {
             let token = options.token_file.as_ref().context(
                 "Studio tools require --token-file matching rojo serve --studio-token-file",
@@ -435,13 +496,7 @@ fn command(
                 .arg(format!("--token-file={}", token.display()))
                 .arg("--json");
             let action = name.strip_prefix("studio_").context("Unknown tool")?;
-            // Validation already parsed the UUID; pass its canonical form so
-            // cancellation names the same session the bridge registered.
-            let session = arguments
-                .get("session")
-                .and_then(Value::as_str)
-                .and_then(|session| uuid::Uuid::parse_str(session).ok())
-                .map(|session| session.hyphenated().to_string());
+            let session = canonical_session(arguments);
             if let (true, Some(session)) = (action != "sessions", &session) {
                 let request = uuid::Uuid::new_v4().to_string();
                 command.arg(format!("--request-id={request}"));
@@ -454,7 +509,7 @@ fn command(
             if let Some(session) = &session {
                 command.arg(format!("--session={session}"));
             }
-            for key in ["instance", "depth", "limit", "seconds"] {
+            for key in ["instance", "depth", "limit", "seconds", "after"] {
                 if let Some(value) = arguments.get(key) {
                     command.arg(format!(
                         "--{key}={}",
@@ -480,7 +535,27 @@ fn command(
             }
         }
     }
-    Ok((command, cancellable))
+    Ok(Prepared {
+        command,
+        cancellable,
+        timeout,
+        reports_failure,
+    })
+}
+
+/// The deadline for `rojo test`, 5 seconds past the CLI's own wait.
+fn test_timeout(seconds: u64) -> Duration {
+    super::test::client_timeout(seconds) + Duration::from_secs(5)
+}
+
+/// Validation already parsed the session UUID; its canonical form makes
+/// cancellation name the same session the bridge registered.
+fn canonical_session(arguments: &Map<String, Value>) -> Option<String> {
+    arguments
+        .get("session")
+        .and_then(Value::as_str)
+        .and_then(|session| uuid::Uuid::parse_str(session).ok())
+        .map(|session| session.hyphenated().to_string())
 }
 
 fn checked_output(project: &Path, directory: &Path, value: &str) -> anyhow::Result<PathBuf> {
@@ -537,6 +612,9 @@ fn mapped_paths(project: &Path) -> anyhow::Result<Vec<PathBuf>> {
     Ok(paths)
 }
 
+/// The largest integer JSON clients and Luau numbers both represent exactly.
+const MAX_SAFE_INTEGER: u64 = (1 << 53) - 1;
+
 fn catalog() -> Vec<Value> {
     let session = json!({"type":"string","format":"uuid","maxLength":128});
     let instance = json!({"type":"string","minLength":1,"maxLength":1024});
@@ -547,15 +625,26 @@ fn catalog() -> Vec<Value> {
         ("studio_test", "Run a 1-5 second native simulation, then return to Edit mode. This executes the place's existing and synced scripts in game context, which can have side effects such as DataStore or HTTP requests when Studio API access is enabled.", json!({"session":session,"seconds":{"type":"integer","minimum":1,"maximum":5}}), vec!["session"]),
         ("studio_tree", "Inspect a bounded instance tree in the selected Studio session.", json!({"session":session,"instance":instance,"depth":{"type":"integer","minimum":0,"maximum":6},"limit":{"type":"integer","minimum":1,"maximum":500}}), vec!["session"]),
         ("studio_properties", "Read named properties from one instance.", json!({"session":session,"instance":instance,"properties":{"type":"array","minItems":1,"maxItems":64,"items":{"type":"string","pattern":"^[A-Za-z_][A-Za-z0-9_]*$","maxLength":128}}}), vec!["session","instance","properties"]),
-        ("studio_logs", "Read a bounded number of captured Studio log entries.", json!({"session":session,"limit":{"type":"integer","minimum":1,"maximum":200}}), vec!["session"]),
+        ("studio_logs", "Read a bounded number of captured Studio log entries. Pass `after` (0 to start) to read only entries newer than that sequence number; the result then has `entries`, `nextAfter` to pass on the next call, `more` when entries are still waiting, and `dropped` for entries lost from the 200-entry buffer.", json!({"session":session,"limit":{"type":"integer","minimum":1,"maximum":200},"after":{"type":"integer","minimum":0,"maximum":MAX_SAFE_INTEGER}}), vec!["session"]),
+        ("run_tests", "Run the place's *.spec modules (TestEZ, or Jest-Lua) in Studio's Run mode and return a report: status (passed, failed, error or timedOut), counts, and each failure's test path and messages. A failing test is a result, not a tool error. This executes the place's existing and synced scripts in game context, like studio_test. The session may be omitted when exactly one is connected, but only a call with an explicit session can be cancelled.", json!({"session":session,"roots":{"type":"array","minItems":1,"maxItems":32,"items":instance},"filter":{"type":"string","maxLength":256,"description":"At most 256 bytes of UTF-8, without control characters"},"framework":{"type":"string","enum":["auto","testez","jest"]},"module":instance,"timeout":{"type":"integer","minimum":1,"maximum":300}}), vec![]),
         ("studio_export", "Export an instance to a new relative .rbxm file inside the fixed project. Does not save or publish the place.", json!({"session":session,"instance":instance,"output":{"type":"string","minLength":1,"maxLength":1024}}), vec!["session","instance","output"]),
         ("checkpoint_list", "List archived checkpoints for the fixed project.", json!({}), vec![]),
         ("workspace_list", "List Git worktrees and saved-place identities for the fixed project.", json!({}), vec![]),
         ("packages_doctor", "Inspect Wally/pesde manifests, lockfiles and declared Rojo package mappings without running a package manager.", json!({}), vec![]),
     ] {
-        tools.push(json!({"name":name,"description":description,"inputSchema":{"type":"object","properties":properties,"required":required,"additionalProperties":false},"annotations":{"readOnlyHint":!matches!(name, "studio_export" | "studio_test"),"destructiveHint":name == "studio_test","openWorldHint":name == "studio_test"}}));
+        tools.push(json!({"name":name,"description":description,"inputSchema":{"type":"object","properties":properties,"required":required,"additionalProperties":false},"annotations":{"readOnlyHint":!matches!(name, "studio_export" | "studio_test" | "run_tests"),"destructiveHint":matches!(name, "studio_test" | "run_tests"),"openWorldHint":matches!(name, "studio_test" | "run_tests")}}));
     }
     tools
+}
+
+/// A `run_tests` root or module: a `game/...` path the runner can resolve,
+/// within the schema's length. Checked here so a bad path is invalid
+/// arguments rather than a failed run.
+fn is_spec_path(text: &str) -> bool {
+    !text.is_empty()
+        && text.len() <= 1024
+        && !text.chars().any(char::is_control)
+        && super::test::is_instance_path(text)
 }
 
 fn validate_arguments<'a>(name: &str, value: &'a Value) -> Result<&'a Map<String, Value>, String> {
@@ -587,7 +676,7 @@ fn validate_arguments<'a>(name: &str, value: &'a Value) -> Result<&'a Map<String
                     return Err("Invalid string argument".into());
                 }
             }
-            "depth" | "limit" | "seconds" => {
+            "depth" | "limit" | "seconds" | "timeout" | "after" => {
                 let number = value.as_u64().ok_or("Expected a non-negative integer")?;
                 // Bounds come from the advertised schema so they cannot drift
                 // apart, such as the log limit that the plugin caps lower than
@@ -596,6 +685,35 @@ fn validate_arguments<'a>(name: &str, value: &'a Value) -> Result<&'a Map<String
                 let (minimum, maximum) = (bound("minimum"), bound("maximum"));
                 if !(minimum..=maximum).contains(&number) {
                     return Err(format!("{key} is outside the supported range"));
+                }
+            }
+            "roots" => {
+                let entries = value.as_array().ok_or("roots must be an array")?;
+                if entries.is_empty() || entries.len() > 32 {
+                    return Err("roots must contain 1-32 instance paths".into());
+                }
+                for entry in entries {
+                    let text = entry.as_str().ok_or("Roots must be strings")?;
+                    if !is_spec_path(text) {
+                        return Err("Each root must be a game/... instance path".into());
+                    }
+                }
+            }
+            "module" => {
+                let text = value.as_str().ok_or("Expected a string")?;
+                if !is_spec_path(text) {
+                    return Err("module must be a game/... instance path".into());
+                }
+            }
+            "filter" => {
+                let text = value.as_str().ok_or("filter must be a string")?;
+                if text.len() > 256 || text.chars().any(char::is_control) {
+                    return Err("Invalid filter".into());
+                }
+            }
+            "framework" => {
+                if !matches!(value.as_str(), Some("auto" | "testez" | "jest")) {
+                    return Err("framework must be auto, testez or jest".into());
                 }
             }
             "properties" => {
@@ -655,14 +773,11 @@ impl fmt::Display for TimedOut {
 
 impl std::error::Error for TimedOut {}
 
-fn run_command(command: Command, cancel: &AtomicBool) -> anyhow::Result<String> {
-    run_command_for(command, cancel, COMMAND_TIMEOUT)
-}
-
 fn run_command_for(
     mut command: Command,
     cancel: &AtomicBool,
     timeout: Duration,
+    reports_failure: bool,
 ) -> anyhow::Result<String> {
     let mut child = command
         .stdout(Stdio::piped())
@@ -705,7 +820,10 @@ fn run_command_for(
         "Native tool output exceeded 256 KiB per stream; request fewer instances or log entries"
     );
     let output = String::from_utf8(stdout).context("Native tool returned invalid UTF-8")?;
-    if !status.success() {
+    let reported_failure = reports_failure
+        && status.code() == Some(1)
+        && serde_json::from_str::<Value>(&output).is_ok_and(|value| value.is_object());
+    if !status.success() && !reported_failure {
         bail!(
             "Native tool failed with {status}: {}{}",
             output.trim(),
@@ -740,6 +858,101 @@ mod tests {
     }
 
     #[test]
+    fn run_tests_arguments_are_bounded() {
+        let session = "00000000-0000-4000-8000-000000000000";
+        let valid = |arguments: Value| validate_arguments("run_tests", &arguments).is_ok();
+        assert!(valid(json!({})));
+        assert!(valid(json!({
+            "session": session,
+            "roots": ["game/ReplicatedStorage/Shared"],
+            "filter": "Math",
+            "framework": "testez",
+            "module": "game/ReplicatedStorage/Packages/TestEZ",
+            "timeout": 300,
+        })));
+        for invalid in [
+            json!({"timeout": 0}),
+            json!({"timeout": 301}),
+            json!({"roots": []}),
+            json!({"roots": [""]}),
+            json!({"roots": ["game\nWorkspace"]}),
+            json!({"roots": [5]}),
+            json!({"framework": "mocha"}),
+            json!({"filter": "a".repeat(257)}),
+            // The limit is in bytes: 86 three-byte characters are 258 bytes.
+            json!({"filter": "\u{2603}".repeat(86)}),
+            json!({"roots": ["ReplicatedStorage/Shared"]}),
+            json!({"roots": ["game/"]}),
+            json!({"roots": ["game//Shared"]}),
+            json!({"module": ""}),
+            json!({"module": "Packages/TestEZ"}),
+            json!({"module": "game/ReplicatedStorage/Packages/"}),
+            json!({"script": "print(1)"}),
+            json!({"session": "--help"}),
+        ] {
+            assert!(!valid(invalid.clone()), "{invalid}");
+        }
+        let tool = catalog()
+            .into_iter()
+            .find(|tool| tool["name"] == "run_tests")
+            .unwrap();
+        assert_eq!(tool["annotations"]["destructiveHint"], true);
+        assert_eq!(tool["annotations"]["readOnlyHint"], false);
+    }
+
+    #[test]
+    fn run_tests_asks_for_a_report_within_the_stream_limit() {
+        let options = McpCommand {
+            project: std::env::temp_dir(),
+            address: "http://127.0.0.1:34872".into(),
+            token_file: Some(PathBuf::from("token")),
+        };
+        let prepared = command(&options, "run_tests", &Map::new()).unwrap();
+        let args: Vec<_> = prepared
+            .command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            args.contains(&format!("--max-report-bytes={MAX_OUTPUT_BYTES}")),
+            "{args:?}"
+        );
+    }
+
+    #[test]
+    fn run_tests_outlasts_the_cli_for_long_runs() {
+        assert!(test_timeout(300) > super::super::test::client_timeout(300));
+        // Longer than any other tool's deadline, which a 300-second run needs.
+        assert!(test_timeout(300) > COMMAND_TIMEOUT + Duration::from_secs(300));
+        assert!(test_timeout(1) >= COMMAND_TIMEOUT);
+    }
+
+    #[test]
+    fn logs_after_is_passed_to_the_native_command() {
+        let options = McpCommand {
+            project: std::env::temp_dir(),
+            address: "http://127.0.0.1:34872".into(),
+            token_file: Some(PathBuf::from("token")),
+        };
+        let arguments = json!({
+            "session": "00000000-0000-4000-8000-000000000000",
+            "after": 41,
+            "limit": 5,
+        });
+        let prepared = command(&options, "studio_logs", arguments.as_object().unwrap()).unwrap();
+        let args: Vec<_> = prepared
+            .command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+
+        assert!(args.contains(&"logs".to_owned()), "{args:?}");
+        assert!(args.contains(&"--after=41".to_owned()), "{args:?}");
+        assert!(args.contains(&"--limit=5".to_owned()), "{args:?}");
+        assert!(!args.iter().any(|arg| arg == "--follow"), "{args:?}");
+    }
+
+    #[test]
     fn numeric_bounds_follow_the_advertised_schema() {
         let session = "00000000-0000-4000-8000-000000000000";
         let call = |name: &str, limit: u64| {
@@ -749,6 +962,14 @@ mod tests {
         assert!(call("studio_logs", 200));
         assert!(!call("studio_logs", 201));
         assert!(call("studio_tree", 500));
+        let after = |after: Value| {
+            validate_arguments("studio_logs", &json!({"session":session,"after":after})).is_ok()
+        };
+        assert!(after(json!(0)));
+        assert!(after(json!(MAX_SAFE_INTEGER)));
+        assert!(!after(json!(MAX_SAFE_INTEGER + 1)));
+        assert!(!after(json!(-1)));
+        assert!(!after(json!("5")));
         assert!(!call("studio_tree", 501));
         assert!(!call("studio_tree", 0));
     }

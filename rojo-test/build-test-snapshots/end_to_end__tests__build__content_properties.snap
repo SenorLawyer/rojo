@@ -1,0 +1,128 @@
+---
+source: tests/tests/build.rs
+expression: contents
+---
+<roblox version="4">
+  <Item class="DataModel" referent="0">
+    <Properties>
+      <string name="Name">content_properties</string>
+    </Properties>
+    <Item class="Workspace" referent="1">
+      <Properties>
+        <string name="Name">Workspace</string>
+        <bool name="NeedsPivotMigration">false</bool>
+      </Properties>
+      <Item class="Sound" referent="2">
+        <Properties>
+          <string name="Name">BothSound</string>
+          <Content name="AudioContent">
+            <uri>rbxassetid://444</uri>
+          </Content>
+        </Properties>
+      </Item>
+      <Item class="Sound" referent="3">
+        <Properties>
+          <string name="Name">EmptyNew</string>
+          <Content name="AudioContent">
+            <null>
+            </null>
+          </Content>
+        </Properties>
+      </Item>
+      <Item class="CharacterMesh" referent="4">
+        <Properties>
+          <string name="Name">LegacyChar</string>
+          <Content name="MeshContent">
+            <uri>rbxassetid://123</uri>
+          </Content>
+        </Properties>
+      </Item>
+      <Item class="Sound" referent="5">
+        <Properties>
+          <string name="Name">LegacyOverride</string>
+          <Content name="AudioContent">
+            <uri>rbxassetid://2</uri>
+          </Content>
+        </Properties>
+      </Item>
+      <Item class="Sound" referent="6">
+        <Properties>
+          <string name="Name">LegacySound</string>
+          <Content name="AudioContent">
+            <uri>rbxassetid://111</uri>
+          </Content>
+        </Properties>
+      </Item>
+      <Item class="CharacterMesh" referent="7">
+        <Properties>
+          <string name="Name">NewChar</string>
+          <Content name="MeshContent">
+            <uri>rbxassetid://9</uri>
+          </Content>
+        </Properties>
+      </Item>
+      <Item class="Sound" referent="8">
+        <Properties>
+          <string name="Name">NewOverride</string>
+          <Content name="AudioContent">
+            <uri>rbxassetid://3</uri>
+          </Content>
+        </Properties>
+      </Item>
+      <Item class="Sound" referent="9">
+        <Properties>
+          <string name="Name">NewSound</string>
+          <Content name="AudioContent">
+            <uri>rbxassetid://222</uri>
+          </Content>
+        </Properties>
+      </Item>
+      <Item class="Folder" referent="10">
+        <Properties>
+          <string name="Name">Src</string>
+        </Properties>
+        <Item class="Decal" referent="11">
+          <Properties>
+            <string name="Name">LegacyDecal</string>
+            <Content name="TextureContent">
+              <uri>rbxassetid://7</uri>
+            </Content>
+          </Properties>
+        </Item>
+        <Item class="Sound" referent="12">
+          <Properties>
+            <string name="Name">LegacyXml</string>
+            <Content name="AudioContent">
+              <uri>rbxassetid://666</uri>
+            </Content>
+          </Properties>
+        </Item>
+        <Item class="Decal" referent="13">
+          <Properties>
+            <string name="Name">NewDecal</string>
+            <Content name="TextureContent">
+              <uri>rbxassetid://8</uri>
+            </Content>
+          </Properties>
+        </Item>
+        <Item class="Sound" referent="14">
+          <Properties>
+            <string name="Name">NewXml</string>
+            <Content name="AudioContent">
+              <uri>rbxassetid://555</uri>
+            </Content>
+          </Properties>
+          <Item class="Decal" referent="15">
+            <Properties>
+              <string name="Name">NullDecal</string>
+              <Content name="TextureContent">
+                <null>
+                </null>
+              </Content>
+            </Properties>
+          </Item>
+        </Item>
+      </Item>
+    </Item>
+  </Item>
+</roblox>

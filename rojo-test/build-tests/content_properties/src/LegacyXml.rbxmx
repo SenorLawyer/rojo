@@ -1,0 +1,8 @@
+<roblox version="4">
+  <Item class="Sound" referent="RBX1">
+    <Properties>
+      <string name="Name">LegacyXml</string>
+      <Content name="SoundId"><url>rbxassetid://666</url></Content>
+    </Properties>
+  </Item>
+</roblox>

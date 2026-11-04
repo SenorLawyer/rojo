@@ -50,9 +50,11 @@ instances:
     Name: Sword
     Parent: id-3
     Properties:
-      MeshId:
-        ContentId: "rbxasset://fonts/sword.mesh"
-      TextureID:
-        ContentId: "rbxasset://textures/SwordTexture.png"
+      MeshContent:
+        Content:
+          Uri: "rbxasset://fonts/sword.mesh"
+      TextureContent:
+        Content:
+          Uri: "rbxasset://textures/SwordTexture.png"
 messageCursor: 0
 sessionId: id-1

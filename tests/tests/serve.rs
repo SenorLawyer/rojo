@@ -231,6 +231,43 @@ fn edit_init() {
 }
 
 #[test]
+fn edit_data_csv() {
+    run_serve_test("edit_data_csv", |session, mut redactions| {
+        let info = session.get_api_rojo().unwrap();
+        let root_id = info.root_instance_id;
+
+        assert_yaml_snapshot!("edit_data_csv_info", redactions.redacted_yaml(info));
+
+        let read_response = session.get_api_read(root_id).unwrap();
+        assert_yaml_snapshot!(
+            "edit_data_csv_all",
+            read_response.intern_and_redact(&mut redactions, root_id)
+        );
+
+        // Written beside the file and renamed over it, so the watcher never
+        // sees a partly written CSV and the first packet is the final edit.
+        let staged = session.path().join("Items.data.csv.tmp");
+        fs::write(
+            &staged,
+            "id,cost
+sword,150
+shield,50
+",
+        )
+        .unwrap();
+        fs::rename(&staged, session.path().join("src/Items.data.csv")).unwrap();
+
+        let socket_packet = session
+            .get_api_socket_packet(SocketPacketType::Messages, 0)
+            .unwrap();
+        assert_yaml_snapshot!(
+            "edit_data_csv_subscribe",
+            socket_packet.intern_and_redact(&mut redactions, ())
+        );
+    });
+}
+
+#[test]
 fn move_folder_of_stuff() {
     run_serve_test("move_folder_of_stuff", |session, mut redactions| {
         let info = session.get_api_rojo().unwrap();

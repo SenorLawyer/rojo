@@ -32,8 +32,27 @@ syncback_tests! {
     // Ensures that there's only one copy written to disk if navigating a
     // project file might yield two copies
     child_but_not => ["OnlyOneCopy/child_of_one.luau", "ReplicatedStorage/child_replicated_storage.luau"],
+    // Ensures that a place saved with Studio's Content asset properties leaves
+    // files using the legacy names alone while their values match, and writes
+    // the new names when a value changes or an instance is added
+    content_properties => ["default.project.json", "unchanged.project.json", "src/Unchanged.model.json", "src/Changed.model.json", "src/Cleared.model.json", "src/AlreadyNew.model.json", "src/Added.model.json", "src/AddedEmpty.model.json"],
+    // Ensures that with `syncUnscriptable` off, entries for unscriptable
+    // asset properties are kept rather than taken for values reset to default
+    content_properties_unscriptable => ["default.project.json"],
+    // Ensures that ignoring a Content property also leaves entries that use
+    // its legacy name alone, rather than removing them as reset to default
+    content_properties_ignored => ["default.project.json", "unchanged.project.json", "src/Ignored.model.json"],
+    // Ensures that ignoring a legacy asset property also ignores the Content
+    // property that places hold in its place
+    content_properties_ignored_legacy => ["default.project.json", "unchanged.project.json", "src/Ignored.model.json"],
+    // Ensures that a Content property that refers to an object is neither
+    // written nor allowed to remove the asset files set
+    content_properties_object => ["default.project.json", "unchanged.project.json", "src/Label.model.json"],
     // Ensures that syncback works with CSVs
     csv => ["src/csv_init/init.csv", "src/csv.csv"],
+    // Ensures that the children of a directory with an `init.data.csv` are
+    // synced back, while the data CSV files themselves are left as they are
+    data_csv_init => ["src/Items.data.csv", "src/Levels/init.data.csv", "src/Levels/Helper.luau", "src/Levels/Added.luau"],
     // Ensures that if a RojoId is duplicated somewhere in the project, it's
     // rewritten rather than synced back as a conflict
     duplicate_rojo_id => ["container.model.json"],

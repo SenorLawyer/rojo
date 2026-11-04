@@ -1,0 +1,45 @@
+---
+source: tests/tests/syncback.rs
+expression: default.project.json
+---
+{
+  "name": "content_properties",
+  "tree": {
+    "$className": "DataModel",
+    "Lighting": {
+      "$path": "unchanged.project.json"
+    },
+    "ReplicatedStorage": {
+      "$path": "src"
+    },
+    "ServerStorage": {
+      "MeshChanged": {
+        "$className": "CharacterMesh",
+        "$properties": {
+          "MeshContent": "rbxassetid://11"
+        }
+      },
+      "MeshUnchanged": {
+        "$className": "CharacterMesh",
+        "$properties": {
+          "MeshId": 123.0
+        }
+      },
+      "ProjectChanged": {
+        "$className": "Sound",
+        "$properties": {
+          "AudioContent": "rbxassetid://3"
+        }
+      },
+      "ProjectCleared": {
+        "$className": "Decal"
+      },
+      "ProjectUnchanged": {
+        "$className": "Sound",
+        "$properties": {
+          "SoundId": "rbxassetid://1"
+        }
+      }
+    }
+  }
+}

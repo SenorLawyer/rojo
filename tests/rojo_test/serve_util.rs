@@ -247,11 +247,15 @@ impl TestServeSession {
                     // Ignore other message types (ping, pong, text)
                     continue;
                 }
-                // A read timeout is reported as `TimedOut` on Windows.
+                // A read timeout is reported as `TimedOut` on Windows. A read
+                // interrupted by a signal (EINTR, seen on Linux CI) is retried
+                // as well; no data was lost.
                 Err(hyper_tungstenite::tungstenite::Error::Io(e))
                     if matches!(
                         e.kind(),
-                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                        std::io::ErrorKind::WouldBlock
+                            | std::io::ErrorKind::TimedOut
+                            | std::io::ErrorKind::Interrupted
                     ) =>
                 {
                     // No data available yet, sleep a bit and try again

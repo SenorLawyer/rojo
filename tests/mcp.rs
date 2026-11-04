@@ -100,8 +100,8 @@ fn stdio_handshake_catalog_native_call_and_error_recovery() {
         .iter()
         .map(|tool| tool["name"].as_str().unwrap())
         .collect();
-    assert_eq!(names.len(), 10);
-    assert!(names.contains(&"studio_test"));
+    assert_eq!(names.len(), 11);
+    assert!(names.contains(&"studio_test") && names.contains(&"run_tests"));
     assert!(names.contains(&"studio_export") && names.contains(&"workspace_list"));
     assert!(!names.iter().any(|name| name.contains("publish")
         || name.contains("import")

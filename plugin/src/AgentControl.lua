@@ -57,7 +57,7 @@ local CONFIRMATION_SETTING_HINT =
 
 -- Any plugin, the command bar or a Studio MCP tool can invoke the controller,
 -- so anything that lets changes reach the place or the file system without
--- the user's review needs the user's explicit opt-in.
+-- the user's review must respect their saved agent-confirmation preference.
 function AgentControl.checkConfirmationChange(name, value)
 	if Settings:get("agentControlCanChangeConfirmation") then
 		return

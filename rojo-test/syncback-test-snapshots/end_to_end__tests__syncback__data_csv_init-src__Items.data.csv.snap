@@ -1,0 +1,6 @@
+---
+source: tests/tests/syncback.rs
+expression: src/Items.data.csv
+---
+id,cost
+sword,100

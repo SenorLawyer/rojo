@@ -1,0 +1,38 @@
+---
+source: tests/tests/syncback.rs
+expression: default.project.json
+---
+{
+  "name": "content_properties_ignored_legacy",
+  "tree": {
+    "$className": "DataModel",
+    "Lighting": {
+      "$path": "unchanged.project.json"
+    },
+    "ReplicatedStorage": {
+      "$path": "src"
+    },
+    "ServerStorage": {
+      "Ignored": {
+        "$className": "Sound",
+        "$properties": {
+          "SoundId": "rbxassetid://1",
+          "Volume": 0.25
+        }
+      },
+      "IgnoredNew": {
+        "$className": "Sound",
+        "$properties": {
+          "AudioContent": "rbxassetid://1"
+        }
+      }
+    }
+  },
+  "syncbackRules": {
+    "ignoreProperties": {
+      "Sound": [
+        "SoundId"
+      ]
+    }
+  }
+}

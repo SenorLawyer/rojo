@@ -17,9 +17,15 @@ local Log = require(Packages.Log)
 local RbxDom = require(Packages.RbxDom)
 local ReflectionDatabase = require(Packages.RbxDom.database)
 local Settings = require(script.Parent.Settings)
+local SpecRunner = require(script.Parent.SpecRunner)
+local StreamRequest = require(Packages.Http.StreamRequest)
+local StreamBudget = require(Packages.Http.StreamBudget)
 
 local MAX_MODEL_BYTES = 5 * 1024 * 1024
 local MAX_BODY_BYTES = 8 * 1024 * 1024
+-- The stream stops buffering a response past this, a little above
+-- MAX_BODY_BYTES so an oversized body is still reported as such.
+local MAX_STREAM_BYTES = 12 * 1024 * 1024
 -- The server holds every /api/studio request for up to 15 seconds while Git
 -- holds its locks (GIT_WAIT_LIMIT in src/web/studio.rs), and then holds a
 -- poll for up to 2 more seconds. 30 covers both with room for Studio's own
@@ -29,36 +35,101 @@ local REQUEST_TIMEOUT = 30
 -- again, up to this many attempts in a row, before the bridge stops. A poll
 -- that took the whole timeout usually outlived its session on the server, in
 -- which case the retry gets 404 and the bridge stops; the retries mainly help
--- with transport errors and 5xx responses.
+-- with transport errors and 5xx responses. The one exception is the first
+-- poll after Run mode, which registers the session again instead.
 local MAX_REQUEST_ATTEMPTS = 3
 -- IDs are held strongly so Roblox cannot collect an Instance proxy while the
 -- instance still exists. The oldest IDs are forgotten beyond this bound.
 local MAX_TRACKED_INSTANCES = 20_000
 local MAX_LOG_BYTES = 4096
+local MAX_LOG_ENTRIES = 200
 local MAX_SANITIZE_DEPTH = 64
 local REPLACEMENT_CHARACTER = utf8.char(0xFFFD)
 
 local StudioBridge = {}
 StudioBridge.__index = StudioBridge
---[[
-	Sends one bridge request. Replaced by tests.
+-- One request at a time, on the stream slot the budget holds back for the
+-- bridge, so agent traffic never waits behind sync or delays it.
+-- Replaced by tests.
+StudioBridge.bridgeStream = StreamRequest.new(nil, nil, StreamBudget.Priority.Bridge)
 
-	The bridge uses RequestAsync, never an HTTP stream. Studio caps how many
-	stream clients a plugin can have open, and what happens past that cap is
-	undocumented, so Rojo stays under it. Sync's WebSocket and requests need
-	those clients, and the bridge is optional, so it takes none. RequestAsync is
-	never queued behind sync either, so agent traffic still cannot delay
-	sync. It cannot be cancelled, but a bridge request ends within about 17
-	seconds (up to 15 waiting for Git, then up to 2 for a poll), so a request
-	still running when the bridge stops ends soon after.
+--[[
+	Sends one bridge request and returns its response. Replaced by tests.
+
+	Requests go over an HTTP stream, not RequestAsync. Once a plugin uses
+	RequestAsync for requests that the server holds open, as a poll is,
+	Studio delays that plugin's later RequestAsync calls more and more until
+	it reloads, so a polling bridge fell behind until its session expired.
+	Streams are not affected and can be closed when the bridge stops. The
+	bodies are JSON, which never contains the NUL bytes a raw stream cuts
+	at. Only when no stream slot is free, which needs another Rojo session in
+	the same plugin, does a request fall back to RequestAsync.
+
+	`onCancel` registers a function that closes the stream if the caller
+	gives up.
 ]]
-function StudioBridge.requestAsync(options)
+function StudioBridge.requestAsync(options, onCancel)
+	local pending = StudioBridge.bridgeStream(options, {
+		timeout = REQUEST_TIMEOUT,
+		queueTimeout = REQUEST_TIMEOUT,
+		maxBytes = MAX_STREAM_BYTES,
+	})
+	if onCancel then
+		onCancel(function()
+			pending:cancel()
+		end)
+	end
+	local ok, response = pending:await()
+	if not ok then
+		error(response, 0)
+	end
+	if response == StreamRequest.BudgetExhausted then
+		Log.debug("No stream slot is free for the Studio bridge; using RequestAsync")
+		return StudioBridge.fallbackRequestAsync(options)
+	end
+	return response
+end
+
+-- Sends a bridge request with RequestAsync when no stream slot is free.
+-- Replaced by tests.
+function StudioBridge.fallbackRequestAsync(options)
 	return HttpService:RequestAsync(options)
 end
 
 -- How the test runner's insert and removal are kept in undo history. See
 -- recordRunnerChange.
 StudioBridge.runnerHistoryOperation = Enum.FinishRecordingOperation.Append
+
+-- Copied into the spec runner. Replaced by tests.
+StudioBridge.specRunnerModule = script.Parent.SpecRunner
+
+-- While Studio is in Run mode the worker cannot poll, and the server expires a
+-- session that has not been heard from in 30 seconds. A run therefore checks
+-- in this often (seconds), which also keeps the session listed. Replaced by
+-- tests.
+StudioBridge.heartbeatInterval = 5
+
+-- How long past its expected duration a run is given before the runner is
+-- removed and the heartbeats stop (seconds). Replaced by tests.
+StudioBridge.runModeGrace = REQUEST_TIMEOUT
+
+-- A spec run starts only with at least this many seconds of its request's
+-- deadline left beyond its own timeout, for Studio to start and leave Run
+-- mode. The server allows 30 (SPEC_RUN_MARGIN in src/web/studio.rs), so a
+-- run that waited behind another one may have too little left.
+local SPEC_START_MARGIN = 10
+
+--[[
+	Starts Run mode and waits for the runner to call EndTest. Replaced by tests.
+]]
+function StudioBridge.executeRunMode(args)
+	local service = game:GetService("StudioTestService")
+	local found, executeRunMode = pcall(function()
+		return service.ExecuteRunModeAsync
+	end)
+	assert(found and executeRunMode, "StudioTestService.ExecuteRunModeAsync is unavailable in this Studio version")
+	return executeRunMode(service, args)
+end
 
 -- AgentControl sets this around an explicit bridge.retry so a manual start is
 -- allowed even when automatic enabling is turned off in settings.
@@ -214,6 +285,10 @@ function StudioBridge.new(apiContext, pairing, onFailure)
 		transports = {},
 		testRunners = {},
 		logs = {},
+		-- Numbers every captured message so `rojo studio logs --follow` can ask
+		-- for what is new since its last read. It keeps counting when the
+		-- buffer is trimmed or cleared, so a follower can tell what it missed.
+		logSequence = 0,
 	}, StudioBridge)
 	self:__resetInstances()
 	return self
@@ -328,7 +403,12 @@ function StudioBridge:capabilities()
 		tree = { available = true, maxInstances = 2000, maxDepth = 10 },
 		properties = { available = true, maxProperties = 64 },
 		selection = { available = true },
-		logs = { available = true, maxEntries = 200, scope = "Messages since this bridge session connected" },
+		logs = {
+			available = true,
+			maxEntries = MAX_LOG_ENTRIES,
+			follow = true,
+			scope = "Messages since this bridge session connected",
+		},
 		export = { available = true, format = "Native SerializationService model bytes", maxBytes = MAX_MODEL_BYTES },
 		import = {
 			available = RunService:IsEdit(),
@@ -348,6 +428,14 @@ function StudioBridge:capabilities()
 			mode = "Run",
 			maxSimulationSeconds = 5,
 			reason = "StudioTestService.ExecuteRunModeAsync runs existing game scripts with a controlled EndTest runner",
+		},
+		spec = {
+			available = RunService:IsEdit(),
+			mode = "Run",
+			frameworks = { "testez", "jest" },
+			maxTimeoutSeconds = SpecRunner.MAX_TIMEOUT_SECONDS,
+			maxFailures = SpecRunner.MAX_FAILURES,
+			reason = "Runs the place's *.spec modules in Run mode with a fixed runner and returns a bounded report",
 		},
 	}
 end
@@ -441,13 +529,19 @@ end
 	twice, a poll delivers each command at most once, so a lost poll response
 	is never answered twice, and a result for a request the server already
 	settled is answered with 410, not applied again.
+
+	`lastFailure`, when passed, receives the `status` of the last attempt, so
+	a caller can tell which refusal it was.
 ]]
-function StudioBridge:__requestWithRetry(route, value)
+function StudioBridge:__requestWithRetry(route, value, lastFailure)
 	local attempt = 0
 	while true do
 		attempt += 1
 		local failure = {}
 		local ok, response = self:request(route, value, failure):await()
+		if lastFailure then
+			lastFailure.status = failure.status
+		end
 		if ok then
 			return response, attempt
 		end
@@ -464,11 +558,12 @@ function StudioBridge:__requestWithRetry(route, value)
 end
 
 function StudioBridge:__requestAsync(options, token)
-	local request = Promise.new(function(resolve, reject)
+	local request = Promise.new(function(resolve, reject, onCancel)
 		-- Cancelling a promise closes its executor thread, so the request runs
-		-- on its own thread rather than being closed while Studio sends it.
+		-- on its own thread rather than being closed while Studio sends it,
+		-- and cancelling closes its stream instead.
 		task.spawn(function()
-			local ok, response = pcall(StudioBridge.requestAsync, options)
+			local ok, response = pcall(StudioBridge.requestAsync, options, onCancel)
 			if ok then
 				resolve(response)
 			else
@@ -558,20 +653,13 @@ function StudioBridge.recordRunnerChange(name, callback)
 	return ok, err
 end
 
-function StudioBridge:__runTest(command, seconds)
-	local service = game:GetService("StudioTestService")
-	local found, executeRunMode = pcall(function()
-		return service.ExecuteRunModeAsync
-	end)
-	assert(found and executeRunMode, "StudioTestService.ExecuteRunModeAsync is unavailable in this Studio version")
-
-	local runner = Instance.new("Script")
-	runner.Name = "__RojoBridgeTest_" .. self.sessionId
-	runner.Source = [[local service = game:GetService("StudioTestService")
-local args = service:GetTestArgs()
-task.wait(args.simulationSeconds)
-service:EndTest({ completed = true, simulationSeconds = args.simulationSeconds, requestId = args.requestId })]]
-
+--[[
+	Runs `runner`, a Script the caller prepared, in Run mode and removes it
+	afterwards. `seconds` is how long the run is expected to take at most.
+	Returns whether Run mode succeeded, what the runner passed to EndTest and
+	the elapsed time.
+]]
+function StudioBridge:__runInRunMode(command, runner, args, seconds)
 	local function removeRunner()
 		self.testRunners[runner] = nil
 		if runner.Parent then
@@ -586,20 +674,142 @@ service:EndTest({ completed = true, simulationSeconds = args.simulationSeconds, 
 	self.testRunners[runner] = true
 	-- If Studio never returns from the run, remove the runner anyway so it is
 	-- not saved or published with the place.
-	local watchdog = task.delay(seconds + REQUEST_TIMEOUT, removeRunner)
+	local grace = seconds + StudioBridge.runModeGrace
+	local watchdog = task.delay(grace, removeRunner)
+	local heartbeatsEnd = os.clock() + grace
+	local running = true
+	task.spawn(function()
+		while true do
+			task.wait(StudioBridge.heartbeatInterval)
+			-- Past the watchdog's time the run is presumed hung, and its
+			-- heartbeats would only keep a session that cannot answer listed.
+			if not running or self.stopped or os.clock() >= heartbeatsEnd then
+				return
+			end
+			-- Failures are left to the command's own result. A cancelled or
+			-- expired request answers 410 here, but Run mode cannot be stopped
+			-- from the plugin, so the run continues and its result is
+			-- discarded. The heartbeats still go on: they keep the session
+			-- registered, so the bridge can poll again once Run mode ends.
+			self:request("validate", { requestId = command.requestId }):await()
+		end
+	end)
 	local parented, parentError = StudioBridge.recordRunnerChange("Rojo: Insert Studio test runner", function()
 		runner.Parent = game:GetService("ServerScriptService")
 	end)
 	local started = os.clock()
 	local ok, result = false, parentError
 	if parented then
-		ok, result = pcall(executeRunMode, service, { simulationSeconds = seconds, requestId = command.requestId })
+		ok, result = pcall(StudioBridge.executeRunMode, args)
 	end
+	running = false
 	if coroutine.status(watchdog) == "suspended" then
 		task.cancel(watchdog)
 	end
 	removeRunner()
 	return ok, result, os.clock() - started
+end
+
+function StudioBridge:__runTest(command, seconds)
+	local runner = Instance.new("Script")
+	runner.Name = "__RojoBridgeTest_" .. self.sessionId
+	runner.Source = [[local service = game:GetService("StudioTestService")
+local args = service:GetTestArgs()
+task.wait(args.simulationSeconds)
+service:EndTest({ completed = true, simulationSeconds = args.simulationSeconds, requestId = args.requestId })]]
+	return self:__runInRunMode(command, runner, { simulationSeconds = seconds, requestId = command.requestId }, seconds)
+end
+
+-- The spec runner's fixed source. It only reads options from GetTestArgs and
+-- runs the SpecRunner module copied beside it, so a caller passes data, never
+-- code. Any error still ends the run with a report, because Run mode would
+-- otherwise continue until someone stops it in Studio.
+StudioBridge.SPEC_RUNNER_SOURCE = [[local service = game:GetService("StudioTestService")
+local ok, report = pcall(function()
+	return require(script:WaitForChild("SpecRunner")).runWithTimeout(service:GetTestArgs())
+end)
+service:EndTest(if ok then report else { framework = "testez", status = "error", error = tostring(report) })]]
+
+function StudioBridge:__runSpecs(command, options)
+	local runner = Instance.new("Script")
+	runner.Name = "__RojoBridgeSpec_" .. self.sessionId
+	runner.Source = StudioBridge.SPEC_RUNNER_SOURCE
+	local module = StudioBridge.specRunnerModule:Clone()
+	module.Name = "SpecRunner"
+	module.Parent = runner
+	local ok, report, elapsed = self:__runInRunMode(command, runner, options, options.timeoutSeconds)
+	if ok and type(report) ~= "table" then
+		ok, report = false, "The spec runner ended Run mode without a report"
+	end
+	return ok, report, elapsed
+end
+
+function StudioBridge:__recordLog(message, kind)
+	self.logSequence += 1
+	table.insert(self.logs, {
+		sequence = self.logSequence,
+		message = StudioBridge.truncateUtf8(message, MAX_LOG_BYTES),
+		kind = kind,
+		timestamp = DateTime.now().UnixTimestampMillis,
+	})
+	if #self.logs > MAX_LOG_ENTRIES then
+		table.remove(self.logs, 1)
+	end
+end
+
+--[[
+	Chooses the entries a `logs` command returns.
+
+	Without `after`, returns the newest `limit` entries as a list, which is
+	what CLIs from before follow mode expect. With `after`, returns the oldest
+	`limit` entries whose sequence is greater, along with:
+
+	- `latestSequence`: the sequence of the newest message captured so far.
+	- `nextAfter`: the `after` to send next. It is `latestSequence` unless
+	  `more` is true, in which case more entries are waiting.
+	- `dropped`: how many entries after `after` were trimmed from the buffer,
+	  or cleared when the bridge stopped, before they could be read.
+	- `restarted`: true when `after` was ahead of `latestSequence`, so the
+	  entries start over from the oldest one still kept.
+]]
+function StudioBridge.selectLogs(logs, latestSequence, args)
+	local limit = math.clamp(tonumber(args.limit) or 100, 1, MAX_LOG_ENTRIES)
+	local after = tonumber(args.after)
+	if after == nil then
+		local result = {}
+		for index = math.max(1, #logs - limit + 1), #logs do
+			table.insert(result, logs[index])
+		end
+		return result
+	end
+
+	after = math.max(0, math.floor(after))
+	local restarted = after > latestSequence
+	if restarted then
+		after = 0
+	end
+
+	local oldest = if logs[1] then logs[1].sequence else latestSequence + 1
+	local entries = {}
+	local more = false
+	for _, entry in logs do
+		if entry.sequence > after then
+			if #entries >= limit then
+				more = true
+				break
+			end
+			table.insert(entries, entry)
+		end
+	end
+
+	return {
+		entries = entries,
+		latestSequence = latestSequence,
+		nextAfter = if more then entries[#entries].sequence else latestSequence,
+		dropped = math.max(0, oldest - after - 1),
+		more = more,
+		restarted = restarted,
+	}
 end
 
 function StudioBridge:execute(command)
@@ -617,12 +827,7 @@ function StudioBridge:execute(command)
 		end
 		return result
 	elseif command.action == "logs" then
-		local limit = math.clamp(tonumber(args.limit) or 100, 1, 200)
-		local result = {}
-		for index = math.max(1, #self.logs - limit + 1), #self.logs do
-			table.insert(result, self.logs[index])
-		end
-		return result
+		return StudioBridge.selectLogs(self.logs, self.logSequence, args)
 	elseif command.action == "tree" then
 		local limit = math.clamp(tonumber(args.limit) or 500, 1, 2000)
 		local maxDepth = math.clamp(tonumber(args.depth) or 3, 0, 10)
@@ -691,6 +896,31 @@ function StudioBridge:execute(command)
 		self:ensureActive(command)
 		assert(ok, tostring(result))
 		return { mode = "Run", result = result, elapsedSeconds = elapsed, isEdit = RunService:IsEdit() }
+	elseif command.action == "spec" then
+		assert(RunService:IsEdit(), "Specs must start in Edit mode")
+		local options = SpecRunner.normalizeOptions(args)
+		-- Resolve the roots and the framework now, so a wrong path or a
+		-- missing TestEZ fails without starting Run mode.
+		SpecRunner.prepare(options, game)
+		self:request("validate", { requestId = command.requestId }):expect()
+		self:ensureActive(command)
+		-- A spec that waited behind another run may have too little of its
+		-- deadline left. Starting it anyway would run the place's scripts for a
+		-- result the server has already given up on.
+		local remaining = (command.expiresAt - DateTime.now().UnixTimestampMillis) / 1000
+		assert(
+			remaining >= options.timeoutSeconds + SPEC_START_MARGIN,
+			string.format(
+				"Only %d seconds were left of this request's deadline when Studio could start it, "
+					.. "too few for a %d-second spec run. Studio was probably busy with another run; run the specs again.",
+				math.max(0, math.floor(remaining)),
+				options.timeoutSeconds
+			)
+		)
+		local ok, report, elapsed = self:__runSpecs(command, options)
+		self:ensureActive(command)
+		assert(ok, tostring(report))
+		return { mode = "Run", report = report, elapsedSeconds = elapsed, isEdit = RunService:IsEdit() }
 	elseif command.action == "export" then
 		local instance = self:resolve(args.instance)
 		assert(
@@ -812,24 +1042,43 @@ function StudioBridge:start()
 		if self.stopped then
 			return
 		end
-		table.insert(self.logs, {
-			message = StudioBridge.truncateUtf8(message, MAX_LOG_BYTES),
-			kind = kind.Name,
-			timestamp = DateTime.now().UnixTimestampMillis,
-		})
-		if #self.logs > 200 then
-			table.remove(self.logs, 1)
-		end
+		self:__recordLog(message, kind.Name)
 	end)
 	self.worker = task.spawn(function()
 		local ok, err = pcall(function()
-			self:__requestWithRetry("register", { description = self:status() })
+			local description = self:status()
+			self:__requestWithRetry("register", { description = description })
 			self:__announce()
+			-- Set after a command that ran in Run mode, until the next poll
+			-- succeeds. See below.
+			local afterRunMode = false
 			while not self.stopped do
-				local response = self:__requestWithRetry("poll", {})
+				local failure = {}
+				local polled, response = pcall(self.__requestWithRetry, self, "poll", {}, failure)
+				if not polled then
+					-- Studio cannot poll in Run mode, and if its heartbeats did not
+					-- reach the server for long enough the session expired, which
+					-- the next poll reports as 404. Registering the same session
+					-- again with the same description is safe: the server adds it
+					-- back, or refreshes it if it was still there. Only once, so a
+					-- server that keeps refusing still stops the bridge. A session
+					-- evicted by newer registrations during Run mode also comes
+					-- back this way, evicting the oldest one in turn.
+					if afterRunMode and failure.status == 404 and not self.stopped then
+						afterRunMode = false
+						Log.warn("Rojo Studio bridge session expired during Run mode; registering it again")
+						self:__requestWithRetry("register", { description = description })
+						continue
+					end
+					error(response, 0)
+				end
+				afterRunMode = false
 				for _, command in response.commands do
 					if self.stopped then
 						break
+					end
+					if command.action == "test" or command.action == "spec" then
+						afterRunMode = true
 					end
 					local success, value = pcall(self.execute, self, command)
 					if self.stopped then

@@ -6,6 +6,7 @@
 #![allow(dead_code)]
 
 mod csv;
+mod data_csv;
 mod dir;
 mod json;
 mod json_model;
@@ -40,6 +41,7 @@ use crate::{
 
 use self::{
     csv::{snapshot_csv, snapshot_csv_init, syncback_csv, syncback_csv_init},
+    data_csv::{snapshot_data_csv, snapshot_data_csv_init, syncback_data_csv_init},
     dir::{snapshot_dir, syncback_dir},
     json::snapshot_json,
     json_model::{snapshot_json_model, syncback_json_model},
@@ -101,6 +103,7 @@ pub(crate) fn is_init_file_name(file_name: &str) -> bool {
             | "init.luau"
             | "init.lua"
             | "init.csv"
+            | "init.data.csv"
     )
 }
 
@@ -132,6 +135,7 @@ pub(crate) fn get_dir_middleware<'path>(
             (Middleware::PluginScriptDir, "init.plugin.lua"),
             (Middleware::PluginScriptDir, "init.plugin.luau"),
             (Middleware::CsvDir, "init.csv"),
+            (Middleware::DataCsvDir, "init.data.csv"),
         ]
     });
 
@@ -195,6 +199,7 @@ fn snapshot_from_path(
 #[serde(rename_all = "camelCase")]
 pub enum Middleware {
     Csv,
+    DataCsv,
     JsonModel,
     Json,
     ServerScript,
@@ -225,6 +230,8 @@ pub enum Middleware {
     ModuleScriptDir,
     #[serde(skip_deserializing)]
     CsvDir,
+    #[serde(skip_deserializing)]
+    DataCsvDir,
 }
 
 impl Middleware {
@@ -239,6 +246,7 @@ impl Middleware {
     ) -> anyhow::Result<Option<InstanceSnapshot>> {
         let mut output = match self {
             Self::Csv => snapshot_csv(context, vfs, path, name),
+            Self::DataCsv => snapshot_data_csv(context, vfs, path, name),
             Self::JsonModel => snapshot_json_model(context, vfs, path, name),
             Self::Json => snapshot_json(context, vfs, path, name),
             Self::ServerScript => snapshot_lua(context, vfs, path, name, ScriptType::Server),
@@ -279,6 +287,7 @@ impl Middleware {
                 snapshot_lua_init(context, vfs, path, name, ScriptType::Module)
             }
             Self::CsvDir => snapshot_csv_init(context, vfs, path, name),
+            Self::DataCsvDir => snapshot_data_csv_init(context, vfs, path, name),
         };
         if let Ok(Some(ref mut snapshot)) = output {
             snapshot.metadata.middleware = Some(*self);
@@ -302,6 +311,11 @@ impl Middleware {
             Middleware::Csv => syncback_csv(snapshot),
             Middleware::JsonModel => syncback_json_model(snapshot),
             Middleware::Json => anyhow::bail!("cannot syncback Json middleware"),
+            // The module is generated from the spreadsheet, and turning edited
+            // Luau back into CSV would lose formatting and comments people
+            // keep in their spreadsheet tools.
+            Middleware::DataCsv => anyhow::bail!("cannot syncback {self:?} middleware"),
+            Middleware::DataCsvDir => syncback_data_csv_init(snapshot),
             // Projects are only generated from files that already exist on the
             // file system, so we don't need to pass a file name.
             Middleware::Project => syncback_project(snapshot),
@@ -342,6 +356,7 @@ impl Middleware {
                 | Middleware::PluginScriptDir
                 | Middleware::ModuleScriptDir
                 | Middleware::CsvDir
+                | Middleware::DataCsvDir
         )
     }
 
@@ -446,6 +461,8 @@ pub fn default_sync_rules() -> &'static [SyncRule] {
             sync_rule!("*.json", Json, ".json", "*.meta.json"),
             sync_rule!("*.jsonc", Json, ".jsonc", "*.meta.jsonc"),
             sync_rule!("*.toml", Toml),
+            // Must come before `*.csv`, which would match it too.
+            sync_rule!("*.data.csv", DataCsv, ".data.csv"),
             sync_rule!("*.csv", Csv),
             sync_rule!("*.txt", Text),
             sync_rule!("*.rbxmx", Rbxmx),
@@ -493,6 +510,118 @@ mod tests {
             assert_eq!(snapshot.class_name, expected_class, "{name}");
             assert!(snapshot.children.is_empty(), "{name}");
         }
+    }
+
+    #[test]
+    fn data_csv_files_become_module_scripts_instead_of_localization_tables() {
+        let mut fs = InMemoryFs::new();
+        fs.load_snapshot(
+            "/foo",
+            VfsSnapshot::dir([
+                (
+                    "items.data.csv",
+                    VfsSnapshot::file(
+                        "id,cost
+sword,1
+",
+                    ),
+                ),
+                (
+                    "strings.csv",
+                    VfsSnapshot::file(
+                        "Key,Source
+Hi,Hello
+",
+                    ),
+                ),
+            ]),
+        )
+        .unwrap();
+        let vfs = Vfs::new(fs);
+
+        let data = snapshot_from_vfs(
+            &InstanceContext::default(),
+            &vfs,
+            Path::new("/foo/items.data.csv"),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(data.class_name, "ModuleScript");
+        assert_eq!(data.name, "items");
+        assert_eq!(data.metadata.middleware, Some(Middleware::DataCsv));
+
+        let strings = snapshot_from_vfs(
+            &InstanceContext::default(),
+            &vfs,
+            Path::new("/foo/strings.csv"),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(strings.class_name, "LocalizationTable");
+    }
+
+    /// The upgrade advice in docs/data-modules.md relies on this sync rule
+    /// keeping the name a `.data.csv` LocalizationTable had before.
+    #[test]
+    fn csv_sync_rule_restores_data_csv_localization_tables() {
+        let mut fs = InMemoryFs::new();
+        fs.load_snapshot(
+            "/foo",
+            VfsSnapshot::dir([
+                (
+                    "default.project.json",
+                    VfsSnapshot::file(
+                        r#"{
+                            "name": "foo",
+                            "syncRules": [{ "pattern": "**/Strings.data.csv", "use": "csv" }],
+                            "tree": { "$path": "src" }
+                        }"#,
+                    ),
+                ),
+                (
+                    "src",
+                    VfsSnapshot::dir([
+                        (
+                            "Strings.data.csv",
+                            VfsSnapshot::file("Key,Source\nHi,Hello\n"),
+                        ),
+                        ("Items.data.csv", VfsSnapshot::file("id,cost\nsword,5\n")),
+                        (
+                            "Levels",
+                            VfsSnapshot::dir([(
+                                "init.data.csv",
+                                VfsSnapshot::file("Key,Source\nHi,Hello\n"),
+                            )]),
+                        ),
+                    ]),
+                ),
+            ]),
+        )
+        .unwrap();
+
+        let snapshot = snapshot_from_vfs(
+            &InstanceContext::default(),
+            &Vfs::new(fs),
+            Path::new("/foo"),
+        )
+        .unwrap()
+        .unwrap();
+        let child = |name: &str| {
+            snapshot
+                .children
+                .iter()
+                .find(|child| child.name == name)
+                .unwrap_or_else(|| panic!("no child named {name}"))
+        };
+
+        // The rule the warning suggests names the file, matches it inside
+        // `src`, and leaves the project's other data modules alone.
+        assert_eq!(child("Strings.data").class_name, "LocalizationTable");
+        assert_eq!(child("Items").class_name, "ModuleScript");
+        // Directories are not matched by sync rules, so an init.data.csv
+        // still makes its directory a data module.
+        assert_eq!(child("Levels").class_name, "ModuleScript");
+        assert!(child("Levels").children.is_empty());
     }
 
     #[test]

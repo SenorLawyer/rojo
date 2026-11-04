@@ -3,7 +3,10 @@ use std::{env, panic, process};
 use backtrace::Backtrace;
 use clap::Parser;
 
-use librojo::{cli::Options, memory_cap::CappedAllocator};
+use librojo::{
+    cli::{exit_status, Options},
+    memory_cap::CappedAllocator,
+};
 
 // Uncapped unless this process is checking an untrusted model.
 #[global_allocator]
@@ -79,7 +82,10 @@ fn main() {
         .init();
 
     if let Err(err) = options.run() {
-        log::error!("{:?}", err);
-        process::exit(1);
+        let (code, log) = exit_status(&err);
+        if log {
+            log::error!("{:?}", err);
+        }
+        process::exit(code);
     }
 }

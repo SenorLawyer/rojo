@@ -1,5 +1,6 @@
 use std::{
     borrow::Cow,
+    collections::HashMap,
     io::{BufWriter, Write},
     mem::forget,
     path::{self, Path, PathBuf},
@@ -198,6 +199,7 @@ fn recurse_create_node<'a>(
     project_dir: &Path,
     filter: fn(&InstanceWithMeta) -> bool,
     use_absolute_paths: bool,
+    file_overrides: &HashMap<Ref, PathBuf>,
 ) -> Option<SourcemapNode<'a>> {
     let instance = tree.get_instance(referent).expect("instance did not exist");
 
@@ -205,7 +207,14 @@ fn recurse_create_node<'a>(
         .children()
         .par_iter()
         .filter_map(|&child_id| {
-            recurse_create_node(tree, child_id, project_dir, filter, use_absolute_paths)
+            recurse_create_node(
+                tree,
+                child_id,
+                project_dir,
+                filter,
+                use_absolute_paths,
+                file_overrides,
+            )
         })
         .collect();
 
@@ -213,6 +222,16 @@ fn recurse_create_node<'a>(
     // contain any information we're looking for.
     if children.is_empty() && !filter(&instance) {
         return None;
+    }
+
+    if let Some(path) = file_overrides.get(&referent) {
+        return Some(SourcemapNode {
+            name: instance.name(),
+            class_name: instance.class_name(),
+            run_context: None,
+            file_paths: vec![Cow::Owned(path.clone())],
+            children,
+        });
     }
 
     let file_paths = instance
@@ -281,6 +300,7 @@ fn write_sourcemap(
         session.root_dir(),
         filter,
         use_absolute_paths,
+        &HashMap::new(),
     );
 
     if let Some(output_path) = output {
@@ -294,6 +314,36 @@ fn write_sourcemap(
         println!("{}", output);
     }
 
+    Ok(())
+}
+
+/// Writes the session's sourcemap as JSON, with paths relative to the
+/// project folder.
+///
+/// Instances listed in `file_overrides` get that one path as their file
+/// instead of their own files, which lets `rojo typecheck` point luau-lsp at
+/// Luau written out for modules generated from other formats.
+pub(super) fn write_sourcemap_json(
+    session: &ServeSession,
+    writer: impl Write,
+    include_non_scripts: bool,
+    file_overrides: &HashMap<Ref, PathBuf>,
+) -> anyhow::Result<()> {
+    let filter = if include_non_scripts {
+        filter_nothing
+    } else {
+        filter_non_scripts
+    };
+    let tree = session.tree();
+    let root_node = recurse_create_node(
+        &tree,
+        tree.get_root_id(),
+        session.root_dir(),
+        filter,
+        false,
+        file_overrides,
+    );
+    serde_json::to_writer(writer, &root_node)?;
     Ok(())
 }
 

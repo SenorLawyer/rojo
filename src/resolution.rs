@@ -213,8 +213,14 @@ impl AmbiguousValue {
                 (VariantType::Tags, AmbiguousValue::StringArray(value)) => {
                     Ok(Tags::from(value).into())
                 }
+                // Studio saves an unset Content property as none, not as an
+                // empty URI, and rbx-dom writes an empty string for none.
                 (VariantType::Content, AmbiguousValue::String(value)) => {
-                    Ok(Content::from(value).into())
+                    if value.is_empty() {
+                        Ok(Content::none().into())
+                    } else {
+                        Ok(Content::from(value).into())
+                    }
                 }
                 (VariantType::ContentId, AmbiguousValue::String(value)) => {
                     Ok(ContentId::from(value).into())
@@ -408,6 +414,12 @@ mod test {
                 "\"rbxasset://totally-a-real-uri.tiff\""
             ),
             Variant::Content("rbxasset://totally-a-real-uri.tiff".into())
+        );
+
+        // An empty string is an unset Content, as Studio saves it.
+        assert_eq!(
+            resolve("Sound", "AudioContent", r#""""#),
+            Variant::Content(Content::none())
         );
 
         // What about BinaryString values? For forward-compatibility reasons, we

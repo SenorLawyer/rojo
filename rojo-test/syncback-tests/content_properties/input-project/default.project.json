@@ -1,0 +1,44 @@
+{
+  "name": "content_properties",
+  "tree": {
+    "$className": "DataModel",
+    "ReplicatedStorage": {
+      "$path": "src"
+    },
+    "ServerStorage": {
+      "ProjectUnchanged": {
+        "$className": "Sound",
+        "$properties": {
+          "SoundId": "rbxassetid://1"
+        }
+      },
+      "ProjectChanged": {
+        "$className": "Sound",
+        "$properties": {
+          "SoundId": "rbxassetid://2"
+        }
+      },
+      "ProjectCleared": {
+        "$className": "Decal",
+        "$properties": {
+          "Texture": "rbxassetid://4"
+        }
+      },
+      "MeshUnchanged": {
+        "$className": "CharacterMesh",
+        "$properties": {
+          "MeshId": 123
+        }
+      },
+      "MeshChanged": {
+        "$className": "CharacterMesh",
+        "$properties": {
+          "MeshId": 10
+        }
+      }
+    },
+    "Lighting": {
+      "$path": "unchanged.project.json"
+    }
+  }
+}

@@ -1,0 +1,10 @@
+---
+source: tests/tests/syncback.rs
+expression: src/AlreadyNew.model.json
+---
+{
+  "className": "Sound",
+  "properties": {
+    "AudioContent": "rbxassetid://5"
+  }
+}

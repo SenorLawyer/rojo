@@ -1,0 +1,14 @@
+<roblox version="4">
+  <Item class="Sound" referent="RBX1">
+    <Properties>
+      <string name="Name">NewXml</string>
+      <Content name="AudioContent"><uri>rbxassetid://555</uri></Content>
+    </Properties>
+    <Item class="Decal" referent="RBX2">
+      <Properties>
+        <string name="Name">NullDecal</string>
+        <Content name="TextureContent"><null></null></Content>
+      </Properties>
+    </Item>
+  </Item>
+</roblox>

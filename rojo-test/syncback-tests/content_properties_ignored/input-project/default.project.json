@@ -1,0 +1,32 @@
+{
+  "name": "content_properties_ignored",
+  "tree": {
+    "$className": "DataModel",
+    "ReplicatedStorage": {
+      "$path": "src"
+    },
+    "ServerStorage": {
+      "Ignored": {
+        "$className": "Sound",
+        "$properties": {
+          "SoundId": "rbxassetid://1",
+          "Volume": 0.75
+        }
+      },
+      "IgnoredNew": {
+        "$className": "Sound",
+        "$properties": {
+          "AudioContent": "rbxassetid://1"
+        }
+      }
+    },
+    "Lighting": {
+      "$path": "unchanged.project.json"
+    }
+  },
+  "syncbackRules": {
+    "ignoreProperties": {
+      "Sound": ["AudioContent"]
+    }
+  }
+}

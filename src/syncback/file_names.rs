@@ -33,6 +33,7 @@ pub fn name_for_inst<'old>(
         Ok(match middleware {
             Middleware::Dir
             | Middleware::CsvDir
+            | Middleware::DataCsvDir
             | Middleware::ServerScriptDir
             | Middleware::ClientScriptDir
             | Middleware::PluginScriptDir
@@ -53,6 +54,7 @@ pub fn name_for_inst<'old>(
 pub fn extension_for_middleware(middleware: Middleware) -> &'static str {
     match middleware {
         Middleware::Csv => "csv",
+        Middleware::DataCsv => "data.csv",
         Middleware::JsonModel => "model.json",
         Middleware::Json => "json",
         Middleware::ServerScript => "server.luau",
@@ -77,6 +79,7 @@ pub fn extension_for_middleware(middleware: Middleware) -> &'static str {
         Middleware::Ignore => unimplemented!("syncback does not work on Ignore middleware"),
         Middleware::Dir
         | Middleware::CsvDir
+        | Middleware::DataCsvDir
         | Middleware::ServerScriptDir
         | Middleware::ClientScriptDir
         | Middleware::PluginScriptDir

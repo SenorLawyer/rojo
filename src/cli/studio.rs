@@ -108,6 +108,14 @@ pub enum StudioSubcommand {
         target: Target,
         #[clap(long, default_value = "100")]
         limit: u16,
+        /// Return only entries whose sequence number is greater than this,
+        /// with the sequence to pass next and how many entries were dropped.
+        #[clap(long)]
+        after: Option<u64>,
+        /// Keep printing new entries every second until interrupted. With
+        /// --json, prints one JSON object per entry and line.
+        #[clap(long)]
+        follow: bool,
     },
     /// Export native SerializationService bytes. Services and DataModel are unsupported.
     Export {
@@ -162,6 +170,21 @@ impl StudioCommand {
                 .send()?;
             return print_json(&read_response(response)?, self.json);
         }
+        if let StudioSubcommand::Logs {
+            target,
+            limit,
+            after,
+            follow: true,
+        } = &self.command
+        {
+            let bridge = Bridge {
+                client: &client,
+                address: &address,
+                token: token.trim(),
+                session: &target.session,
+            };
+            return follow_logs(&bridge, *limit, *after, self.json);
+        }
         let (session, action, args, export_path) = match &self.command {
             StudioSubcommand::Status(target) | StudioSubcommand::Capabilities(target) => {
                 (&target.session, "status", json!({}), None)
@@ -195,8 +218,17 @@ impl StudioCommand {
                 json!({"instance":instance,"properties":properties}),
                 None,
             ),
-            StudioSubcommand::Logs { target, limit } => {
-                (&target.session, "logs", json!({"limit":limit}), None)
+            StudioSubcommand::Logs {
+                target,
+                limit,
+                after,
+                ..
+            } => {
+                let mut args = json!({"limit":limit});
+                if let Some(after) = after {
+                    args["after"] = json!(after);
+                }
+                (&target.session, "logs", args, None)
             }
             StudioSubcommand::Export {
                 target,
@@ -248,6 +280,9 @@ impl StudioCommand {
                     .unwrap_or("Invalid plugin response")
             );
         }
+        if let StudioSubcommand::Logs { after, .. } = &self.command {
+            check_logs_answer(&response["value"], *after)?;
+        }
         if let Some(path) = export_path {
             let bytes = BASE64.decode(
                 response["value"]["model"]
@@ -278,19 +313,247 @@ impl StudioCommand {
     }
 }
 
+/// The most entries one `logs` command returns; the plugin's buffer size.
+const MAX_LOG_ENTRIES: u64 = 200;
+const FOLLOW_INTERVAL: Duration = Duration::from_secs(1);
+/// Consecutive failed polls before `--follow` gives up, so a brief hiccup
+/// such as Studio entering Play mode does not end it.
+const MAX_FOLLOW_FAILURES: u32 = 5;
+const UNNUMBERED_LOGS: &str = "The connected Rojo plugin does not number its log entries, so it \
+     cannot follow logs. Update the plugin, or run `rojo studio logs` without --follow or --after.";
+
+/// A Studio session to send bridge commands to.
+struct Bridge<'a> {
+    client: &'a Client,
+    address: &'a Url,
+    token: &'a str,
+    session: &'a str,
+}
+
+impl Bridge<'_> {
+    /// Runs one command and returns the value the plugin answered with.
+    fn command(&self, action: &str, args: Value) -> anyhow::Result<Value> {
+        let mut result = request(
+            self.client,
+            self.address,
+            self.token,
+            Some(json!({
+                "sessionId": self.session,
+                "action": action,
+                "args": args,
+                "requestId": uuid::Uuid::new_v4().to_string(),
+            })),
+        )?;
+        let response = &mut result["result"];
+        if response.get("ok") != Some(&json!(true)) {
+            bail!(
+                "Studio command failed: {}",
+                response
+                    .get("error")
+                    .and_then(Value::as_str)
+                    .unwrap_or("Invalid plugin response")
+            );
+        }
+        Ok(response["value"].take())
+    }
+}
+
+/// One answer to a `logs` command sent with `after`.
+#[derive(Debug, PartialEq, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LogPage {
+    #[serde(default)]
+    entries: Vec<Value>,
+    latest_sequence: u64,
+    next_after: Option<u64>,
+    #[serde(default)]
+    dropped: u64,
+    #[serde(default)]
+    more: bool,
+    #[serde(default)]
+    restarted: bool,
+}
+
+impl LogPage {
+    fn parse(mut value: Value) -> anyhow::Result<Self> {
+        // Plugins from before follow mode ignore `after` and answer with the
+        // plain list of entries.
+        if value.is_array() {
+            bail!(UNNUMBERED_LOGS);
+        }
+        // Luau encodes an empty table as `[]`, but accept `{}` too.
+        if value
+            .get("entries")
+            .is_some_and(|entries| entries.as_object().is_some_and(serde_json::Map::is_empty))
+        {
+            value["entries"] = json!([]);
+        }
+        serde_json::from_value(value).context("Invalid log response from the Studio plugin")
+    }
+
+    fn next_after(&self) -> u64 {
+        self.next_after.unwrap_or(self.latest_sequence)
+    }
+}
+
+/// Plugins from before numbered logs ignore `after` and answer with every
+/// entry they keep, which would pass for the entries after `after` without a
+/// word. Fails like `--follow` does instead.
+fn check_logs_answer(value: &Value, after: Option<u64>) -> anyhow::Result<()> {
+    if after.is_some() && value.is_array() {
+        bail!(UNNUMBERED_LOGS);
+    }
+    Ok(())
+}
+
+fn follow_logs(bridge: &Bridge, limit: u16, after: Option<u64>, json: bool) -> anyhow::Result<()> {
+    let limit = u64::from(limit).clamp(1, MAX_LOG_ENTRIES);
+    let mut after = match after {
+        Some(after) => after,
+        // Like `tail -f`, start with the newest `limit` entries.
+        None => {
+            let page = LogPage::parse(bridge.command("logs", json!({"after":0,"limit":1}))?)?;
+            page.latest_sequence.saturating_sub(limit)
+        }
+    };
+
+    let mut failures = 0;
+    loop {
+        let page = bridge
+            .command("logs", json!({"after":after,"limit":limit}))
+            .and_then(LogPage::parse);
+        match page {
+            Ok(page) => {
+                failures = 0;
+                for line in follow_lines(&page, json)? {
+                    match line {
+                        FollowLine::Out(line) => {
+                            // Piping into a reader that stops early, such as
+                            // `head`, ends following like Ctrl+C does.
+                            match writeln!(std::io::stdout(), "{line}") {
+                                Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => {
+                                    return Ok(())
+                                }
+                                result => result?,
+                            }
+                        }
+                        FollowLine::Err(line) => eprintln!("{line}"),
+                    }
+                }
+                after = page.next_after();
+                if page.more {
+                    continue;
+                }
+            }
+            // An old plugin will not start numbering entries on a retry.
+            Err(error) if error.to_string() == UNNUMBERED_LOGS => return Err(error),
+            Err(error) => {
+                failures += 1;
+                if failures >= MAX_FOLLOW_FAILURES {
+                    return Err(error.context("Stopped following Studio logs"));
+                }
+                log::warn!("Could not read Studio logs, trying again: {error:#}");
+            }
+        }
+        std::thread::sleep(FOLLOW_INTERVAL);
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum FollowLine {
+    Out(String),
+    Err(String),
+}
+
+/// Formats one page of followed logs. Entries go to stdout, so `--json`
+/// output stays one entry per line; notices about missed entries go to stderr.
+fn follow_lines(page: &LogPage, json: bool) -> anyhow::Result<Vec<FollowLine>> {
+    let mut lines = Vec::new();
+    if page.restarted {
+        lines.push(FollowLine::Err(
+            "Studio log numbering started over; showing every entry still kept".to_owned(),
+        ));
+    }
+    if page.dropped > 0 {
+        lines.push(FollowLine::Err(format!(
+            "{} log entries were dropped from Studio's {MAX_LOG_ENTRIES}-entry buffer before they could be read",
+            page.dropped
+        )));
+    }
+    for entry in &page.entries {
+        lines.push(FollowLine::Out(if json {
+            json_escape_controls(serde_json::to_string(entry)?)
+        } else {
+            let kind = entry["kind"].as_str().unwrap_or("Message");
+            format!(
+                "[{}] {}: {}",
+                entry["sequence"],
+                escape_controls(
+                    kind.strip_prefix("Message")
+                        .filter(|kind| !kind.is_empty())
+                        .unwrap_or(kind)
+                ),
+                // Continuation lines are indented, so a message cannot print
+                // a line that looks like another entry.
+                escape_controls(entry["message"].as_str().unwrap_or_default())
+                    .replace('\n', "\n    ")
+            )
+        }));
+    }
+    Ok(lines)
+}
+
+/// Escapes control characters other than line breaks and tabs, as in
+/// `\u{1b}`. Scripts in the place choose what they log, and printed raw, an
+/// escape sequence could rewrite the terminal's title, clipboard or earlier
+/// output.
+fn escape_controls(text: &str) -> String {
+    let mut escaped = String::with_capacity(text.len());
+    for character in text.chars() {
+        if character.is_control() && !matches!(character, '\n' | '\t') {
+            escaped.extend(character.escape_unicode());
+        } else {
+            escaped.push(character);
+        }
+    }
+    escaped
+}
+
 fn print_json(value: &Value, compact: bool) -> anyhow::Result<()> {
     println!(
         "{}",
-        if compact {
+        json_escape_controls(if compact {
             serde_json::to_string(value)?
         } else {
             serde_json::to_string_pretty(value)?
-        }
+        })
     );
     Ok(())
 }
 
-fn local_address(address: &str) -> anyhow::Result<Url> {
+/// serde_json escapes the control characters JSON requires it to, but leaves
+/// DEL and the C1 controls, which some terminals read as the start of an
+/// escape sequence. Outside strings JSON has no control characters, so each
+/// one left can be written as a `\u` escape in place.
+fn json_escape_controls(json: String) -> String {
+    if !json
+        .chars()
+        .any(|character| character.is_control() && character != '\n')
+    {
+        return json;
+    }
+    let mut escaped = String::with_capacity(json.len());
+    for character in json.chars() {
+        if character.is_control() && character != '\n' {
+            escaped.push_str(&format!("\\u{:04x}", u32::from(character)));
+        } else {
+            escaped.push(character);
+        }
+    }
+    escaped
+}
+
+pub(super) fn local_address(address: &str) -> anyhow::Result<Url> {
     let mut url = Url::parse(address)?;
     let host = url.host_str().context("Studio address must have a host")?;
     anyhow::ensure!(
@@ -327,7 +590,7 @@ fn request(
     read_response(response)
 }
 
-fn read_response(response: reqwest::blocking::Response) -> anyhow::Result<Value> {
+pub(super) fn read_response(response: reqwest::blocking::Response) -> anyhow::Result<Value> {
     let status = response.status();
     let mut bytes = Vec::new();
     response.take(8 * 1024 * 1024 + 1).read_to_end(&mut bytes)?;
@@ -443,6 +706,188 @@ mod tests {
                 allow_scripts: false
             })
         ));
+    }
+
+    #[test]
+    fn logs_accepts_follow_and_after() {
+        use crate::cli::{Options, Subcommand};
+        let session = "00000000-0000-4000-8000-000000000000";
+        let options = Options::try_parse_from([
+            "rojo",
+            "studio",
+            "--json",
+            "logs",
+            "--session",
+            session,
+            "--follow",
+            "--after",
+            "7",
+        ])
+        .unwrap();
+        let Subcommand::Studio(studio) = options.subcommand else {
+            panic!("expected a studio command");
+        };
+        assert!(studio.json);
+        assert!(matches!(
+            studio.command,
+            StudioSubcommand::Logs {
+                limit: 100,
+                after: Some(7),
+                follow: true,
+                ..
+            }
+        ));
+
+        // Both are optional, so older invocations keep working.
+        let options =
+            Options::try_parse_from(["rojo", "studio", "logs", "--session", session]).unwrap();
+        let Subcommand::Studio(studio) = options.subcommand else {
+            panic!("expected a studio command");
+        };
+        assert!(matches!(
+            studio.command,
+            StudioSubcommand::Logs {
+                after: None,
+                follow: false,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn log_pages_parse_and_tell_the_next_sequence() {
+        let page = LogPage::parse(json!({
+            "entries": [{"sequence": 4, "kind": "MessageWarning", "message": "careful", "timestamp": 1}],
+            "latestSequence": 9,
+            "nextAfter": 4,
+            "dropped": 2,
+            "more": true,
+            "restarted": false,
+        }))
+        .unwrap();
+        assert_eq!(page.entries.len(), 1);
+        assert_eq!(page.next_after(), 4);
+        assert_eq!(page.dropped, 2);
+        assert!(page.more);
+
+        // Luau encodes an empty table as either kind of empty JSON value, and
+        // optional fields may be missing.
+        for entries in [json!([]), json!({})] {
+            let page = LogPage::parse(json!({"entries": entries, "latestSequence": 3})).unwrap();
+            assert!(page.entries.is_empty());
+            assert_eq!(page.next_after(), 3);
+            assert_eq!(page.dropped, 0);
+            assert!(!page.more && !page.restarted);
+        }
+    }
+
+    #[test]
+    fn log_pages_from_plugins_without_sequences_explain_the_update() {
+        let error = LogPage::parse(json!([{"message": "hi", "kind": "MessageOutput"}]))
+            .unwrap_err()
+            .to_string();
+        assert_eq!(error, UNNUMBERED_LOGS);
+        assert!(error.contains("Update the plugin"), "{error}");
+    }
+
+    #[test]
+    fn logs_after_a_sequence_need_a_plugin_that_numbers_them() {
+        let unnumbered = json!([{"message": "hi", "kind": "MessageOutput"}]);
+        assert_eq!(
+            check_logs_answer(&unnumbered, Some(4))
+                .unwrap_err()
+                .to_string(),
+            UNNUMBERED_LOGS
+        );
+
+        // Without --after, an old plugin's list is the answer that was asked for.
+        check_logs_answer(&unnumbered, None).unwrap();
+        check_logs_answer(&json!({"entries": [], "latestSequence": 3}), Some(4)).unwrap();
+    }
+
+    #[test]
+    fn followed_entries_print_one_per_line() {
+        let page = LogPage {
+            entries: vec![
+                json!({"sequence": 5, "kind": "MessageOutput", "message": "hello", "timestamp": 1}),
+                json!({"sequence": 6, "kind": "MessageError", "message": "line\nbreak", "timestamp": 2}),
+            ],
+            latest_sequence: 6,
+            next_after: None,
+            dropped: 3,
+            more: false,
+            restarted: true,
+        };
+
+        let text = follow_lines(&page, false).unwrap();
+        assert_eq!(
+            text,
+            vec![
+                FollowLine::Err(
+                    "Studio log numbering started over; showing every entry still kept".into()
+                ),
+                FollowLine::Err(
+                    "3 log entries were dropped from Studio's 200-entry buffer before they could be read"
+                        .into()
+                ),
+                FollowLine::Out("[5] Output: hello".into()),
+                FollowLine::Out("[6] Error: line\n    break".into()),
+            ]
+        );
+
+        let json_lines = follow_lines(&page, true).unwrap();
+        let FollowLine::Out(line) = &json_lines[3] else {
+            panic!("expected an entry line");
+        };
+        assert!(!line.contains('\n'), "{line}");
+        assert_eq!(
+            serde_json::from_str::<Value>(line).unwrap(),
+            page.entries[1]
+        );
+    }
+
+    #[test]
+    fn followed_entries_escape_terminal_control_characters() {
+        let page = LogPage {
+            entries: vec![json!({
+                "sequence": 1,
+                "kind": "MessageOutput\u{9b}",
+                "message": "\u{1b}]52;c;aGk=\u{7}\u{1b}[2Jcarriage\rreturn\ttab\nnext \u{7f}é",
+            })],
+            latest_sequence: 1,
+            next_after: None,
+            dropped: 0,
+            more: false,
+            restarted: false,
+        };
+
+        assert_eq!(
+            follow_lines(&page, false).unwrap(),
+            vec![FollowLine::Out(
+                r"[1] Output\u{9b}: \u{1b}]52;c;aGk=\u{7}\u{1b}[2Jcarriage\u{d}return".to_owned()
+                    + "\ttab\n    next "
+                    + r"\u{7f}é"
+            )]
+        );
+        // JSON output escapes them too, including DEL and C1 controls that
+        // serde_json leaves as they are, and still reads back the same.
+        let FollowLine::Out(line) = &follow_lines(&page, true).unwrap()[0] else {
+            panic!("expected an entry line");
+        };
+        assert!(!line.chars().any(char::is_control), "{line}");
+        assert_eq!(
+            serde_json::from_str::<Value>(line).unwrap(),
+            page.entries[0]
+        );
+        let pretty = json_escape_controls(serde_json::to_string_pretty(&page.entries[0]).unwrap());
+        assert!(
+            !pretty.chars().any(|c| c.is_control() && c != '\n'),
+            "{pretty}"
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(&pretty).unwrap(),
+            page.entries[0]
+        );
     }
 
     #[test]

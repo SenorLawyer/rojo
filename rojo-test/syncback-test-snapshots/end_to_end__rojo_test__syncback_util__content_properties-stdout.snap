@@ -1,0 +1,9 @@
+---
+source: tests/rojo_test/syncback_util.rs
+expression: "String::from_utf8_lossy(&output.stdout)"
+---
+Writing default.project.json
+Writing src/Added.model.json
+Writing src/AddedEmpty.model.json
+Writing src/Changed.model.json
+Writing src/Cleared.model.json
