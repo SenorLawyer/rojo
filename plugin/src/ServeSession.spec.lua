@@ -179,6 +179,80 @@ return function()
 		expect(ChangeHistoryService:IsRecordingInProgress()).to.equal(wasRecording)
 	end)
 
+	it("ends the session with a readable error when sending Studio's changes fails", function()
+		local details
+		session:onStatusChanged(function(status, detail)
+			if status == ServeSession.Status.Disconnected then
+				details = detail
+			end
+		end)
+		api.write = function()
+			return Promise.reject("Timed out sending changes to the Rojo server.")
+		end
+		local patch = PatchSet.newEmpty()
+		table.insert(patch.removed, "REMOVED")
+		session:__sendChanges(patch)
+		task.wait()
+		expect(session:getStatus()).to.equal(ServeSession.Status.Disconnected)
+		expect(string.find(details, "Couldn't send Studio's changes to the Rojo server", 1, true) ~= nil).to.equal(true)
+		expect(string.find(details, "Timed out sending changes", 1, true) ~= nil).to.equal(true)
+		expect(string.find(details, "Reconnect to resync.", 1, true) ~= nil).to.equal(true)
+	end)
+
+	it("ignores a failed write that finishes after the session stopped", function()
+		local calls = 0
+		local rejectWrite
+		api.write = function()
+			return Promise.new(function(_, reject)
+				rejectWrite = reject
+			end)
+		end
+		session:__sendChanges(PatchSet.newEmpty())
+		session:stop()
+		session:onStatusChanged(function()
+			calls += 1
+		end)
+		rejectWrite("late failure")
+		task.wait()
+		expect(calls).to.equal(0)
+	end)
+
+	it("keeps the session when asking the server to open a script fails", function()
+		local Settings = require(script.Parent.Settings)
+		local originalGet = Settings.get
+		Settings.get = function(self, name)
+			if name == "openScriptsExternally" then
+				return true
+			end
+			return originalGet(self, name)
+		end
+
+		local handleFailure
+		api.open = function()
+			return {
+				catch = function(_, handler)
+					handleFailure = handler
+				end,
+			}
+		end
+		local activeScript = Instance.new("ModuleScript")
+		session.__instanceMap.fromInstances[activeScript] = "SCRIPT"
+		session.__status = ServeSession.Status.Connected
+
+		local ok, err = pcall(session.__onActiveScriptChanged, session, activeScript)
+		Settings.get = originalGet
+		if not ok then
+			error(err, 0)
+		end
+		expect(handleFailure).to.be.ok()
+		handleFailure("Timed out asking the Rojo server to open the script.")
+		expect(session:getStatus()).to.equal(ServeSession.Status.Connected)
+
+		session.__instanceMap.fromInstances[activeScript] = nil
+		task.wait(0.1)
+		activeScript:Destroy()
+	end)
+
 	it("keeps syncing when the place identity still matches", function()
 		session:__onPlaceIdChanged()
 		expect(session:getStatus()).to.equal(ServeSession.Status.NotStarted)

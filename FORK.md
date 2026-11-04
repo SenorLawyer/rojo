@@ -16,7 +16,13 @@ Windows x64 is the primary supported target. Windows ARM is excluded from CI and
 
 ## Compatibility
 
-Use this fork's Studio plugin (7.7.2-fork.1 or later) with this fork's server. Mixing it with the upstream plugin has these known issues:
+Use this fork's Studio plugin (7.7.2-fork.1 or later) with this fork's server. Mixing the upstream plugin with this fork's server has these known issues:
 
 - When the target of a `Rojo_Target_*` attribute is removed, the server clears the referencing property by sending a null reference. The upstream plugin treats it as a failed change. With sync fallback enabled, it replaces the referencing instance. Otherwise it logs the change as unapplied. Before this fork, the upstream plugin kept the stale reference without reporting it.
-- The upstream plugin does not send a session ID when it subscribes. After the server restarts, a subscription from an older session is only rejected when its message cursor is beyond the new server's queue. Otherwise the server accepts it, and the upstream plugin then ignores the packets because they come from a different session. This also happens with upstream Rojo. Reconnect after restarting the server.
+- The upstream plugin does not send a session ID when it subscribes. After the server restarts, a subscription from an older session is only rejected when its message cursor is beyond the new server's queue. The server then closes the socket with code 1012, which the upstream plugin reports as "WebSocket connection closed unexpectedly" instead of waiting without syncing. Otherwise the server accepts it, and the upstream plugin then ignores the packets because they come from a different session. This also happens with upstream Rojo. Reconnect after restarting the server.
+
+Mixing this fork's plugin with an upstream server has these known issues:
+
+- The upstream server does not clear properties that point at a removed `Rojo_Target_*` target, so Studio keeps the stale reference.
+- When any requested instance was removed in the meantime, the upstream server rejects the whole `/api/serialize` request with a 400 instead of listing the missing IDs. The sync fallback then replaces none of the instances in that request.
+- The upstream server ignores the `sessionId` query parameter on `/api/socket` and does not check the message cursor, so it accepts a socket opened against a restarted server. The plugin only notices the restart when the first message from the new server arrives, and then ends the session. Reconnect after restarting the server.

@@ -3,6 +3,7 @@ return function()
 	local ServeSession = require(script.Parent.Parent.ServeSession)
 	local ApiContext = require(script.Parent.Parent.ApiContext)
 	local Version = require(script.Parent.Parent.Version)
+	local Http = require(script:FindFirstAncestor("Rojo").Packages.Http)
 	local AppComponent = App({}).component
 	local originalSessionNew = ServeSession.new
 	local originalApiNew = ApiContext.new
@@ -145,6 +146,61 @@ return function()
 		table.clear(states)
 		expect(AppComponent.onConfirmationAnswered(app, session, "Accept")).to.equal("Accept")
 		expect(#states).to.equal(0)
+	end)
+
+	it("wakes a pending confirmation when the session stops on its own", function()
+		local app = fakeApp()
+		local bindable = Instance.new("BindableEvent")
+		app.confirmationBindable = bindable
+		AppComponent.startSession(app)
+		local session = app.serveSession
+
+		local answer
+		task.spawn(function()
+			answer = bindable.Event:Wait()
+		end)
+		-- A place-ID change stops the session internally, not through endSession.
+		session.callback(ServeSession.Status.Disconnected, "The place ID changed.")
+		task.wait()
+		expect(answer).to.equal("Abort")
+		expect(app.serveSession).to.equal(nil)
+		bindable:Destroy()
+	end)
+
+	describe("background probes", function()
+		local function probeApp(host)
+			local app = fakeApp()
+			app.activeProbes = {}
+			app.getHostAndPort = function()
+				return host, "34872"
+			end
+			app.getBaseUrl = AppComponent.getBaseUrl
+			return app
+		end
+
+		it("skips probing while a request is blocked on an unanswered prompt", function()
+			local app = probeApp("probe-blocked.test")
+			expect(AppComponent.isProbeBlocked(app)).to.equal(false)
+
+			local finish = Http._beginOutstandingRequest("http://probe-blocked.test:34872/api/rojo")
+			expect(AppComponent.isProbeBlocked(app)).to.equal(true)
+			finish()
+			expect(AppComponent.isProbeBlocked(app)).to.equal(false)
+		end)
+
+		it("probes alongside other requests once the host has answered", function()
+			local app = probeApp("probe-answered.test")
+			Http._recordPermissionAnswer("http://probe-answered.test:34872/api/rojo", false)
+			local finish = Http._beginOutstandingRequest("http://probe-answered.test:34872/api/rojo")
+			expect(AppComponent.isProbeBlocked(app)).to.equal(false)
+			finish()
+		end)
+
+		it("skips probing while an earlier probe is still active", function()
+			local app = probeApp("probe-active.test")
+			app.activeProbes[{}] = true
+			expect(AppComponent.isProbeBlocked(app)).to.equal(true)
+		end)
 	end)
 
 	it("defers update checks and ignores results after unmounting", function()

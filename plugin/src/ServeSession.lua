@@ -79,7 +79,7 @@ function ServeSession.new(options)
 	end
 
 	local function onChangesFlushed(patch)
-		self.__apiContext:write(patch)
+		self:__sendChanges(patch)
 	end
 
 	local instanceMap = InstanceMap.new(onInstanceChanged)
@@ -324,7 +324,26 @@ function ServeSession:__onActiveScriptChanged(activeScript)
 	end)
 
 	-- Notify the Rojo server to open this script
-	self.__apiContext:open(scriptId)
+	self.__apiContext:open(scriptId):catch(function(err)
+		Log.warn("Could not open {} externally: {}", activeScript:GetFullName(), err)
+	end)
+end
+
+function ServeSession:__sendChanges(patch)
+	self.__apiContext:write(patch):catch(function(err)
+		if self.__status == Status.Disconnected then
+			return
+		end
+
+		-- The batcher does not keep changes it has flushed, so a failed write
+		-- means the server and Studio now disagree. Continuing would sync on
+		-- top of that difference without the user knowing.
+		local count = PatchSet.countInstances(patch)
+		Log.warn("Could not send changes to {} instance(s) to the Rojo server: {}", count, err)
+		self:__stopInternal(
+			string.format("Couldn't send Studio's changes to the Rojo server: %s\nReconnect to resync.", tostring(err))
+		)
+	end)
 end
 
 -- Separate so specs can supply instances without a real serialized model.

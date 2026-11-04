@@ -10,6 +10,7 @@ local Packages = Rojo.Packages
 local Roact = require(Packages.Roact)
 local Log = require(Packages.Log)
 local Promise = require(Packages.Promise)
+local Http = require(Packages.Http)
 
 local Assets = require(Plugin.Assets)
 local Version = require(Plugin.Version)
@@ -413,11 +414,16 @@ function App:releaseSyncLock()
 	Log.trace("Could not relase sync lock because it is owned by {}", lock.Value)
 end
 
-function App:findActiveServer()
+function App:getBaseUrl()
 	local host, port = self:getHostAndPort()
 	local baseUrl = if string.find(host, "^https?://")
 		then string.format("%s:%s", host, port)
 		else string.format("http://%s:%s", host, port)
+	return baseUrl, host, port
+end
+
+function App:findActiveServer()
+	local baseUrl, host, port = self:getBaseUrl()
 
 	Log.trace("Checking for active sync server at {}", baseUrl)
 
@@ -474,9 +480,7 @@ function App:checkSyncReminder()
 		return
 	end
 
-	if next(self.activeProbes) ~= nil then
-		-- A probe can take up to ApiContext's probe timeout against a stalled
-		-- server, so polling must not pile up more requests behind it.
+	if self:isProbeBlocked() then
 		return
 	end
 
@@ -515,6 +519,20 @@ function App:checkSyncReminder()
 				)
 			end
 		end)
+end
+
+function App:isProbeBlocked(): boolean
+	if next(self.activeProbes) ~= nil then
+		-- A probe can take up to ApiContext's probe timeout against a stalled
+		-- server, so polling must not pile up more requests behind it.
+		return true
+	end
+
+	-- A probe gives up after its timeout, but its RequestAsync keeps waiting
+	-- while Studio's permission prompt is unanswered. Starting another probe
+	-- would only add one more blocked request.
+	local baseUrl = self:getBaseUrl()
+	return Http.isPermissionPending(baseUrl) and Http.hasOutstandingRequest(baseUrl)
 end
 
 function App:startSyncReminderPolling()
@@ -761,6 +779,11 @@ function App:startSession()
 			})
 		elseif status == ServeSession.Status.Disconnected then
 			self.serveSession = nil
+			-- A session can stop on its own while the Confirming page is open,
+			-- for example when the place ID changes. Wake the confirmation so
+			-- its thread observes the stopped session instead of waiting for
+			-- the next session's answer. Firing with no waiter does nothing.
+			self.confirmationBindable:Fire("Abort")
 			self:releaseSyncLock()
 			self:clearRunningConnectionInfo()
 			self:setState({

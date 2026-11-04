@@ -99,5 +99,21 @@ return function()
 			Http._recordPermissionAnswer("http://denied-host.test:1/a", false)
 			expect(Http.isPermissionDenied("http://denied-host.test/")).to.equal(false)
 		end)
+
+		it("tracks outstanding requests per host until each finishes", function()
+			local url = "http://outstanding-host.test:34872/api/rojo"
+			expect(Http.hasOutstandingRequest(url)).to.equal(false)
+			local finishFirst = Http._beginOutstandingRequest(url)
+			local finishSecond = Http._beginOutstandingRequest("http://OUTSTANDING-host.test:1/other")
+			expect(Http.hasOutstandingRequest(url)).to.equal(true)
+			expect(Http.hasOutstandingRequest("http://other-outstanding-host.test/")).to.equal(false)
+
+			finishFirst()
+			-- Finishing the same request twice must not hide the other one.
+			finishFirst()
+			expect(Http.hasOutstandingRequest(url)).to.equal(true)
+			finishSecond()
+			expect(Http.hasOutstandingRequest(url)).to.equal(false)
+		end)
 	end)
 end
