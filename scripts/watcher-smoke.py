@@ -16,13 +16,16 @@ EXE = Path(sys.argv[1]).resolve()
 BASE = Path(tempfile.mkdtemp(prefix="rojo-watcher-proof-")).resolve()
 ROOT = Path(tempfile.mkdtemp(prefix="watcher-smoke-", dir=BASE)).resolve()
 REPORT = {"fixture": str(ROOT), "binary": str(EXE), "stages": []}
+# Keeps console windows from popping up on Windows. Other platforms do not
+# have this flag.
+NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 
 def git(*args):
     return subprocess.run(
         ["git", "-c", "core.autocrlf=false", "-c", "user.name=Rojo smoke", "-c", "user.email=smoke@example.invalid", *args],
         cwd=ROOT, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-        creationflags=subprocess.CREATE_NO_WINDOW,
+        creationflags=NO_WINDOW,
     ).stdout.strip()
 
 
@@ -71,11 +74,12 @@ class Server:
         self.log_path = ROOT / f"{label}.log"
         self.log = self.log_path.open("wb")
         project = str(ROOT / "default.project.json")
-        if verbatim:
+        # Verbatim paths only exist on Windows.
+        if verbatim and os.name == "nt":
             project = "\\\\?\\" + project
         self.process = subprocess.Popen(
             [str(EXE), "serve", project, "--port", str(self.port)], cwd=ROOT,
-            stdout=self.log, stderr=subprocess.STDOUT, creationflags=subprocess.CREATE_NO_WINDOW,
+            stdout=self.log, stderr=subprocess.STDOUT, creationflags=NO_WINDOW,
         )
         start = time.perf_counter()
         while time.perf_counter() - start < 15:
@@ -197,7 +201,19 @@ try:
     server.converge("write_after_restart", expected_scripts())
     REPORT["success"] = True
 finally:
+    stop_error = None
     if server is not None:
-        server.stop()
+        try:
+            server.stop()
+        except Exception as err:
+            # After a failure, raising here would hide the error that ended
+            # the run, so only report it.
+            if REPORT.get("success"):
+                REPORT["success"] = False
+                stop_error = err
+            else:
+                print(f"Stopping the server failed too: {err}", file=sys.stderr, flush=True)
     (BASE / "watcher-smoke-results.json").write_text(json.dumps(REPORT, indent=2), encoding="utf-8")
     print(json.dumps({"report": str(BASE / "watcher-smoke-results.json"), "fixture": str(ROOT), "success": REPORT.get("success", False)}), flush=True)
+    if stop_error is not None:
+        raise stop_error

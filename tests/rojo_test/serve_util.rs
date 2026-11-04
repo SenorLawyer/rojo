@@ -101,21 +101,10 @@ impl TestServeSession {
         std::thread::sleep(Duration::from_millis(100));
 
         let port = get_port_number();
-        let port_string = port.to_string();
-
-        let rojo_process = Command::new(ROJO_PATH)
-            .args([
-                "serve",
-                project_path.to_str().unwrap(),
-                "--port",
-                port_string.as_str(),
-            ])
-            .current_dir(working_dir)
-            .spawn()
-            .expect("Couldn't start Rojo");
+        let rojo_process = spawn_rojo_serve(&working_dir, &project_path, port);
 
         TestServeSession {
-            rojo_process: KillOnDrop(rojo_process),
+            rojo_process,
             _dir: dir,
             port,
             project_path,
@@ -136,9 +125,25 @@ impl TestServeSession {
         const BASE_DURATION_MS: f32 = 30.0;
         const EXP_BACKOFF_FACTOR: f32 = 1.3;
         const MAX_TRIES: u32 = 5;
+        const MAX_RESTARTS: u32 = 3;
 
-        for i in 1..=MAX_TRIES {
+        let mut restarts = 0;
+        let mut i = 0;
+        while i < MAX_TRIES {
+            i += 1;
             match self.rojo_process.0.try_wait() {
+                Ok(Some(status)) if restarts < MAX_RESTARTS => {
+                    // Test ports come from a range that the OS also hands out
+                    // to outgoing connections, so something else can briefly
+                    // hold one. Rojo exits when it cannot bind, so try another.
+                    log::warn!("Rojo process exited with status {}, restarting", status);
+                    restarts += 1;
+                    i = 0;
+                    self.port = get_port_number();
+                    self.rojo_process =
+                        spawn_rojo_serve(&get_working_dir_path(), &self.project_path, self.port);
+                    continue;
+                }
                 Ok(Some(status)) => panic!("Rojo process exited with status {}", status),
                 Ok(None) => { /* The process is still running, as expected */ }
                 Err(err) => panic!("Failed to wait on Rojo process: {}", err),
@@ -295,6 +300,21 @@ pub fn deserialize_msgpack<'a, T: Deserialize<'a>>(
     let mut deserializer = rmp_serde::Deserializer::new(input).with_human_readable();
 
     T::deserialize(&mut deserializer)
+}
+
+fn spawn_rojo_serve(working_dir: &Path, project_path: &Path, port: usize) -> KillOnDrop {
+    let port_string = port.to_string();
+    let rojo_process = Command::new(ROJO_PATH)
+        .args([
+            "serve",
+            project_path.to_str().unwrap(),
+            "--port",
+            port_string.as_str(),
+        ])
+        .current_dir(working_dir)
+        .spawn()
+        .expect("Couldn't start Rojo");
+    KillOnDrop(rojo_process)
 }
 
 /// Probably-okay way to generate random enough port numbers for running the

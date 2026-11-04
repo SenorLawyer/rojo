@@ -2,7 +2,9 @@ use crossbeam_channel::{select, Receiver, RecvError, Sender};
 use jod_thread::JoinHandle;
 use memofs::{IoResultExt, Vfs, VfsEvent};
 use rbx_dom_weak::types::{Ref, Variant};
+use std::cell::Cell;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 use std::{
     fs, io,
     sync::{Arc, Mutex},
@@ -57,11 +59,7 @@ impl ChangeProcessor {
     ) -> Self {
         let (shutdown_sender, shutdown_receiver) = crossbeam_channel::bounded(1);
         let vfs_receiver = vfs.event_receiver();
-        let task = JobThreadContext {
-            tree,
-            vfs,
-            message_queue,
-        };
+        let task = JobThreadContext::new(tree, vfs, message_queue);
 
         let job_thread = jod_thread::Builder::new()
             .name("ChangeProcessor thread".to_owned())
@@ -69,9 +67,16 @@ impl ChangeProcessor {
                 log::trace!("ChangeProcessor thread started");
 
                 loop {
+                    let resync_timer = match task.pending_resync_deadline() {
+                        Some(deadline) => crossbeam_channel::at(deadline),
+                        None => crossbeam_channel::never(),
+                    };
                     select! {
                         recv(vfs_receiver) -> event => {
                             task.handle_vfs_event(event?);
+                        },
+                        recv(resync_timer) -> _ => {
+                            task.resync_tree();
                         },
                         recv(tree_mutation_receiver) -> patch_set => {
                             task.handle_tree_event(patch_set?);
@@ -114,9 +119,37 @@ struct JobThreadContext {
     /// Whenever changes are applied to the DOM, we should push those changes
     /// into this message queue to inform any connected clients.
     message_queue: Arc<MessageQueue<AppliedPatchSet>>,
+
+    /// When the whole tree was last resynced because of a rescan.
+    last_resync: Cell<Option<Instant>>,
+
+    /// Whether a rescan arrived too soon after the last resync and still
+    /// needs one.
+    resync_pending: Cell<bool>,
 }
 
+/// The shortest time between two resyncs of the whole tree.
+///
+/// Watchers can report a rescan for every burst of changes they could not
+/// keep up with, such as a large `git checkout` or package install, and each
+/// resync snapshots the entire project.
+const RESYNC_INTERVAL: Duration = Duration::from_secs(1);
+
 impl JobThreadContext {
+    fn new(
+        tree: Arc<Mutex<RojoTree>>,
+        vfs: Arc<Vfs>,
+        message_queue: Arc<MessageQueue<AppliedPatchSet>>,
+    ) -> Self {
+        Self {
+            tree,
+            vfs,
+            message_queue,
+            last_resync: Cell::new(None),
+            resync_pending: Cell::new(false),
+        }
+    }
+
     /// Computes and applies patches to the DOM for a given file path.
     ///
     /// This function finds the nearest ancestor to the given path that has associated instances
@@ -165,10 +198,42 @@ impl JobThreadContext {
         }
     }
 
+    /// Resyncs the whole tree after the watcher reported that it may have
+    /// dropped events, unless it was resynced very recently. Then the resync
+    /// is deferred, so a burst of rescans costs at most one more.
+    fn request_resync(&self) {
+        let recently_resynced = self
+            .last_resync
+            .get()
+            .is_some_and(|last| last.elapsed() < RESYNC_INTERVAL);
+        if recently_resynced {
+            self.resync_pending.set(true);
+        } else {
+            self.resync_tree();
+        }
+    }
+
+    /// When a deferred resync is due, if there is one.
+    fn pending_resync_deadline(&self) -> Option<Instant> {
+        if !self.resync_pending.get() {
+            return None;
+        }
+        Some(
+            self.last_resync
+                .get()
+                .map_or_else(Instant::now, |last| last + RESYNC_INTERVAL),
+        )
+    }
+
     /// Snapshots the whole tree again after the watcher reported that it may
     /// have dropped events.
     fn resync_tree(&self) {
+        self.resync_pending.set(false);
         log::warn!("The filesystem watcher may have missed changes; resyncing the whole project");
+        // Watches can be lost along with the events, so recover them first.
+        if let Err(err) = self.vfs.commit_event(&VfsEvent::Rescan) {
+            log::error!("Error recovering filesystem watches: {:?}", err);
+        }
         let mut tree = self.tree.lock().unwrap();
         let root_id = tree.get_root_id();
         if let Some(patch) = compute_and_apply_changes(&mut tree, &self.vfs, root_id) {
@@ -176,10 +241,17 @@ impl JobThreadContext {
                 self.message_queue.push_messages(&[patch]);
             }
         }
+        self.last_resync.set(Some(Instant::now()));
     }
 
     fn handle_vfs_event(&self, event: VfsEvent) {
         log::trace!("Vfs event: {:?}", event);
+
+        // Recovering every watch is deferred along with the resync.
+        if let VfsEvent::Rescan = event {
+            self.request_resync();
+            return;
+        }
 
         // Update the VFS immediately with the event.
         if let Err(err) = self.vfs.commit_event(&event) {
@@ -194,10 +266,7 @@ impl JobThreadContext {
             Some(Err(err)) => {
                 log::error!("Error resolving filesystem event {:?}: {:?}", event, err);
             }
-            None => match event {
-                VfsEvent::Rescan => self.resync_tree(),
-                _ => log::warn!("Unhandled VFS event: {:?}", event),
-            },
+            None => log::warn!("Unhandled VFS event: {:?}", event),
         }
     }
 
@@ -264,7 +333,15 @@ impl JobThreadContext {
                                     InstigatingSource::Path(path) => {
                                         if let Some(Variant::String(value)) = changed_value {
                                             match resolve_source_path(&self.vfs, path) {
-                                                Ok(source_path) => {
+                                                Ok(None) => {
+                                                    // Writing would bring back a file
+                                                    // whose removal is still on its way.
+                                                    log::warn!(
+                                                        "Not writing {}, since it no longer exists",
+                                                        path.display()
+                                                    );
+                                                }
+                                                Ok(Some(source_path)) => {
                                                     if let Err(err) = fs::write(&source_path, value)
                                                     {
                                                         log::error!(
@@ -316,13 +393,14 @@ impl JobThreadContext {
     }
 }
 
-fn resolve_source_path(vfs: &Vfs, path: &Path) -> io::Result<PathBuf> {
-    if !vfs
-        .metadata(path)
-        .with_not_found()?
-        .is_some_and(|meta| meta.is_dir())
-    {
-        return Ok(path.to_owned());
+/// Returns the file that holds the source of the instance created from
+/// `path`, or `None` if `path` no longer exists.
+fn resolve_source_path(vfs: &Vfs, path: &Path) -> io::Result<Option<PathBuf>> {
+    let Some(meta) = vfs.metadata(path).with_not_found()? else {
+        return Ok(None);
+    };
+    if meta.is_file() {
+        return Ok(Some(path.to_owned()));
     }
 
     let (middleware, _, init_path) = get_dir_middleware(vfs, path).map_err(io::Error::other)?;
@@ -330,7 +408,7 @@ fn resolve_source_path(vfs: &Vfs, path: &Path) -> io::Result<PathBuf> {
         Middleware::ModuleScriptDir
         | Middleware::ServerScriptDir
         | Middleware::ClientScriptDir
-        | Middleware::PluginScriptDir => Ok(init_path),
+        | Middleware::PluginScriptDir => Ok(Some(init_path)),
         _ => Err(io::Error::other(format!(
             "directory {} does not contain an init script",
             path.display()
@@ -390,9 +468,25 @@ fn compute_and_apply_changes(tree: &mut RojoTree, vfs: &Vfs, id: Ref) -> Option<
                         return None;
                     }
                 };
+                if snapshot.is_none() && id == tree.get_root_id() {
+                    log::warn!(
+                        "{} no longer produces an instance. Keeping the last synced project.",
+                        path.display()
+                    );
+                    return None;
+                }
 
                 let patch_set = compute_patch_set(snapshot, tree, id);
                 apply_patch_set(tree, patch_set)
+            }
+            Ok(None) if id == tree.get_root_id() => {
+                // The root cannot be removed. Keep the last synced tree, which
+                // still maps the path, so it is resynced once the path returns.
+                log::warn!(
+                    "{} no longer exists. Keeping the last synced project until it is restored.",
+                    path.display()
+                );
+                return None;
             }
             Ok(None) => {
                 // Our instance was previously created from a path, but that
@@ -447,6 +541,11 @@ fn compute_and_apply_changes(tree: &mut RojoTree, vfs: &Vfs, id: Ref) -> Option<
                 if let Some(parent_id) = parent_id.filter(|parent_id| parent_id.is_some()) {
                     return compute_and_apply_changes(tree, vfs, parent_id);
                 }
+                // The root cannot be removed.
+                if id == tree.get_root_id() {
+                    log::warn!("The project root no longer produces an instance");
+                    return None;
+                }
             }
 
             let patch_set = compute_patch_set(snapshot, tree, id);
@@ -474,11 +573,11 @@ mod test {
         let mut tree = RojoTree::new(InstanceSnapshot::new());
         let patch = compute_patch_set(Some(snapshot), &tree, tree.get_root_id());
         apply_patch_set(&mut tree, patch);
-        JobThreadContext {
-            tree: Arc::new(Mutex::new(tree)),
-            vfs: Arc::new(vfs),
-            message_queue: Arc::new(MessageQueue::new()),
-        }
+        JobThreadContext::new(
+            Arc::new(Mutex::new(tree)),
+            Arc::new(vfs),
+            Arc::new(MessageQueue::new()),
+        )
     }
 
     #[test]
@@ -652,6 +751,97 @@ mod test {
         assert!(!task.tree.lock().unwrap().get_ids_at_path(&added).is_empty());
     }
 
+    #[test]
+    fn rescans_soon_after_a_resync_are_coalesced() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dunce::canonicalize(dir.path()).unwrap();
+        let task = context(&root);
+        task.handle_vfs_event(VfsEvent::Rescan);
+        assert!(task.pending_resync_deadline().is_none());
+
+        let added = root.join("missed.luau");
+        fs::write(&added, "return 1").unwrap();
+        task.handle_vfs_event(VfsEvent::Rescan);
+        task.handle_vfs_event(VfsEvent::Rescan);
+        assert!(task.tree.lock().unwrap().get_ids_at_path(&added).is_empty());
+        let deadline = task.pending_resync_deadline().unwrap();
+        assert!(deadline <= Instant::now() + RESYNC_INTERVAL);
+
+        // The processor thread resyncs once the deadline passes.
+        task.resync_tree();
+        assert!(task.pending_resync_deadline().is_none());
+        assert!(!task.tree.lock().unwrap().get_ids_at_path(&added).is_empty());
+    }
+
+    #[test]
+    fn removing_the_served_path_keeps_the_root() {
+        // Served as a project file, and as a plain directory.
+        for serve_project in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let base = dunce::canonicalize(dir.path()).unwrap();
+            let root = base.join("game");
+            fs::create_dir(&root).unwrap();
+            fs::write(root.join("module.luau"), "return 1").unwrap();
+            let served = if serve_project {
+                write_project(&base, r#"{"$path":"game"}"#)
+            } else {
+                root.clone()
+            };
+            let task = context(&served);
+            let root_id = task.tree.lock().unwrap().get_root_id();
+
+            // A branch switch can remove the served path, and a rescan or its
+            // own removal event can be handled before it comes back.
+            if serve_project {
+                fs::remove_file(&served).unwrap();
+            } else {
+                fs::remove_dir_all(&served).unwrap();
+            }
+            task.handle_vfs_event(VfsEvent::Rescan);
+            task.handle_vfs_event(VfsEvent::Remove(served.clone()));
+            assert!(task.tree.lock().unwrap().get_instance(root_id).is_some());
+
+            // The processor keeps going, and resyncs once the path is back.
+            fs::create_dir_all(&root).unwrap();
+            fs::write(root.join("added.luau"), "return 2").unwrap();
+            if serve_project {
+                write_project(&base, r#"{"$path":"game"}"#);
+            }
+            task.handle_vfs_event(VfsEvent::Create(served.clone()));
+            let tree = task.tree.lock().unwrap();
+            assert!(
+                !tree.get_ids_at_path(&root.join("added.luau")).is_empty(),
+                "serve_project: {serve_project}"
+            );
+        }
+    }
+
+    #[test]
+    fn two_way_sync_does_not_recreate_a_deleted_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dunce::canonicalize(dir.path()).unwrap();
+        let script = root.join("module.luau");
+        fs::write(&script, "return 1").unwrap();
+        let task = context(&root);
+        let id = task.tree.lock().unwrap().get_ids_at_path(&script)[0];
+
+        // Studio sends an edit before the removal event is handled.
+        fs::remove_file(&script).unwrap();
+        let mut properties = UstrMap::default();
+        properties.insert(ustr("Source"), Some(Variant::String("return 2".into())));
+        task.handle_tree_event(PatchSet {
+            updated_instances: vec![PatchUpdate {
+                id,
+                changed_name: None,
+                changed_class_name: None,
+                changed_properties: properties,
+                changed_metadata: None,
+            }],
+            ..PatchSet::new()
+        });
+        assert!(!script.exists());
+    }
+
     #[cfg(unix)]
     #[test]
     fn removal_of_a_recreated_symlink_keeps_its_own_path() {
@@ -745,12 +935,12 @@ mod test {
         let vfs = Vfs::new_default_without_watch();
         assert_eq!(
             resolve_source_path(&vfs, root).unwrap(),
-            root.join("init.luau")
+            Some(root.join("init.luau"))
         );
         fs::remove_file(root.join("init.luau")).unwrap();
         assert_eq!(
             resolve_source_path(&vfs, root).unwrap(),
-            root.join("init.lua")
+            Some(root.join("init.lua"))
         );
         fs::write(root.join("default.project.json"), "{}").unwrap();
         assert!(resolve_source_path(&vfs, root).is_err());

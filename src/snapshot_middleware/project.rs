@@ -25,7 +25,7 @@ use crate::{
     RojoRef,
 };
 
-use super::{canonicalize_existing_ancestor, emit_legacy_scripts_default, snapshot_from_vfs};
+use super::{emit_legacy_scripts_default, snapshot_from_vfs, util::missing_relevant_path};
 
 pub fn snapshot_project(
     context: &InstanceContext,
@@ -165,7 +165,7 @@ pub fn snapshot_project_node(
             // reinstall or branch switch, for example) would never resync it.
             metadata
                 .relevant_paths
-                .push(canonicalize_existing_ancestor(vfs, &full_path)?);
+                .push(missing_relevant_path(vfs, &full_path));
         }
     }
 
@@ -265,7 +265,7 @@ pub fn snapshot_project_node(
                     let full_path = project_folder.join(path_node.path());
                     metadata
                         .relevant_paths
-                        .push(canonicalize_existing_ancestor(vfs, &full_path)?);
+                        .push(missing_relevant_path(vfs, &full_path));
                 }
             }
         }

@@ -94,3 +94,54 @@ pub fn canonicalize_existing_ancestor(vfs: &Vfs, path: &Path) -> io::Result<Path
         }
     }
 }
+
+/// Returns the form of `path` to store as a relevant path while it is missing.
+///
+/// This is [`canonicalize_existing_ancestor`], except that a path which cannot
+/// be resolved, for example because of a permission error or a symlink loop,
+/// is kept as written. A missing optional path must not fail the snapshot of
+/// the whole project.
+pub fn missing_relevant_path(vfs: &Vfs, path: &Path) -> PathBuf {
+    canonicalize_existing_ancestor(vfs, path).unwrap_or_else(|err| {
+        log::warn!(
+            "Could not resolve {}, so recreating it may not be noticed: {}",
+            path.display(),
+            err
+        );
+        path.to_owned()
+    })
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn unresolvable_missing_paths_are_kept_as_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dunce::canonicalize(dir.path()).unwrap();
+        let link = root.join("loop");
+        std::os::unix::fs::symlink(&link, &link).unwrap();
+        let path = link.join("child");
+        let vfs = Vfs::new_default_without_watch();
+        let err = canonicalize_existing_ancestor(&vfs, &path).unwrap_err();
+        assert!(
+            !matches!(
+                err.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+            ),
+            "{err}"
+        );
+        assert_eq!(missing_relevant_path(&vfs, &path), path);
+    }
+
+    #[test]
+    fn missing_relevant_paths_resolve_their_existing_ancestor() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dunce::canonicalize(dir.path()).unwrap();
+        let vfs = Vfs::new_default_without_watch();
+        let missing = root.join("missing").join("child");
+        assert_eq!(missing_relevant_path(&vfs, &missing), missing);
+    }
+}

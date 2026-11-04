@@ -12,6 +12,12 @@
 * Added `VfsEvent::Rescan`, emitted when the watcher may have dropped events. Watcher errors are logged instead of ignored.
 * `read_dir` registers its watch before listing, so entries created during the listing are reported.
 * Failing to watch a parent directory no longer fails the read that requested the watch.
+* Failing to watch a path for any reason other than it missing, such as reaching the inotify watch limit or lacking permission, is logged once and no longer fails the read. The watch is retried after a rescan.
+* Watching a missing path reports `io::ErrorKind::NotFound` on every platform.
+* After a rescan, existing watch roots are registered again, so on Linux a root replaced while events were dropped, and directories created meanwhile, are watched again.
+* On Linux, removing a watch root nested inside another watch root no longer removes the outer root's watches below it.
+* Parent watches used to notice recreated roots are only placed inside directories that were watched before, so a missing path cannot put a watch on the home directory or filesystem root.
+* On macOS, watches survive the removal of their path, since FSEvents reports the path again once it is recreated, and no parent watches are added. Parent watches made FSEvents report every change in the parent's subtree, and each watch change restarted its event stream.
 
 # 0.4.0 (2026-07-01)
 * Added `Vfs::canonicalize`. [#1201]
