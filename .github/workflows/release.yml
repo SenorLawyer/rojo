@@ -73,11 +73,6 @@ jobs:
             target: x86_64-pc-windows-msvc
             label: windows-x86_64
 
-          - host: windows
-            os: windows-11-arm
-            target: aarch64-pc-windows-msvc
-            label: windows-aarch64
-
           - host: macos
             os: macos-latest
             target: x86_64-apple-darwin

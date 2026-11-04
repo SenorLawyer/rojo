@@ -11,3 +11,5 @@ The default branch requires a pull request, passing CI and resolved review threa
 To profile initial sync or file churn, build with `cargo build --release --locked --features profile-with-tracy`. Run the resulting binary with `serve` and attach the [Tracy UI](https://github.com/wolfpld/tracy) before reproducing. Match the UI version to the locked tracy-client-sys dependency using the [client version table](https://docs.rs/tracy-client/latest/tracy_client/#version-support-table). Based on [upstream PR 1282](https://github.com/rojo-rbx/rojo/pull/1282).
 
 For generated projects, use `rojo build -o place.rbxl` for a place or `rojo build -o model.rbxm` for a model. Binary output supports `--compress lz4`, `--compress zstd` and `--compress none`. XML output rejects compression flags.
+
+Windows x64 is the primary supported target. Windows ARM is excluded from CI and release artifacts. Linux and macOS retain their existing CI coverage.
