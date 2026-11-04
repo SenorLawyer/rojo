@@ -1,0 +1,10 @@
+---
+source: tests/tests/syncback.rs
+expression: src/AddedEmpty.model.json
+---
+{
+  "className": "Sky",
+  "properties": {
+    "MoonTextureContent": ""
+  }
+}

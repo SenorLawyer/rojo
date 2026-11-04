@@ -22,6 +22,7 @@ Measured on November 4, 2026, on Windows x64 with Studio, against private test e
 - **Staged releases.** `release stage` published a checkpointed release to the staging test place and its smoke script passed against that version; `release promote` then published it to a second test place. A stage whose smoke script returned `{ ok = false }` was recorded as failed and promote refused.
 - **Assets.** `rojo assets sync` uploaded two 8x8 test images (both approved), a rerun uploaded nothing, and a rename kept the existing asset id.
 - **Data modules and logs.** A `.data.csv` file arrived in Studio as a typed ModuleScript and a later edit synced live. `rojo studio logs --follow` printed new Studio output, including warnings, as it appeared.
+- **Content asset properties.** A project setting legacy names (`Sound.SoundId`, `Decal.Texture`, `CharacterMesh.MeshId` as a number), `Content` names, both names on one instance, an empty `AudioContent`, and `.rbxmx` models in the legacy `<url>` and new `<uri>`/`<null>` forms built to `.rbxlx` and `.rbxl` with one `Content` property per asset and the same value in both formats. Synced to Studio, every instance showed matching legacy and `Content` values; a reconnect found no differences, and edits to legacy names in the project and a model file reached Studio live.
 - **Specs.** The plugin specs passed in Studio after the review fixes: 304 passed, 0 failed, 1 skipped.
 
 ## Observed results

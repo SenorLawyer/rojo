@@ -11,6 +11,7 @@ use rbx_dom_weak::{
 use crate::{variant_eq::variant_eq, RojoRef, REF_ID_ATTRIBUTE_NAME, REF_POINTER_ATTRIBUTE_PREFIX};
 
 use super::{
+    normalize_content_properties,
     patch::{PatchAdd, PatchSet, PatchUpdate},
     InstanceSnapshot, InstanceWithMeta, RojoTree,
 };
@@ -19,7 +20,8 @@ use super::{
 pub fn compute_patch_set(snapshot: Option<InstanceSnapshot>, tree: &RojoTree, id: Ref) -> PatchSet {
     let mut patch_set = PatchSet::new();
 
-    if let Some(snapshot) = snapshot {
+    if let Some(mut snapshot) = snapshot {
+        normalize_content_properties(&mut snapshot);
         let mut context = ComputePatchContext::default();
 
         compute_patch_set_internal(&mut context, snapshot, tree, id, &mut patch_set);

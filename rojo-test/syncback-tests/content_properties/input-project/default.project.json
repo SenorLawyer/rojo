@@ -1,0 +1,9 @@
+{
+  "name": "content_properties",
+  "tree": {
+    "$className": "DataModel",
+    "ReplicatedStorage": {
+      "$path": "src"
+    }
+  }
+}

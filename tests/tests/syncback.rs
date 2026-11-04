@@ -32,6 +32,10 @@ syncback_tests! {
     // Ensures that there's only one copy written to disk if navigating a
     // project file might yield two copies
     child_but_not => ["OnlyOneCopy/child_of_one.luau", "ReplicatedStorage/child_replicated_storage.luau"],
+    // Ensures that a place saved with Studio's Content asset properties leaves
+    // files using the legacy names alone while their values match, and writes
+    // the new names when a value changes or an instance is added
+    content_properties => ["src/Unchanged.model.json", "src/Changed.model.json", "src/Cleared.model.json", "src/AlreadyNew.model.json", "src/Added.model.json", "src/AddedEmpty.model.json"],
     // Ensures that syncback works with CSVs
     csv => ["src/csv_init/init.csv", "src/csv.csv"],
     // Ensures that the children of a directory with an `init.data.csv` are
