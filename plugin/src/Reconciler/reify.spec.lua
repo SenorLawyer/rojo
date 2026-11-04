@@ -378,4 +378,28 @@ return function()
 		expect(update.id).to.equal("ROOT")
 		expect(update.changedProperties.Value).to.equal(virtualInstances["ROOT"].Properties.Value)
 	end)
+
+	it("should clear ref properties set to the null ref", function()
+		local virtualInstances = {
+			ROOT = {
+				ClassName = "ObjectValue",
+				Name = "Root",
+				Properties = {
+					Value = {
+						Ref = "00000000000000000000000000000000",
+					},
+				},
+				Children = {},
+			},
+		}
+
+		local deferredRefs = {}
+		local instanceMap = InstanceMap.new()
+		local unappliedPatch = reifyInstance(deferredRefs, instanceMap, virtualInstances, "ROOT")
+
+		applyDeferredRefs(instanceMap, deferredRefs, unappliedPatch)
+
+		assert(PatchSet.isEmpty(unappliedPatch), "expected remaining patch to be empty")
+		expect(instanceMap.fromIds["ROOT"].Value).to.equal(nil)
+	end)
 end

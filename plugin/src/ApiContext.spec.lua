@@ -251,6 +251,18 @@ return function()
 			expect(socket.Opened.isConnected()).to.equal(false)
 		end)
 
+		it("tells the server which session the socket belongs to", function()
+			local context, socket = socketContext()
+			local socketUrl
+			context.__createWebSocket = function(_, url)
+				socketUrl = url
+				return socket
+			end
+			context:connectWebSocket({})
+			expect(socketUrl).to.equal("ws://localhost:34872/api/socket/-1?sessionId=test-session")
+			context:disconnect()
+		end)
+
 		it("notifies the session only after the socket opens", function()
 			local context, socket = socketContext()
 			socket.ConnectionState = Enum.WebStreamClientState.Connecting

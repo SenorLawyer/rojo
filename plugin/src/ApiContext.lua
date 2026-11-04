@@ -300,6 +300,12 @@ function ApiContext:connectWebSocket(packetHandlers, onOpened)
 	end
 
 	local url = ("%s/api/socket/%s"):format(self.__baseUrl, self.__messageCursor)
+	-- Lets the server reject a socket from a session that predates a restart,
+	-- whose message cursor would mean nothing. Servers that don't check it
+	-- route on the path alone and ignore the query.
+	if self.__sessionId ~= nil then
+		url ..= "?sessionId=" .. HttpService:UrlEncode(self.__sessionId)
+	end
 	-- Convert HTTP/HTTPS URL to WS/WSS
 	url = url:gsub("^http://", "ws://"):gsub("^https://", "wss://")
 
