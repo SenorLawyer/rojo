@@ -86,11 +86,15 @@ fn report(status: &str, failed: u64) -> Value {
 
 fn token() -> TempDir {
     let directory = tempdir().unwrap();
-    fs_err::write(
-        directory.path().join("token"),
-        "0123456789abcdef0123456789abcdef",
-    )
-    .unwrap();
+    let path = directory.path().join("token");
+    fs_err::write(&path, "0123456789abcdef0123456789abcdef").unwrap();
+    // Rojo warns on stderr about token files other users can read, which
+    // tests that expect a quiet stderr would otherwise see on Unix.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs_err::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
     directory
 }
 
