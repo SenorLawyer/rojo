@@ -297,6 +297,25 @@ fn write_sourcemap(
     Ok(())
 }
 
+/// Writes the session's sourcemap as JSON, with paths relative to the
+/// project folder.
+pub(super) fn write_sourcemap_json(
+    session: &ServeSession,
+    writer: impl Write,
+    include_non_scripts: bool,
+) -> anyhow::Result<()> {
+    let filter = if include_non_scripts {
+        filter_nothing
+    } else {
+        filter_non_scripts
+    };
+    let tree = session.tree();
+    let root_node =
+        recurse_create_node(&tree, tree.get_root_id(), session.root_dir(), filter, false);
+    serde_json::to_writer(writer, &root_node)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod test {
     use crate::cli::sourcemap::SourcemapNode;

@@ -14,6 +14,7 @@ mod sourcemap;
 mod studio;
 mod syncback;
 mod test;
+mod typecheck;
 mod upload;
 
 use std::{borrow::Cow, env, path::Path, str::FromStr};
@@ -36,6 +37,7 @@ pub use self::sourcemap::SourcemapCommand;
 pub use self::studio::{CheckUntrustedModelCommand, StudioCommand};
 pub use self::syncback::SyncbackCommand;
 pub use self::test::TestCommand;
+pub use self::typecheck::TypecheckCommand;
 pub use self::upload::UploadCommand;
 
 /// Command line options that Rojo accepts, defined using the clap crate.
@@ -58,6 +60,7 @@ impl Options {
             Subcommand::Build(subcommand) => subcommand.run(),
             Subcommand::Upload(subcommand) => subcommand.run(),
             Subcommand::Sourcemap(subcommand) => subcommand.run(),
+            Subcommand::Typecheck(subcommand) => subcommand.run(),
             Subcommand::FmtProject(subcommand) => subcommand.run(),
             Subcommand::Doc(subcommand) => subcommand.run(),
             Subcommand::Plugin(subcommand) => subcommand.run(),
@@ -141,6 +144,7 @@ pub enum Subcommand {
     Build(BuildCommand),
     Upload(UploadCommand),
     Sourcemap(SourcemapCommand),
+    Typecheck(TypecheckCommand),
     FmtProject(FmtProjectCommand),
     Doc(DocCommand),
     Plugin(PluginCommand),
