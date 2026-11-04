@@ -88,6 +88,12 @@ pub struct StdBackend {
     /// Ancestors that could not be watched for the creation of a path. They
     /// are not retried, or logged again, until the watcher asks for a rescan.
     failed_creation_watches: HashSet<PathBuf>,
+    /// Paths that were registered only because a project references them
+    /// while they are missing. Their parent is not watched just for being
+    /// their parent: once canonicalized, a `../shared` path has no `..` left,
+    /// and its parent would be the project's parent, such as the home
+    /// directory. They are watched for inside watched directories, or polled.
+    missing_roots: HashSet<PathBuf>,
 }
 
 impl StdBackend {
@@ -115,6 +121,7 @@ impl StdBackend {
             missing_poll_interval: MISSING_POLL_INTERVAL,
             poll_thread: None,
             failed_creation_watches: HashSet::new(),
+            missing_roots: HashSet::new(),
         }
     }
 
@@ -233,7 +240,9 @@ impl StdBackend {
             // missing absolute or `..` path could climb to the home directory.
             // A parent reached through `..`, like the project's parent for
             // `../shared`, or the filesystem root, is no exception.
-            if !(is_plain_parent(path, ancestor) || self.is_anchored(ancestor)) {
+            let parent_allowed =
+                is_plain_parent(path, ancestor) && !self.missing_roots.contains(path);
+            if !(parent_allowed || self.is_anchored(ancestor)) {
                 log::debug!(
                     "Not watching {} for the creation of {}, since nothing in it was watched before",
                     ancestor.display(),
@@ -813,6 +822,7 @@ impl VfsBackend for StdBackend {
             self.poll_for_creation(path);
             return Ok(());
         }
+        self.missing_roots.insert(path.to_owned());
         self.lost_watches.insert(path.to_owned());
         // It may have been created after the caller found it missing, without
         // an event from the creation watch registered here.
@@ -1516,6 +1526,34 @@ mod test {
         // What the change processor does with the event.
         backend.recover_watches(&shared).unwrap();
         assert!(backend.lost_watches.is_empty());
+    }
+
+    #[test]
+    fn canonical_missing_paths_beside_the_project_are_polled_too() {
+        let mut backend = StdBackend::new().unwrap();
+        backend.missing_poll_interval = Duration::from_millis(20);
+        let (_dir, dir) = tempdir();
+        let project = dir.join("project");
+        fs_err::create_dir(&project).unwrap();
+        let project_file = project.join("default.project.json");
+        fs_err::write(&project_file, "{}").unwrap();
+        backend.watch(&project_file).unwrap();
+
+        // Rojo canonicalizes `../shared` before asking for the watch, so the
+        // path no longer has a `..` that would reveal where its parent is.
+        let shared = dir.join("shared");
+        backend.watch_missing(&shared).unwrap();
+        assert!(!backend.parent_watches.contains(&dir));
+        if !POLL_MISSING {
+            assert_eq!(
+                backend.polled.lock().unwrap().missing,
+                std::slice::from_ref(&shared)
+            );
+        }
+
+        let receiver = backend.event_receiver();
+        fs_err::create_dir(&shared).unwrap();
+        wait_for_creation(&receiver, &shared);
     }
 
     #[cfg(unix)]

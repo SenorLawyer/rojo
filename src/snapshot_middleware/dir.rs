@@ -341,5 +341,12 @@ mod test {
             .unwrap()
             .unwrap();
         assert!(snapshot.children.is_empty());
+
+        // The entry point used for real projects must not fail on it either.
+        let snapshot = snapshot_from_vfs(&InstanceContext::default(), &vfs, &dir)
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshot.class_name, "Folder");
+        assert!(snapshot.children.is_empty());
     }
 }

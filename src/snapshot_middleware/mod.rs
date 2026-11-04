@@ -144,8 +144,16 @@ pub(crate) fn get_dir_middleware<'path>(
 
     for (middleware, name) in order {
         let test_path = dir_path.join(name);
-        if vfs.metadata(&test_path).with_not_found()?.is_some() {
-            return Ok((*middleware, dir_name, test_path));
+        match vfs.metadata(&test_path) {
+            Ok(_) => return Ok((*middleware, dir_name, test_path)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            // An unreadable init file (for example, permission denied) is
+            // skipped like `snapshot_dir` skips it, so the rest of the
+            // directory still loads as a folder instead of failing.
+            Err(error) => log::warn!(
+                "Ignoring init file {} because its metadata could not be read: {error}",
+                test_path.display()
+            ),
         }
     }
 
