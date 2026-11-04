@@ -47,6 +47,13 @@ pub(crate) const IMPORT_CHECK_LIMIT: Duration = Duration::from_secs(15);
 /// Studio (15 s), with a margin. Clients must wait longer than this so they see
 /// the server's answer.
 pub(crate) const MAX_COMMAND_REQUEST: Duration = Duration::from_secs(60);
+/// The longest and the default `timeoutSeconds` of a `spec` command, which
+/// runs the place's specs in Run mode.
+pub(crate) const MAX_SPEC_SECONDS: u64 = 300;
+pub(crate) const DEFAULT_SPEC_SECONDS: u64 = 60;
+/// Time a spec run spends outside its specs: Studio starting Run mode, which
+/// takes several seconds for a large place, and returning to Edit mode.
+const SPEC_RUN_MARGIN: Duration = Duration::from_secs(30);
 /// How long a checkout read through Git (for the reftable backend) is reused,
 /// so frequent requests do not each start Git processes.
 const GIT_OBSERVE_CACHE: Duration = Duration::from_millis(250);
@@ -278,6 +285,36 @@ fn session_id(value: &Value) -> Option<String> {
         .and_then(Value::as_str)
         .and_then(|id| Uuid::parse_str(id).ok())
         .map(|id| id.hyphenated().to_string())
+}
+
+/// The `timeoutSeconds` of a `spec` command's arguments.
+pub(crate) fn spec_seconds(args: &Value) -> Result<u64, String> {
+    match args.get("timeoutSeconds") {
+        None | Some(Value::Null) => Ok(DEFAULT_SPEC_SECONDS),
+        Some(value) => value
+            .as_u64()
+            .filter(|seconds| (1..=MAX_SPEC_SECONDS).contains(seconds))
+            .ok_or_else(|| {
+                format!("timeoutSeconds must be a whole number from 1 to {MAX_SPEC_SECONDS}")
+            }),
+    }
+}
+
+/// How long the server waits for Studio to complete a command. A spec run
+/// lasts as long as its own timeout allows; every other command gets
+/// [`COMMAND_TIMEOUT`].
+pub(crate) fn studio_deadline(action: &str, args: &Value) -> Result<Duration, String> {
+    if action == "spec" {
+        Ok(Duration::from_secs(spec_seconds(args)?) + SPEC_RUN_MARGIN)
+    } else {
+        Ok(COMMAND_TIMEOUT)
+    }
+}
+
+/// The longest the server holds a command request whose Studio deadline is
+/// `deadline`, the counterpart of [`MAX_COMMAND_REQUEST`] for every action.
+pub(crate) fn max_command_request(deadline: Duration) -> Duration {
+    MAX_COMMAND_REQUEST - COMMAND_TIMEOUT + deadline
 }
 
 fn unix_millis(time: SystemTime) -> u64 {
@@ -954,6 +991,13 @@ impl StudioBridge {
             "/api/studio/validate" => {
                 let mut state = self.state();
                 Self::prune(&mut state);
+                // The plugin cannot poll while Studio is in Run mode, so a
+                // long spec run validates its request periodically instead,
+                // which must keep the session from expiring.
+                if let Some(session) = session_id(&value).and_then(|id| state.sessions.get_mut(&id))
+                {
+                    session.last_seen = Instant::now();
+                }
                 let pending = value
                     .get("requestId")
                     .and_then(Value::as_str)
@@ -1156,7 +1200,15 @@ impl StudioBridge {
         };
         if !matches!(
             action,
-            "status" | "tree" | "properties" | "selection" | "logs" | "export" | "import" | "test"
+            "status"
+                | "tree"
+                | "properties"
+                | "selection"
+                | "logs"
+                | "export"
+                | "import"
+                | "test"
+                | "spec"
         ) {
             return failure(StatusCode::BAD_REQUEST, "Unsupported action. Arbitrary Luau execution, whole-place save, publish and play control are unavailable through this bridge.");
         }
@@ -1166,6 +1218,10 @@ impl StudioBridge {
             _ => return failure(StatusCode::BAD_REQUEST, "requestId must be a UUID"),
         };
         let args = value.get("args").cloned().unwrap_or(json!({}));
+        let deadline = match studio_deadline(action, &args) {
+            Ok(deadline) => deadline,
+            Err(message) => return failure(StatusCode::BAD_REQUEST, message),
+        };
         if action == "import" {
             // Checking an import is the expensive step, so fail fast when
             // there is no session to deliver it to.
@@ -1187,7 +1243,7 @@ impl StudioBridge {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis()
-            + COMMAND_TIMEOUT.as_millis();
+            + deadline.as_millis();
         let command =
             json!({"requestId":id,"action":action,"args":args,"expiresAt":expires as u64});
         let bytes = command.to_string().len();
@@ -1253,7 +1309,7 @@ impl StudioBridge {
                     // `prune` must not drop this before the timeout below
                     // fires, or the caller would see a disconnect (503)
                     // instead of a timeout (504).
-                    deadline: Instant::now() + COMMAND_TIMEOUT + PENDING_GRACE,
+                    deadline: Instant::now() + deadline + PENDING_GRACE,
                     generation,
                     result: sender,
                 },
@@ -1263,11 +1319,11 @@ impl StudioBridge {
             }
         }
         self.changed.notify_waiters();
-        let response = match tokio::time::timeout(COMMAND_TIMEOUT, receiver).await {
+        let response = match tokio::time::timeout(deadline, receiver).await {
             Ok(Ok(Outcome::Completed(result))) => reply(StatusCode::OK, json!({"sessionId":session_id,"requestId":id,"result":result})),
             Ok(Ok(Outcome::Cancelled)) => reply(StatusCode::GONE, json!({"error":"The Studio command was cancelled before it completed.","cancelled":true,"requestId":id})),
             Ok(Err(_)) => failure(StatusCode::SERVICE_UNAVAILABLE, "The Studio session disconnected or expired before completing the command. Reconnect Studio and retry."),
-            Err(_) => failure(StatusCode::GATEWAY_TIMEOUT, "Studio did not complete the command within 15 seconds. Reconnect Studio and retry."),
+            Err(_) => failure(StatusCode::GATEWAY_TIMEOUT, format!("Studio did not complete the command within {} seconds. Reconnect Studio and retry.", deadline.as_secs())),
         };
         let mut state = self.state();
         if state
@@ -1639,6 +1695,111 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(value["result"]["value"]["mode"], "Edit");
         assert!(bridge.state().pending.is_empty());
+    }
+
+    #[test]
+    fn spec_runs_get_a_deadline_from_their_own_timeout() {
+        assert_eq!(
+            studio_deadline("spec", &json!({})).unwrap(),
+            Duration::from_secs(DEFAULT_SPEC_SECONDS) + SPEC_RUN_MARGIN
+        );
+        assert_eq!(
+            studio_deadline("spec", &json!({"timeoutSeconds":300})).unwrap(),
+            Duration::from_secs(330)
+        );
+        for invalid in [json!(0), json!(301), json!(1.5), json!("60"), json!(-1)] {
+            assert!(
+                studio_deadline("spec", &json!({ "timeoutSeconds": invalid })).is_err(),
+                "{invalid}"
+            );
+        }
+        // Other actions keep the short deadline, whatever their arguments.
+        for action in ["status", "test", "import", "logs"] {
+            assert_eq!(
+                studio_deadline(action, &json!({"timeoutSeconds":300})).unwrap(),
+                COMMAND_TIMEOUT
+            );
+        }
+        assert_eq!(max_command_request(COMMAND_TIMEOUT), MAX_COMMAND_REQUEST);
+        assert_eq!(
+            max_command_request(Duration::from_secs(330)),
+            MAX_COMMAND_REQUEST + Duration::from_secs(315)
+        );
+    }
+
+    #[tokio::test]
+    async fn spec_commands_stay_pending_until_their_longer_deadline() {
+        let (_dir, bridge) = fixture();
+        let session = register(&bridge).await;
+        let id = Uuid::new_v4().to_string();
+        let mut pending = command_future(
+            &bridge,
+            json!({"sessionId":session,"action":"spec","requestId":id,"args":{"timeoutSeconds":120}}),
+        );
+        assert!(poll!(&mut pending).is_pending());
+        let (_, value) = plugin(&bridge, "/api/studio/poll", json!({"sessionId":session})).await;
+        let command = &value["commands"][0];
+        assert_eq!(command["action"], "spec");
+        // The plugin checks expiresAt before and after Run mode, so it must
+        // cover the whole run rather than the usual 15 seconds.
+        let now = unix_millis(SystemTime::now());
+        let expires = command["expiresAt"].as_u64().unwrap();
+        assert!(expires >= now + 149_000, "{expires} - {now}");
+        assert!(expires <= now + 151_000, "{expires} - {now}");
+        {
+            let state = bridge.state();
+            let entry = &state.pending[&id];
+            assert!(entry.deadline > Instant::now() + Duration::from_secs(149));
+        }
+        let (status, _) = plugin(
+            &bridge,
+            "/api/studio/result",
+            json!({"requestId":id,"sessionId":session,"result":{"ok":true,"value":{"report":{"status":"passed"}}}}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, value) = into_value(pending.await).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(value["result"]["value"]["report"]["status"], "passed");
+    }
+
+    #[tokio::test]
+    async fn spec_commands_with_invalid_timeouts_are_refused() {
+        let (_dir, bridge) = fixture();
+        let session = register(&bridge).await;
+        let (status, value) = cli(
+            &bridge,
+            "/api/studio/command",
+            json!({"sessionId":session,"action":"spec","args":{"timeoutSeconds":301}}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(value["error"].as_str().unwrap().contains("timeoutSeconds"));
+        assert!(bridge.state().pending.is_empty());
+    }
+
+    #[tokio::test]
+    async fn validating_a_request_keeps_its_session_alive() {
+        let (_dir, bridge) = fixture();
+        let session = register(&bridge).await;
+        let id = Uuid::new_v4().to_string();
+        let mut pending = command_future(
+            &bridge,
+            json!({"sessionId":session,"action":"spec","requestId":id}),
+        );
+        assert!(poll!(&mut pending).is_pending());
+        plugin(&bridge, "/api/studio/poll", json!({"sessionId":session})).await;
+        // As if Studio had been in Run mode, unable to poll, for 25 seconds.
+        bridge.state().sessions.get_mut(&session).unwrap().last_seen =
+            Instant::now().checked_sub(Duration::from_secs(25)).unwrap();
+        let (status, _) = plugin(
+            &bridge,
+            "/api/studio/validate",
+            json!({"sessionId":session,"requestId":id}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(bridge.state().sessions[&session].last_seen.elapsed() < Duration::from_secs(5));
     }
 
     #[tokio::test]

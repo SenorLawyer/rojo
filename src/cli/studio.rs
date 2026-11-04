@@ -290,7 +290,7 @@ fn print_json(value: &Value, compact: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn local_address(address: &str) -> anyhow::Result<Url> {
+pub(super) fn local_address(address: &str) -> anyhow::Result<Url> {
     let mut url = Url::parse(address)?;
     let host = url.host_str().context("Studio address must have a host")?;
     anyhow::ensure!(
@@ -327,7 +327,7 @@ fn request(
     read_response(response)
 }
 
-fn read_response(response: reqwest::blocking::Response) -> anyhow::Result<Value> {
+pub(super) fn read_response(response: reqwest::blocking::Response) -> anyhow::Result<Value> {
     let status = response.status();
     let mut bytes = Vec::new();
     response.take(8 * 1024 * 1024 + 1).read_to_end(&mut bytes)?;

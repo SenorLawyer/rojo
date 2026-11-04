@@ -32,6 +32,7 @@ Making a new release? Simply add the new header with the version and date undern
 ## Unreleased
 
 * Agent Can Skip Confirmation is now on by default for new plugin settings. Existing saved preferences, including an off setting, are preserved. ([fork#3])
+* Added `rojo test`, which runs a place's TestEZ specs (and, untested in Studio so far, Jest-Lua) in Studio's Run mode through the Studio bridge and prints each failure and a summary, or a JSON report with `--json`. It exits with 1 when a test fails or the run cannot finish and with 2 when Studio cannot be reached. The bridge's new `spec` action runs a fixed runner with options passed as data, and its deadline follows the run's own 1-300 second timeout. `rojo mcp` offers the same run as `run_tests`. During `test` and `spec` runs the plugin keeps its bridge session alive while it cannot poll. See [docs/testing.md](docs/testing.md). ([fork#3])
 * The Studio plugin now cancels abandoned connections and prevents overlapping sessions. When the server asks it to resync, the session ends with a readable error; reconnect to resync. ([fork#1])
 * The Studio plugin now disconnects when the place ID changes, including when a local file is published or the initial sync is waiting for confirmation. Reconnect to sync the new place. ([fork#1])
 * Update checks now look for releases of SenorLawyer/rojo instead of upstream Rojo. ([fork#1])

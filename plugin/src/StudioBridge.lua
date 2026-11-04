@@ -17,6 +17,7 @@ local Log = require(Packages.Log)
 local RbxDom = require(Packages.RbxDom)
 local ReflectionDatabase = require(Packages.RbxDom.database)
 local Settings = require(script.Parent.Settings)
+local SpecRunner = require(script.Parent.SpecRunner)
 
 local MAX_MODEL_BYTES = 5 * 1024 * 1024
 local MAX_BODY_BYTES = 8 * 1024 * 1024
@@ -59,6 +60,27 @@ end
 -- How the test runner's insert and removal are kept in undo history. See
 -- recordRunnerChange.
 StudioBridge.runnerHistoryOperation = Enum.FinishRecordingOperation.Append
+
+-- Copied into the spec runner. Replaced by tests.
+StudioBridge.specRunnerModule = script.Parent.SpecRunner
+
+-- While Studio is in Run mode the worker cannot poll, and the server expires a
+-- session that has not been heard from in 30 seconds. A run therefore checks
+-- in this often (seconds), which also keeps the session listed. Replaced by
+-- tests.
+StudioBridge.heartbeatInterval = 5
+
+--[[
+	Starts Run mode and waits for the runner to call EndTest. Replaced by tests.
+]]
+function StudioBridge.executeRunMode(args)
+	local service = game:GetService("StudioTestService")
+	local found, executeRunMode = pcall(function()
+		return service.ExecuteRunModeAsync
+	end)
+	assert(found and executeRunMode, "StudioTestService.ExecuteRunModeAsync is unavailable in this Studio version")
+	return executeRunMode(service, args)
+end
 
 -- AgentControl sets this around an explicit bridge.retry so a manual start is
 -- allowed even when automatic enabling is turned off in settings.
@@ -349,6 +371,14 @@ function StudioBridge:capabilities()
 			maxSimulationSeconds = 5,
 			reason = "StudioTestService.ExecuteRunModeAsync runs existing game scripts with a controlled EndTest runner",
 		},
+		spec = {
+			available = RunService:IsEdit(),
+			mode = "Run",
+			frameworks = { "testez", "jest" },
+			maxTimeoutSeconds = SpecRunner.MAX_TIMEOUT_SECONDS,
+			maxFailures = SpecRunner.MAX_FAILURES,
+			reason = "Runs the place's *.spec modules in Run mode with a fixed runner and returns a bounded report",
+		},
 	}
 end
 
@@ -558,20 +588,13 @@ function StudioBridge.recordRunnerChange(name, callback)
 	return ok, err
 end
 
-function StudioBridge:__runTest(command, seconds)
-	local service = game:GetService("StudioTestService")
-	local found, executeRunMode = pcall(function()
-		return service.ExecuteRunModeAsync
-	end)
-	assert(found and executeRunMode, "StudioTestService.ExecuteRunModeAsync is unavailable in this Studio version")
-
-	local runner = Instance.new("Script")
-	runner.Name = "__RojoBridgeTest_" .. self.sessionId
-	runner.Source = [[local service = game:GetService("StudioTestService")
-local args = service:GetTestArgs()
-task.wait(args.simulationSeconds)
-service:EndTest({ completed = true, simulationSeconds = args.simulationSeconds, requestId = args.requestId })]]
-
+--[[
+	Runs `runner`, a Script the caller prepared, in Run mode and removes it
+	afterwards. `seconds` is how long the run is expected to take at most.
+	Returns whether Run mode succeeded, what the runner passed to EndTest and
+	the elapsed time.
+]]
+function StudioBridge:__runInRunMode(command, runner, args, seconds)
 	local function removeRunner()
 		self.testRunners[runner] = nil
 		if runner.Parent then
@@ -587,19 +610,67 @@ service:EndTest({ completed = true, simulationSeconds = args.simulationSeconds, 
 	-- If Studio never returns from the run, remove the runner anyway so it is
 	-- not saved or published with the place.
 	local watchdog = task.delay(seconds + REQUEST_TIMEOUT, removeRunner)
+	local running = true
+	task.spawn(function()
+		while true do
+			task.wait(StudioBridge.heartbeatInterval)
+			if not running or self.stopped then
+				return
+			end
+			-- Failures are left to the command's own result. A cancelled
+			-- request answers 410 here, but Run mode cannot be stopped from
+			-- the plugin, so the run continues and its result is discarded.
+			self:request("validate", { requestId = command.requestId }):await()
+		end
+	end)
 	local parented, parentError = StudioBridge.recordRunnerChange("Rojo: Insert Studio test runner", function()
 		runner.Parent = game:GetService("ServerScriptService")
 	end)
 	local started = os.clock()
 	local ok, result = false, parentError
 	if parented then
-		ok, result = pcall(executeRunMode, service, { simulationSeconds = seconds, requestId = command.requestId })
+		ok, result = pcall(StudioBridge.executeRunMode, args)
 	end
+	running = false
 	if coroutine.status(watchdog) == "suspended" then
 		task.cancel(watchdog)
 	end
 	removeRunner()
 	return ok, result, os.clock() - started
+end
+
+function StudioBridge:__runTest(command, seconds)
+	local runner = Instance.new("Script")
+	runner.Name = "__RojoBridgeTest_" .. self.sessionId
+	runner.Source = [[local service = game:GetService("StudioTestService")
+local args = service:GetTestArgs()
+task.wait(args.simulationSeconds)
+service:EndTest({ completed = true, simulationSeconds = args.simulationSeconds, requestId = args.requestId })]]
+	return self:__runInRunMode(command, runner, { simulationSeconds = seconds, requestId = command.requestId }, seconds)
+end
+
+-- The spec runner's fixed source. It only reads options from GetTestArgs and
+-- runs the SpecRunner module copied beside it, so a caller passes data, never
+-- code. Any error still ends the run with a report, because Run mode would
+-- otherwise continue until someone stops it in Studio.
+StudioBridge.SPEC_RUNNER_SOURCE = [[local service = game:GetService("StudioTestService")
+local ok, report = pcall(function()
+	return require(script:WaitForChild("SpecRunner")).runWithTimeout(service:GetTestArgs())
+end)
+service:EndTest(if ok then report else { framework = "testez", status = "error", error = tostring(report) })]]
+
+function StudioBridge:__runSpecs(command, options)
+	local runner = Instance.new("Script")
+	runner.Name = "__RojoBridgeSpec_" .. self.sessionId
+	runner.Source = StudioBridge.SPEC_RUNNER_SOURCE
+	local module = StudioBridge.specRunnerModule:Clone()
+	module.Name = "SpecRunner"
+	module.Parent = runner
+	local ok, report, elapsed = self:__runInRunMode(command, runner, options, options.timeoutSeconds)
+	if ok and type(report) ~= "table" then
+		ok, report = false, "The spec runner ended Run mode without a report"
+	end
+	return ok, report, elapsed
 end
 
 function StudioBridge:execute(command)
@@ -691,6 +762,18 @@ function StudioBridge:execute(command)
 		self:ensureActive(command)
 		assert(ok, tostring(result))
 		return { mode = "Run", result = result, elapsedSeconds = elapsed, isEdit = RunService:IsEdit() }
+	elseif command.action == "spec" then
+		assert(RunService:IsEdit(), "Specs must start in Edit mode")
+		local options = SpecRunner.normalizeOptions(args)
+		-- Resolve the roots and the framework now, so a wrong path or a
+		-- missing TestEZ fails without starting Run mode.
+		SpecRunner.prepare(options, game)
+		self:request("validate", { requestId = command.requestId }):expect()
+		self:ensureActive(command)
+		local ok, report, elapsed = self:__runSpecs(command, options)
+		self:ensureActive(command)
+		assert(ok, tostring(report))
+		return { mode = "Run", report = report, elapsedSeconds = elapsed, isEdit = RunService:IsEdit() }
 	elseif command.action == "export" then
 		local instance = self:resolve(args.instance)
 		assert(

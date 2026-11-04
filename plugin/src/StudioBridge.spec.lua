@@ -719,4 +719,130 @@ return function()
 		bridge:execute(command("import", args))
 		expect(fixture.Script.Disabled).to.equal(true)
 	end)
+
+	describe("spec", function()
+		local originalExecuteRunMode = StudioBridge.executeRunMode
+		local originalHeartbeatInterval = StudioBridge.heartbeatInterval
+		local fixturePath = "game/ReplicatedStorage/__RojoBridgeSpec"
+
+		local function specFixture()
+			local framework = Instance.new("ModuleScript")
+			framework.Name = "TestEZ"
+			framework.Parent = fixture
+			local spec = Instance.new("ModuleScript")
+			spec.Name = "Example.spec"
+			spec.Parent = fixture
+			return { roots = { fixturePath }, module = fixturePath .. "/TestEZ", timeoutSeconds = 5 }
+		end
+
+		local function runner()
+			return game:GetService("ServerScriptService"):FindFirstChild("__RojoBridgeSpec_" .. bridge.sessionId)
+		end
+
+		afterEach(function()
+			StudioBridge.executeRunMode = originalExecuteRunMode
+			StudioBridge.heartbeatInterval = originalHeartbeatInterval
+		end)
+
+		it("advertises its bounds", function()
+			local capability = bridge:capabilities().spec
+			expect(capability.maxTimeoutSeconds).to.equal(300)
+			expect(capability.mode).to.equal("Run")
+		end)
+
+		it("rejects bad options and missing paths before starting Run mode", function()
+			local started = false
+			StudioBridge.executeRunMode = function()
+				started = true
+				return {}
+			end
+			for _, case in
+				{
+					{ args = { timeoutSeconds = 0 }, reason = "timeoutSeconds" },
+					{ args = { framework = "mocha" }, reason = "framework" },
+					{ args = { roots = { fixturePath .. "/Missing" } }, reason = "does not exist" },
+					{
+						args = { roots = { fixturePath }, module = fixturePath .. "/Missing" },
+						reason = "does not exist",
+					},
+				}
+			do
+				local ok, err = pcall(bridge.execute, bridge, command("spec", case.args))
+				expect(ok).to.equal(false)
+				expect(string.find(tostring(err), case.reason, 1, true)).to.be.ok()
+			end
+			expect(started).to.equal(false)
+			expect(runner()).to.equal(nil)
+		end)
+
+		it("runs a fixed runner with the options as data and removes it afterwards", function()
+			local args = specFixture()
+			local seen
+			StudioBridge.executeRunMode = function(testArgs)
+				local inserted = runner()
+				seen = {
+					args = testArgs,
+					source = inserted and inserted.Source,
+					module = inserted and inserted:FindFirstChild("SpecRunner"),
+				}
+				return { framework = "testez", status = "passed", passed = 1, failed = 0, skipped = 0 }
+			end
+			local result = bridge:execute(command("spec", args))
+			expect(seen.source).to.equal(StudioBridge.SPEC_RUNNER_SOURCE)
+			expect(seen.module).to.be.ok()
+			expect(seen.module:IsA("ModuleScript")).to.equal(true)
+			expect(seen.args.roots[1]).to.equal(fixturePath)
+			expect(seen.args.module).to.equal(fixturePath .. "/TestEZ")
+			expect(seen.args.timeoutSeconds).to.equal(5)
+			expect(seen.args.framework).to.equal("auto")
+			expect(result.mode).to.equal("Run")
+			expect(result.report.status).to.equal("passed")
+			expect(result.report.passed).to.equal(1)
+			expect(runner()).to.equal(nil)
+		end)
+
+		it("keeps the session alive while Run mode lasts", function()
+			local args = specFixture()
+			local validations = 0
+			bridge.request = function(_, route)
+				if route == "validate" then
+					validations += 1
+				end
+				return Promise.resolve({ active = true })
+			end
+			StudioBridge.heartbeatInterval = 0.05
+			StudioBridge.executeRunMode = function()
+				task.wait(0.4)
+				return { status = "passed" }
+			end
+			bridge:execute(command("spec", args))
+			-- One validation before Run mode starts, then the heartbeats.
+			expect(validations >= 3).to.equal(true)
+			local after = validations
+			task.wait(0.2)
+			expect(validations).to.equal(after)
+		end)
+
+		it("fails when Run mode ends without a report", function()
+			local args = specFixture()
+			StudioBridge.executeRunMode = function()
+				return nil
+			end
+			local ok, err = pcall(bridge.execute, bridge, command("spec", args))
+			expect(ok).to.equal(false)
+			expect(string.find(tostring(err), "without a report", 1, true)).to.be.ok()
+			expect(runner()).to.equal(nil)
+		end)
+
+		it("removes the runner when Run mode fails", function()
+			local args = specFixture()
+			StudioBridge.executeRunMode = function()
+				error("Studio is already running a test")
+			end
+			local ok, err = pcall(bridge.execute, bridge, command("spec", args))
+			expect(ok).to.equal(false)
+			expect(string.find(tostring(err), "already running", 1, true)).to.be.ok()
+			expect(runner()).to.equal(nil)
+		end)
+	end)
 end

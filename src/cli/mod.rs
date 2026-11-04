@@ -13,6 +13,7 @@ mod serve;
 mod sourcemap;
 mod studio;
 mod syncback;
+mod test;
 mod upload;
 
 use std::{borrow::Cow, env, path::Path, str::FromStr};
@@ -34,6 +35,7 @@ pub use self::serve::ServeCommand;
 pub use self::sourcemap::SourcemapCommand;
 pub use self::studio::{CheckUntrustedModelCommand, StudioCommand};
 pub use self::syncback::SyncbackCommand;
+pub use self::test::TestCommand;
 pub use self::upload::UploadCommand;
 
 /// Command line options that Rojo accepts, defined using the clap crate.
@@ -66,6 +68,7 @@ impl Options {
             Subcommand::Merge(subcommand) => subcommand.run(),
             Subcommand::Packages(subcommand) => subcommand.run(),
             Subcommand::Studio(subcommand) => subcommand.run(),
+            Subcommand::Test(subcommand) => subcommand.run(),
             Subcommand::Mcp(subcommand) => subcommand.run(),
             Subcommand::CheckUntrustedModel(subcommand) => subcommand.run(),
         }
@@ -148,12 +151,37 @@ pub enum Subcommand {
     Merge(MergeCommand),
     Packages(PackagesCommand),
     Studio(StudioCommand),
+    Test(TestCommand),
     Mcp(McpCommand),
     /// Internal: checks one untrusted model read from stdin. `rojo serve` and
     /// `rojo studio import` run it as a child process.
     // Must match `model_check::SUBCOMMAND`; a test checks that it does.
     #[clap(name = "check-untrusted-model", hide = true)]
     CheckUntrustedModel(CheckUntrustedModelCommand),
+}
+
+/// A command was used incorrectly or could not reach what it needs, as opposed
+/// to its work failing. The process exits with status 2 instead of 1.
+#[derive(Debug, Error)]
+#[error("{0:#}")]
+pub struct UsageError(pub anyhow::Error);
+
+/// The command already reported its outcome; exit with this status without
+/// logging an error.
+#[derive(Debug, Error)]
+#[error("exit status {0}")]
+pub struct ExitStatus(pub i32);
+
+/// The process exit status for an error returned by [`Options::run`], and
+/// whether the error still needs to be logged.
+pub fn exit_status(error: &anyhow::Error) -> (i32, bool) {
+    if let Some(ExitStatus(code)) = error.downcast_ref::<ExitStatus>() {
+        (*code, false)
+    } else if error.is::<UsageError>() {
+        (2, true)
+    } else {
+        (1, true)
+    }
 }
 
 pub(super) fn resolve_path(path: &Path) -> anyhow::Result<Cow<'_, Path>> {
