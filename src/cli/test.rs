@@ -611,7 +611,10 @@ impl TestReport {
 fn without_runner_frames(message: &str) -> String {
     let is_runner_frame = |line: &str| {
         let line = line.trim_start();
+        // Wally installs TestEZ under a lower-case package name, such as
+        // `_Index.roblox_testez@0.4.1.testez`.
         line.contains(".TestEZ.")
+            || line.contains(".testez.")
             || line.contains("__RojoBridgeSpec_")
             || line.starts_with("SpecRunner:")
             || line.contains(".SpecRunner:")
@@ -900,6 +903,7 @@ mod tests {
         let message = [
             "ReplicatedStorage.Packages.TestEZ.TestRunner:86: Expected value 3, got 2",
             "ReplicatedStorage.Packages.TestEZ.Expectation:47 function equal",
+            "ReplicatedStorage.Packages._Index.roblox_testez@0.4.1.testez.TestRunner:86",
             "ReplicatedStorage.Shared.Math.spec:11",
             "ServerScriptService.__RojoBridgeSpec_x.SpecRunner:554 function runTestEZ",
             "TaskScript:555 function runTestEZ",

@@ -1018,11 +1018,13 @@ fn plan(sources: &[Source], lock: &LockFile, config: &Config, retry_rejected: bo
             _ => None,
         })
         .collect();
+    // Pending uploads for another creator are kept: switching the config's
+    // creator back resumes them instead of uploading those contents again.
     let stale_pending = lock
         .pending
-        .keys()
-        .filter(|key| !resumed.contains(key.as_str()))
-        .cloned()
+        .iter()
+        .filter(|(key, pending)| pending.creator == creator && !resumed.contains(key.as_str()))
+        .map(|(key, _)| key.clone())
         .collect();
     Plan {
         items,
@@ -2624,5 +2626,32 @@ mod tests {
 
         assert_eq!(report.uploaded, ids(&[("Coin.png", 1002)]));
         assert_eq!(fixture.lock().assets["Coin.png"].creator, "group:9");
+    }
+
+    #[test]
+    fn pending_uploads_for_another_creator_are_kept() {
+        let user = "source = \"assets\"\noutput = \"src/Assets.luau\"\nname_prefix = \"test-\"\n\n[creator]\nuser_id = 42\n";
+        let group = "source = \"assets\"\noutput = \"src/Assets.luau\"\nname_prefix = \"test-\"\n\n[creator]\ngroup_id = 9\n";
+        let fixture = Fixture::new();
+        fixture.write("Coin.png", &png(8, 8, "coin"));
+        let cloud = FakeCloud::start(None);
+        cloud.defer.store(true, Ordering::SeqCst);
+        cloud.refuse_polls.store(true, Ordering::SeqCst);
+        fixture.sync(&cloud).unwrap_err();
+        cloud.refuse_polls.store(false, Ordering::SeqCst);
+
+        // A sync for another creator uploads its own copy and leaves the
+        // first creator's pending upload alone.
+        fs::write(fixture.config(), group).unwrap();
+        fixture.sync(&cloud).unwrap();
+        assert_eq!(fixture.lock().pending.len(), 1);
+
+        // Switching back resumes that upload instead of sending the file again.
+        fs::write(fixture.config(), user).unwrap();
+        let (report, _) = fixture.sync(&cloud).unwrap();
+
+        assert_eq!(report.uploaded, ids(&[("Coin.png", 1001)]));
+        assert_eq!(cloud.uploads(), ["test-Coin", "test-Coin"]);
+        assert!(fixture.lock().pending.is_empty());
     }
 }

@@ -2024,7 +2024,7 @@ fn passing_staging_record(
     Ok(record)
 }
 
-/// How far ahead of the clock a staging record or journal entry may be dated
+/// How far ahead of the clock a staging record may be dated
 /// before promote assumes the clock was wrong when it was written.
 const CLOCK_SLACK_SECONDS: u64 = 5 * 60;
 

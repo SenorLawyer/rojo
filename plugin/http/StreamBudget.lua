@@ -2,8 +2,8 @@
 	Counts the stream clients Rojo holds from HttpService:CreateWebStreamClient.
 
 	Studio caps how many stream clients can be open at once, and what happens
-	past that cap is not documented. Rojo therefore stays well under the cap
-	and leaves the rest for other plugins: everything that
+	past that cap is not documented. Rojo therefore stays under the cap, which
+	Studio applies to each plugin separately: everything that
 	creates a stream client takes a slot from here first and does not create
 	one when no slot is free.
 

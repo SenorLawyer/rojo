@@ -18,7 +18,7 @@ The command:
    | --- | --- |
    | 0 | luau-lsp found no problems. |
    | 1 | luau-lsp reported a problem, or the project could not be loaded. |
-   | 2 | The check could not run: luau-lsp was not found or `luau-lsp --version` failed, or the project has no `.lua` or `.luau` scripts. |
+   | 2 | The check could not run: luau-lsp was not found, could not be run or `luau-lsp --version` failed, or the project has no `.lua` or `.luau` scripts. |
 
 The temporary folder is removed when the command finishes. If the command is stopped with Ctrl+C, the folder (named `rojo-typecheck-*`, in the system's temporary directory) can be left behind.
 

@@ -158,8 +158,14 @@ fn luau_lsp_version(luau_lsp: &Path) -> anyhow::Result<String> {
             ))
             .into());
         }
+        // Anything else, such as a path that is not a program, also means the
+        // check could not run rather than that the scripts have type errors.
         Err(error) => {
-            return Err(error).with_context(|| format!("Could not run {}", luau_lsp.display()))
+            return Err(UsageError(anyhow!(
+                "Could not run {}: {error}. Pass the luau-lsp program with --luau-lsp.",
+                luau_lsp.display()
+            ))
+            .into());
         }
     };
 
@@ -455,6 +461,16 @@ mod test {
             "--!nocheck\n-- Generated\nreturn {}\n"
         );
         assert_eq!(nocheck_source("return {}\n"), "--!nocheck\nreturn {}\n");
+    }
+
+    #[test]
+    fn a_luau_lsp_path_that_is_not_a_program_is_a_usage_error() {
+        // A directory exists but cannot be run, on every platform.
+        let dir = tempfile::tempdir().unwrap();
+        let error = luau_lsp_version(dir.path()).unwrap_err();
+
+        assert!(error.is::<UsageError>(), "{error:#}");
+        assert!(error.to_string().contains("--luau-lsp"), "{error}");
     }
 
     #[test]
