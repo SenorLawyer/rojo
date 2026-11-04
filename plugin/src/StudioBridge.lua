@@ -84,9 +84,15 @@ function StudioBridge.requestAsync(options, onCancel)
 	end
 	if response == StreamRequest.BudgetExhausted then
 		Log.debug("No stream slot is free for the Studio bridge; using RequestAsync")
-		return HttpService:RequestAsync(options)
+		return StudioBridge.fallbackRequestAsync(options)
 	end
 	return response
+end
+
+-- Sends a bridge request with RequestAsync when no stream slot is free.
+-- Replaced by tests.
+function StudioBridge.fallbackRequestAsync(options)
+	return HttpService:RequestAsync(options)
 end
 
 -- How the test runner's insert and removal are kept in undo history. See

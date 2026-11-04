@@ -284,17 +284,23 @@ return function()
 			local release = budget:tryAcquire(StreamBudget.Priority.Socket)
 			local create, created = fakeClient(function() end)
 			StudioBridge.bridgeStream = StreamRequest.new(create, budget, StreamBudget.Priority.Bridge)
-			-- Port 9 refuses connections, so the fallback fails without
-			-- sending anything anywhere.
-			local ok, err = pcall(bridge.__requestAsync, bridge, {
-				Url = "http://127.0.0.1:9/api/studio/poll",
+			local previousFallback = StudioBridge.fallbackRequestAsync
+			local fallbackUrl
+			StudioBridge.fallbackRequestAsync = function(options)
+				fallbackUrl = options.Url
+				return { Success = true, StatusCode = 200, Body = '{"commands":[]}' }
+			end
+			local ok, response = pcall(bridge.__requestAsync, bridge, {
+				Url = "http://127.0.0.1:34872/api/studio/poll",
 				Method = "POST",
 				Body = "{}",
 			})
+			StudioBridge.fallbackRequestAsync = previousFallback
 			release()
 			expect(#created).to.equal(0)
-			expect(ok).to.equal(false)
-			expect(err).to.be.ok()
+			expect(ok).to.equal(true)
+			expect(response.Body).to.equal('{"commands":[]}')
+			expect(fallbackUrl).to.equal("http://127.0.0.1:34872/api/studio/poll")
 		end)
 	end)
 
