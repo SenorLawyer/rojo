@@ -1,5 +1,6 @@
 //! Defines Rojo's CLI through clap types.
 
+mod assets;
 mod build;
 mod doc;
 mod fmt_project;
@@ -23,6 +24,7 @@ use anyhow::Context;
 use clap::Parser;
 use thiserror::Error;
 
+pub use self::assets::AssetsCommand;
 pub use self::build::BuildCommand;
 pub use self::doc::DocCommand;
 pub use self::fmt_project::FmtProjectCommand;
@@ -73,6 +75,7 @@ impl Options {
             Subcommand::Studio(subcommand) => subcommand.run(),
             Subcommand::Test(subcommand) => subcommand.run(),
             Subcommand::Mcp(subcommand) => subcommand.run(),
+            Subcommand::Assets(subcommand) => subcommand.run(),
             Subcommand::CheckUntrustedModel(subcommand) => subcommand.run(),
         }
     }
@@ -157,6 +160,7 @@ pub enum Subcommand {
     Studio(StudioCommand),
     Test(TestCommand),
     Mcp(McpCommand),
+    Assets(AssetsCommand),
     /// Internal: checks one untrusted model read from stdin. `rojo serve` and
     /// `rojo studio import` run it as a child process.
     // Must match `model_check::SUBCOMMAND`; a test checks that it does.
