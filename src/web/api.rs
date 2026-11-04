@@ -123,10 +123,9 @@ impl ApiService {
         // against a restarted server is rejected even when the cursor happens
         // to be valid there.
         let expected_session_id = request.uri().query().and_then(|query| {
-            query.split('&').find_map(|pair| {
-                pair.strip_prefix("sessionId=")
-                    .map(|session_id| session_id.to_owned())
-            })
+            query
+                .split('&')
+                .find_map(|pair| pair.strip_prefix("sessionId=").map(percent_decode))
         });
 
         // Upgrade the connection to WebSocket
@@ -691,9 +690,43 @@ fn parent_requirements(class: &str) -> Option<&str> {
     })
 }
 
+/// Decodes `%XX` escapes in a query value. Clients may percent-encode the
+/// session ID (Roblox's `HttpService:UrlEncode` escapes `-`), and comparing the
+/// raw text would reject every such connection. Invalid escapes are kept as-is.
+fn percent_decode(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        let escape = (bytes[index] == b'%')
+            .then(|| bytes.get(index + 1..index + 3))
+            .flatten()
+            .and_then(|hex| std::str::from_utf8(hex).ok())
+            .and_then(|hex| u8::from_str_radix(hex, 16).ok());
+        match escape {
+            Some(byte) => {
+                decoded.push(byte);
+                index += 3;
+            }
+            None => {
+                decoded.push(bytes[index]);
+                index += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&decoded).into_owned()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn percent_decode_handles_encoded_session_ids() {
+        assert_eq!(percent_decode("1d4b%2Dee43%2d9c"), "1d4b-ee43-9c");
+        assert_eq!(percent_decode("plain-id"), "plain-id");
+        assert_eq!(percent_decode("bad%zzend%2"), "bad%zzend%2");
+    }
     use serde::Deserialize;
 
     #[derive(Debug, Deserialize, PartialEq)]

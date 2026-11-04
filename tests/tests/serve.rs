@@ -911,8 +911,13 @@ fn subscription_with_matching_session_id_receives_messages() {
     run_serve_test("empty", |session, _| {
         let info = session.get_api_rojo().unwrap();
 
-        // Uppercase to show the comparison doesn't depend on UUID formatting.
-        let session_id = info.session_id.to_string().to_uppercase();
+        // Uppercase and percent-encoded (as Roblox's UrlEncode escapes "-") to
+        // show the comparison doesn't depend on how the client formats the ID.
+        let session_id = info
+            .session_id
+            .to_string()
+            .to_uppercase()
+            .replace('-', "%2D");
         let url = format!(
             "ws://localhost:{}/api/socket/0?sessionId={session_id}",
             session.port()

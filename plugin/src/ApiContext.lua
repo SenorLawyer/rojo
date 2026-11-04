@@ -304,7 +304,8 @@ function ApiContext:connectWebSocket(packetHandlers, onOpened)
 	-- whose message cursor would mean nothing. Servers that don't check it
 	-- route on the path alone and ignore the query.
 	if self.__sessionId ~= nil then
-		url ..= "?sessionId=" .. HttpService:UrlEncode(self.__sessionId)
+		-- Session IDs are UUIDs, which are URL-safe. UrlEncode would escape "-".
+		url ..= "?sessionId=" .. self.__sessionId
 	end
 	-- Convert HTTP/HTTPS URL to WS/WSS
 	url = url:gsub("^http://", "ws://"):gsub("^https://", "wss://")
