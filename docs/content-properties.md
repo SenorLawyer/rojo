@@ -48,6 +48,8 @@ In `syncbackRules.ignoreProperties`, a legacy name and its `Content` name are th
 
 With `syncbackRules.syncUnscriptable` set to `false`, Syncback has no value for an unscriptable `Content` property, such as `SurfaceAppearance.TexturePackContent`, so an entry for it, or for its legacy name, is kept as written.
 
+Syncback writes a changed value to the file a node's `$path` points to, not to the node's `$properties`, as for any other property. An override in `$properties` therefore keeps its value and wins again at the next build.
+
 ## Limits
 
 - A `Content` value that refers to an object, such as an `EditableImage`, only exists in a running game. Rojo leaves such a property out of its tree and logs a warning. Syncback also logs a warning and handles the property as if `ignoreProperties` listed it for that instance, so it does not write the value and leaves the entry your files already have.

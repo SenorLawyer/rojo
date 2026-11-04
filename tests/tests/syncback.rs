@@ -36,10 +36,10 @@ syncback_tests! {
     // files using the legacy names alone while their values match, and writes
     // the new names when a value changes or an instance is added
     content_properties => ["default.project.json", "unchanged.project.json", "src/Unchanged.model.json", "src/Changed.model.json", "src/Cleared.model.json", "src/AlreadyNew.model.json", "src/Added.model.json", "src/AddedEmpty.model.json"],
-    // Ensures that ignoring a Content property also leaves entries that use
     // Ensures that with `syncUnscriptable` off, entries for unscriptable
     // asset properties are kept rather than taken for values reset to default
     content_properties_unscriptable => ["default.project.json"],
+    // Ensures that ignoring a Content property also leaves entries that use
     // its legacy name alone, rather than removing them as reset to default
     content_properties_ignored => ["default.project.json", "unchanged.project.json", "src/Ignored.model.json"],
     // Ensures that ignoring a legacy asset property also ignores the Content

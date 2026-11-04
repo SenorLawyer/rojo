@@ -108,6 +108,7 @@ Before data modules, every `.csv` file became a LocalizationTable. When upgradin
   A pattern such as `*.data.csv` also works, but it turns every data module in the project back into a LocalizationTable.
 
   Renaming the file to `Strings.csv` also keeps it a LocalizationTable, but renames the instance to `Strings`.
+- `rojo syncback` names a file after its instance, so a LocalizationTable named `Strings.data` in a place is written as `Strings.data.csv`, which loads as a data module. Keep the sync rule above in projects that still have such LocalizationTables.
 - A directory with an `init.data.csv` file becomes a ModuleScript. Before, the file was a child LocalizationTable named `init.data`. Sync rules do not apply to directories, so a sync rule does not change this. To keep the LocalizationTable, rename the file, for example to `Strings.csv`, and update scripts that refer to `init.data`.
 - Data CSV files must be UTF-8. A spreadsheet exported in another encoding, such as Windows-1252, fails with an invalid UTF-8 error; export it as "CSV UTF-8" instead.
 - When a directory has both an `init.luau` (or another init script) and an `init.data.csv`, the init script wins as before, and the `init.data.csv` is now ignored instead of becoming a child LocalizationTable.
