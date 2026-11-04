@@ -1,6 +1,9 @@
 use insta::assert_yaml_snapshot;
 
-use rbx_dom_weak::{ustr, UstrMap};
+use rbx_dom_weak::{
+    types::{Attributes, Ref, Variant},
+    ustr, UstrMap,
+};
 use rojo_insta_ext::RedactionMap;
 
 use std::path::PathBuf;
@@ -10,6 +13,7 @@ use crate::{
         apply_patch_set, InstanceMetadata, InstanceSnapshot, PatchSet, PatchUpdate, RojoTree,
     },
     tree_view::{intern_tree, view_tree},
+    RojoRef,
 };
 
 #[test]
@@ -151,6 +155,88 @@ fn changed_ignore_unknown_instances_is_unset_when_only_internal_metadata_changes
 
     assert_eq!(update.changed_ignore_unknown_instances, None);
     assert!(update.changed_metadata.is_some());
+}
+
+fn target(specified_id: &str) -> InstanceSnapshot {
+    InstanceSnapshot::new()
+        .name("target")
+        .class_name("Folder")
+        .metadata(InstanceMetadata::new().specified_id(Some(RojoRef::new(specified_id.into()))))
+}
+
+/// Builds a tree with an ObjectValue whose Value was resolved from a
+/// `Rojo_Target_Value` attribute, as patch application does for attribute refs.
+fn tree_with_pointer() -> (RojoTree, Ref, Ref) {
+    let mut tree = empty_tree();
+    let root_id = tree.get_root_id();
+    let target_id = tree.insert_instance(root_id, target("the target"));
+
+    let mut attributes = Attributes::new();
+    attributes.insert("Rojo_Target_Value".into(), "the target".into());
+    let pointer_id = tree.insert_instance(
+        root_id,
+        InstanceSnapshot::new()
+            .name("pointer")
+            .class_name("ObjectValue")
+            .property(ustr("Attributes"), attributes)
+            .property(ustr("Value"), Variant::Ref(target_id)),
+    );
+
+    (tree, target_id, pointer_id)
+}
+
+#[test]
+fn removing_ref_target_clears_pointer() {
+    let (mut tree, target_id, pointer_id) = tree_with_pointer();
+
+    let applied_patch_set = apply_patch_set(
+        &mut tree,
+        PatchSet {
+            removed_instances: vec![target_id],
+            ..Default::default()
+        },
+    );
+
+    let pointer = tree.get_instance(pointer_id).unwrap();
+    assert!(!pointer.properties().contains_key(&ustr("Value")));
+
+    assert_eq!(applied_patch_set.removed, vec![target_id]);
+    assert_eq!(applied_patch_set.updated.len(), 1);
+    let update = &applied_patch_set.updated[0];
+    assert_eq!(update.id, pointer_id);
+    assert_eq!(update.changed_properties.get(&ustr("Value")), Some(&None));
+}
+
+#[test]
+fn replacing_ref_target_in_one_patch_repoints_pointer() {
+    let (mut tree, target_id, pointer_id) = tree_with_pointer();
+    let root_id = tree.get_root_id();
+
+    let applied_patch_set = apply_patch_set(
+        &mut tree,
+        PatchSet {
+            removed_instances: vec![target_id],
+            added_instances: vec![crate::snapshot::PatchAdd {
+                parent_id: root_id,
+                instance: target("the target"),
+            }],
+            ..Default::default()
+        },
+    );
+
+    let new_target_id = applied_patch_set.added[0];
+    let pointer = tree.get_instance(pointer_id).unwrap();
+    assert_eq!(
+        pointer.properties().get(&ustr("Value")),
+        Some(&Variant::Ref(new_target_id))
+    );
+
+    let update = &applied_patch_set.updated[0];
+    assert_eq!(update.id, pointer_id);
+    assert_eq!(
+        update.changed_properties.get(&ustr("Value")),
+        Some(&Some(Variant::Ref(new_target_id)))
+    );
 }
 
 fn empty_tree() -> RojoTree {

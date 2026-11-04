@@ -1,0 +1,18 @@
+{
+  "name": "run_contexts",
+  "emitLegacyScripts": false,
+  "tree": {
+    "$className": "DataModel",
+    "ServerScriptService": {
+      "Scripts": {
+        "$path": "src"
+      },
+      "Legacy": {
+        "$className": "Script",
+        "$properties": {
+          "RunContext": "Legacy"
+        }
+      }
+    }
+  }
+}

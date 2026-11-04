@@ -87,6 +87,23 @@ pub fn snapshot_from_vfs(
     }
 }
 
+/// Returns whether `file_name` is one of the `init` files that turn their
+/// containing directory into a script or localization table.
+pub(crate) fn is_init_file_name(file_name: &str) -> bool {
+    matches!(
+        file_name,
+        "init.server.luau"
+            | "init.server.lua"
+            | "init.client.luau"
+            | "init.client.lua"
+            | "init.plugin.luau"
+            | "init.plugin.lua"
+            | "init.luau"
+            | "init.lua"
+            | "init.csv"
+    )
+}
+
 /// Gets the appropriate middleware for a directory by checking for `init`
 /// files. This uses an intrinsic priority list and for compatibility,
 /// that order should be left unchanged.
@@ -539,5 +556,67 @@ mod tests {
         assert_eq!(child.class_name, "ModuleScript");
         assert_eq!(child.name, "ExplicitName");
         assert!(child.children.is_empty());
+    }
+
+    #[test]
+    fn explicit_init_path_ignores_directory_metadata() {
+        let mut fs = InMemoryFs::new();
+        fs.load_snapshot(
+            "/project",
+            VfsSnapshot::dir([
+                (
+                    "default.project.json",
+                    VfsSnapshot::file(
+                        r#"{
+                            "name": "example",
+                            "tree": {
+                                "$className": "Folder",
+                                "Directory": { "$path": "folder" },
+                                "Script": { "$path": "folder/init.luau" }
+                            }
+                        }"#,
+                    ),
+                ),
+                (
+                    "folder",
+                    VfsSnapshot::dir([
+                        ("init.luau", VfsSnapshot::file("return {}")),
+                        (
+                            "init.meta.json",
+                            VfsSnapshot::file(r#"{ "attributes": { "FromDirectory": true } }"#),
+                        ),
+                    ]),
+                ),
+            ]),
+        )
+        .unwrap();
+
+        let snapshot = snapshot_from_vfs(
+            &InstanceContext::default(),
+            &Vfs::new(fs),
+            Path::new("/project/default.project.json"),
+        )
+        .unwrap()
+        .unwrap();
+
+        let child = |name: &str| {
+            snapshot
+                .children
+                .iter()
+                .find(|child| child.name == name)
+                .unwrap()
+        };
+
+        // The directory's init script still receives the directory metadata.
+        assert!(child("Directory")
+            .properties
+            .contains_key(&rbx_dom_weak::ustr("Attributes")));
+
+        // The same init script synced on its own does not.
+        let script = child("Script");
+        assert_eq!(script.class_name, "ModuleScript");
+        assert!(!script
+            .properties
+            .contains_key(&rbx_dom_weak::ustr("Attributes")));
     }
 }

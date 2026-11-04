@@ -31,18 +31,32 @@ Making a new release? Simply add the new header with the version and date undern
 
 ## Unreleased
 
-* The Studio plugin cancels abandoned connections, prevents overlapping sessions, and reports stale subscriptions so they can be retried.
-* File events can outlive removed or replaced paths without crashing the server. Mapped directories are watched again after deletion and recreation. One-shot commands no longer start an OS watcher.
-* Edits keep syncing after a mapped folder is replaced faster than the watcher can report it, after the folder containing mapped folders is replaced, and after the watcher drops events. A project `$path` that is missing syncs once it is created.
-* Two-way edits to directory scripts use the init file. Internal metadata changes no longer produce spurious Studio updates.
-* Added binary build compression choices and protection against overwriting a place with a model. Sourcemaps report explicit script run contexts.
-* Accepted UTF-8 BOMs in JSON, numeric enum members, explicit init script paths and byte-array colors. Circular project references now report an error; syncback sorts metadata keys.
-* See [FORK.md](FORK.md) for contributing and the [upstream PR inventory](docs/upstream-pull-requests.md) for patch credits.
+* The Studio plugin now cancels abandoned connections, prevents overlapping sessions, and retries subscriptions that the server asks it to resync. ([fork#1])
+* Fixed the server closing the Studio plugin's connection when an instance was changed and then removed (for example a save followed by a delete, or a `git checkout`) before the change was sent. ([fork#1])
+* Fixed file events for removed or replaced paths crashing the server. Mapped directories are now watched again after being deleted and recreated. ([fork#1])
+* Edits keep syncing after a mapped folder is replaced faster than the watcher can report it, after the folder containing mapped folders is replaced, and after the watcher drops events. A project `$path` that is missing now syncs once it is created. ([fork#1])
+* One-shot commands such as `rojo build` and `rojo sourcemap` no longer start a file watcher. ([fork#1])
+* Two-way sync edits to directory scripts now write to the directory's init file. ([fork#1])
+* Internal metadata changes no longer produce spurious updates in Studio. ([fork#1])
+* Removing an instance that is the target of a `Rojo_Target_*` attribute now clears the referencing property instead of leaving it pointing at a removed instance. ([fork#1])
+* Added a `--compress` option to `rojo build` for choosing the compression of binary models and places. ([fork#1])
+* **Behavior change:** `rojo build` now fails when building a project whose root is not a `DataModel` to a place file (`.rbxl` or `.rbxlx`), and leaves any existing output untouched. Previously, the root's children were written as the place's services. Build to `.rbxm` or `.rbxmx` instead, or set the root's `$className` to `DataModel`. ([fork#1])
+* `rojo build --watch` now reports a failed rebuild and keeps watching instead of exiting. ([fork#1])
+* Sourcemaps now include the `runContext` of `Script` instances. ([fork#1])
+* JSON files may now start with a UTF-8 byte order mark. ([fork#1])
+* Enum properties can now be specified by their numeric value. ([fork#1])
+* `$path` can now point directly at an init script, such as `folder/init.luau`. The directory's `init.meta.json` is not applied to a script synced this way. ([fork#1])
+* `Color3uint8` properties can now be specified as an array of three integers from 0 to 255. ([fork#1])
+* Circular project references now report an error. ([fork#1])
+* Syncback now writes metadata keys in sorted order. ([fork#1])
+* `rojo plugin install` now installs the plugin atomically and keeps it readable by other users on Unix. ([fork#1])
+* Added a `--plugins-dir` option to `rojo plugin install` and `rojo plugin uninstall`. ([fork#1])
 * LocalizationTables no longer report as changed when nothing changes. ([#1333])
 * Sounds now preloaded correctly. The warning "*ContentId: rbxassetid://203785492 failed due to: Asset type does not match requested type*" is fixed. ([#1351])
 
 [#1333]: https://github.com/rojo-rbx/rojo/pull/1333
 [#1351]: https://github.com/rojo-rbx/rojo/pull/1351
+[fork#1]: https://github.com/SenorLawyer/rojo/pull/1
 
 ## [7.7.1] (October 1st, 2026)
 

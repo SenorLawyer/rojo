@@ -13,7 +13,7 @@ use crate::{
     syncback::{hash_instance, FsSnapshot, SyncbackReturn, SyncbackSnapshot},
 };
 
-use super::{meta_file::DirectoryMetadata, snapshot_from_vfs};
+use super::{is_init_file_name, meta_file::DirectoryMetadata, snapshot_from_vfs};
 
 const EMPTY_DIR_KEEP_NAME: &str = ".gitkeep";
 
@@ -57,20 +57,12 @@ pub fn snapshot_dir_no_meta(
 
         // Init files represent their containing directory. Explicit $path values
         // still need to be able to snapshot these files on their own.
-        if matches!(
-            entry.path().file_name().and_then(|name| name.to_str()),
-            Some(
-                "init.server.luau"
-                    | "init.server.lua"
-                    | "init.client.luau"
-                    | "init.client.lua"
-                    | "init.plugin.luau"
-                    | "init.plugin.lua"
-                    | "init.luau"
-                    | "init.lua"
-                    | "init.csv"
-            )
-        ) && vfs.metadata(entry.path())?.is_file()
+        if entry
+            .path()
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(is_init_file_name)
+            && vfs.metadata(entry.path())?.is_file()
         {
             continue;
         }

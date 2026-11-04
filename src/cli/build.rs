@@ -109,7 +109,15 @@ impl BuildCommand {
                 };
                 cursor = new_cursor;
 
-                write_model(&session, &output_path, output_kind, self.compress)?;
+                // A rebuild can fail because of an in-progress edit (for
+                // example, the root's class temporarily isn't a DataModel).
+                // Keep watching so that the next change can fix the build;
+                // write_model validates before touching the output, so the
+                // last good build stays in place.
+                if let Err(error) = write_model(&session, &output_path, output_kind, self.compress)
+                {
+                    log::error!("Failed to rebuild project: {error:?}");
+                }
             }
         }
 

@@ -33,7 +33,11 @@ pub enum PluginSubcommand {
     },
 
     /// Removes the plugin if it is installed.
-    Uninstall,
+    Uninstall {
+        /// Remove from this plugins folder instead of discovering Studio automatically.
+        #[clap(long)]
+        plugins_dir: Option<PathBuf>,
+    },
 }
 
 impl PluginCommand {
@@ -46,14 +50,19 @@ impl PluginSubcommand {
     pub fn run(self) -> anyhow::Result<()> {
         match self {
             PluginSubcommand::Install { plugins_dir } => {
-                let path = match plugins_dir {
-                    Some(path) => path,
-                    None => RobloxStudio::locate()?.plugins_path().to_path_buf(),
-                };
-                install_plugin(&path)
+                install_plugin(&resolve_plugins_dir(plugins_dir)?)
             }
-            PluginSubcommand::Uninstall => uninstall_plugin(),
+            PluginSubcommand::Uninstall { plugins_dir } => {
+                uninstall_plugin(&resolve_plugins_dir(plugins_dir)?)
+            }
         }
+    }
+}
+
+fn resolve_plugins_dir(plugins_dir: Option<PathBuf>) -> anyhow::Result<PathBuf> {
+    match plugins_dir {
+        Some(path) => Ok(path),
+        None => Ok(RobloxStudio::locate()?.plugins_path().to_path_buf()),
     }
 }
 
@@ -81,15 +90,23 @@ fn install_plugin(plugins_dir: &Path) -> anyhow::Result<()> {
         rbx_binary::to_writer(&mut writer, tree.inner(), &[tree.get_root_id()])?;
         writer.flush()?;
     }
+    // Temporary files are created owner-only (0600) on Unix. A plugin file
+    // created directly would be world-readable, so match that before it
+    // replaces the old plugin.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        staged
+            .as_file()
+            .set_permissions(fs::Permissions::from_mode(0o644))?;
+    }
     staged.persist(&destination)?;
     println!("Installed plugin to {}", destination.display());
     Ok(())
 }
 
-fn uninstall_plugin() -> anyhow::Result<()> {
-    let studio = RobloxStudio::locate()?;
-
-    let plugin_path = studio.plugins_path().join(PLUGIN_FILE_NAME);
+fn uninstall_plugin(plugins_dir: &Path) -> anyhow::Result<()> {
+    let plugin_path = plugins_dir.join(PLUGIN_FILE_NAME);
 
     if plugin_path.exists() {
         log::debug!("Removing existing plugin from {}", plugin_path.display());
@@ -120,4 +137,29 @@ fn installs_and_replaces_a_complete_plugin() {
         "Rojo"
     );
     assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn installed_plugin_is_world_readable() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    install_plugin(dir.path()).unwrap();
+    let mode = fs::metadata(dir.path().join(PLUGIN_FILE_NAME))
+        .unwrap()
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o777, 0o644);
+}
+
+#[test]
+fn uninstalls_from_an_explicit_plugins_dir() {
+    let dir = tempfile::tempdir().unwrap();
+    install_plugin(dir.path()).unwrap();
+    uninstall_plugin(dir.path()).unwrap();
+    assert!(!dir.path().join(PLUGIN_FILE_NAME).exists());
+
+    // Uninstalling when nothing is installed is not an error.
+    uninstall_plugin(dir.path()).unwrap();
 }

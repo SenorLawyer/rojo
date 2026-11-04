@@ -52,6 +52,21 @@ impl AdjacentMetadata {
         name: &str,
         snapshot: &mut InstanceSnapshot,
     ) -> anyhow::Result<()> {
+        // An init file referenced directly (for example `"$path":
+        // "folder/init.luau"`) is snapshotted as a standalone file named
+        // `init`, so its adjacent metadata would be `init.meta.json`. That file
+        // belongs to the containing directory and is applied by
+        // `DirectoryMetadata` when the directory itself is snapshotted, so it
+        // must not leak onto the standalone script.
+        if name == "init"
+            && path
+                .file_name()
+                .and_then(|file_name| file_name.to_str())
+                .is_some_and(super::is_init_file_name)
+        {
+            return Ok(());
+        }
+
         let meta_path_json = path.with_file_name(format!("{name}.meta.json"));
         let meta_path_jsonc = path.with_file_name(format!("{name}.meta.jsonc"));
 
