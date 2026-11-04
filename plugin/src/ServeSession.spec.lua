@@ -118,6 +118,33 @@ return function()
 		expect(session:getStatus()).to.equal(ServeSession.Status.Disconnected)
 	end)
 
+	it("explains a slow handshake that may be waiting on Studio's permission prompt", function()
+		local loadingText
+		session:setUpdateLoadingTextCallback(function(text)
+			loadingText = text
+		end)
+		api.connect = function(onWaitingForPermission)
+			return Promise.new(function()
+				onWaitingForPermission()
+			end)
+		end
+		session:start()
+		expect(string.find(loadingText, "choose Allow", 1, true) ~= nil).to.equal(true)
+		expect(session:getStatus()).to.equal(ServeSession.Status.Connecting)
+	end)
+
+	it("finishes the history recording when applying a patch fails", function()
+		local ChangeHistoryService = game:GetService("ChangeHistoryService")
+		local wasRecording = ChangeHistoryService:IsRecordingInProgress()
+		session.__applyPatchInRecording = function()
+			error("fallback failed")
+		end
+		local ok, err = pcall(session.__applyPatch, session, PatchSet.newEmpty())
+		expect(ok).to.equal(false)
+		expect(string.find(tostring(err), "fallback failed", 1, true) ~= nil).to.equal(true)
+		expect(ChangeHistoryService:IsRecordingInProgress()).to.equal(wasRecording)
+	end)
+
 	it("keeps syncing when the place identity still matches", function()
 		session:__onPlaceIdChanged()
 		expect(session:getStatus()).to.equal(ServeSession.Status.NotStarted)

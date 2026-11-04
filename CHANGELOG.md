@@ -32,6 +32,11 @@ Making a new release? Simply add the new header with the version and date undern
 ## Unreleased
 
 * The Studio plugin cancels abandoned connections, prevents overlapping sessions, and reports stale subscriptions so they can be retried.
+* Connecting no longer times out while Studio's "allow HTTP access" prompt is open. The plugin says it is waiting and Cancel still works. Update checks remember a Deny even when it comes late.
+* Initial project loads and sync fallback requests time out after 60 seconds instead of stalling the sync queue. Undo history recordings now close when applying a patch fails.
+* A server message that fails to apply now ends the session with a logged error and traceback instead of syncing on top of a partial change. Reconnect to resync.
+* Update checks treat `-fork.N` versions as releases rather than prereleases. Changing the prerelease setting during a check runs it again.
+* The patch visualizer shows vector, UDim2, CFrame and NumberRange components at float32 precision, so 0.0001 no longer appears as 9.999999747378752e-05.
 * File events can outlive removed or replaced paths without crashing the server. Mapped directories are watched again after deletion and recreation. One-shot commands no longer start an OS watcher.
 * Two-way edits to directory scripts use the init file. Internal metadata changes no longer produce spurious Studio updates.
 * Added binary build compression choices and protection against overwriting a place with a model. Sourcemaps report explicit script run contexts.

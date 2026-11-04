@@ -208,7 +208,13 @@ function ServeSession:start()
 	self:setLoadingText("Connecting to server...")
 
 	self.__apiContext
-		:connect()
+		:connect(function()
+			if self.__status == Status.Connecting then
+				self:setLoadingText(
+					"Still waiting for the Rojo server...\nIf Studio is asking whether Rojo may access this address, choose Allow."
+				)
+			end
+		end)
 		:andThen(function(serverInfo)
 			if self.__status == Status.Disconnected then
 				return
@@ -343,6 +349,10 @@ function ServeSession:__replaceInstances(idList)
 			return instanceMap
 		end)
 		:await()
+	if not modelSuccess then
+		Log.warn("Could not replace instances through the sync fallback: {}", replacements)
+		return false
+	end
 
 	local refSuccess, refPatch = self.__apiContext
 		:refPatch(idList)
@@ -350,8 +360,8 @@ function ServeSession:__replaceInstances(idList)
 			return response.patch
 		end)
 		:await()
-
-	if not (modelSuccess and refSuccess) then
+	if not refSuccess then
+		Log.warn("Could not fetch references for the sync fallback: {}", refPatch)
 		return false
 	end
 
@@ -429,13 +439,14 @@ function ServeSession:__replaceInstances(idList)
 		end
 	end
 
+	-- Restore the selection even if applying references fails, since the
+	-- swapped instances are already in place.
 	local patchApplySuccess, unappliedPatch = pcall(self.__reconciler.applyPatch, self.__reconciler, refPatch)
-	if patchApplySuccess then
-		Selection:Set(selection)
-		return true, unappliedPatch
-	else
-		error(unappliedPatch)
+	Selection:Set(selection)
+	if not patchApplySuccess then
+		error(unappliedPatch, 0)
 	end
+	return true, unappliedPatch
 end
 
 function ServeSession:__applyPatch(patch)
@@ -446,6 +457,19 @@ function ServeSession:__applyPatch(patch)
 		Log.debug("Failed to begin history recording for " .. patchTimestamp .. ". Another recording is in progress.")
 	end
 
+	-- A recording left open blocks every later recording in this Studio
+	-- session, so it must be finished however patch application exits. Partial
+	-- changes are committed so the user can still undo them.
+	local success, err = pcall(self.__applyPatchInRecording, self, patch)
+	if historyRecording then
+		ChangeHistoryService:FinishRecording(historyRecording, Enum.FinishRecordingOperation.Commit)
+	end
+	if not success then
+		error(err, 0)
+	end
+end
+
+function ServeSession:__applyPatchInRecording(patch)
 	Timer.start("precommitCallbacks")
 	-- Precommit callbacks must be serial in order to obey the contract that
 	-- they execute before commit
@@ -457,15 +481,7 @@ function ServeSession:__applyPatch(patch)
 	end
 	Timer.stop()
 
-	local patchApplySuccess, unappliedPatch = pcall(self.__reconciler.applyPatch, self.__reconciler, patch)
-	if not patchApplySuccess then
-		if historyRecording then
-			ChangeHistoryService:FinishRecording(historyRecording, Enum.FinishRecordingOperation.Commit)
-		end
-		-- This might make a weird stack trace but the only way applyPatch can
-		-- fail is if a bug occurs so it's probably fine.
-		error(unappliedPatch)
-	end
+	local unappliedPatch = self.__reconciler:applyPatch(patch)
 
 	if Settings:get("enableSyncFallback") and not PatchSet.isEmpty(unappliedPatch) then
 		-- Some changes did not apply, let's try replacing them instead
@@ -512,10 +528,6 @@ function ServeSession:__applyPatch(patch)
 		end)
 	end
 	Timer.stop()
-
-	if historyRecording then
-		ChangeHistoryService:FinishRecording(historyRecording, Enum.FinishRecordingOperation.Commit)
-	end
 end
 
 function ServeSession:__initialSync(serverInfo)

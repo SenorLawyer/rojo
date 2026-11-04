@@ -119,13 +119,77 @@ return function()
 			Http.get = function()
 				return pending
 			end
-			local context = ApiContext.new("http://localhost:34872")
+			-- Permission answers are per host and last for the session, so each
+			-- test that depends on them uses its own host.
+			local baseUrl = "http://handshake-answered.test:34872"
+			Http._recordPermissionAnswer(baseUrl, false)
+			local context = ApiContext.new(baseUrl)
 			context.__handshakeTimeout = 0.01
 			local ok, err = context:connect():await()
 			expect(ok).to.equal(false)
 			expect(string.find(tostring(err), "Timed out connecting", 1, true) ~= nil).to.equal(true)
 			expect(pending:getStatus()).to.equal(Promise.Status.Cancelled)
 			expect(next(context.__activeRequests)).to.equal(nil)
+		end)
+
+		it("waits on Studio's permission prompt instead of timing out the handshake", function()
+			local pending = Promise.new(function() end)
+			Http.get = function()
+				return pending
+			end
+			local context = ApiContext.new("http://handshake-prompt.test:34872")
+			context.__handshakeTimeout = 0.01
+			local waitingCalls = 0
+			local request = context:connect(function()
+				waitingCalls += 1
+			end)
+			task.wait(0.1)
+			expect(request:getStatus()).to.equal(Promise.Status.Started)
+			expect(waitingCalls).to.equal(1)
+
+			-- Cancel from the connecting page must still stop the request.
+			context:disconnect()
+			expect(request:getStatus()).to.equal(Promise.Status.Cancelled)
+			expect(pending:getStatus()).to.equal(Promise.Status.Cancelled)
+		end)
+
+		it("bounds a stalled initial read", function()
+			local pending = Promise.new(function() end)
+			Http.get = function()
+				return pending
+			end
+			local baseUrl = "http://read-answered.test:34872"
+			Http._recordPermissionAnswer(baseUrl, false)
+			local context = ApiContext.new(baseUrl)
+			context.__transferTimeout = 0.01
+			local ok, err = context:read({ "ROOT" }):await()
+			expect(ok).to.equal(false)
+			expect(string.find(tostring(err), "Timed out loading", 1, true) ~= nil).to.equal(true)
+			expect(pending:getStatus()).to.equal(Promise.Status.Cancelled)
+		end)
+
+		it("bounds stalled fallback serialization requests", function()
+			local originalPost = Http.post
+			local pending = {}
+			Http.post = function()
+				local request = Promise.new(function() end)
+				table.insert(pending, request)
+				return request
+			end
+			local baseUrl = "http://serialize-answered.test:34872"
+			Http._recordPermissionAnswer(baseUrl, false)
+			local context = ApiContext.new(baseUrl)
+			context.__transferTimeout = 0.01
+			local serializeOk, serializeErr = context:serialize({ "A" }):await()
+			local refOk, refErr = context:refPatch({ "A" }):await()
+			Http.post = originalPost
+			expect(serializeOk).to.equal(false)
+			expect(string.find(tostring(serializeErr), "Timed out serializing", 1, true) ~= nil).to.equal(true)
+			expect(refOk).to.equal(false)
+			expect(string.find(tostring(refErr), "Timed out fetching references", 1, true) ~= nil).to.equal(true)
+			for _, request in pending do
+				expect(request:getStatus()).to.equal(Promise.Status.Cancelled)
+			end
 		end)
 	end)
 
@@ -202,6 +266,18 @@ return function()
 			expect(ok).to.equal(false)
 			expect(string.find(tostring(err), "Server changed ID", 1, true) ~= nil).to.equal(true)
 			expect(calls).to.equal(0)
+		end)
+
+		it("settles the connection even if closing the socket throws", function()
+			local context, socket = socketContext()
+			socket.Close = function()
+				error("socket already closed")
+			end
+			local request = context:connectWebSocket({})
+			socket.Error:Fire(500, "boom")
+			local ok = request:await()
+			expect(ok).to.equal(false)
+			expect(socket.Error.isConnected()).to.equal(false)
 		end)
 
 		it("fails malformed packets through the connection promise", function()

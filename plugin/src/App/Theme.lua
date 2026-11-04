@@ -25,6 +25,24 @@ local strict = require(script.Parent.Parent.strict)
 
 local BRAND_COLOR = Color3.fromHex("E13835")
 
+local FONTS = {
+	Main = Font.new("rbxasset://fonts/families/Montserrat.json", Enum.FontWeight.Medium, Enum.FontStyle.Normal),
+	Bold = Font.new("rbxasset://fonts/families/Montserrat.json", Enum.FontWeight.Bold, Enum.FontStyle.Normal),
+	Thin = Font.new("rbxasset://fonts/families/Montserrat.json", Enum.FontWeight.Regular, Enum.FontStyle.Normal),
+	Code = Font.new("rbxasset://fonts/families/Inconsolata.json", Enum.FontWeight.Regular, Enum.FontStyle.Normal),
+}
+
+-- Components measure text with GetTextBoundsAsync during their first render,
+-- so the download starts when the plugin loads rather than after mounting.
+-- It runs in its own thread so loading the plugin never waits on it.
+task.spawn(function()
+	local fontAssetIds = {}
+	for _, font in FONTS do
+		table.insert(fontAssetIds, font.Family)
+	end
+	pcall(ContentProvider.PreloadAsync, ContentProvider, fontAssetIds)
+end)
+
 local Context = Roact.createContext({})
 
 local StudioProvider = Roact.Component:extend("StudioProvider")
@@ -36,20 +54,7 @@ function StudioProvider:updateTheme()
 	local isDark = studioTheme.Name == "Dark"
 
 	local theme = strict(studioTheme.Name .. "Theme", {
-		Font = {
-			Main = Font.new("rbxasset://fonts/families/Montserrat.json", Enum.FontWeight.Medium, Enum.FontStyle.Normal),
-			Bold = Font.new("rbxasset://fonts/families/Montserrat.json", Enum.FontWeight.Bold, Enum.FontStyle.Normal),
-			Thin = Font.new(
-				"rbxasset://fonts/families/Montserrat.json",
-				Enum.FontWeight.Regular,
-				Enum.FontStyle.Normal
-			),
-			Code = Font.new(
-				"rbxasset://fonts/families/Inconsolata.json",
-				Enum.FontWeight.Regular,
-				Enum.FontStyle.Normal
-			),
-		},
+		Font = table.clone(FONTS),
 		TextSize = {
 			Body = 15,
 			Small = 13,
@@ -241,21 +246,10 @@ function StudioProvider:didMount()
 	self.connection = getStudio().ThemeChanged:Connect(function()
 		self:updateTheme()
 	end)
-	-- Font downloads must not delay mounting the toolbar and connection controls.
-	self.preloadThread = task.defer(function()
-		local fontAssetIds = {}
-		for _, font in self.state.theme.Font do
-			table.insert(fontAssetIds, font.Family)
-		end
-		pcall(ContentProvider.PreloadAsync, ContentProvider, fontAssetIds)
-	end)
 end
 
 function StudioProvider:willUnmount()
 	self.connection:Disconnect()
-	if self.preloadThread and coroutine.status(self.preloadThread) ~= "dead" then
-		task.cancel(self.preloadThread)
-	end
 end
 
 local function with(callback)
