@@ -5,7 +5,7 @@ use std::{
 };
 
 use anyhow::{bail, Context};
-use clap::{CommandFactory, Parser};
+use clap::{CommandFactory, Parser, ValueEnum};
 use fs_err::File;
 use memofs::Vfs;
 use roblox_install::RobloxStudio;
@@ -38,6 +38,10 @@ pub struct BuildCommand {
     /// Should end in .rbxm or .rbxl.
     #[clap(long, short, conflicts_with = "output")]
     pub plugin: Option<PathBuf>,
+
+    /// Compression for binary models and places. Defaults to lz4.
+    #[clap(long, value_enum)]
+    pub compress: Option<Compression>,
 
     /// Whether to automatically rebuild when any input files change.
     #[clap(long)]
@@ -75,16 +79,22 @@ impl BuildCommand {
             _ => unreachable!(),
         };
 
+        if self.compress.is_some() && matches!(output_kind, OutputKind::Rbxlx | OutputKind::Rbxmx) {
+            bail!("--compress requires a binary output (.rbxl or .rbxm)");
+        }
         let project_path = resolve_path(&self.project)?;
 
         log::trace!("Constructing in-memory filesystem");
-        let vfs = Vfs::new_default()?;
-        vfs.set_watch_enabled(self.watch);
+        let vfs = if self.watch {
+            Vfs::new_default()?
+        } else {
+            Vfs::new_default_without_watch()
+        };
 
         let session = ServeSession::new(vfs, project_path)?;
         let mut cursor = session.message_queue().cursor();
 
-        write_model(&session, &output_path, output_kind)?;
+        write_model(&session, &output_path, output_kind, self.compress)?;
 
         if self.watch {
             let rt = Runtime::new().context("Failed to start the async runtime for watch mode")?;
@@ -99,7 +109,7 @@ impl BuildCommand {
                 };
                 cursor = new_cursor;
 
-                write_model(&session, &output_path, output_kind)?;
+                write_model(&session, &output_path, output_kind, self.compress)?;
             }
         }
 
@@ -108,6 +118,23 @@ impl BuildCommand {
         forget(session);
 
         Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum Compression {
+    Lz4,
+    Zstd,
+    None,
+}
+
+impl Compression {
+    fn serializer(self) -> rbx_binary::Serializer<'static> {
+        rbx_binary::Serializer::new().compression_type(match self {
+            Self::Lz4 => rbx_binary::CompressionType::Lz4,
+            Self::Zstd => rbx_binary::CompressionType::Zstd,
+            Self::None => rbx_binary::CompressionType::None,
+        })
     }
 }
 
@@ -160,24 +187,35 @@ fn write_model(
     session: &ServeSession,
     output: &Path,
     output_kind: OutputKind,
+    compression: Option<Compression>,
 ) -> anyhow::Result<()> {
     println!("Building project '{}'", session.project_name());
 
     let tree = session.tree();
     let root_id = tree.get_root_id();
 
+    let class = tree.get_instance(root_id).unwrap().class_name();
+    if matches!(output_kind, OutputKind::Rbxl | OutputKind::Rbxlx) && class != "DataModel" {
+        bail!("Cannot build a {} root as a place. Use .rbxm or .rbxmx, or set the root class to DataModel.", class);
+    }
     log::trace!("Opening output file for write");
     let mut file = BufWriter::new(File::create(output)?);
 
     match output_kind {
         OutputKind::Rbxm => {
-            rbx_binary::to_writer(&mut file, tree.inner(), &[root_id])?;
+            compression
+                .unwrap_or(Compression::Lz4)
+                .serializer()
+                .serialize(&mut file, tree.inner(), &[root_id])?;
         }
         OutputKind::Rbxl => {
             let root_instance = tree.get_instance(root_id).unwrap();
             let top_level_ids = root_instance.children();
 
-            rbx_binary::to_writer(&mut file, tree.inner(), top_level_ids)?;
+            compression
+                .unwrap_or(Compression::Lz4)
+                .serializer()
+                .serialize(&mut file, tree.inner(), top_level_ids)?;
         }
         OutputKind::Rbxmx => {
             // Model files include the root instance of the tree and all its

@@ -61,7 +61,7 @@ impl AdjacentMetadata {
         }
 
         if let Some(meta_contents) = vfs.read(&meta_path_jsonc).with_not_found()? {
-            let mut metadata = Self::from_slice(&meta_contents, meta_path_json.clone())?;
+            let mut metadata = Self::from_slice(&meta_contents, meta_path_jsonc.clone())?;
             metadata.apply_all(snapshot)?;
         }
 
@@ -143,6 +143,9 @@ impl AdjacentMetadata {
                 }
             }
         }
+
+        properties.sort_by(|a, _, b, _| a.as_str().cmp(b.as_str()));
+        attributes.sort_keys();
 
         Ok(Some(Self {
             ignore_unknown_instances: if ignore_unknown_instances {
@@ -371,6 +374,9 @@ impl DirectoryMetadata {
                 }
             }
         }
+
+        properties.sort_by(|a, _, b, _| a.as_str().cmp(b.as_str()));
+        attributes.sort_keys();
 
         Ok(Some(Self {
             ignore_unknown_instances: if ignore_unknown_instances {

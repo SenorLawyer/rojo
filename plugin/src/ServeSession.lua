@@ -96,9 +96,16 @@ function ServeSession.new(options)
 		end
 	end)
 	table.insert(connections, connection)
+	table.insert(
+		connections,
+		game:GetPropertyChangedSignal("PlaceId"):Connect(function()
+			self:__onPlaceIdChanged()
+		end)
+	)
 
 	self = {
 		__status = Status.NotStarted,
+		__expectedPlaceId = game.PlaceId,
 		__apiContext = options.apiContext,
 		__twoWaySync = options.twoWaySync,
 		__reconciler = reconciler,
@@ -190,16 +197,30 @@ function ServeSession:hookPostcommit(callback)
 end
 
 function ServeSession:start()
+	if self.__status ~= Status.NotStarted then
+		return
+	end
+
 	self:__setStatus(Status.Connecting)
+	if self.__status == Status.Disconnected then
+		return
+	end
 	self:setLoadingText("Connecting to server...")
 
 	self.__apiContext
 		:connect()
 		:andThen(function(serverInfo)
+			if self.__status == Status.Disconnected then
+				return
+			end
+
 			self:setLoadingText("Loading initial data from server...")
 			return self:__initialSync(serverInfo):andThen(function()
+				if self.__status == Status.Disconnected then
+					return
+				end
+
 				self:setLoadingText("Starting sync loop...")
-				self:__setStatus(Status.Connected, serverInfo.projectName)
 				self:__applyGameAndPlaceId(serverInfo)
 
 				return self.__apiContext:connectWebSocket({
@@ -215,7 +236,11 @@ function ServeSession:start()
 						end
 						self.__apiContext:setMessageCursor(messagesPacket.messageCursor)
 					end,
-				})
+				}, function()
+					if self.__status ~= Status.Disconnected then
+						self:__setStatus(Status.Connected, serverInfo.projectName)
+					end
+				end)
 			end)
 		end)
 		:catch(function(err)
@@ -235,7 +260,16 @@ function ServeSession:__applyGameAndPlaceId(serverInfo)
 	end
 
 	if serverInfo.placeId ~= nil then
+		self.__expectedPlaceId = serverInfo.placeId
 		game:SetPlaceId(serverInfo.placeId)
+	end
+end
+
+function ServeSession:__onPlaceIdChanged()
+	if game.PlaceId ~= self.__expectedPlaceId then
+		-- Publishing a local file invalidates the allowlist check and hydration
+		-- performed for the previous place identity.
+		self:__stopInternal("The place ID changed. Reconnect to sync this place with the Rojo server.")
 	end
 end
 
@@ -486,6 +520,10 @@ end
 
 function ServeSession:__initialSync(serverInfo)
 	return self.__apiContext:read({ serverInfo.rootInstanceId }):andThen(function(readResponseBody)
+		if self.__status == Status.Disconnected then
+			return
+		end
+
 		-- Tell the API Context that we're up-to-date with the version of
 		-- the tree defined in this response.
 		self.__apiContext:setMessageCursor(readResponseBody.messageCursor)
@@ -525,6 +563,10 @@ function ServeSession:__initialSync(serverInfo)
 		local userDecision = "Accept"
 		if self.__userConfirmCallback ~= nil then
 			userDecision = self.__userConfirmCallback(self.__instanceMap, catchUpPatch, serverInfo)
+		end
+		-- Confirmation can yield while the user disconnects or unloads the plugin.
+		if self.__status == Status.Disconnected then
+			return
 		end
 
 		if userDecision == "Abort" then
@@ -569,7 +611,11 @@ function ServeSession:__initialSync(serverInfo)
 end
 
 function ServeSession:__stopInternal(err)
-	self:__setStatus(Status.Disconnected, err)
+	if self.__status == Status.Disconnected then
+		return
+	end
+
+	self.__status = Status.Disconnected
 	self.__apiContext:disconnect()
 	self.__instanceMap:stop()
 	self.__changeBatcher:stop()
@@ -578,6 +624,7 @@ function ServeSession:__stopInternal(err)
 		connection:Disconnect()
 	end
 	self.__connections = {}
+	self:__setStatus(Status.Disconnected, err)
 end
 
 function ServeSession:__setStatus(status, detail)

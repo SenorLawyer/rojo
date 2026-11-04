@@ -2,6 +2,12 @@
 
 ## Unreleased Changes
 
+* Added `StdBackend::new_without_watch` and `Vfs::new_default_without_watch` to avoid allocating an OS watcher for one-shot operations.
+* Failed watch registrations can be retried, and removing a directory clears descendant watch registrations.
+* Mapped directories can be watched again after deletion and recreation, using a surviving nonrecursive parent watch.
+* Unwatching an unregistered path no longer restarts the macOS event stream and loses unrelated changes.
+* Watcher errors preserve their underlying OS error details.
+
 # 0.4.0 (2026-07-01)
 * Added `Vfs::canonicalize`. [#1201]
 * **Breaking:** `StdBackend::new` and `Vfs::new_default` now return `io::Result`, so a failure to create the filesystem watcher is reported as an error instead of panicking. The `Default` implementation for `StdBackend` has been removed as a result. [#1267]

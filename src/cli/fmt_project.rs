@@ -18,8 +18,7 @@ pub struct FmtProjectCommand {
 
 impl FmtProjectCommand {
     pub fn run(self) -> anyhow::Result<()> {
-        let vfs = Vfs::new_default()?;
-        vfs.set_watch_enabled(false);
+        let vfs = Vfs::new_default_without_watch();
 
         let base_path = resolve_path(&self.project)?;
         let project = Project::load_fuzzy(&vfs, &base_path)?

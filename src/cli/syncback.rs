@@ -69,8 +69,7 @@ impl SyncbackCommand {
             dom_start_timer.elapsed().as_secs_f32()
         );
 
-        let vfs = Vfs::new_default()?;
-        vfs.set_watch_enabled(false);
+        let vfs = Vfs::new_default_without_watch();
 
         let project_start_timer = Instant::now();
         let session_old = ServeSession::new(vfs, path_old.clone())?;

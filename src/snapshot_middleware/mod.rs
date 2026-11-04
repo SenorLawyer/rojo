@@ -83,20 +83,6 @@ pub fn snapshot_from_vfs(
             _ => middleware.snapshot(context, vfs, &init_path, dir_name),
         }
     } else {
-        let file_name = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .with_context(|| format!("file name of {} is invalid", path.display()))?;
-
-        // TODO: Is this even necessary anymore?
-        match file_name {
-            "init.server.luau" | "init.server.lua" | "init.client.luau" | "init.client.lua"
-            | "init.plugin.luau" | "init.plugin.lua" | "init.luau" | "init.lua" | "init.csv" => {
-                return Ok(None)
-            }
-            _ => {}
-        }
-
         snapshot_from_path(context, vfs, path)
     }
 }
@@ -107,7 +93,7 @@ pub fn snapshot_from_vfs(
 ///
 /// Returns the middleware, the name of the directory, and the path to
 /// the init location.
-fn get_dir_middleware<'path>(
+pub(crate) fn get_dir_middleware<'path>(
     vfs: &Vfs,
     dir_path: &'path Path,
 ) -> anyhow::Result<(Middleware, &'path str, PathBuf)> {
@@ -442,4 +428,116 @@ pub fn default_sync_rules() -> &'static [SyncRule] {
             sync_rule!("*.{yml,yaml}", Yaml),
         ]
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use memofs::{InMemoryFs, VfsSnapshot};
+
+    #[test]
+    fn explicit_init_paths_snapshot_only_the_requested_file() {
+        for (name, expected_class) in [
+            ("init.lua", "ModuleScript"),
+            ("init.luau", "ModuleScript"),
+            ("init.server.lua", "Script"),
+            ("init.server.luau", "Script"),
+            ("init.client.lua", "LocalScript"),
+            ("init.client.luau", "LocalScript"),
+            ("init.plugin.lua", "Script"),
+            ("init.plugin.luau", "Script"),
+        ] {
+            let mut fs = InMemoryFs::new();
+            fs.load_snapshot(
+                "/foo",
+                VfsSnapshot::dir([
+                    (name, VfsSnapshot::file("return {}")),
+                    ("sibling.luau", VfsSnapshot::file("return {}")),
+                ]),
+            )
+            .unwrap();
+
+            let snapshot = snapshot_from_vfs(
+                &InstanceContext::default(),
+                &Vfs::new(fs),
+                &Path::new("/foo").join(name),
+            )
+            .unwrap()
+            .unwrap();
+
+            assert_eq!(snapshot.class_name, expected_class, "{name}");
+            assert!(snapshot.children.is_empty(), "{name}");
+        }
+    }
+
+    #[test]
+    fn directory_init_does_not_duplicate_init_files() {
+        let mut fs = InMemoryFs::new();
+        fs.load_snapshot(
+            "/foo",
+            VfsSnapshot::dir([
+                ("init.luau", VfsSnapshot::file("return {}")),
+                ("init.server.luau", VfsSnapshot::file("return {}")),
+                ("child.luau", VfsSnapshot::file("return {}")),
+            ]),
+        )
+        .unwrap();
+
+        let snapshot = snapshot_from_vfs(
+            &InstanceContext::default(),
+            &Vfs::new(fs),
+            Path::new("/foo"),
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(snapshot.class_name, "ModuleScript");
+        assert_eq!(snapshot.name, "foo");
+        assert_eq!(snapshot.children.len(), 1);
+        assert_eq!(snapshot.children[0].name, "child");
+    }
+
+    #[test]
+    fn project_path_can_reference_an_init_file_without_siblings() {
+        let mut fs = InMemoryFs::new();
+        fs.load_snapshot(
+            "/project",
+            VfsSnapshot::dir([
+                (
+                    "default.project.json",
+                    VfsSnapshot::file(
+                        r#"{
+                            "name": "example",
+                            "tree": {
+                                "$className": "Folder",
+                                "ExplicitName": { "$path": "folder/init.luau" }
+                            }
+                        }"#,
+                    ),
+                ),
+                (
+                    "folder",
+                    VfsSnapshot::dir([
+                        ("init.luau", VfsSnapshot::file("return {}")),
+                        ("sibling.luau", VfsSnapshot::file("return {}")),
+                    ]),
+                ),
+            ]),
+        )
+        .unwrap();
+
+        let snapshot = snapshot_from_vfs(
+            &InstanceContext::default(),
+            &Vfs::new(fs),
+            Path::new("/project/default.project.json"),
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(snapshot.children.len(), 1);
+        let child = &snapshot.children[0];
+        assert_eq!(child.class_name, "ModuleScript");
+        assert_eq!(child.name, "ExplicitName");
+        assert!(child.children.is_empty());
+    }
 }

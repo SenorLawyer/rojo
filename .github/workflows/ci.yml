@@ -9,9 +9,12 @@ on:
     branches:
     - master
 
+permissions:
+  contents: read
+
 jobs:
   build:
-    name: Build and Test
+    name: Build and Test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
 
     strategy:
@@ -38,8 +41,19 @@ jobs:
     - name: Build
       run: cargo build --locked --verbose
 
+    - name: Export embedded Studio plugin
+      shell: bash
+      run: target/debug/rojo plugin install --plugins-dir artifacts
+
+    - name: Upload Studio plugin
+      if: matrix.os == 'windows-latest'
+      uses: actions/upload-artifact@v4
+      with:
+        name: Rojo-Studio-plugin
+        path: artifacts/RojoManagedPlugin.rbxm
+
     - name: Test
-      run: cargo test --locked --verbose
+      run: cargo test --workspace --locked --verbose
 
     - name: Save Rust Cache
       uses: actions/cache/save@v4
@@ -121,7 +135,7 @@ jobs:
       run: cargo fmt -- --check
 
     - name: Clippy
-      run: cargo clippy
+      run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
     - name: Save Rust Cache
       uses: actions/cache/save@v4
@@ -131,3 +145,14 @@ jobs:
           ~/.cargo/git
           target
         key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+  gate:
+    name: Fork CI
+    if: always()
+    needs: [build, msrv, lint]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require every platform and lint job
+        env:
+          RESULTS: ${{ toJSON(needs.*.result) }}
+        run: jq -e 'all(.[]; . == "success")' <<< "$RESULTS"

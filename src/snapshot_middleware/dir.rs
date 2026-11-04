@@ -55,6 +55,26 @@ pub fn snapshot_dir_no_meta(
             continue;
         }
 
+        // Init files represent their containing directory. Explicit $path values
+        // still need to be able to snapshot these files on their own.
+        if matches!(
+            entry.path().file_name().and_then(|name| name.to_str()),
+            Some(
+                "init.server.luau"
+                    | "init.server.lua"
+                    | "init.client.luau"
+                    | "init.client.lua"
+                    | "init.plugin.luau"
+                    | "init.plugin.lua"
+                    | "init.luau"
+                    | "init.lua"
+                    | "init.csv"
+            )
+        ) && vfs.metadata(entry.path())?.is_file()
+        {
+            continue;
+        }
+
         if let Some(child_snapshot) = snapshot_from_vfs(context, vfs, entry.path())? {
             snapshot_children.push(child_snapshot);
         }

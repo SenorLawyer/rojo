@@ -7,6 +7,7 @@ local Promise = require(Packages.Promise)
 local Config = require(script.Parent.Config)
 local Types = require(script.Parent.Types)
 local Version = require(script.Parent.Version)
+local formatWebSocketError = require(script.Parent.formatWebSocketError)
 
 local validateApiInfo = Types.ifEnabled(Types.ApiInfoResponse)
 local validateApiRead = Types.ifEnabled(Types.ApiReadResponse)
@@ -25,13 +26,19 @@ local function rejectFailedRequests(response)
 end
 
 local function rejectWrongProtocolVersion(infoResponseBody)
+	if type(infoResponseBody) ~= "table" or type(infoResponseBody.protocolVersion) ~= "number" then
+		return Promise.reject(
+			"Invalid response from the Rojo server: expected server info with a numeric protocolVersion."
+		)
+	end
+
 	if infoResponseBody.protocolVersion ~= Config.protocolVersion then
 		local message = (
 			"Found a Rojo dev server, but it's using a different protocol version, and is incompatible."
 			.. "\nMake sure you have matching versions of both the Rojo plugin and server!"
 			.. "\n\nYour client is version %s, with protocol version %s. It expects server version %s."
 			.. "\nYour server is version %s, with protocol version %s."
-			.. "\n\nGo to https://github.com/rojo-rbx/rojo for more details."
+			.. "\n\nGo to https://github.com/SenorLawyer/rojo for more details."
 		):format(
 			Version.display(Config.version),
 			Config.protocolVersion,
@@ -103,6 +110,7 @@ function ApiContext.new(baseUrl)
 		__wsClient = nil,
 		__connected = true,
 		__activeRequests = {},
+		__handshakeTimeout = 15,
 	}
 
 	return setmetatable(self, ApiContext)
@@ -123,17 +131,33 @@ end
 
 function ApiContext:disconnect()
 	self.__connected = false
-	for request in self.__activeRequests do
+	local activeRequests = self.__activeRequests
+	self.__activeRequests = {}
+	for request in activeRequests do
 		Log.trace("Cancelling request {}", request)
 		request:cancel()
 	end
-	self.__activeRequests = {}
 
 	if self.__wsClient then
 		Log.trace("Closing WebSocket client")
 		self.__wsClient:Close()
 	end
 	self.__wsClient = nil
+end
+
+function ApiContext:__request(method, url, body, timeoutMessage)
+	if not self.__connected then
+		return Promise.reject("Cannot send a request after disconnecting")
+	end
+
+	local request = Http[method](url, body)
+	if timeoutMessage then
+		request = request:timeout(self.__handshakeTimeout, timeoutMessage)
+	end
+	self.__activeRequests[request] = true
+	return request:finally(function()
+		self.__activeRequests[request] = nil
+	end)
 end
 
 function ApiContext:setMessageCursor(index)
@@ -143,7 +167,7 @@ end
 function ApiContext:connect()
 	local url = ("%s/api/rojo"):format(self.__baseUrl)
 
-	return Http.get(url)
+	return self:__request("get", url, nil, "Timed out connecting to the Rojo server. Check `rojo serve` and retry.")
 		:andThen(rejectFailedRequests)
 		:andThen(Http.Response.msgpack)
 		:andThen(rejectWrongProtocolVersion)
@@ -163,15 +187,18 @@ end
 function ApiContext:read(ids)
 	local url = ("%s/api/read/%s"):format(self.__baseUrl, table.concat(ids, ","))
 
-	return Http.get(url):andThen(rejectFailedRequests):andThen(Http.Response.msgpack):andThen(function(body)
-		if body.sessionId ~= self.__sessionId then
-			return Promise.reject("Server changed ID")
-		end
+	return self:__request("get", url)
+		:andThen(rejectFailedRequests)
+		:andThen(Http.Response.msgpack)
+		:andThen(function(body)
+			if body.sessionId ~= self.__sessionId then
+				return Promise.reject("Server changed ID")
+			end
 
-		assert(validateApiRead(body))
+			assert(validateApiRead(body))
 
-		return body
-	end)
+			return body
+		end)
 end
 
 function ApiContext:write(patch)
@@ -208,7 +235,7 @@ function ApiContext:write(patch)
 
 	body = Http.msgpackEncode(body)
 
-	return Http.post(url, body)
+	return self:__request("post", url, body)
 		:andThen(rejectFailedRequests)
 		:andThen(Http.Response.msgpack)
 		:andThen(function(responseBody)
@@ -218,29 +245,83 @@ function ApiContext:write(patch)
 		end)
 end
 
-function ApiContext:connectWebSocket(packetHandlers)
+function ApiContext:connectWebSocket(packetHandlers, onOpened)
+	if not self.__connected then
+		return Promise.reject("Cannot open a WebSocket after disconnecting")
+	end
+
 	local url = ("%s/api/socket/%s"):format(self.__baseUrl, self.__messageCursor)
 	-- Convert HTTP/HTTPS URL to WS/WSS
 	url = url:gsub("^http://", "ws://"):gsub("^https://", "wss://")
 
-	return Promise.new(function(resolve, reject)
-		local success, wsClient =
-			pcall(HttpService.CreateWebStreamClient, HttpService, Enum.WebStreamClientType.WebSocket, {
-				Url = url,
-			})
+	local request = Promise.new(function(resolve, reject, onCancel)
+		local success, wsClient = pcall(self.__createWebSocket, self, url)
 		if not success then
 			reject("Failed to create WebSocket client: " .. tostring(wsClient))
 			return
 		end
 		self.__wsClient = wsClient
 
-		local closed, errored, received
+		local connections = {}
+		local pendingMessages = {}
+		local processingMessages = false
+		local openingTimeout
+		local opened = false
+		local settled = false
+		local function cleanup()
+			if settled then
+				return
+			end
+			settled = true
+			if openingTimeout then
+				task.cancel(openingTimeout)
+				openingTimeout = nil
+			end
+			table.clear(pendingMessages)
+			for _, connection in connections do
+				connection:Disconnect()
+			end
+			if self.__wsClient == wsClient then
+				self.__wsClient = nil
+			end
+			wsClient:Close()
+		end
 
-		received = self.__wsClient.MessageReceived:Connect(function(msg)
+		onCancel(cleanup)
+		if not self.__connected then
+			cleanup()
+			resolve()
+			return
+		end
+
+		local function markOpened()
+			if settled or opened then
+				return
+			end
+			opened = true
+			if openingTimeout then
+				task.cancel(openingTimeout)
+				openingTimeout = nil
+			end
+			if onOpened then
+				local ok, err = pcall(onOpened)
+				if not ok then
+					cleanup()
+					reject(err)
+				end
+			end
+		end
+		table.insert(connections, wsClient.Opened:Connect(markOpened))
+		openingTimeout = task.delay(self.__handshakeTimeout, function()
+			openingTimeout = nil
+			cleanup()
+			reject("Timed out opening the Rojo sync connection. Check `rojo serve` and reconnect.")
+		end)
+
+		local function handleMessage(msg)
 			local data = Http.msgpackDecode(msg)
 			if data.sessionId ~= self.__sessionId then
-				Log.warn("Received message with wrong session ID; ignoring")
-				return
+				error("Server changed ID; reconnect to sync with the restarted server")
 			end
 
 			assert(validateApiSocketPacket(data))
@@ -249,54 +330,87 @@ function ApiContext:connectWebSocket(packetHandlers)
 
 			local handler = packetHandlers[data.packetType]
 			if handler then
-				local ok, err = pcall(handler, data.body)
-				if not ok then
-					Log.error("Error in WebSocket packet handler for type '%s': %s", data.packetType, err)
-				end
+				handler(data.body)
 			else
 				Log.warn("No handler for WebSocket packet type '%s'", data.packetType)
 			end
-		end)
+		end
 
-		closed = self.__wsClient.Closed:Connect(function()
-			closed:Disconnect()
-			errored:Disconnect()
-			received:Disconnect()
+		table.insert(
+			connections,
+			wsClient.MessageReceived:Connect(function(msg)
+				table.insert(pendingMessages, msg)
+				if processingMessages then
+					return
+				end
+				-- Applying a patch can yield for fallback requests. Preserve wire order
+				-- rather than applying a later patch while the previous one is suspended.
+				processingMessages = true
+				while not settled and #pendingMessages > 0 do
+					local ok, err = pcall(handleMessage, table.remove(pendingMessages, 1))
+					if not ok then
+						cleanup()
+						reject("Failed to process a Rojo server message: " .. tostring(err))
+					end
+				end
+				processingMessages = false
+			end)
+		)
 
-			if self.__connected then
-				reject("WebSocket connection closed unexpectedly")
-			else
-				resolve()
-			end
-		end)
+		table.insert(
+			connections,
+			wsClient.Closed:Connect(function(_code, reason)
+				cleanup()
+				if self.__connected then
+					local detail = if type(reason) == "string" and #reason > 0 then " " .. reason else ""
+					reject("Connection to the Rojo server closed. Reconnect to resync." .. detail)
+				else
+					resolve()
+				end
+			end)
+		)
 
-		errored = self.__wsClient.Error:Connect(function(code, msg)
-			closed:Disconnect()
-			errored:Disconnect()
-			received:Disconnect()
-
-			reject("WebSocket error: " .. code .. " - " .. msg)
-		end)
+		table.insert(
+			connections,
+			wsClient.Error:Connect(function(code, msg)
+				cleanup()
+				reject(formatWebSocketError(code, msg))
+			end)
+		)
+		if wsClient.ConnectionState == Enum.WebStreamClientState.Open then
+			markOpened()
+		end
 	end)
+	self.__activeRequests[request] = true
+	return request:finally(function()
+		self.__activeRequests[request] = nil
+	end)
+end
+
+function ApiContext:__createWebSocket(url)
+	return HttpService:CreateWebStreamClient(Enum.WebStreamClientType.WebSocket, { Url = url })
 end
 
 function ApiContext:open(id)
 	local url = ("%s/api/open/%s"):format(self.__baseUrl, id)
 
-	return Http.post(url, ""):andThen(rejectFailedRequests):andThen(Http.Response.msgpack):andThen(function(body)
-		if body.sessionId ~= self.__sessionId then
-			return Promise.reject("Server changed ID")
-		end
+	return self:__request("post", url, "")
+		:andThen(rejectFailedRequests)
+		:andThen(Http.Response.msgpack)
+		:andThen(function(body)
+			if body.sessionId ~= self.__sessionId then
+				return Promise.reject("Server changed ID")
+			end
 
-		return nil
-	end)
+			return nil
+		end)
 end
 
 function ApiContext:serialize(ids: { string })
 	local url = ("%s/api/serialize"):format(self.__baseUrl)
 	local request_body = Http.msgpackEncode({ sessionId = self.__sessionId, ids = ids })
 
-	return Http.post(url, request_body)
+	return self:__request("post", url, request_body)
 		:andThen(rejectFailedRequests)
 		:andThen(Http.Response.msgpack)
 		:andThen(function(response_body)
@@ -314,7 +428,7 @@ function ApiContext:refPatch(ids: { string })
 	local url = ("%s/api/ref-patch"):format(self.__baseUrl)
 	local request_body = Http.msgpackEncode({ sessionId = self.__sessionId, ids = ids })
 
-	return Http.post(url, request_body)
+	return self:__request("post", url, request_body)
 		:andThen(rejectFailedRequests)
 		:andThen(Http.Response.msgpack)
 		:andThen(function(response_body)

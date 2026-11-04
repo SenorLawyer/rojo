@@ -229,13 +229,6 @@ end
 
 function StudioProvider:init()
 	self:updateTheme()
-
-	-- Preload the Fonts so that getTextBoundsAsync won't yield
-	local fontAssetIds = {}
-	for _, font in self.state.theme.Font do
-		table.insert(fontAssetIds, font.Family)
-	end
-	pcall(ContentProvider.PreloadAsync, ContentProvider, fontAssetIds)
 end
 
 function StudioProvider:render()
@@ -248,10 +241,21 @@ function StudioProvider:didMount()
 	self.connection = getStudio().ThemeChanged:Connect(function()
 		self:updateTheme()
 	end)
+	-- Font downloads must not delay mounting the toolbar and connection controls.
+	self.preloadThread = task.defer(function()
+		local fontAssetIds = {}
+		for _, font in self.state.theme.Font do
+			table.insert(fontAssetIds, font.Family)
+		end
+		pcall(ContentProvider.PreloadAsync, ContentProvider, fontAssetIds)
+	end)
 end
 
 function StudioProvider:willUnmount()
 	self.connection:Disconnect()
+	if self.preloadThread and coroutine.status(self.preloadThread) ~= "dead" then
+		task.cancel(self.preloadThread)
+	end
 end
 
 local function with(callback)

@@ -31,6 +31,12 @@ Making a new release? Simply add the new header with the version and date undern
 
 ## Unreleased
 
+* The Studio plugin cancels abandoned connections, prevents overlapping sessions, and reports stale subscriptions so they can be retried.
+* File events can outlive removed or replaced paths without crashing the server. Mapped directories are watched again after deletion and recreation. One-shot commands no longer start an OS watcher.
+* Two-way edits to directory scripts use the init file. Internal metadata changes no longer produce spurious Studio updates.
+* Added binary build compression choices and protection against overwriting a place with a model. Sourcemaps report explicit script run contexts.
+* Accepted UTF-8 BOMs in JSON, numeric enum members, explicit init script paths and byte-array colors. Circular project references now report an error; syncback sorts metadata keys.
+* See [FORK.md](FORK.md) for contributing and the [upstream PR inventory](docs/upstream-pull-requests.md) for patch credits.
 * LocalizationTables no longer report as changed when nothing changes. ([#1333])
 * Sounds now preloaded correctly. The warning "*ContentId: rbxassetid://203785492 failed due to: Asset type does not match requested type*" is fixed. ([#1351])
 

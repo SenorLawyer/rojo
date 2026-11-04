@@ -1,5 +1,45 @@
 return function()
 	local Version = require(script.Parent.Version)
+	local Settings = require(script.Parent.Settings)
+
+	describe("cached update state", function()
+		local originalRetrieve
+		local originalCache
+		local originalBlocked
+		local originalCheck
+		beforeEach(function()
+			originalRetrieve = Version.retrieveLatestCompatible
+			originalCache = Version._cachedLatestCompatible
+			originalBlocked = Version._apiBlocked
+			originalCheck = Settings:get("checkForUpdates")
+			Settings:set("checkForUpdates", true)
+			Version.retrieveLatestCompatible = function()
+				error("Render must not fetch releases")
+			end
+		end)
+		afterEach(function()
+			Version.retrieveLatestCompatible = originalRetrieve
+			Version._cachedLatestCompatible = originalCache
+			Version._apiBlocked = originalBlocked
+			Settings:set("checkForUpdates", originalCheck)
+		end)
+
+		it("does not fetch when update or permission state is unknown", function()
+			Version._cachedLatestCompatible = nil
+			Version._apiBlocked = nil
+			expect(Version.getCachedUpdateMessage()).to.equal(nil)
+			expect(Version.isApiBlocked()).to.equal(false)
+		end)
+
+		it("formats a cached update without fetching again", function()
+			Version._cachedLatestCompatible = {
+				value = { version = { 99, 0, 0 }, publishedUnixTimestamp = os.time() },
+				timestamp = os.clock(),
+			}
+			local message = Version.getCachedUpdateMessage()
+			expect(string.find(message, "99.0.0", 1, true) ~= nil).to.equal(true)
+		end)
+	end)
 
 	it("should compare equal versions", function()
 		expect(Version.compare({ 1, 2, 3 }, { 1, 2, 3 })).to.equal(0)

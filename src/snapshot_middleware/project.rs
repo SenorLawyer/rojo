@@ -33,6 +33,28 @@ pub fn snapshot_project(
     path: &Path,
     name: &str,
 ) -> anyhow::Result<Option<InstanceSnapshot>> {
+    // A project can refer back to itself through a directory, another project,
+    // or a symlink. Track the current call chain, not all previously read projects.
+    thread_local! {
+        static ACTIVE: std::cell::RefCell<Vec<std::path::PathBuf>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    struct ActiveProject;
+    impl Drop for ActiveProject {
+        fn drop(&mut self) {
+            ACTIVE.with_borrow_mut(|paths| paths.pop());
+        }
+    }
+
+    let canonical = vfs.canonicalize(path)?;
+    ACTIVE.with_borrow_mut(|paths| {
+        if paths.contains(&canonical) {
+            bail!("Circular Rojo project reference: {}", canonical.display());
+        }
+        paths.push(canonical);
+        Ok(())
+    })?;
+    let _active = ActiveProject;
+
     let project = Project::load_exact(vfs, path, Some(name))
         .with_context(|| format!("File was not a valid Rojo project: {}", path.display()))?;
     let project_name = match project.name.as_deref() {
@@ -710,6 +732,30 @@ mod test {
     use super::*;
 
     use memofs::{InMemoryFs, VfsSnapshot};
+
+    #[test]
+    fn rejects_project_referring_to_its_own_directory() {
+        let mut fs = InMemoryFs::new();
+        fs.load_snapshot(
+            "/foo",
+            VfsSnapshot::dir([(
+                "default.project.json",
+                VfsSnapshot::file(r#"{"name":"cycle","tree":{"$path":"."}}"#),
+            )]),
+        )
+        .unwrap();
+        let err = snapshot_project(
+            &InstanceContext::default(),
+            &Vfs::new(fs),
+            Path::new("/foo/default.project.json"),
+            "cycle",
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("Circular Rojo project reference"),
+            "{err:#}"
+        );
+    }
 
     #[ignore = "Functionality moved to root snapshot middleware"]
     #[test]

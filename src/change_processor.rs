@@ -2,9 +2,9 @@ use crossbeam_channel::{select, Receiver, RecvError, Sender};
 use jod_thread::JoinHandle;
 use memofs::{IoResultExt, Vfs, VfsEvent};
 use rbx_dom_weak::types::{Ref, Variant};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::{
-    fs,
+    fs, io,
     sync::{Arc, Mutex},
 };
 
@@ -13,7 +13,9 @@ use crate::{
     snapshot::{
         apply_patch_set, compute_patch_set, AppliedPatchSet, InstigatingSource, PatchSet, RojoTree,
     },
-    snapshot_middleware::{snapshot_from_vfs, snapshot_project_node},
+    snapshot_middleware::{
+        get_dir_middleware, snapshot_from_vfs, snapshot_project_node, Middleware,
+    },
 };
 
 /// Processes file change events, updates the DOM, and sends those updates
@@ -119,8 +121,8 @@ impl JobThreadContext {
     /// This function finds the nearest ancestor to the given path that has associated instances
     /// in the tree.
     /// It then computes and applies changes for each affected instance ID and
-    /// returns a vector of applied patch sets.
-    fn apply_patches(&self, path: PathBuf) -> Vec<AppliedPatchSet> {
+    /// publishes them before releasing the tree.
+    fn apply_patches(&self, path: PathBuf) {
         let mut tree = self.tree.lock().unwrap();
         let mut applied_patches = Vec::new();
 
@@ -154,46 +156,55 @@ impl JobThreadContext {
             }
         }
 
-        applied_patches
+        // Initial reads take the tree lock before sampling the queue cursor.
+        // Publish under that lock so a reconnect cannot replay an addition
+        // already present in the tree it just received.
+        if !applied_patches.is_empty() {
+            self.message_queue.push_messages(&applied_patches);
+        }
     }
 
     fn handle_vfs_event(&self, event: VfsEvent) {
         log::trace!("Vfs event: {:?}", event);
 
+        // Parent anchor watches can report directory timestamp changes even
+        // when the contents are unchanged. Child Create/Remove/Write events
+        // carry the actual changes. Avoid resnapshotting on those timestamps.
+        if matches!(&event, VfsEvent::Write(path) if path.is_dir()) {
+            return;
+        }
+
         // Update the VFS immediately with the event.
-        self.vfs
-            .commit_event(&event)
-            .expect("Error applying VFS change");
+        if let Err(err) = self.vfs.commit_event(&event) {
+            log::error!("Error applying VFS change: {:?}", err);
+            return;
+        }
 
         // For a given VFS event, we might have many changes to different parts
         // of the tree. Calculate and apply all of these changes.
-        let applied_patches = match event {
-            VfsEvent::Create(path) | VfsEvent::Write(path) => {
-                self.apply_patches(self.vfs.canonicalize(&path).unwrap())
-            }
-            VfsEvent::Remove(path) => {
-                // MemoFS does not track parent removals yet, so we can canonicalize
-                // the parent path safely and then append the removed path's file name.
-                let parent = path.parent().unwrap();
-                let file_name = path.file_name().unwrap();
-                let parent_normalized = self.vfs.canonicalize(parent).unwrap();
-                self.apply_patches(parent_normalized.join(file_name))
+        match event {
+            VfsEvent::Create(path) | VfsEvent::Write(path) | VfsEvent::Remove(path) => {
+                match canonicalize_event_path(&self.vfs, &path) {
+                    Ok(path) => self.apply_patches(path),
+                    Err(err) => {
+                        log::error!(
+                            "Error resolving filesystem event at {}: {:?}",
+                            path.display(),
+                            err
+                        );
+                    }
+                }
             }
             _ => {
                 log::warn!("Unhandled VFS event: {:?}", event);
-                Vec::new()
             }
-        };
-
-        // Notify anyone listening to the message queue about the changes we
-        // just made.
-        self.message_queue.push_messages(&applied_patches);
+        }
     }
 
     fn handle_tree_event(&self, patch_set: PatchSet) {
         log::trace!("Applying PatchSet from client: {:#?}", patch_set);
 
-        let applied_patch = {
+        {
             let mut tree = self.tree.lock().unwrap();
 
             for &id in &patch_set.removed_instances {
@@ -252,7 +263,9 @@ impl JobThreadContext {
                                 match instigating_source {
                                     InstigatingSource::Path(path) => {
                                         if let Some(Variant::String(value)) = changed_value {
-                                            if let Err(err) = fs::write(path, value) {
+                                            if let Err(err) = resolve_source_path(&self.vfs, path)
+                                                .and_then(|path| fs::write(path, value))
+                                            {
                                                 log::error!(
                                                     "Failed to write file {}: {}",
                                                     path.display(),
@@ -285,11 +298,67 @@ impl JobThreadContext {
                 }
             }
 
-            apply_patch_set(&mut tree, patch_set)
-        };
+            let applied_patch = apply_patch_set(&mut tree, patch_set);
+            if !applied_patch.is_empty() {
+                self.message_queue.push_messages(&[applied_patch]);
+            }
+        }
+    }
+}
 
-        if !applied_patch.is_empty() {
-            self.message_queue.push_messages(&[applied_patch]);
+fn resolve_source_path(vfs: &Vfs, path: &Path) -> io::Result<PathBuf> {
+    if !vfs
+        .metadata(path)
+        .with_not_found()?
+        .is_some_and(|meta| meta.is_dir())
+    {
+        return Ok(path.to_owned());
+    }
+
+    let (middleware, _, init_path) = get_dir_middleware(vfs, path).map_err(io::Error::other)?;
+    match middleware {
+        Middleware::ModuleScriptDir
+        | Middleware::ServerScriptDir
+        | Middleware::ClientScriptDir
+        | Middleware::PluginScriptDir => Ok(init_path),
+        _ => Err(io::Error::other(format!(
+            "directory {} does not contain an init script",
+            path.display()
+        ))),
+    }
+}
+
+/// Preserve canonical tree keys even when queued events outlive their files.
+fn canonicalize_event_path(vfs: &Vfs, path: &Path) -> io::Result<PathBuf> {
+    let mut ancestor = path;
+    let mut suffix = Vec::new();
+
+    loop {
+        match vfs.canonicalize(ancestor) {
+            Ok(mut canonical) => {
+                for component in suffix.iter().rev() {
+                    canonical.push(component);
+                }
+                return Ok(canonical);
+            }
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+                ) =>
+            {
+                // A recursive delete can remove every parent before its first
+                // child event is handled. Resolve the deepest surviving parent
+                // so symlinked and Windows verbatim paths still match the tree.
+                match (ancestor.parent(), ancestor.file_name()) {
+                    (Some(parent), Some(name)) => {
+                        suffix.push(name.to_owned());
+                        ancestor = parent;
+                    }
+                    _ => return Err(err),
+                }
+            }
+            Err(err) => return Err(err),
         }
     }
 }
@@ -382,4 +451,135 @@ fn compute_and_apply_changes(tree: &mut RojoTree, vfs: &Vfs, id: Ref) -> Option<
     };
 
     Some(applied_patch_set)
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use crate::snapshot::{InstanceContext, PatchUpdate};
+    use rbx_dom_weak::{ustr, UstrMap};
+
+    fn context(path: &Path) -> JobThreadContext {
+        let vfs = Vfs::new_default_without_watch();
+        let snapshot = snapshot_from_vfs(&InstanceContext::default(), &vfs, path)
+            .unwrap()
+            .unwrap();
+        JobThreadContext {
+            tree: Arc::new(Mutex::new(RojoTree::new(snapshot))),
+            vfs: Arc::new(vfs),
+            message_queue: Arc::new(MessageQueue::new()),
+        }
+    }
+
+    #[test]
+    fn stale_create_write_and_remove_events_reconcile_and_keep_processing() {
+        for make_event in [VfsEvent::Create, VfsEvent::Write, VfsEvent::Remove] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dunce::canonicalize(dir.path()).unwrap();
+            let nested = root.join("nested").join("deeper");
+            fs::create_dir_all(&nested).unwrap();
+            let script = nested.join("script.luau");
+            fs::write(&script, "return 1").unwrap();
+            let task = context(&root);
+            let script_id = task.tree.lock().unwrap().get_ids_at_path(&script)[0];
+
+            fs::remove_dir_all(root.join("nested")).unwrap();
+            task.handle_vfs_event(make_event(script));
+            task.handle_vfs_event(VfsEvent::Remove(nested));
+            task.handle_vfs_event(VfsEvent::Remove(root.join("nested")));
+            assert!(task.tree.lock().unwrap().get_instance(script_id).is_none());
+            assert!(task.tree.lock().unwrap().root().children().is_empty());
+
+            let replacement = root.join("replacement.luau");
+            fs::write(&replacement, "return 2").unwrap();
+            task.handle_vfs_event(VfsEvent::Create(replacement.clone()));
+            let tree = task.tree.lock().unwrap();
+            let id = tree.get_ids_at_path(&replacement)[0];
+            assert_eq!(
+                tree.get_instance(id).unwrap().properties()[&ustr("Source")],
+                Variant::String("return 2".into())
+            );
+        }
+    }
+
+    #[test]
+    fn event_path_resolves_missing_descendants_of_a_replaced_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dunce::canonicalize(dir.path()).unwrap();
+        let replaced = root.join("replaced");
+        fs::write(&replaced, "now a file").unwrap();
+        let vfs = Vfs::new_default_without_watch();
+        let missing = replaced.join("child.luau");
+        assert_eq!(canonicalize_event_path(&vfs, &missing).unwrap(), missing);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stale_events_through_symlinks_use_canonical_tree_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        let alias = dir.path().join("alias");
+        let nested = real.join("nested");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(nested.join("script.luau"), "return 1").unwrap();
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        let task = context(&real);
+        fs::remove_dir_all(&nested).unwrap();
+        task.handle_vfs_event(VfsEvent::Remove(alias.join("nested/script.luau")));
+        task.handle_vfs_event(VfsEvent::Remove(alias.join("nested")));
+        assert!(task.tree.lock().unwrap().root().children().is_empty());
+    }
+
+    #[test]
+    fn two_way_sync_updates_init_source_and_preserves_children() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dunce::canonicalize(dir.path()).unwrap();
+        let folder = root.join("module");
+        fs::create_dir(&folder).unwrap();
+        let init = folder.join("init.luau");
+        fs::write(&init, "return 1").unwrap();
+        fs::write(folder.join("child.luau"), "return 'child'").unwrap();
+        let task = context(&root);
+        let id = task.tree.lock().unwrap().get_ids_at_path(&folder)[0];
+        let mut properties = UstrMap::default();
+        properties.insert(ustr("Source"), Some(Variant::String("return 2".into())));
+        task.handle_tree_event(PatchSet {
+            updated_instances: vec![PatchUpdate {
+                id,
+                changed_name: None,
+                changed_class_name: None,
+                changed_properties: properties,
+                changed_metadata: None,
+            }],
+            ..PatchSet::new()
+        });
+        assert_eq!(fs::read_to_string(&init).unwrap(), "return 2");
+        assert!(folder.join("child.luau").is_file());
+    }
+
+    #[test]
+    fn init_source_resolution_matches_snapshot_priority() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        for name in [
+            "init.lua",
+            "init.luau",
+            "init.server.luau",
+            "init.plugin.luau",
+        ] {
+            fs::write(root.join(name), "return 1").unwrap();
+        }
+        let vfs = Vfs::new_default_without_watch();
+        assert_eq!(
+            resolve_source_path(&vfs, root).unwrap(),
+            root.join("init.luau")
+        );
+        fs::remove_file(root.join("init.luau")).unwrap();
+        assert_eq!(
+            resolve_source_path(&vfs, root).unwrap(),
+            root.join("init.lua")
+        );
+        fs::write(root.join("default.project.json"), "{}").unwrap();
+        assert!(resolve_source_path(&vfs, root).is_err());
+    }
 }

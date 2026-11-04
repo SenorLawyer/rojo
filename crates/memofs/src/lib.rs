@@ -262,6 +262,14 @@ impl Vfs {
         Ok(Self::new(StdBackend::new()?))
     }
 
+    /// Creates a default filesystem with watching disabled and no OS watcher.
+    /// Enabling watching later allocates the watcher on the next read.
+    pub fn new_default_without_watch() -> Self {
+        let vfs = Self::new(StdBackend::new_without_watch());
+        vfs.set_watch_enabled(false);
+        vfs
+    }
+
     /// Creates a new `Vfs` with the given backend.
     pub fn new<B: VfsBackend>(backend: B) -> Self {
         let lock = VfsInner {
@@ -695,5 +703,28 @@ mod test {
         let vfs = Vfs::new(StdBackend::new().unwrap());
         let err = vfs.canonicalize(&file_path).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn filesystem_without_watch_can_enable_watching_later() {
+        let dir = tempfile::tempdir().unwrap();
+        let vfs = Vfs::new_default_without_watch();
+        assert!(!vfs.inner.lock().unwrap().watch_enabled);
+        vfs.read_dir(dir.path()).unwrap();
+        vfs.set_watch_enabled(true);
+        vfs.read_dir(dir.path()).unwrap();
+
+        let receiver = vfs.event_receiver();
+        let file = dir.path().join("created.txt");
+        fs_err::write(&file, "hello").unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let event = receiver.recv_deadline(deadline).unwrap();
+            if let crate::VfsEvent::Create(path) | crate::VfsEvent::Write(path) = event {
+                if path.file_name() == file.file_name() {
+                    break;
+                }
+            }
+        }
     }
 }

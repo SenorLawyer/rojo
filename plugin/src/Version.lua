@@ -119,14 +119,7 @@ Version._cachedLatestCompatible = nil :: {
 Version._apiBlocked = nil :: boolean?
 
 function Version.isApiBlocked(): boolean
-	if Version._apiBlocked == nil then
-		local isLocalInstall = string.find(debug.traceback(), "\n[^\n]-user_.-$") ~= nil
-		Version.retrieveLatestCompatible({
-			version = Config.version,
-			includePrereleases = isLocalInstall and Settings:get("checkForPrereleases"),
-		})
-	end
-	return Version._apiBlocked
+	return Version._apiBlocked == true
 end
 
 function Version.retrieveLatestCompatible(options: {
@@ -140,7 +133,8 @@ function Version.retrieveLatestCompatible(options: {
 
 	Log.debug("Retrieving latest compatible version from GitHub")
 
-	local success, releases = Http.get("https://api.github.com/repos/rojo-rbx/rojo/releases?per_page=10")
+	local success, releases = Http.get("https://api.github.com/repos/SenorLawyer/rojo/releases?per_page=10")
+		:timeout(15, "Timed out checking for Rojo updates")
 		:andThen(function(response)
 			if response.code >= 400 then
 				local message = string.format("HTTP %s:\n%s", tostring(response.code), response.body)
@@ -209,16 +203,7 @@ function Version.retrieveLatestCompatible(options: {
 	return latestCompatible
 end
 
-function Version.getUpdateMessage(): string?
-	if not Settings:get("checkForUpdates") then
-		return
-	end
-
-	local isLocalInstall = string.find(debug.traceback(), "\n[^\n]-user_.-$") ~= nil
-	local latestCompatibleVersion = Version.retrieveLatestCompatible({
-		version = Config.version,
-		includePrereleases = isLocalInstall and Settings:get("checkForPrereleases"),
-	})
+local function formatUpdateMessage(latestCompatibleVersion): string?
 	if not latestCompatibleVersion then
 		return
 	end
@@ -228,6 +213,26 @@ function Version.getUpdateMessage(): string?
 		Version.display(latestCompatibleVersion.version),
 		timeUtil.elapsedToText(DateTime.now().UnixTimestamp - latestCompatibleVersion.publishedUnixTimestamp)
 	)
+end
+
+-- Render functions must never fetch releases or wait for network permission.
+function Version.getCachedUpdateMessage(): string?
+	if not Settings:get("checkForUpdates") or not Version._cachedLatestCompatible then
+		return nil
+	end
+	return formatUpdateMessage(Version._cachedLatestCompatible.value)
+end
+
+function Version.getUpdateMessage(): string?
+	if not Settings:get("checkForUpdates") then
+		return nil
+	end
+
+	local isLocalInstall = string.find(debug.traceback(), "\n[^\n]-user_.-$") ~= nil
+	return formatUpdateMessage(Version.retrieveLatestCompatible({
+		version = Config.version,
+		includePrereleases = isLocalInstall and Settings:get("checkForPrereleases"),
+	}))
 end
 
 return Version

@@ -108,3 +108,53 @@ fn run_build_test(test_name: &str) {
         assert_snapshot!(test_name, contents);
     });
 }
+
+#[test]
+fn building_model_as_place_preserves_existing_output() {
+    let temp = tempdir().unwrap();
+    let path = temp.path().join("existing.rbxl");
+    fs::write(&path, "keep").unwrap();
+    let result = Command::new(ROJO_PATH)
+        .current_dir(get_working_dir_path())
+        .arg("build")
+        .arg(Path::new(BUILD_TESTS_PATH).join("module_init"))
+        .arg("-o")
+        .arg(&path)
+        .output()
+        .unwrap();
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("as a place"));
+    assert_eq!(fs::read(path).unwrap(), b"keep");
+}
+
+#[test]
+fn binary_compression_modes_round_trip() {
+    let temp = tempdir().unwrap();
+    for mode in ["lz4", "zstd", "none"] {
+        let output = temp.path().join(format!("{mode}.rbxm"));
+        let result = Command::new(ROJO_PATH)
+            .current_dir(get_working_dir_path())
+            .arg("build")
+            .arg(Path::new(BUILD_TESTS_PATH).join("module_init"))
+            .arg("-o")
+            .arg(&output)
+            .args(["--compress", mode])
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let bytes = fs::read(output).unwrap();
+        let dom = rbx_binary::from_reader(bytes.as_slice()).unwrap();
+        let root = dom.get_by_ref(dom.root().children()[0]).unwrap();
+        assert_eq!(root.class, "ModuleScript");
+        assert!(root.properties.contains_key(&rbx_dom_weak::ustr("Source")));
+        if mode == "zstd" {
+            assert!(bytes
+                .windows(4)
+                .any(|bytes| bytes == [0x28, 0xb5, 0x2f, 0xfd]));
+        }
+    }
+}
