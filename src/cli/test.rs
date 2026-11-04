@@ -106,6 +106,18 @@ pub struct TestCommand {
     /// `rojo studio cancel` before Studio starts it.
     #[clap(long)]
     pub request_id: Option<String>,
+    /// With --json: leave out failures and shorten messages until the
+    /// printed report fits this many bytes, counting what was cut in the
+    /// report's omitted and truncated fields. `rojo mcp` passes it so a large
+    /// failing report stays within its output limit.
+    #[clap(
+        long,
+        value_name = "BYTES",
+        requires = "json",
+        conflicts_with = "cloud",
+        hide = true
+    )]
+    pub max_report_bytes: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy, ArgEnum, PartialEq, Eq)]
@@ -154,6 +166,47 @@ impl SpecOptions {
         }
         args
     }
+
+    /// The runner's own checks in `normalizeOptions` and `resolvePath`,
+    /// repeated here so an invalid option is a usage error (exit 2) instead of
+    /// a run that failed in Studio or in the cloud (exit 1).
+    pub(crate) fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.roots.len() <= MAX_ROOTS,
+            "--root can be given at most {MAX_ROOTS} times"
+        );
+        for root in &self.roots {
+            check_instance_path("--root", root)?;
+        }
+        if let Some(module) = &self.module {
+            check_instance_path("--module", module)?;
+        }
+        if let Some(filter) = &self.filter {
+            anyhow::ensure!(
+                filter.len() <= MAX_FILTER_BYTES,
+                "--filter must be at most {MAX_FILTER_BYTES} bytes"
+            );
+        }
+        Ok(())
+    }
+}
+
+/// Bounds the runner applies to options, from `SpecRunner.lua`.
+const MAX_ROOTS: usize = 32;
+const MAX_PATH_BYTES: usize = 2048;
+const MAX_FILTER_BYTES: usize = 256;
+
+/// The runner resolves paths whose first name is `game`.
+fn check_instance_path(option: &str, path: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        path == "game" || path.starts_with("game/"),
+        "{option} must be a game/... instance path, such as game/ReplicatedStorage/Shared, not '{path}'"
+    );
+    anyhow::ensure!(
+        path.len() <= MAX_PATH_BYTES,
+        "{option} must be at most {MAX_PATH_BYTES} bytes"
+    );
+    Ok(())
 }
 
 /// Luau source that runs the specs in the DataModel it executes in and
@@ -214,6 +267,36 @@ pub(crate) struct TestReport {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     pub duration_seconds: f64,
+}
+
+/// Room for the omitted and truncated counters to grow to 20 digits each.
+const COUNTER_SLACK: usize = 64;
+
+/// The least room worth shortening a message into rather than leaving its
+/// entry out.
+const MIN_SHORTENED_BYTES: usize = 256;
+
+/// Bytes an entry takes in a compact JSON list, with its comma.
+fn entry_len(value: &impl Serialize) -> usize {
+    serde_json::to_vec(value).map_or(usize::MAX / 2, |bytes| bytes.len()) + 1
+}
+
+/// Cuts `text` on a character boundary so that its JSON escaped form,
+/// without quotes, is at most `max_bytes`. Counts escapes as serde_json
+/// writes them.
+fn shorten(text: &mut String, max_bytes: usize) {
+    let mut used = 0;
+    for (index, character) in text.char_indices() {
+        used += match character {
+            '"' | '\\' | '\n' | '\r' | '\t' | '\u{8}' | '\u{c}' => 2,
+            character if (character as u32) < 0x20 => 6,
+            character => character.len_utf8(),
+        };
+        if used > max_bytes {
+            text.truncate(index);
+            return;
+        }
+    }
 }
 
 /// Luau encodes an empty table as `[]` or `{}`, so both mean an empty list.
@@ -309,6 +392,89 @@ impl TestReport {
             0
         } else {
             1
+        }
+    }
+
+    /// Cuts the report until `size` of it is at most `max_bytes`. Load errors
+    /// and failures are kept in order while they fit; the first one that does
+    /// not fit has its messages shortened when enough room is left, and the
+    /// rest are left out. What was cut is counted in `omitted_load_errors`,
+    /// `omitted_failures` and `truncated_messages`, as the runner counts its
+    /// own cuts, so the report still says how much is missing.
+    ///
+    /// `size` measures the whole printed output, so whatever surrounds the
+    /// report counts too. Each list entry is measured on its own, which is
+    /// exact for serde_json's compact output apart from one comma per list.
+    pub(crate) fn fit(&mut self, max_bytes: usize, size: impl Fn(&TestReport) -> usize) {
+        if size(self) <= max_bytes {
+            return;
+        }
+        let load_errors = std::mem::take(&mut self.load_errors);
+        let failures = std::mem::take(&mut self.failures);
+        // The counters grow as entries are cut, so reserve their widest form.
+        let mut used = size(self) + COUNTER_SLACK;
+        let mut full = false;
+
+        for mut error in load_errors {
+            let room = max_bytes.saturating_sub(used);
+            if !full && entry_len(&error) <= room {
+                used += entry_len(&error);
+                self.load_errors.push(error);
+                continue;
+            }
+            if !full {
+                full = true;
+                let bare = entry_len(&LoadError {
+                    module: error.module.clone(),
+                    message: String::new(),
+                });
+                if bare + MIN_SHORTENED_BYTES <= room {
+                    shorten(&mut error.message, room - bare);
+                    self.truncated_messages += 1;
+                    used += entry_len(&error);
+                    self.load_errors.push(error);
+                    continue;
+                }
+            }
+            self.omitted_load_errors += 1;
+        }
+
+        for mut failure in failures {
+            let room = max_bytes.saturating_sub(used);
+            if !full && entry_len(&failure) <= room {
+                used += entry_len(&failure);
+                self.failures.push(failure);
+                continue;
+            }
+            if !full {
+                full = true;
+                let messages = std::mem::take(&mut failure.messages);
+                let mut kept = entry_len(&failure);
+                if kept + MIN_SHORTENED_BYTES <= room {
+                    let mut messages = messages.into_iter();
+                    for mut message in messages.by_ref() {
+                        let cost = entry_len(&message);
+                        if kept + cost <= room {
+                            kept += cost;
+                            failure.messages.push(message);
+                            continue;
+                        }
+                        if kept + MIN_SHORTENED_BYTES <= room {
+                            // Two quotes and a comma surround the text.
+                            shorten(&mut message, room - kept - 3);
+                            kept += entry_len(&message);
+                            failure.messages.push(message);
+                        }
+                        self.truncated_messages += 1;
+                        break;
+                    }
+                    self.truncated_messages += messages.len() as u64;
+                    used += entry_len(&failure);
+                    self.failures.push(failure);
+                    continue;
+                }
+            }
+            self.omitted_failures += 1;
         }
     }
 
@@ -527,8 +693,17 @@ impl TestCommand {
         if self.cloud {
             return self.run_cloud();
         }
-        let (session, request_id, report) = self.execute().map_err(UsageError)?;
+        let (session, request_id, mut report) = self.execute().map_err(UsageError)?;
         if self.json {
+            if let Some(max_bytes) = self.max_report_bytes {
+                report.fit(max_bytes, |report| {
+                    entry_len(&Output {
+                        session_id: &session,
+                        request_id: &request_id,
+                        report,
+                    })
+                });
+            }
             let output = Output {
                 session_id: &session,
                 request_id: &request_id,
@@ -569,7 +744,8 @@ impl TestCommand {
             (Some(universe), Some(place)) if universe > 0 && place > 0 => Ok((universe, place)),
             (Some(_), Some(_)) => anyhow::bail!("--universe-id and --place-id must be positive"),
             _ => anyhow::bail!(
-                "--cloud needs both --universe-id and --place-id. Use a place set aside for testing:                  the build is saved to it as a new version."
+                "--cloud needs both --universe-id and --place-id. Use a place set aside for testing: \
+                 the build is saved to it as a new version."
             ),
         }
     }
@@ -591,6 +767,7 @@ impl TestCommand {
     /// usage or connection problems.
     fn execute_cloud(&self) -> anyhow::Result<cloud::CloudRun> {
         self.check_timeout()?;
+        self.spec_options().validate()?;
         let (universe_id, place_id) = self.cloud_target()?;
         let client =
             OpenCloud::from_env(self.api_key_env.as_deref().unwrap_or(DEFAULT_API_KEY_VAR))?;
@@ -620,6 +797,7 @@ impl TestCommand {
     /// problems; a run that fails is a report.
     fn execute(&self) -> anyhow::Result<(String, String, TestReport)> {
         self.check_timeout()?;
+        self.spec_options().validate()?;
         if let Some(id) = &self.request_id {
             uuid::Uuid::parse_str(id).context("--request-id must be a UUID")?;
         }
@@ -993,6 +1171,232 @@ ReplicatedStorage.Shared.Math.spec:11"
             .cloud_target()
             .unwrap_err();
         assert!(error.to_string().contains("positive"));
+    }
+
+    #[test]
+    fn the_cloud_usage_error_reads_as_one_sentence_pair() {
+        let error = parse_test(&["--cloud"])
+            .unwrap()
+            .cloud_target()
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            error,
+            "--cloud needs both --universe-id and --place-id. Use a place set aside for testing: \
+             the build is saved to it as a new version."
+        );
+        assert!(!error.contains("  "), "{error}");
+    }
+
+    fn options_with(roots: &[&str], module: Option<&str>, filter: Option<&str>) -> SpecOptions {
+        SpecOptions {
+            roots: roots.iter().map(|root| root.to_string()).collect(),
+            framework: Framework::Auto,
+            module: module.map(str::to_owned),
+            filter: filter.map(str::to_owned),
+            timeout_seconds: DEFAULT_SPEC_SECONDS,
+        }
+    }
+
+    #[test]
+    fn options_are_checked_as_the_runner_checks_them() {
+        assert!(options_with(&[], None, None).validate().is_ok());
+        assert!(options_with(
+            &["game", "game/ReplicatedStorage/Shared", "game/a\\/b"],
+            Some("game/ReplicatedStorage/Packages/TestEZ"),
+            Some("a".repeat(MAX_FILTER_BYTES).as_str()),
+        )
+        .validate()
+        .is_ok());
+        let long_path = format!("game/{}", "a".repeat(MAX_PATH_BYTES));
+        let many_roots = vec!["game"; MAX_ROOTS + 1];
+        let too_long_filter = "a".repeat(MAX_FILTER_BYTES + 1);
+        for (options, expected) in [
+            (
+                options_with(&["ReplicatedStorage/Shared"], None, None),
+                "--root must be a game/",
+            ),
+            (options_with(&[""], None, None), "--root must be a game/"),
+            (
+                options_with(&["games/Shared"], None, None),
+                "--root must be a game/",
+            ),
+            (
+                options_with(&["game\\/Shared"], None, None),
+                "--root must be a game/",
+            ),
+            (
+                options_with(&[long_path.as_str()], None, None),
+                "at most 2048 bytes",
+            ),
+            (options_with(&many_roots, None, None), "at most 32 times"),
+            (
+                options_with(&[], Some(""), None),
+                "--module must be a game/",
+            ),
+            (
+                options_with(&[], Some("Packages/TestEZ"), None),
+                "--module must be a game/",
+            ),
+            (
+                options_with(&[], None, Some(too_long_filter.as_str())),
+                "--filter must be at most 256",
+            ),
+        ] {
+            let error = options.validate().unwrap_err().to_string();
+            assert!(error.contains(expected), "{error}");
+        }
+    }
+
+    #[test]
+    fn option_bounds_match_the_runner() {
+        for line in [
+            format!("SpecRunner.MAX_ROOTS = {MAX_ROOTS}\n"),
+            format!("SpecRunner.MAX_PATH_BYTES = {MAX_PATH_BYTES}\n"),
+            format!("SpecRunner.MAX_FILTER_BYTES = {MAX_FILTER_BYTES}\n"),
+        ] {
+            assert!(SPEC_RUNNER.contains(&line), "SpecRunner.lua lacks {line:?}");
+        }
+    }
+
+    #[test]
+    fn invalid_options_stop_a_cloud_run_before_reading_the_key() {
+        let mut command = parse_test(&[
+            "--cloud",
+            "--universe-id",
+            "1",
+            "--place-id",
+            "2",
+            "--root",
+            "ReplicatedStorage",
+        ])
+        .unwrap();
+        command.api_key_env = Some("ROJO_TEST_UNSET_KEY_VARIABLE".into());
+        let error = command.execute_cloud().unwrap_err().to_string();
+        assert!(error.contains("--root must be a game/"), "{error}");
+    }
+
+    /// A failing report with `count` failures, each carrying `message`.
+    fn large_report(count: usize, message: &str) -> TestReport {
+        let mut report = TestReport::from_runner(&failing_report()).unwrap();
+        report.failed = count as u64;
+        report.failures = (0..count)
+            .map(|index| Failure {
+                path: vec!["Shared".into(), "Math".into(), format!("test {index}")],
+                messages: vec![message.to_owned()],
+            })
+            .collect();
+        report
+    }
+
+    fn json_len(report: &TestReport) -> usize {
+        serde_json::to_vec(report).unwrap().len()
+    }
+
+    #[test]
+    fn a_report_that_fits_is_left_alone() {
+        let mut report = large_report(3, "expected 1, got 2");
+        let before = report.clone();
+        report.fit(json_len(&report), json_len);
+        assert_eq!(report, before);
+    }
+
+    #[test]
+    fn large_reports_are_cut_to_fit_and_say_how_much_was_cut() {
+        // About 1.1 KB per failure, with characters JSON has to escape.
+        let message = format!(
+            "ReplicatedStorage.Shared.Math.spec:4: Expected \"3\", got \"2\"\n{}",
+            "ReplicatedStorage.Shared.Util:12 function helper\t\\\u{1}\n".repeat(20)
+        );
+        let mut report = large_report(250, &message);
+        let max_bytes = 64 * 1024;
+        assert!(json_len(&report) > 4 * max_bytes);
+        report.fit(max_bytes, json_len);
+
+        let bytes = serde_json::to_vec(&report).unwrap();
+        assert!(bytes.len() <= max_bytes, "{}", bytes.len());
+        // Nearly all of the room is used.
+        assert!(
+            bytes.len() > max_bytes - message.len() * 2,
+            "{}",
+            bytes.len()
+        );
+        let value: Value = serde_json::from_slice(&bytes).unwrap();
+        let listed = value["failures"].as_array().unwrap().len() as u64;
+        assert!(listed > 0);
+        assert_eq!(listed + value["omittedFailures"].as_u64().unwrap(), 250);
+        assert_eq!(value["failed"], 250);
+        // Whole failures were kept in order; at most the last was shortened.
+        assert_eq!(value["failures"][0]["messages"][0], message.as_str());
+        assert_eq!(value["failures"][0]["path"][2], "test 0");
+        let last = value["failures"][listed as usize - 1]["messages"][0]
+            .as_str()
+            .unwrap();
+        assert!(message.starts_with(last));
+        let shortened = u64::from(last != message);
+        assert_eq!(value["truncatedMessages"], shortened);
+        assert_eq!(
+            value["failures"][listed as usize - 1]["path"][2],
+            format!("test {}", listed - 1)
+        );
+        assert!(report
+            .render()
+            .contains(&format!("... {} more failures not shown", 250 - listed)));
+    }
+
+    #[test]
+    fn one_huge_failure_keeps_its_path_and_some_of_its_messages() {
+        let mut report = large_report(1, &"x".repeat(4096));
+        report.failures[0].messages = vec!["x".repeat(4096); 40];
+        report.load_errors = vec![LoadError {
+            module: "game/ReplicatedStorage/Broken.spec".into(),
+            message: "é".repeat(10_000),
+        }];
+        report.fit(16 * 1024, json_len);
+        assert!(json_len(&report) <= 16 * 1024);
+        // The load error came first and was shortened on a character boundary,
+        // which left no room for the failure.
+        assert!(report.load_errors[0].message.len() > 8 * 1024);
+        assert!(report.load_errors[0].message.len() < 16 * 1024);
+        assert!(report.load_errors[0].message.starts_with('é'));
+        assert_eq!(report.omitted_failures, 1);
+        assert_eq!(report.truncated_messages, 1);
+
+        let mut report = large_report(1, "unused");
+        report.failures[0].messages = vec!["x".repeat(4096); 40];
+        report.fit(16 * 1024, json_len);
+        assert!(json_len(&report) <= 16 * 1024);
+        let kept = &report.failures[0].messages;
+        assert_eq!(report.failures[0].path[2], "test 0");
+        assert!(kept.len() > 1 && kept.len() < 40);
+        assert!(kept.last().unwrap().len() < 4096);
+        assert_eq!(report.truncated_messages, (40 - kept.len() + 1) as u64);
+        assert_eq!(report.omitted_failures, 0);
+    }
+
+    #[test]
+    fn shortening_counts_json_escapes() {
+        for text in ["plain text here", "\"quoted\"", "tab\there\u{1}", "ééééé"] {
+            for max_bytes in 0..20 {
+                let mut shortened = text.to_owned();
+                shorten(&mut shortened, max_bytes);
+                assert!(text.starts_with(&shortened));
+                let escaped = serde_json::to_string(&shortened).unwrap().len() - 2;
+                assert!(escaped <= max_bytes, "{text:?} at {max_bytes}");
+            }
+        }
+    }
+
+    #[test]
+    fn max_report_bytes_is_only_for_studio_json_output() {
+        assert_eq!(
+            parse_test(&["--json", "--max-report-bytes", "1000"])
+                .unwrap()
+                .max_report_bytes,
+            Some(1000)
+        );
+        assert!(parse_test(&["--max-report-bytes", "1000"]).is_err());
+        assert!(parse_test(&["--cloud", "--json", "--max-report-bytes", "1000"]).is_err());
     }
 
     #[test]

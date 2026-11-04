@@ -298,6 +298,56 @@ return function()
 			expect(total <= SpecRunner.MAX_TEXT_BYTES).to.equal(true)
 			expect(report.truncatedMessages > 0).to.equal(true)
 		end)
+
+		it("charges test paths and module paths against the text budget", function()
+			-- A small budget keeps the fixture small; restored even on failure.
+			local budget = SpecRunner.MAX_TEXT_BYTES
+			SpecRunner.MAX_TEXT_BYTES = 10000
+			local ok, err = pcall(function()
+				local phrase = string.rep("p", SpecRunner.MAX_PHRASE_BYTES)
+				local tests = {}
+				for index = 1, 20 do
+					table.insert(tests, {
+						status = "failed",
+						title = phrase .. index,
+						ancestorTitles = { phrase, phrase, phrase },
+						failureMessages = {},
+					})
+				end
+				local files = { { testFilePath = "ReplicatedStorage/Project/Paths.spec", testResults = tests } }
+				for index = 1, 10 do
+					table.insert(files, {
+						testFilePath = string.rep("m", SpecRunner.MAX_PATH_BYTES - 4) .. index,
+						testResults = {},
+						testExecError = { message = "boom" },
+					})
+				end
+				local report = SpecRunner.collectJest({ testResults = files })
+				local total = 0
+				for _, failure in report.failures do
+					for _, part in failure.path do
+						total += #part
+					end
+					for _, message in failure.messages do
+						total += #message
+					end
+				end
+				for _, loadError in report.loadErrors do
+					total += #loadError.module + #loadError.message
+				end
+				expect(total <= SpecRunner.MAX_TEXT_BYTES).to.equal(true)
+				expect(report.failed).to.equal(20)
+				expect(#report.failures + report.omittedFailures).to.equal(20)
+				expect(report.omittedFailures > 0).to.equal(true)
+				expect(#report.loadErrors + report.omittedLoadErrors).to.equal(10)
+				expect(report.omittedLoadErrors > 0).to.equal(true)
+				expect(report.status).to.equal("failed")
+			end)
+			SpecRunner.MAX_TEXT_BYTES = budget
+			if not ok then
+				error(err, 0)
+			end
+		end)
 	end)
 
 	describe("collectJest", function()

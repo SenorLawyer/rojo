@@ -236,15 +236,16 @@ fn usage_and_connection_problems_exit_2() {
     );
 }
 
-#[test]
-fn mcp_run_tests_returns_failed_runs_as_results() {
+/// Calls the MCP `run_tests` tool once against a bridge answering every
+/// command with `body`, and returns the tool result and the commands sent.
+fn mcp_run_tests(body: Value) -> (Value, Vec<Value>) {
     let directory = token();
     fs_err::write(
         directory.path().join("default.project.json"),
         r#"{"name":"mcp-test","tree":{"$className":"Folder"}}"#,
     )
     .unwrap();
-    let (address, commands) = bridge(one_session(), 200, report("failed", 1));
+    let (address, commands) = bridge(one_session(), 200, body);
     let mut child = Command::new(env!("CARGO_BIN_EXE_rojo"))
         .args(["mcp", "--project"])
         .arg(directory.path())
@@ -263,7 +264,12 @@ fn mcp_run_tests_returns_failed_runs_as_results() {
         json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"run_tests","arguments":{"session":SESSION,"roots":["game/ReplicatedStorage/Shared"],"timeout":5}}}),
     ] {
         serde_json::to_writer(&mut input, &message).unwrap();
-        input.write_all(b"\n").unwrap();
+        input
+            .write_all(
+                b"
+",
+            )
+            .unwrap();
     }
     drop(input);
     let output = child.wait_with_output().unwrap();
@@ -272,10 +278,17 @@ fn mcp_run_tests_returns_failed_runs_as_results() {
         .lines()
         .map(|line| serde_json::from_str(line).unwrap())
         .collect();
-    let result = &replies
+    let reply = replies
         .iter()
         .find(|reply| reply["id"] == 2)
-        .expect("run_tests reply")["result"];
+        .expect("run_tests reply");
+    let commands = commands.lock().unwrap().clone();
+    (reply["result"].clone(), commands)
+}
+
+#[test]
+fn mcp_run_tests_returns_failed_runs_as_results() {
+    let (result, commands) = mcp_run_tests(report("failed", 1));
     assert_eq!(result["isError"], false, "{result}");
     assert_eq!(result["structuredContent"]["status"], "failed");
     assert_eq!(result["structuredContent"]["failed"], 1);
@@ -284,8 +297,66 @@ fn mcp_run_tests_returns_failed_runs_as_results() {
         .as_str()
         .unwrap()
         .contains("untrusted"));
-    let commands = commands.lock().unwrap();
     assert_eq!(commands[0]["action"], "spec");
     assert_eq!(commands[0]["args"]["timeoutSeconds"], 5);
     assert_eq!(commands[0]["sessionId"], SESSION);
+}
+
+#[test]
+fn mcp_run_tests_cuts_a_large_report_instead_of_failing() {
+    // 250 failures with long tracebacks: within the runner's own bounds, but
+    // larger than the 256 KiB the adapter reads from a command.
+    let traceback = "ReplicatedStorage.Shared.Util:12 function helper
+"
+    .repeat(20);
+    let failures: Vec<Value> = (0..250)
+        .map(|index| {
+            json!({
+                "path": ["Shared", "Math", format!("test {index}")],
+                "messages": [format!("ReplicatedStorage.Shared.Math.spec:{index}: Expected value 3, got 2
+{traceback}")],
+            })
+        })
+        .collect();
+    let mut body = report("failed", 250);
+    body["result"]["value"]["report"]["failures"] = json!(failures);
+    assert!(body.to_string().len() > 256 * 1024);
+
+    let (result, _) = mcp_run_tests(body);
+    assert_eq!(result["isError"], false, "{}", result["content"][0]);
+    let text = result["content"][0]["text"].as_str().unwrap();
+    assert!(text.len() <= 256 * 1024, "{}", text.len());
+    let report: Value = serde_json::from_str(text).unwrap();
+    assert_eq!(report, result["structuredContent"]);
+    assert_eq!(report["status"], "failed");
+    assert_eq!(report["failed"], 250);
+    let listed = report["failures"].as_array().unwrap().len() as u64;
+    assert!(listed > 100, "{listed}");
+    assert_eq!(listed + report["omittedFailures"].as_u64().unwrap(), 250);
+}
+
+#[test]
+fn invalid_options_exit_2_without_reaching_studio() {
+    let directory = token();
+    let (address, commands) = bridge(one_session(), 200, report("passed", 0));
+    let roots: Vec<String> = (0..33)
+        .map(|index| format!("--root=game/R{index}"))
+        .collect();
+    let roots: Vec<&str> = roots.iter().map(String::as_str).collect();
+    let long_filter = format!("--filter={}", "a".repeat(257));
+    for (extra, expected) in [
+        (
+            &["--root", "ReplicatedStorage/Shared"][..],
+            "--root must be a game/",
+        ),
+        (&roots[..], "at most 32 times"),
+        (&[long_filter.as_str()][..], "--filter must be at most 256"),
+        (&["--module="][..], "--module must be a game/"),
+    ] {
+        let output = rojo_test(&address, directory.path(), extra);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(2), "{stderr}");
+        assert!(stderr.contains(expected), "{stderr}");
+    }
+    assert!(commands.lock().unwrap().is_empty());
 }

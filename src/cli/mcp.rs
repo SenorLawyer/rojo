@@ -22,6 +22,10 @@ use serde_json::{json, Map, Value};
 const MAX_LINE_BYTES: usize = 64 * 1024;
 const MAX_OUTPUT_BYTES: usize = 256 * 1024;
 const MAX_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
+// A result carries a native command's JSON twice: escaped as text, where each
+// byte of compact JSON becomes at most two, and parsed as structuredContent.
+// So output within the stream limit always fits one response.
+const _: () = assert!(3 * MAX_OUTPUT_BYTES + 4096 < MAX_RESPONSE_BYTES);
 /// Outlasts the Studio CLI's own HTTP timeout (65 s), so a slow Studio command
 /// reports its own error instead of being killed first.
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(70);
@@ -451,7 +455,11 @@ fn command(
                 .arg("test")
                 .arg(format!("--address={}", options.address))
                 .arg(format!("--token-file={}", token.display()))
-                .arg("--json");
+                .arg("--json")
+                // A long list of failures is still a result: have the CLI cut
+                // the report to fit the stream limit, counting what it left
+                // out, rather than exceeding it and losing the whole report.
+                .arg(format!("--max-report-bytes={MAX_OUTPUT_BYTES}"));
             if let Some(session) = canonical_session(arguments) {
                 let request = uuid::Uuid::new_v4().to_string();
                 command
@@ -867,6 +875,25 @@ mod tests {
             .unwrap();
         assert_eq!(tool["annotations"]["destructiveHint"], true);
         assert_eq!(tool["annotations"]["readOnlyHint"], false);
+    }
+
+    #[test]
+    fn run_tests_asks_for_a_report_within_the_stream_limit() {
+        let options = McpCommand {
+            project: std::env::temp_dir(),
+            address: "http://127.0.0.1:34872".into(),
+            token_file: Some(PathBuf::from("token")),
+        };
+        let prepared = command(&options, "run_tests", &Map::new()).unwrap();
+        let args: Vec<_> = prepared
+            .command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            args.contains(&format!("--max-report-bytes={MAX_OUTPUT_BYTES}")),
+            "{args:?}"
+        );
     }
 
     #[test]

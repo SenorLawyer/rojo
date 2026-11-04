@@ -61,7 +61,9 @@ local VENDORED = { ["_Index"] = true, [".pesde"] = true }
 
 -- Roblox inserts its default player scripts at run time when a place does not
 -- provide its own, and PlayerModule ships internal `*.spec` modules that only
--- load inside Roblox's own test setup. They are skipped the same way.
+-- load inside Roblox's own test setup. They are skipped the same way. This
+-- matches by name, so a project's own fork of PlayerModule is skipped too
+-- unless a root points at it or inside it.
 local function isRobloxDefaultScripts(instance)
 	local parent = instance.Parent
 	return instance.Name == "PlayerModule" and parent ~= nil and parent.Name == "StarterPlayerScripts"
@@ -432,11 +434,21 @@ local function addFailure(report, path, messages)
 		return
 	end
 	local phrases = {}
+	local pathBytes = 0
 	-- Keep the innermost phrases, which name the test, when a path is deep.
 	local first = math.max(1, #path - SpecRunner.MAX_PATH_DEPTH + 1)
 	for index = first, #path do
-		table.insert(phrases, text(path[index], SpecRunner.MAX_PHRASE_BYTES))
+		local phrase = text(path[index], SpecRunner.MAX_PHRASE_BYTES)
+		pathBytes += #phrase
+		table.insert(phrases, phrase)
 	end
+	-- Paths are charged against the text budget too, so the report's total
+	-- text stays bounded. A failure whose path no longer fits is left out.
+	if pathBytes > report.budget then
+		report.omittedFailures += 1
+		return
+	end
+	report.budget -= pathBytes
 	local kept = {}
 	for index, message in messages do
 		-- Messages past the per-failure limit or the report's text budget
@@ -455,8 +467,15 @@ local function addLoadError(report, module, message)
 		report.omittedLoadErrors += 1
 		return
 	end
+	-- Charged like a failure's path.
+	local modulePath = text(module, SpecRunner.MAX_PATH_BYTES)
+	if #modulePath > report.budget then
+		report.omittedLoadErrors += 1
+		return
+	end
+	report.budget -= #modulePath
 	table.insert(report.loadErrors, {
-		module = text(module, SpecRunner.MAX_PATH_BYTES),
+		module = modulePath,
 		message = addText(report, message, SpecRunner.MAX_MESSAGE_BYTES),
 	})
 end

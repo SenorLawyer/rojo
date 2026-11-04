@@ -48,14 +48,14 @@ rojo test --token-file <private-token-file>
 
 With one Studio session connected, `rojo test` uses it. With several, it lists them and asks for `--session <id>`.
 
-By default the specs are searched for in ReplicatedFirst, ReplicatedStorage, ServerScriptService, ServerStorage, StarterGui, StarterPack and StarterPlayer. Specs inside `_Index` (Wally) and `.pesde` folders belong to dependencies and are skipped, as is anything inside the TestEZ module. Roblox's default `PlayerModule` under StarterPlayerScripts is skipped too: Roblox inserts it at run time and its internal specs do not load outside Roblox's own tests.
+By default the specs are searched for in ReplicatedFirst, ReplicatedStorage, ServerScriptService, ServerStorage, StarterGui, StarterPack and StarterPlayer. Specs inside `_Index` (Wally) and `.pesde` folders belong to dependencies and are skipped, as is anything inside the TestEZ module. Roblox's default `PlayerModule` under StarterPlayerScripts is skipped too: Roblox inserts it at run time and its internal specs do not load outside Roblox's own tests. It is recognized by name, so a project that ships its own fork of `PlayerModule` there has that fork's specs skipped as well; pass a `--root` that points at the `PlayerModule` or inside it to run them.
 
 | Option | Meaning |
 | --- | --- |
-| `--root <path>` | Search only beneath this instance, such as `game/ReplicatedStorage/Shared`. Repeat for several roots, up to 32. Paths use the bridge's syntax: `/` between names and `\` before a `/` or `\` inside a name. |
-| `--filter <pattern>` | Run only tests whose full name (the describe phrases and the test's own phrase, joined by spaces) matches this Lua pattern. TestEZ marks the rest as skipped. |
+| `--root <path>` | Search only beneath this instance, such as `game/ReplicatedStorage/Shared`. Repeat for several roots, up to 32. Paths start with `game`, are at most 2048 bytes and use the bridge's syntax: `/` between names and `\` before a `/` or `\` inside a name. |
+| `--filter <pattern>` | Run only tests whose full name (the describe phrases and the test's own phrase, joined by spaces) matches this Lua pattern, at most 256 bytes. TestEZ marks the rest as skipped. |
 | `--framework auto\|testez\|jest` | Which framework to run. `auto`, the default, uses TestEZ when the place has it, otherwise Jest. |
-| `--module <path>` | The framework's ModuleScript. When omitted, the shallowest ModuleScript named `TestEZ` (or `Jest`) in ReplicatedStorage, ServerStorage or ServerScriptService is used. |
+| `--module <path>` | The framework's ModuleScript, as a `game/...` path like `--root`. When omitted, the shallowest ModuleScript named `TestEZ` (or `Jest`) in ReplicatedStorage, ServerStorage or ServerScriptService is used. |
 | `--timeout <seconds>` | How long the specs may run, 1 to 300 seconds. The default is 60. |
 | `--session <id>` | The Studio session, from `rojo studio sessions`. |
 | `--json` | Print the report as JSON. |
@@ -79,7 +79,7 @@ A spec module that fails to load (a syntax error, or an error while it is requir
 | --- | --- |
 | 0 | Every test passed. |
 | 1 | A test failed, a module failed to load, or the run could not finish: no TestEZ was found, no specs were found, the specs did not finish within `--timeout`, Studio was not in Edit mode, or Studio did not answer in time. |
-| 2 | `rojo test` could not reach Studio or was used incorrectly: the bridge is not running or refused the token, no session or several sessions are connected without `--session`, or an option is invalid. |
+| 2 | `rojo test` could not reach Studio or was used incorrectly: the bridge is not running or refused the token, no session or several sessions are connected without `--session`, or an option is invalid, such as a root that does not start with `game/`, more than 32 roots or a filter longer than 256 bytes. A root that does not exist is only found in Studio, so it exits with 1. |
 
 ### JSON report
 
@@ -93,7 +93,7 @@ A spec module that fails to load (a syntax error, or an error while it is requir
 | `failures` | Up to 500 entries of `{ "path": [...phrases], "messages": [...] }`. |
 | `loadErrors` | Up to 100 entries of `{ "module", "message" }`. |
 | `omittedFailures`, `omittedLoadErrors` | Entries left out past those limits. |
-| `truncatedMessages` | Messages shortened or left out. Each message is cut to 4 KiB, a failure keeps 8 messages, and a report carries at most 2 MiB of message text. |
+| `truncatedMessages` | Messages shortened or left out. Each message is cut to 4 KiB, a failure keeps 8 messages, and a report carries at most 2 MiB of text: messages, test paths and module paths together. A failure or load error whose path no longer fits is left out and counted above. |
 | `error` | Why the run could not finish, for `error` and `timedOut`. |
 | `durationSeconds` | Time spent running the specs inside Studio. |
 | `framework`, `sessionId`, `requestId` | What ran, and where. |
@@ -135,7 +135,7 @@ rojo test --cloud --universe-id <universe> --place-id <place> [PROJECT]
 It does three things:
 
 1. Builds the project (by default the one in the current directory) into a place in memory. The project's root must be a `DataModel`.
-2. Saves the place as a new **Saved** version of `--place-id`. It is never published: players keep joining the current published version. Rojo prints the version number it saved.
+2. Saves the place as a new **Saved** version of `--place-id`. It is never published: players keep joining the current published version. Rojo prints the version number it saved. Studio, however, opens a place's latest saved version, so whoever opens the place in Studio next gets the test build, and publishing from Studio then would publish it. This is another reason to use a place set aside for testing.
 3. Runs the same spec runner as Studio mode as a Luau Execution task against exactly that version, and prints the report and exits as Studio mode does.
 
 Use a place set aside for testing, since every run adds a version to its history. Both `--universe-id` and `--place-id` are required; Rojo never picks a place on its own.

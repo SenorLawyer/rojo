@@ -103,7 +103,10 @@ pub(super) fn run(
     let version = match request.place {
         Some(bytes) => {
             progress(format!(
-                "Saving the built place ({} bytes) as a new version of place {place_id} in universe {universe_id}. It is saved, not published: players keep joining the current published version.",
+                "Saving the built place ({} bytes) as a new version of place {place_id} in universe {universe_id}. \
+                 It is saved, not published: players keep joining the current published version. \
+                 Studio opens the latest saved version, though, so whoever opens this place in Studio next gets this build, \
+                 and publishing from Studio would publish it.",
                 bytes.len()
             ));
             let version = client
@@ -495,6 +498,10 @@ mod tests {
         assert_eq!(run.report.status, Status::Failed);
         assert_eq!(run.report.exit_code(), 1);
         assert!(lines.iter().any(|line| line.contains("not published")));
+        // Saved versions are what Studio opens, which the warning says.
+        assert!(lines
+            .iter()
+            .any(|line| line.contains("publishing from Studio would publish it")));
         assert!(lines.iter().any(|line| line == "Saved place version 7."));
         assert!(lines.iter().any(|line| line.contains("place 2 version 7")));
         assert!(lines.iter().all(|line| !line.contains(KEY)));
