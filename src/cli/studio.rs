@@ -280,6 +280,9 @@ impl StudioCommand {
                     .unwrap_or("Invalid plugin response")
             );
         }
+        if let StudioSubcommand::Logs { after, .. } = &self.command {
+            check_logs_answer(&response["value"], *after)?;
+        }
         if let Some(path) = export_path {
             let bytes = BASE64.decode(
                 response["value"]["model"]
@@ -391,6 +394,16 @@ impl LogPage {
     fn next_after(&self) -> u64 {
         self.next_after.unwrap_or(self.latest_sequence)
     }
+}
+
+/// Plugins from before numbered logs ignore `after` and answer with every
+/// entry they keep, which would pass for the entries after `after` without a
+/// word. Fails like `--follow` does instead.
+fn check_logs_answer(value: &Value, after: Option<u64>) -> anyhow::Result<()> {
+    if after.is_some() && value.is_array() {
+        bail!(UNNUMBERED_LOGS);
+    }
+    Ok(())
 }
 
 fn follow_logs(bridge: &Bridge, limit: u16, after: Option<u64>, json: bool) -> anyhow::Result<()> {
@@ -732,6 +745,21 @@ mod tests {
             .to_string();
         assert_eq!(error, UNNUMBERED_LOGS);
         assert!(error.contains("Update the plugin"), "{error}");
+    }
+
+    #[test]
+    fn logs_after_a_sequence_need_a_plugin_that_numbers_them() {
+        let unnumbered = json!([{"message": "hi", "kind": "MessageOutput"}]);
+        assert_eq!(
+            check_logs_answer(&unnumbered, Some(4))
+                .unwrap_err()
+                .to_string(),
+            UNNUMBERED_LOGS
+        );
+
+        // Without --after, an old plugin's list is the answer that was asked for.
+        check_logs_answer(&unnumbered, None).unwrap();
+        check_logs_answer(&json!({"entries": [], "latestSequence": 3}), Some(4)).unwrap();
     }
 
     #[test]
