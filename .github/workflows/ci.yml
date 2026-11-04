@@ -171,9 +171,9 @@ jobs:
 
   gate:
     name: Fork CI
-    # Unlike always(), this lets a cancelled run stop the gate too. Failed,
-    # cancelled or skipped needs still fail it through the check below.
-    if: ${{ !cancelled() }}
+    # always() keeps the gate running, and failing, when a needed job fails or
+    # the run is cancelled. A skipped gate would satisfy branch protection.
+    if: always()
     needs: [build, msrv, lint]
     runs-on: ubuntu-latest
     steps:
