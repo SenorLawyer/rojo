@@ -1350,6 +1350,24 @@ fn publish_release(
                 release.universe_id,
                 release.place_id
             );
+            // Nor may staging overwrite a place players join through another
+            // release, whether it is already live or only prepared.
+            if let Some((live_universe, live_place)) = repo
+                .live_records()?
+                .into_keys()
+                .find(|(_, live_place)| live_place == place_id)
+            {
+                bail!("Place {live_place} is live: Rojo has published to {live_universe}:{live_place}. Stage to a test place that no release publishes to.");
+            }
+            if let Some(other) = list_manifests(&repo.state.join("releases"), false)
+                .into_iter()
+                .find(|other| other["place_id"] == *place_id)
+            {
+                bail!(
+                    "Place {place_id} is the target of release {}. Stage to a test place that no release publishes to.",
+                    other["name"].as_str().unwrap_or("with no name")
+                );
+            }
             (*universe_id, *place_id, "staging", false)
         }
     };
@@ -1516,8 +1534,9 @@ type SmokeRunner<'a> =
 
 fn stage(options: StageOptions) -> anyhow::Result<()> {
     let key = api_key(&options.api_key_env)?;
-    // Created before publishing so that a key Luau Execution cannot use stops
-    // the stage before anything is uploaded.
+    // Created before publishing so that a missing or malformed key stops the
+    // stage before anything is uploaded. Whether the key has the Luau
+    // Execution scope only shows once the smoke check runs.
     let cloud = match options.smoke {
         Some(_) => Some(OpenCloud::from_env(&options.api_key_env)?),
         None => None,
@@ -1654,7 +1673,7 @@ fn smoke_outcome(result: Result<LuauTaskResult, OpenCloudError>) -> serde_json::
         Err(error) => {
             return serde_json::json!({
                 "status": "error",
-                "reason": error.to_string(),
+                "reason": short_reason(&error.to_string()),
                 "task_may_have_run": error.may_have_applied(),
             })
         }
@@ -1734,11 +1753,20 @@ fn smoke_outcome(result: Result<LuauTaskResult, OpenCloudError>) -> serde_json::
         )
     };
     serde_json::json!({
-        "status": status, "reason": reason, "task": task.path,
+        "status": status, "reason": short_reason(&reason), "task": task.path,
         "results": results, "results_truncated": results_truncated,
         "error_code": task.error_code, "logs": logs,
         "logs_omitted": skip > 0 || task.logs_truncated,
     })
+}
+
+/// The reason comes partly from Roblox and the script (an error message or a
+/// returned `message`), so it is shortened like the other recorded fields.
+fn short_reason(reason: &str) -> String {
+    excerpt(reason)
+        .strip_prefix(": ")
+        .unwrap_or_default()
+        .to_owned()
 }
 
 fn promote(options: PromoteOptions) -> anyhow::Result<()> {
@@ -1797,7 +1825,7 @@ fn passing_staging_record(
         Err(error) if error.kind() == io::ErrorKind::NotFound => bail!("{}", missing()),
         Err(error) => return Err(error.into()),
     };
-    let mut latest: Option<serde_json::Value> = None;
+    let mut latest: Option<(PathBuf, serde_json::Value)> = None;
     for entry in entries {
         let entry = entry?;
         let file = entry.file_name().to_string_lossy().into_owned();
@@ -1813,21 +1841,38 @@ fn passing_staging_record(
             continue;
         }
         let time = record["staged_unix"].as_u64().unwrap_or(0);
-        let newer = latest.as_ref().is_none_or(|current| {
+        let newer = latest.as_ref().is_none_or(|(_, current)| {
             let current_time = current["staged_unix"].as_u64().unwrap_or(0);
             // Times are whole seconds; of two records from the same second a
             // failing one wins, so a tie never hides a failure.
             time > current_time || (time == current_time && record["status"] != "passed")
         });
         if newer {
-            latest = Some(record);
+            latest = Some((entry.path(), record));
         }
     }
-    let record = latest.with_context(missing)?;
+    let (path, record) = latest.with_context(missing)?;
     let attempt = record["attempt"].as_str().unwrap_or("with no attempt ID");
+    let current_time = now();
+    // A record written while the clock was ahead would outrank every later
+    // stage, including failures, and never grow old, so it is not trusted.
+    let staged = record["staged_unix"].as_u64().unwrap_or(0);
+    ensure!(
+        staged <= current_time.saturating_add(CLOCK_SLACK_SECONDS),
+        "The latest staging record of release {name} ({attempt}) is dated {} minutes in the future, so the clock was probably wrong when it was written. It would outrank every later stage, so promote does not trust it. Once the clock is right, remove {} and stage the release again.",
+        (staged - current_time) / 60,
+        path.display()
+    );
+    ensure_latest_staging_attempt(repo, name, &record, current_time)?;
     ensure!(
         record["hash"] == release.checkpoint_hash.as_str(),
         "The latest staging of release {name} ({attempt}) staged different place bytes than the release now has. Stage it again."
+    );
+    let target = format!("{}:{}", release.universe_id, release.place_id);
+    ensure!(
+        record["release_target"] == target.as_str(),
+        "The latest staging of release {name} ({attempt}) was made when the release targeted {}, but it now targets {target}. Stage it again.",
+        record["release_target"].as_str().unwrap_or("another place")
     );
     ensure!(
         record["place_id"]
@@ -1850,13 +1895,72 @@ fn passing_staging_record(
             record["smoke"]["reason"].as_str().unwrap_or("no reason recorded")
         ),
     }
-    let age = now().saturating_sub(record["staged_unix"].as_u64().unwrap_or(0));
+    let age = current_time.saturating_sub(staged);
     ensure!(
         age <= gate.max_age.as_secs(),
         "The latest staging of release {name} ({attempt}) is {} hours old, older than --max-age-hours allows. Stage it again.",
         age / 3600
     );
     Ok(record)
+}
+
+/// How far ahead of the clock a staging record or journal entry may be dated
+/// before promote assumes the clock was wrong when it was written.
+const CLOCK_SLACK_SECONDS: u64 = 5 * 60;
+
+/// Checks that `record` describes this release's newest staging upload.
+/// A stage writes its record only after the smoke check, so a stage that was
+/// killed during the check, is still running it, or was settled with
+/// `release resolve` leaves an upload in the journal and no record, and the
+/// staging place then runs a version no record vouches for.
+fn ensure_latest_staging_attempt(
+    repo: &Repository,
+    name: &str,
+    record: &serde_json::Value,
+    current_time: u64,
+) -> anyhow::Result<()> {
+    let attempt = record["attempt"].as_str().unwrap_or_default();
+    let attempts = repo.state.join("publication-attempts");
+    // A rejected or `--not-published` attempt created no version, so it
+    // cannot have replaced what the record's stage uploaded.
+    let uploads: Vec<_> = list_manifest_entries(&attempts, false)
+        .into_iter()
+        .filter(|(_, receipt)| {
+            receipt["purpose"] == "staging"
+                && receipt["release"] == name
+                && matches!(
+                    receipt["status"].as_str(),
+                    Some("pending" | "unconfirmed" | "published")
+                )
+        })
+        .collect();
+    let created = |receipt: &serde_json::Value| receipt["created_unix"].as_u64().unwrap_or(0);
+    let own = uploads
+        .iter()
+        .find(|(_, receipt)| receipt["attempt"] == attempt)
+        .with_context(|| {
+            format!("The latest staging record of release {name} ({attempt}) has no published staging attempt in {}. Stage the release again.", attempts.display())
+        })?;
+    let own_created = created(&own.1);
+    // Times are whole seconds, so another upload from the same second counts
+    // as later: a tie must not let an older pass stand in for a newer upload.
+    let later = uploads
+        .iter()
+        .filter(|(_, receipt)| receipt["attempt"] != attempt && created(receipt) >= own_created)
+        .max_by_key(|(_, receipt)| created(receipt));
+    if let Some((path, receipt)) = later {
+        let clock = if created(receipt) > current_time.saturating_add(CLOCK_SLACK_SECONDS) {
+            format!(" Its journal entry {} is dated in the future, so the clock was probably wrong when it was written; once the clock is right and that attempt is settled, move the entry out of publication-attempts.", path.display())
+        } else {
+            String::new()
+        };
+        bail!(
+            "Release {name} was staged again ({}, {}) after the stage its latest staging record describes ({attempt}). Only the latest stage counts, and no record shows that one passed: its smoke check may have been interrupted or still be running, or its upload was settled with rojo release resolve. Stage the release again.{clock}",
+            receipt["attempt"].as_str().unwrap_or("with no attempt ID"),
+            receipt["status"].as_str().unwrap_or("unknown")
+        );
+    }
+    Ok(())
 }
 
 /// Creates the publication lock and records which attempt holds it, so a lock
@@ -5217,9 +5321,10 @@ mod tests {
         let repo = staging.fixture.repo();
         assert!(repo.state.join("publication.lock").exists());
         assert_eq!(staging.staging_records().len(), 1);
-        // The lock blocks promote as it blocks any publication.
+        // The unsettled upload may have replaced the passing version, so
+        // promote refuses before it even reaches the lock.
         let error = staging.promote(false).unwrap_err().to_string();
-        assert!(error.contains("Another publication is active"), "{error}");
+        assert!(error.contains("was staged again"), "{error}");
 
         // Resolving the staging attempt records no live pointer for the test place.
         let attempt = pending_or_unconfirmed_attempt(&repo);
@@ -5228,6 +5333,155 @@ mod tests {
         assert_eq!(resolved["lock"], "removed");
         assert!(!repo.state.join("live").exists());
         assert!(!repo.state.join("last-publication.json").exists());
+        // The resolved upload replaced the passing stage's version on the
+        // test place and never ran a smoke check, so the old pass is void.
+        let error = staging.promote(false).unwrap_err().to_string();
+        assert!(error.contains("was staged again"), "{error}");
+        assert!(!repo.state.join("live").exists());
+    }
+
+    /// Moves every journal entry of this fixture back by `seconds`, so a
+    /// later stage is strictly newer than these in whole seconds.
+    fn age_attempts(repo: &Repository, seconds: u64) {
+        for (path, mut receipt) in
+            list_manifest_entries(&repo.state.join("publication-attempts"), false)
+        {
+            receipt["created_unix"] = (receipt["created_unix"].as_u64().unwrap() - seconds).into();
+            fs::write(path, serde_json::to_vec(&receipt).unwrap()).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_stage_cut_off_after_upload_voids_an_earlier_pass() {
+        let staging = Staging::new();
+        staging
+            .stage(finished_task("COMPLETE", "[true]", ""))
+            .0
+            .unwrap();
+        let repo = staging.fixture.repo();
+        age_attempts(&repo, 20);
+        staging.edit_latest(|record| record["staged_unix"] = (now() - 20).into());
+        // A stage that uploaded and then was killed during its smoke check,
+        // or is still running it, leaves this: a published staging receipt
+        // and no staging record.
+        publish_release(
+            &staging.fixture.root,
+            "v1",
+            PublishKind::Staging {
+                universe_id: 9,
+                place_id: 99,
+            },
+            |_, _, _| Ok(8),
+        )
+        .unwrap();
+        let error = staging.promote(false).unwrap_err().to_string();
+        assert!(error.contains("was staged again"), "{error}");
+        assert!(!repo.state.join("live").exists());
+
+        // A rejected upload created no version, so it does not void a pass.
+        age_attempts(&repo, 20);
+        staging.edit_latest(|record| record["staged_unix"] = (now() - 30).into());
+        staging
+            .stage(finished_task("COMPLETE", "[true]", ""))
+            .0
+            .unwrap();
+        age_attempts(&repo, 10);
+        assert!(stage_with(
+            staging.options("9:99", true),
+            |_, _, _| Err(UploadFailure::Rejected("HTTP 400".into())),
+            Box::new(|_, _, _, _, _| panic!("must not run a smoke check")),
+        )
+        .is_err());
+        staging.promote(false).unwrap();
+    }
+
+    #[test]
+    fn promote_refuses_records_without_a_journal_entry() {
+        let staging = Staging::new();
+        staging
+            .stage(finished_task("COMPLETE", "[true]", ""))
+            .0
+            .unwrap();
+        let repo = staging.fixture.repo();
+        fs::remove_dir_all(repo.state.join("publication-attempts")).unwrap();
+        let error = staging.promote(false).unwrap_err().to_string();
+        assert!(error.contains("no published staging attempt"), "{error}");
+    }
+
+    #[test]
+    fn promote_refuses_a_staging_record_dated_in_the_future() {
+        let staging = Staging::new();
+        staging
+            .stage(finished_task("COMPLETE", "[true]", ""))
+            .0
+            .unwrap();
+        staging.edit_latest(|record| record["staged_unix"] = (now() + 3600).into());
+        let error = staging.promote(false).unwrap_err().to_string();
+        assert!(error.contains("in the future"), "{error}");
+        // A few minutes of clock difference is tolerated.
+        staging.edit_latest(|record| record["staged_unix"] = (now() + 60).into());
+        staging.promote(false).unwrap();
+    }
+
+    #[test]
+    fn promote_refuses_a_stage_made_for_another_target() {
+        let staging = Staging::new();
+        staging
+            .stage(finished_task("COMPLETE", "[true]", ""))
+            .0
+            .unwrap();
+        staging.edit_latest(|record| record["release_target"] = "123:789".into());
+        let error = staging.promote(false).unwrap_err().to_string();
+        assert!(error.contains("targeted 123:789"), "{error}");
+    }
+
+    #[test]
+    fn stage_refuses_places_that_are_live_or_another_releases_target() {
+        let staging = Staging::new();
+        let repo = staging.fixture.repo();
+        let releases = repo.state.join("releases");
+        let mut other: serde_json::Value = read_json(&releases.join("v1.json")).unwrap();
+        other["name"] = "other".into();
+        other["place_id"] = 99.into();
+        fs::write(
+            releases.join("other.json"),
+            serde_json::to_vec(&other).unwrap(),
+        )
+        .unwrap();
+        fs::create_dir_all(repo.state.join("live")).unwrap();
+        fs::write(
+            live_record_path(&repo.state, 5, 77),
+            serde_json::to_vec(&serde_json::json!({"universe_id": 5, "place_id": 77})).unwrap(),
+        )
+        .unwrap();
+        for (target, expected) in [
+            ("9:99", "target of release other"),
+            ("9:77", "Place 77 is live"),
+        ] {
+            let error = stage_with(
+                staging.options(target, true),
+                |_, _, _| panic!("must not upload"),
+                Box::new(|_, _, _, _, _| panic!("must not run a smoke check")),
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains(expected), "{error}");
+        }
+        assert!(!repo.state.join("publication-attempts").exists());
+    }
+
+    #[test]
+    fn smoke_reasons_are_shortened() {
+        let outcome = smoke_outcome(Ok(LuauTaskResult {
+            path: TASK_PATH.into(),
+            state: TaskState::Failed,
+            results: Vec::new(),
+            error_code: Some("SCRIPT_ERROR".into()),
+            error_message: Some("x".repeat(100_000)),
+            logs: Vec::new(),
+            logs_truncated: false,
+        }));
+        assert!(outcome["reason"].as_str().unwrap().len() <= 1000);
     }
 
     fn pending_or_unconfirmed_attempt(repo: &Repository) -> String {

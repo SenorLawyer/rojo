@@ -126,7 +126,7 @@ rojo release stage v1 --staging 123:789 --smoke smoke.luau --smoke-timeout 60
 rojo release promote v1 --confirm-target 123:456
 ```
 
-`release stage` publishes the release's exact archived bytes to the staging place, through the same lock, journal and checks as `release publish`. The staging place must be a different place from the release's target; giving the release's own place ID, under any universe ID, is refused before anything is uploaded. Staging writes no `live` record and does not change `last-publication.json`, and its journal entry has `purpose: "staging"`. An unconfirmed staging upload keeps `publication.lock` like any other and is settled with `rojo release resolve`, which for a staging attempt writes no `live` record either. A resolved staging attempt never ran its smoke check, so stage the release again before promoting it.
+`release stage` publishes the release's exact archived bytes to the staging place, through the same lock, journal and checks as `release publish`. The staging place must be a different place from the release's target; giving the release's own place ID, under any universe ID, is refused before anything is uploaded, and so is a place that another release targets or that Rojo has published live. Staging writes no `live` record and does not change `last-publication.json`, and its journal entry has `purpose: "staging"`. An unconfirmed staging upload keeps `publication.lock` like any other and is settled with `rojo release resolve`, which for a staging attempt writes no `live` record either. A resolved staging attempt never ran its smoke check, so stage the release again before promoting it.
 
 With `--smoke`, Rojo then runs the script with Open Cloud Luau Execution against the version that staging just created, in a server Roblox starts for it. The key needs the `universe.place.luau-execution-session:write` scope as well as `universe-places:write`. `--smoke-timeout` is how long the script may run, from 1 to 300 seconds (60 by default); the task can wait in Roblox's queue for up to two minutes longer before Rojo gives up polling. The script passes only when it completes and its first return value is `true` or a table whose `ok` field is `true`:
 
@@ -144,6 +144,9 @@ Each stage writes `rojo-state/staging/<attempt>.json` with the release, place ha
 - the release has no staging record;
 - the latest record is for different place bytes than the release has now;
 - the latest record did not pass. Only the latest counts, so a failed stage after a passing one blocks promotion until a later stage passes;
+- the release was uploaded to staging again after the stage the latest record describes, for example by a stage whose smoke check was interrupted or is still running, or whose upload was settled with `release resolve`. Only the newest upload counts. A rejected upload, or one resolved with `--not-published`, created no version and does not count;
+- the latest record was made while the release had a different target;
+- the latest record is dated more than five minutes in the future, which means the clock was wrong when it was written. Once the clock is right, remove that record and stage again;
 - the latest record ran no smoke check, unless you pass `--allow-unsmoked`;
 - the record is older than `--max-age-hours` (24 by default);
 - a staging record cannot be read, since it could be the latest failure. Fix or remove that file.
