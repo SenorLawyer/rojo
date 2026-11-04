@@ -15,7 +15,7 @@ local SlicedImage = require(script.Parent.SlicedImage)
 local e = Roact.createElement
 
 local function VersionIndicator(props)
-	local updateMessage = Version.getUpdateMessage()
+	local updateMessage = Version.getCachedUpdateMessage()
 
 	return Theme.with(function(theme)
 		return e("Frame", {

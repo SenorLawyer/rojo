@@ -52,6 +52,21 @@ impl AdjacentMetadata {
         name: &str,
         snapshot: &mut InstanceSnapshot,
     ) -> anyhow::Result<()> {
+        // An init file referenced directly (for example `"$path":
+        // "folder/init.luau"`) is snapshotted as a standalone file named
+        // `init`, so its adjacent metadata would be `init.meta.json`. That file
+        // belongs to the containing directory and is applied by
+        // `DirectoryMetadata` when the directory itself is snapshotted, so it
+        // must not leak onto the standalone script.
+        if name == "init"
+            && path
+                .file_name()
+                .and_then(|file_name| file_name.to_str())
+                .is_some_and(super::is_init_file_name)
+        {
+            return Ok(());
+        }
+
         let meta_path_json = path.with_file_name(format!("{name}.meta.json"));
         let meta_path_jsonc = path.with_file_name(format!("{name}.meta.jsonc"));
 
@@ -61,7 +76,7 @@ impl AdjacentMetadata {
         }
 
         if let Some(meta_contents) = vfs.read(&meta_path_jsonc).with_not_found()? {
-            let mut metadata = Self::from_slice(&meta_contents, meta_path_json.clone())?;
+            let mut metadata = Self::from_slice(&meta_contents, meta_path_jsonc.clone())?;
             metadata.apply_all(snapshot)?;
         }
 
@@ -143,6 +158,9 @@ impl AdjacentMetadata {
                 }
             }
         }
+
+        properties.sort_by(|a, _, b, _| a.as_str().cmp(b.as_str()));
+        attributes.sort_keys();
 
         Ok(Some(Self {
             ignore_unknown_instances: if ignore_unknown_instances {
@@ -371,6 +389,9 @@ impl DirectoryMetadata {
                 }
             }
         }
+
+        properties.sort_by(|a, _, b, _| a.as_str().cmp(b.as_str()));
+        attributes.sort_keys();
 
         Ok(Some(Self {
             ignore_unknown_instances: if ignore_unknown_instances {

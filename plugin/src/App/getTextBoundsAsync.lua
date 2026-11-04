@@ -5,8 +5,6 @@ local Packages = Rojo.Packages
 
 local Log = require(Packages.Log)
 
-local params = Instance.new("GetTextBoundsParams")
-
 local function getTextBoundsAsync(
 	text: string,
 	font: Font,
@@ -23,6 +21,9 @@ local function getTextBoundsAsync(
 		return Vector2.zero
 	end
 
+	-- GetTextBoundsAsync yields while loading fonts, so concurrent renders must
+	-- not overwrite one another's measurement parameters.
+	local params = Instance.new("GetTextBoundsParams")
 	params.Text = text
 	params.Font = font
 	params.Size = textSize
@@ -30,6 +31,7 @@ local function getTextBoundsAsync(
 	params.RichText = not not richText
 
 	local success, bounds = pcall(TextService.GetTextBoundsAsync, TextService, params)
+	params:Destroy()
 	if not success then
 		Log.warn(`Failed to get text bounds: {bounds}`)
 		return Vector2.zero

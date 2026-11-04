@@ -6,15 +6,23 @@ on:
     branches:
       - master
 
+# With checkNotification set to Simple, the action only lists the pull
+# request's files and fails the job. It does not comment or create checks.
+permissions:
+  contents: read
+  pull-requests: read
+
 jobs:
   build:
     name: Check Actions
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      with:
+        persist-credentials: false
 
     - name: Changelog check
-      uses: Zomzog/changelog-checker@v1.3.0
+      uses: Zomzog/changelog-checker@09cfe9ad3618dcbfdba261adce0c41904cabb8c4 # v1.3.0
       with:
         fileName: CHANGELOG.md
         noChangelogLabel: skip changelog

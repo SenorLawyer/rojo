@@ -17,9 +17,12 @@ use serde::de::DeserializeOwned;
 /// - The text is not valid JSONC
 /// - The text contains no JSON value
 pub fn parse_value(text: &str) -> anyhow::Result<serde_json::Value> {
-    jsonc_parser::parse_to_serde_value(text, &Default::default())
-        .context("Failed to parse JSONC")?
-        .ok_or_else(|| anyhow::anyhow!("File contains no JSON value"))
+    jsonc_parser::parse_to_serde_value(
+        text.strip_prefix('\u{feff}').unwrap_or(text),
+        &Default::default(),
+    )
+    .context("Failed to parse JSONC")?
+    .ok_or_else(|| anyhow::anyhow!("File contains no JSON value"))
 }
 
 /// Parse JSONC text into a `serde_json::Value` with a custom context message.
@@ -36,9 +39,12 @@ pub fn parse_value_with_context(
     text: &str,
     context: impl Fn() -> String,
 ) -> anyhow::Result<serde_json::Value> {
-    jsonc_parser::parse_to_serde_value(text, &Default::default())
-        .with_context(|| format!("{}: JSONC parse error", context()))?
-        .ok_or_else(|| anyhow::anyhow!("{}: File contains no JSON value", context()))
+    jsonc_parser::parse_to_serde_value(
+        text.strip_prefix('\u{feff}').unwrap_or(text),
+        &Default::default(),
+    )
+    .with_context(|| format!("{}: JSONC parse error", context()))?
+    .ok_or_else(|| anyhow::anyhow!("{}: File contains no JSON value", context()))
 }
 
 /// Parse JSONC text and deserialize it into a specific type.
@@ -135,6 +141,16 @@ pub fn from_slice_with_context<T: DeserializeOwned>(
 mod tests {
     use super::*;
     use serde::Deserialize;
+
+    #[test]
+    fn leading_utf8_bom_is_accepted() {
+        let input = "\u{feff}{\"name\":\"a\u{feff}b\"}";
+        assert_eq!(parse_value(input).unwrap()["name"], "a\u{feff}b");
+        assert_eq!(
+            parse_value_with_context(input, || "model.json".into()).unwrap(),
+            parse_value(input).unwrap()
+        );
+    }
 
     #[test]
     fn test_parse_value() {

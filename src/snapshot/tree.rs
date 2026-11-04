@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     path::{Path, PathBuf},
 };
 
@@ -8,7 +8,7 @@ use rbx_dom_weak::{
     ustr, Instance, InstanceBuilder, Ustr, UstrMap, WeakDom,
 };
 
-use crate::{multimap::MultiMap, RojoRef};
+use crate::{multimap::MultiMap, RojoRef, REF_POINTER_ATTRIBUTE_PREFIX};
 
 use super::{InstanceMetadata, InstanceSnapshot};
 
@@ -39,6 +39,15 @@ pub struct RojoTree {
     /// the same RojoRef for multiple different instances. An entry containing
     /// multiple elements is an error condition that should be raised to the user.
     specified_id_to_refs: MultiMap<RojoRef, Ref>,
+
+    /// Instances that have, or had at some point, a `Rojo_Target_*` attribute.
+    ///
+    /// Patch application uses this to find pointers that need to follow their
+    /// target being removed or re-added without walking the whole tree while
+    /// the tree lock is held. It may contain instances whose pointer
+    /// attributes were since removed, so users must re-check the attributes;
+    /// removed instances are dropped from it.
+    ref_pointer_holders: HashSet<Ref>,
 }
 
 impl RojoTree {
@@ -52,11 +61,15 @@ impl RojoTree {
             metadata_map: HashMap::new(),
             path_to_ids: MultiMap::new(),
             specified_id_to_refs: MultiMap::new(),
+            ref_pointer_holders: HashSet::new(),
         };
 
         let root_ref = tree.inner.root_ref();
 
         tree.insert_metadata(root_ref, snapshot.metadata);
+        if has_ref_pointer_attribute(&tree.inner.root().properties) {
+            tree.ref_pointer_holders.insert(root_ref);
+        }
 
         for child in snapshot.children {
             tree.insert_instance(root_ref, child);
@@ -132,6 +145,9 @@ impl RojoTree {
 
         let referent = self.inner.insert(parent_ref, builder);
         self.insert_metadata(referent, snapshot.metadata);
+        if has_ref_pointer_attribute(&self.inner.get_by_ref(referent).unwrap().properties) {
+            self.ref_pointer_holders.insert(referent);
+        }
 
         for child in snapshot.children {
             self.insert_instance(referent, child);
@@ -231,6 +247,24 @@ impl RojoTree {
         self.specified_id_to_refs.insert(specified, id);
     }
 
+    /// Records that the given instance has a `Rojo_Target_*` attribute. See
+    /// `ref_pointer_holders`.
+    pub fn mark_ref_pointer_holder(&mut self, id: Ref) {
+        self.ref_pointer_holders.insert(id);
+    }
+
+    /// Returns the instances that may have a `Rojo_Target_*` attribute,
+    /// dropping any that no longer do.
+    pub fn ref_pointer_holders(&mut self) -> Vec<Ref> {
+        let inner = &self.inner;
+        self.ref_pointer_holders.retain(|id| {
+            inner
+                .get_by_ref(*id)
+                .is_some_and(|instance| has_ref_pointer_attribute(&instance.properties))
+        });
+        self.ref_pointer_holders.iter().copied().collect()
+    }
+
     fn insert_metadata(&mut self, id: Ref, metadata: InstanceMetadata) {
         for path in &metadata.relevant_paths {
             self.path_to_ids.insert(path.clone(), id);
@@ -251,6 +285,7 @@ impl RojoTree {
     /// tree into some loose maps.
     fn remove_metadata(&mut self, id: Ref) {
         let metadata = self.metadata_map.remove(&id).unwrap();
+        self.ref_pointer_holders.remove(&id);
 
         if let Some(specified) = metadata.specified_id {
             self.specified_id_to_refs.remove(&specified, id);
@@ -259,6 +294,15 @@ impl RojoTree {
         for path in &metadata.relevant_paths {
             self.path_to_ids.remove(path, id);
         }
+    }
+}
+
+fn has_ref_pointer_attribute(properties: &UstrMap<Variant>) -> bool {
+    match properties.get(&ustr("Attributes")) {
+        Some(Variant::Attributes(attributes)) => attributes
+            .iter()
+            .any(|(name, _)| name.starts_with(REF_POINTER_ATTRIBUTE_PREFIX)),
+        _ => false,
     }
 }
 

@@ -4,56 +4,38 @@ on:
   push:
     tags: ["v*"]
 
-jobs:
-  create-release:
-    name: Create Release
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Create Release
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          gh release create ${{ github.ref_name }} --draft --verify-tag --title ${{ github.ref_name }}
+permissions:
+  contents: read
 
+# Build jobs run third-party build scripts, so they only get read access. A
+# single final job with write access publishes everything they produced.
+jobs:
   build-plugin:
-    needs: ["create-release"]
     name: Build Roblox Studio Plugin
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           submodules: true
+          persist-credentials: false
 
       - name: Setup Rokit
-        uses: CompeyDev/setup-rokit@v0.1.2
+        uses: CompeyDev/setup-rokit@d49be92bd9502180218c3f43e7988faa945217b0 # v0.1.2
         with:
           version: 'v1.1.0'
 
       - name: Build Plugin
         run: rojo build plugin.project.json --output Rojo.rbxm
 
-      - name: Upload Plugin to Release
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          gh release upload ${{ github.ref_name }} Rojo.rbxm
-
       - name: Upload Plugin to Artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: Rojo.rbxm
           path: Rojo.rbxm
-      
-      - name: Upload Plugin to Roblox
-        env:
-          RBX_API_KEY: ${{ secrets.PLUGIN_UPLOAD_TOKEN }}
-          RBX_UNIVERSE_ID: ${{ vars.PLUGIN_CI_PLACE_ID }}
-          RBX_PLACE_ID: ${{ vars.PLUGIN_CI_UNIVERSE_ID }}
-        run: lune run upload-plugin Rojo.rbxm
 
   build:
-    needs: ["create-release"]
     strategy:
       fail-fast: false
       matrix:
@@ -74,11 +56,6 @@ jobs:
             target: x86_64-pc-windows-msvc
             label: windows-x86_64
 
-          - host: windows
-            os: windows-11-arm
-            target: aarch64-pc-windows-msvc
-            label: windows-aarch64
-
           - host: macos
             os: macos-latest
             target: x86_64-apple-darwin
@@ -91,38 +68,27 @@ jobs:
 
     name: Build (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
     env:
       BIN: rojo
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           submodules: true
+          persist-credentials: false
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
+          toolchain: stable
           targets: ${{ matrix.target }}
 
-      - name: Restore Rust Cache
-        uses: actions/cache/restore@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ matrix.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-
+      # Published binaries are built from scratch. A restored cache could
+      # carry build outputs or registry sources written by other workflows,
+      # including CI runs on pull request branches.
       - name: Build Release
         run: cargo build --release --locked --verbose --target ${{ matrix.target }}
-
-      - name: Save Rust Cache
-        uses: actions/cache/save@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ matrix.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Generate Artifact Name
         shell: bash
@@ -131,10 +97,8 @@ jobs:
         run: |
           echo "ARTIFACT_NAME=$BIN-${TAG_NAME#v}-${{ matrix.label }}.zip" >> "$GITHUB_ENV"
 
-      - name: Create Archive and Upload to Release
+      - name: Create Archive
         shell: bash
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           mkdir staging
 
@@ -148,10 +112,30 @@ jobs:
             zip ../$ARTIFACT_NAME *
           fi
 
-          gh release upload ${{ github.ref_name }} ../$ARTIFACT_NAME
-
       - name: Upload Archive to Artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           path: ${{ env.ARTIFACT_NAME }}
           name: ${{ env.ARTIFACT_NAME }}
+
+  release:
+    name: Create Release
+    needs: [build-plugin, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download Build Artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create Draft Release with Assets
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          ls -l dist
+          gh release create "$RELEASE_TAG" --draft --verify-tag --title "$RELEASE_TAG" dist/*

@@ -26,6 +26,10 @@ pub fn apply_patch_set(tree: &mut RojoTree, patch_set: PatchSet) -> AppliedPatch
     {
         profiling::scope!("removals");
         for removed_id in patch_set.removed_instances {
+            context.removed_specified_id |= tree.get_instance(removed_id).is_some()
+                && tree
+                    .descendants(removed_id)
+                    .any(|instance| instance.metadata().specified_id.is_some());
             apply_remove_instance(&mut context, tree, removed_id);
         }
     }
@@ -81,6 +85,16 @@ struct PatchApplyContext {
     /// properties.
     attribute_refs_to_rewrite: MultiMap<Ref, (Ustr, String)>,
 
+    /// Whether any removed instance had a user-specified ID, which means
+    /// instances outside of this patch may hold Ref properties (resolved from
+    /// `Rojo_Target_*` attributes) that now point at nothing.
+    removed_specified_id: bool,
+
+    /// Whether an instance gained a user-specified ID, which may be the
+    /// target of `Rojo_Target_*` attributes on instances outside of this
+    /// patch that could not be resolved before.
+    added_specified_id: bool,
+
     /// The current applied patch result, describing changes made to the tree.
     applied_patch_set: AppliedPatchSet,
 }
@@ -129,7 +143,116 @@ fn finalize_patch_application(context: PatchApplyContext, tree: &mut RojoTree) -
         instance.properties_mut().extend(real_rewrites.drain(..));
     }
 
-    context.applied_patch_set
+    let mut applied_patch_set = context.applied_patch_set;
+    if context.removed_specified_id || context.added_specified_id {
+        reconcile_ref_pointers(tree, &mut applied_patch_set);
+    }
+
+    applied_patch_set
+}
+
+/// Keeps `Rojo_Target_*` pointers outside of this patch in step with their
+/// targets being removed or (re-)added.
+///
+/// Attribute refs are only resolved when the instance holding them is
+/// snapshotted. Removing a target (for example deleting its file) would
+/// otherwise leave the pointer referencing a destroyed instance, and adding
+/// the target back in a later patch (a branch switch or package reinstall
+/// often delivers the removal and the re-creation as separate events) would
+/// leave the pointer unset, both until the pointer's own file changes.
+///
+/// For each pointer attribute:
+/// - a property that refers to a removed instance is re-resolved, or removed
+///   if the target no longer exists, which matches what re-snapshotting the
+///   pointer would produce;
+/// - a property that is missing or null is resolved if the target now exists.
+///
+/// Pointers that refer to an existing instance are left alone: if their
+/// attribute changed, the holder was re-snapshotted and resolved already.
+///
+/// Only properties named by a `Rojo_Target_*` attribute are considered: those
+/// are the only refs that can cross into another snapshot and so outlive their
+/// target, while refs inside a single model file are re-snapshotted together
+/// with their target. The tree tracks which instances have such attributes,
+/// so this costs a few lookups per pointer instead of a walk over the whole
+/// tree while the tree lock is held, and nothing when the project has none.
+fn reconcile_ref_pointers(tree: &mut RojoTree, applied_patch_set: &mut AppliedPatchSet) {
+    let attributes_key = ustr("Attributes");
+    let mut changes = Vec::new();
+
+    for holder_id in tree.ref_pointer_holders() {
+        let Some(instance) = tree.get_instance(holder_id) else {
+            continue;
+        };
+        let Some(Variant::Attributes(attributes)) = instance.properties().get(&attributes_key)
+        else {
+            continue;
+        };
+
+        for (attribute_name, target) in attributes.iter() {
+            let Some(name) = attribute_name.strip_prefix(REF_POINTER_ATTRIBUTE_PREFIX) else {
+                continue;
+            };
+            let name = ustr(name);
+            let dangling = match instance.properties().get(&name) {
+                Some(Variant::Ref(referent)) if referent.is_some() => {
+                    if tree.get_instance(*referent).is_some() {
+                        continue;
+                    }
+                    true
+                }
+                None | Some(Variant::Ref(_)) => false,
+                // Not a ref at all; resolving it would change its type.
+                Some(_) => continue,
+            };
+
+            let resolved = attribute_ref_target(target)
+                .and_then(|target| tree.get_specified_id(&RojoRef::new(target)));
+
+            if dangling || resolved.is_some() {
+                changes.push((holder_id, name, resolved));
+            }
+        }
+    }
+
+    for (id, name, resolved) in changes {
+        let mut instance = tree
+            .get_instance_mut(id)
+            .expect("instance holding a ref pointer should still exist");
+        match resolved {
+            Some(target) => instance.properties_mut().insert(name, Variant::Ref(target)),
+            None => instance.properties_mut().remove(&name),
+        };
+
+        let update = match applied_patch_set
+            .updated
+            .iter_mut()
+            .position(|update| update.id == id)
+        {
+            Some(index) => &mut applied_patch_set.updated[index],
+            None => {
+                applied_patch_set.updated.push(AppliedPatchUpdate::new(id));
+                applied_patch_set.updated.last_mut().unwrap()
+            }
+        };
+        // A cleared ref is sent as an explicit null Ref rather than a removed
+        // property: msgpack nil cannot be stored in a Luau table, so the plugin
+        // would never see a removal and Studio would keep the stale pointer.
+        update
+            .changed_properties
+            .insert(name, Some(Variant::Ref(resolved.unwrap_or_else(Ref::none))));
+    }
+}
+
+/// Reads the specified ID named by a `Rojo_Target_*` attribute value.
+fn attribute_ref_target(value: &Variant) -> Option<String> {
+    match value {
+        Variant::String(target) => Some(target.clone()),
+        Variant::BinaryString(target) => {
+            std::str::from_utf8(target.as_ref()).ok().map(str::to_owned)
+        }
+        _ => None,
+    }
 }
 
 fn apply_remove_instance(context: &mut PatchApplyContext, tree: &mut RojoTree, removed_id: Ref) {
@@ -155,6 +278,9 @@ fn apply_add_child(
 
     let id = tree.insert_instance(parent_id, snapshot);
     context.applied_patch_set.added.push(id);
+    context.added_specified_id |= tree
+        .get_metadata(id)
+        .is_some_and(|metadata| metadata.specified_id.is_some());
 
     if has_refs {
         context.has_refs_to_rewrite.insert(id);
@@ -175,6 +301,16 @@ fn apply_update_child(context: &mut PatchApplyContext, tree: &mut RojoTree, patc
     let mut applied_patch = AppliedPatchUpdate::new(patch.id);
 
     if let Some(metadata) = patch.changed_metadata {
+        applied_patch.changed_ignore_unknown_instances = tree
+            .get_instance(patch.id)
+            .map(|instance| instance.metadata().ignore_unknown_instances)
+            .filter(|previous| *previous != metadata.ignore_unknown_instances)
+            .map(|_| metadata.ignore_unknown_instances);
+        context.added_specified_id |= metadata.specified_id.is_some()
+            && tree
+                .get_metadata(patch.id)
+                .is_some_and(|previous| previous.specified_id != metadata.specified_id);
+
         tree.update_metadata(patch.id, metadata.clone());
         applied_patch.changed_metadata = Some(metadata);
     }
@@ -256,6 +392,7 @@ fn defer_ref_properties(tree: &mut RojoTree, id: Ref, context: &mut PatchApplyCo
     };
 
     let mut attr_id = None;
+    let mut has_pointer = false;
     for (attr_name, attr_value) in attributes.iter() {
         if attr_name == REF_ID_ATTRIBUTE_NAME {
             if let Variant::String(specified_id) = attr_value {
@@ -275,6 +412,7 @@ fn defer_ref_properties(tree: &mut RojoTree, id: Ref, context: &mut PatchApplyCo
             }
         }
         if let Some(prop_name) = attr_name.strip_prefix(REF_POINTER_ATTRIBUTE_PREFIX) {
+            has_pointer = true;
             if let Variant::String(prop_value) = attr_value {
                 context
                     .attribute_refs_to_rewrite
@@ -296,7 +434,11 @@ fn defer_ref_properties(tree: &mut RojoTree, id: Ref, context: &mut PatchApplyCo
             }
         }
     }
+    if has_pointer {
+        tree.mark_ref_pointer_holder(id);
+    }
     if let Some(specified_id) = attr_id {
+        context.added_specified_id |= tree.get_specified_id(&specified_id) != Some(id);
         tree.set_specified_id(id, specified_id);
     }
 }

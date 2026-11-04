@@ -1,0 +1,16 @@
+---
+source: tests/tests/serve.rs
+expression: "redactions.redacted_yaml(&after_removal.instances[&pointer_id])"
+---
+Children: []
+ClassName: ObjectValue
+Id: id-3
+Metadata:
+  ignoreUnknownInstances: false
+Name: pointer
+Parent: id-2
+Properties:
+  Attributes:
+    Attributes:
+      Rojo_Target_Value:
+        String: test pointer

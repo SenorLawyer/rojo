@@ -6,6 +6,8 @@ local Roact = require(Packages.Roact)
 
 local Theme = require(Plugin.App.Theme)
 
+local formatValue = require(script.Parent.formatValue)
+
 local e = Roact.createElement
 
 local function DisplayValue(props)
@@ -100,14 +102,7 @@ local function DisplayValue(props)
 			})
 		end
 
-		-- TODO: Maybe add visualizations to other datatypes?
-		-- Or special text handling tostring for some?
-		-- Will add as needed, let's see what cases arise.
-
-		local textRepresentation = string.gsub(tostring(props.value), "%s", " ")
-		if t == "string" then
-			textRepresentation = '"' .. textRepresentation .. '"'
-		end
+		local textRepresentation = formatValue(props.value)
 
 		return e("TextLabel", {
 			Text = textRepresentation,

@@ -1,6 +1,6 @@
 use std::{
-    fs::{self, File},
-    io::BufWriter,
+    fs,
+    path::{Path, PathBuf},
 };
 
 use clap::Parser;
@@ -25,10 +25,18 @@ pub enum PluginSubcommand {
     /// Install the plugin in Roblox Studio's plugins folder. If the plugin is
     /// already installed, installing it again will overwrite the current plugin
     /// file.
-    Install,
+    Install {
+        /// Write to this plugins folder instead of discovering Studio automatically.
+        #[clap(long)]
+        plugins_dir: Option<PathBuf>,
+    },
 
     /// Removes the plugin if it is installed.
-    Uninstall,
+    Uninstall {
+        /// Remove from this plugins folder instead of discovering Studio automatically.
+        #[clap(long)]
+        plugins_dir: Option<PathBuf>,
+    },
 }
 
 impl PluginCommand {
@@ -40,9 +48,20 @@ impl PluginCommand {
 impl PluginSubcommand {
     pub fn run(self) -> anyhow::Result<()> {
         match self {
-            PluginSubcommand::Install => install_plugin(),
-            PluginSubcommand::Uninstall => uninstall_plugin(),
+            PluginSubcommand::Install { plugins_dir } => {
+                install_plugin(&resolve_plugins_dir(plugins_dir)?)
+            }
+            PluginSubcommand::Uninstall { plugins_dir } => {
+                uninstall_plugin(&resolve_plugins_dir(plugins_dir)?)
+            }
         }
+    }
+}
+
+fn resolve_plugins_dir(plugins_dir: Option<PathBuf>) -> anyhow::Result<PathBuf> {
+    match plugins_dir {
+        Some(path) => Ok(path),
+        None => Ok(RobloxStudio::locate()?.plugins_path().to_path_buf()),
     }
 }
 
@@ -57,34 +76,23 @@ fn initialize_plugin() -> anyhow::Result<ServeSession> {
     Ok(ServeSession::new(vfs, "/plugin")?)
 }
 
-fn install_plugin() -> anyhow::Result<()> {
-    let studio = RobloxStudio::locate()?;
-
-    let plugins_folder_path = studio.plugins_path();
-
-    if !plugins_folder_path.exists() {
-        log::debug!("Creating Roblox Studio plugins folder");
-        fs::create_dir(plugins_folder_path)?;
-    }
-
-    let plugin_path = plugins_folder_path.join(PLUGIN_FILE_NAME);
-    log::debug!("Writing plugin to {}", plugin_path.display());
-
-    let mut file = BufWriter::new(File::create(plugin_path)?);
-
+fn install_plugin(plugins_dir: &Path) -> anyhow::Result<()> {
     let session = initialize_plugin()?;
     let tree = session.tree();
-    let root_id = tree.get_root_id();
-
-    rbx_binary::to_writer(&mut file, tree.inner(), &[root_id])?;
-
+    fs::create_dir_all(plugins_dir)?;
+    let destination = plugins_dir.join(PLUGIN_FILE_NAME);
+    // Studio may see this directory while installing, so the old plugin is
+    // only replaced once a complete model has been serialized and flushed.
+    super::build::write_file_atomically(&destination, |writer| {
+        rbx_binary::to_writer(writer, tree.inner(), &[tree.get_root_id()])?;
+        Ok(())
+    })?;
+    println!("Installed plugin to {}", destination.display());
     Ok(())
 }
 
-fn uninstall_plugin() -> anyhow::Result<()> {
-    let studio = RobloxStudio::locate()?;
-
-    let plugin_path = studio.plugins_path().join(PLUGIN_FILE_NAME);
+fn uninstall_plugin(plugins_dir: &Path) -> anyhow::Result<()> {
+    let plugin_path = plugins_dir.join(PLUGIN_FILE_NAME);
 
     if plugin_path.exists() {
         log::debug!("Removing existing plugin from {}", plugin_path.display());
@@ -99,4 +107,59 @@ fn uninstall_plugin() -> anyhow::Result<()> {
 #[test]
 fn plugin_initialize() {
     let _ = initialize_plugin().unwrap();
+}
+
+#[test]
+fn installs_and_replaces_a_complete_plugin() {
+    let dir = tempfile::tempdir().unwrap();
+    let destination = dir.path().join(PLUGIN_FILE_NAME);
+    fs::write(&destination, b"old plugin").unwrap();
+    install_plugin(dir.path()).unwrap();
+    let bytes = fs::read(destination).unwrap();
+    let dom = rbx_binary::from_reader(bytes.as_slice()).unwrap();
+    assert_eq!(dom.root().children().len(), 1);
+    assert_eq!(
+        dom.get_by_ref(dom.root().children()[0]).unwrap().name,
+        "Rojo"
+    );
+    assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn new_plugin_is_world_readable() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    install_plugin(dir.path()).unwrap();
+    let mode = fs::metadata(dir.path().join(PLUGIN_FILE_NAME))
+        .unwrap()
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o777, 0o644);
+}
+
+#[cfg(unix)]
+#[test]
+fn reinstalled_plugin_keeps_existing_permissions() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let destination = dir.path().join(PLUGIN_FILE_NAME);
+    fs::write(&destination, b"old plugin").unwrap();
+    fs::set_permissions(&destination, fs::Permissions::from_mode(0o600)).unwrap();
+    install_plugin(dir.path()).unwrap();
+    let mode = fs::metadata(destination).unwrap().permissions().mode();
+    assert_eq!(mode & 0o777, 0o600);
+}
+
+#[test]
+fn uninstalls_from_an_explicit_plugins_dir() {
+    let dir = tempfile::tempdir().unwrap();
+    install_plugin(dir.path()).unwrap();
+    uninstall_plugin(dir.path()).unwrap();
+    assert!(!dir.path().join(PLUGIN_FILE_NAME).exists());
+
+    // Uninstalling when nothing is installed is not an error.
+    uninstall_plugin(dir.path()).unwrap();
 }

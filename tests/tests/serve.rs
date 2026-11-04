@@ -10,7 +10,9 @@ use crate::rojo_test::{
     serve_util::{deserialize_msgpack, run_serve_test, serialize_to_xml_model},
 };
 
-use librojo::web_api::{SerializeResponse, SocketPacketType};
+use librojo::web_api::{
+    ReadResponse, SerializeResponse, SocketPacketBody, SocketPacketType, SubscribeMessage,
+};
 
 #[test]
 fn rejects_dns_rebinding_requests() {
@@ -552,22 +554,167 @@ fn ref_properties_remove() {
             "ref_properties_remove_all",
             read_response.intern_and_redact(&mut redactions, root_id)
         );
+        let target_id = read_response
+            .instances
+            .values()
+            .find(|instance| instance.name == "target")
+            .unwrap()
+            .id;
+        let pointer_id = read_response
+            .instances
+            .values()
+            .find(|instance| instance.name == "pointer")
+            .unwrap()
+            .id;
+        let initial_pointer = &read_response.instances[&pointer_id];
+        let initial_root = &read_response.instances[&root_id];
 
         fs::remove_file(session.path().join("src/target.model.json")).unwrap();
 
         let socket_packet = session
-            .get_api_socket_packet(SocketPacketType::Messages, 0)
+            .get_api_socket_packet(SocketPacketType::Messages, read_response.message_cursor)
             .unwrap();
+        let SocketPacketBody::Messages(packet) = socket_packet.body;
+        assert!(packet.messages.iter().any(|message| {
+            message.removed.contains(&target_id)
+                && message.updated.iter().any(|update| update.id == pointer_id)
+        }));
+        for message in packet.messages {
+            assert!(message.added.is_empty());
+            assert!(message.removed.iter().all(|id| *id == target_id));
+            // Some backends also report a directory Write. Re-snapshotting
+            // the directory must not produce anything beyond the cleared ref.
+            for update in message.updated {
+                assert_eq!(update.id, pointer_id);
+                assert!(update.changed_name.is_none());
+                assert!(update.changed_class_name.is_none());
+                assert!(update.changed_metadata.is_none());
+                assert_eq!(update.changed_properties.len(), 1);
+                // Sent as an explicit null Ref because the plugin cannot see
+                // a msgpack nil stored in a Luau table.
+                assert_eq!(
+                    update.changed_properties.get(&rbx_dom_weak::ustr("Value")),
+                    Some(&Some(rbx_dom_weak::types::Variant::Ref(
+                        rbx_dom_weak::types::Ref::none()
+                    )))
+                );
+            }
+        }
+
+        let after_removal = session.get_api_read(root_id).unwrap();
+        assert_eq!(after_removal.instances.len(), 2);
+        assert!(!after_removal.instances.contains_key(&target_id));
+        assert!(after_removal.instances.contains_key(&pointer_id));
+        // Removing the target clears the pointer's resolved ref in the same
+        // patch, so it never dangles regardless of which events the platform's
+        // file watcher reports.
         assert_yaml_snapshot!(
-            "ref_properties_remove_subscribe",
-            socket_packet.intern_and_redact(&mut redactions, ())
+            "ref_properties_remove_pointer_after_removal",
+            redactions.redacted_yaml(&after_removal.instances[&pointer_id])
         );
 
+        // A subsequent edit proves processing is still alive and that
+        // re-snapshotting the pointer agrees with the cleared ref.
+        fs::write(
+            session.path().join("src/pointer.model.json"),
+            r#"{
+            "className": "ObjectValue",
+            "attributes": { "Rojo_Target_Value": "test pointer", "AfterRemoval": true }
+        }"#,
+        )
+        .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let final_read = loop {
+            let read = session.get_api_read(root_id).unwrap();
+            let pointer = &read.instances[&pointer_id];
+            let updated = match pointer.properties.get(&rbx_dom_weak::ustr("Attributes")) {
+                Some(value) => {
+                    matches!(value.as_ref(), rbx_dom_weak::types::Variant::Attributes(attributes)
+                    if attributes.get("AfterRemoval") == Some(&rbx_dom_weak::types::Variant::Bool(true)))
+                }
+                None => false,
+            };
+            if updated {
+                break read;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "valid edit after target removal did not sync"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        assert_eq!(final_read.instances.len(), 2);
+        let root = &final_read.instances[&root_id];
+        assert_eq!(root.name, initial_root.name);
+        assert_eq!(root.class_name, initial_root.class_name);
+        assert_eq!(root.parent, initial_root.parent);
+        assert_eq!(root.properties, initial_root.properties);
+        assert_eq!(root.children.as_ref(), &[pointer_id]);
+        let pointer = &final_read.instances[&pointer_id];
+        assert_eq!(pointer.name, initial_pointer.name);
+        assert_eq!(pointer.class_name, initial_pointer.class_name);
+        assert_eq!(pointer.parent, initial_pointer.parent);
+        assert!(pointer.children.is_empty());
+        assert!(!pointer
+            .properties
+            .contains_key(&rbx_dom_weak::ustr("Value")));
+        assert_eq!(pointer.properties.len(), 1);
+    });
+}
+
+/// A target that is removed and later re-created, as a branch switch or a
+/// package reinstall can do in separate watcher events, must be pointed at
+/// again without the pointer's own file changing.
+#[test]
+fn ref_properties_restore_after_target_returns() {
+    run_serve_test("ref_properties_remove", |session, _redactions| {
+        let info = session.get_api_rojo().unwrap();
+        let root_id = info.root_instance_id;
+        let value = rbx_dom_weak::ustr("Value");
+
         let read_response = session.get_api_read(root_id).unwrap();
-        assert_yaml_snapshot!(
-            "ref_properties_remove_all-2",
-            read_response.intern_and_redact(&mut redactions, root_id)
-        );
+        let pointer_id = read_response
+            .instances
+            .values()
+            .find(|instance| instance.name == "pointer")
+            .unwrap()
+            .id;
+
+        let target_path = session.path().join("src/target.model.json");
+        let target_contents = fs::read_to_string(&target_path).unwrap();
+
+        let wait_until = |what: &str, done: &dyn Fn(&ReadResponse<'_>) -> bool| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                let read = session.get_api_read(root_id).unwrap();
+                if done(&read) {
+                    return;
+                }
+                assert!(std::time::Instant::now() < deadline, "timed out: {what}");
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        };
+
+        fs::remove_file(&target_path).unwrap();
+        wait_until("pointer cleared after target removal", &|read| {
+            !read.instances[&pointer_id].properties.contains_key(&value)
+        });
+
+        fs::write(&target_path, target_contents).unwrap();
+        wait_until("pointer restored after target returned", &|read| {
+            let Some(target) = read
+                .instances
+                .values()
+                .find(|instance| instance.name == "target")
+            else {
+                return false;
+            };
+            read.instances[&pointer_id]
+                .properties
+                .get(&value)
+                .map(|value| value.as_ref())
+                == Some(&rbx_dom_weak::types::Variant::Ref(target.id))
+        });
     });
 }
 
@@ -734,16 +881,129 @@ fn meshpart_with_id() {
 }
 
 #[test]
-fn serialize_missing_id() {
+fn serialize_skips_missing_ids() {
     run_serve_test("empty", |session, _| {
         let info = session.get_api_rojo().unwrap();
         let missing_id = Ref::new();
 
+        // One stale ID in a fallback batch must not fail the instances that
+        // still exist.
         let response = session
-            .post_api_serialize(&[missing_id], info.session_id)
+            .post_api_serialize(&[missing_id, info.root_instance_id], info.session_id)
             .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
 
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = response.bytes().unwrap();
+        let serialize_response: SerializeResponse =
+            deserialize_msgpack(&body).expect("Server returned malformed response");
+        assert_eq!(serialize_response.missing_ids, vec![missing_id]);
+
+        let model = rbx_binary::from_reader(serialize_response.model_contents.as_slice()).unwrap();
+        let folder = model.get_by_ref(model.root().children()[0]).unwrap();
+        let names: Vec<_> = folder
+            .children()
+            .iter()
+            .map(|child| model.get_by_ref(*child).unwrap().name.clone())
+            .collect();
+        assert_eq!(names, vec![info.root_instance_id.to_string()]);
+    });
+}
+
+/// Opens a subscription and returns the close frame the server answers with.
+fn socket_close_frame(
+    port: usize,
+    path_and_query: &str,
+) -> Option<hyper_tungstenite::tungstenite::protocol::CloseFrame<'static>> {
+    use hyper_tungstenite::tungstenite::{connect, stream::MaybeTlsStream, Message};
+
+    let (mut socket, _response) =
+        connect(format!("ws://localhost:{port}{path_and_query}")).unwrap();
+    if let MaybeTlsStream::Plain(stream) = socket.get_ref() {
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .unwrap();
+    }
+
+    loop {
+        match socket.read().expect("the server should close the socket") {
+            Message::Close(frame) => return frame.map(|frame| frame.into_owned()),
+            Message::Binary(_) => panic!("a stale subscription must not receive messages"),
+            _ => continue,
+        }
+    }
+}
+
+#[test]
+fn subscription_from_a_previous_server_run_is_closed() {
+    use hyper_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
+
+    run_serve_test("empty", |session, _| {
+        let info = session.get_api_rojo().unwrap();
+        let cursor = session
+            .get_api_read(info.root_instance_id)
+            .unwrap()
+            .message_cursor;
+
+        // A cursor this server never issued means the client read from an
+        // earlier run. Waiting for the queue to reach it would drop the first
+        // changes on this run, so the client is told to resync instead.
+        let frame = socket_close_frame(session.port(), &format!("/api/socket/{}", cursor + 5))
+            .expect("the close frame should explain why");
+        assert_eq!(frame.code, CloseCode::Restart);
+        assert!(frame.reason.contains("restarted"), "{}", frame.reason);
+
+        // A session ID naming another run is rejected even if the cursor
+        // would be valid here.
+        let other_session = uuid::Uuid::new_v4();
+        let frame = socket_close_frame(
+            session.port(),
+            &format!("/api/socket/{cursor}?sessionId={other_session}"),
+        )
+        .expect("the close frame should explain why");
+        assert_eq!(frame.code, CloseCode::Restart);
+    });
+}
+
+#[test]
+fn subscription_with_matching_session_id_receives_messages() {
+    run_serve_test("empty", |session, _| {
+        let info = session.get_api_rojo().unwrap();
+
+        // Uppercase and percent-encoded (as Roblox's UrlEncode escapes "-") to
+        // show the comparison doesn't depend on how the client formats the ID.
+        let session_id = info
+            .session_id
+            .to_string()
+            .to_uppercase()
+            .replace('-', "%2D");
+        let url = format!(
+            "ws://localhost:{}/api/socket/0?sessionId={session_id}",
+            session.port()
+        );
+        let (mut socket, _response) = hyper_tungstenite::tungstenite::connect(url).unwrap();
+        if let hyper_tungstenite::tungstenite::stream::MaybeTlsStream::Plain(stream) =
+            socket.get_ref()
+        {
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+                .unwrap();
+        }
+
+        fs::write(
+            session.path().join("default.project.json"),
+            r#"{ "name": "empty", "tree": { "$className": "Folder", "Child": { "$className": "Folder" } } }"#,
+        )
+        .unwrap();
+
+        loop {
+            match socket.read().unwrap() {
+                hyper_tungstenite::tungstenite::Message::Binary(_) => break,
+                hyper_tungstenite::tungstenite::Message::Close(frame) => {
+                    panic!("subscription with the right session ID was closed: {frame:?}")
+                }
+                _ => continue,
+            }
+        }
     });
 }
 
@@ -774,4 +1034,119 @@ fn forced_parent() {
         let model = serialize_to_xml_model(&serialize_response, &redactions);
         assert_snapshot!("forced_parent_serialize_model", model);
     });
+}
+
+#[test]
+fn changed_metadata() {
+    run_serve_test("changed_metadata", |session, mut redactions| {
+        let _ = session.get_api_rojo().unwrap();
+
+        let project = |anchored: bool, ignore_unknown: Option<bool>, path: &str| {
+            let ignore_unknown = match ignore_unknown {
+                Some(value) => format!("\"$ignoreUnknownInstances\": {value},"),
+                None => String::new(),
+            };
+
+            format!(
+                r#"{{
+  "name": "changed_metadata",
+  "tree": {{
+    "$className": "DataModel",
+    "Workspace": {{
+      "$className": "Workspace",
+      "Baseplate": {{
+        "$className": "Part",
+        {ignore_unknown}
+        "$properties": {{
+          "Anchored": {anchored}
+        }}
+      }},
+      "Thing": {{
+        "$path": "{path}"
+      }}
+    }}
+  }}
+}}
+"#
+            )
+        };
+
+        let write_project = |contents: String| {
+            fs::write(session.path().join("default.project.json"), contents).unwrap();
+        };
+
+        // A single write can reach the server as more than one watcher event,
+        // and each event is its own patch. Rather than assuming one message per
+        // write, collect messages until the expected change has arrived and
+        // snapshot only the messages that carry changes.
+        let mut cursor = 0;
+        let mut wait_for = |done: &dyn Fn(&[SubscribeMessage<'static>]) -> bool| {
+            // Packets that never satisfy `done` would otherwise keep this
+            // waiting forever instead of failing the test.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            let mut received = Vec::new();
+            loop {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "timed out waiting for messages, received: {received:#?}"
+                );
+                let packet = session
+                    .get_api_socket_packet(SocketPacketType::Messages, cursor)
+                    .unwrap();
+                let SocketPacketBody::Messages(packet) = packet.body;
+                cursor = packet.message_cursor;
+                received.extend(packet.messages);
+                if done(&received) {
+                    return received;
+                }
+            }
+        };
+        let any_update = |messages: &[SubscribeMessage<'static>]| {
+            messages.iter().any(|message| !message.updated.is_empty())
+        };
+
+        write_project(project(false, None, "a"));
+        let messages = wait_for(&any_update);
+        assert_yaml_snapshot!(
+            "changed_metadata_property_only",
+            intern_messages(&mut redactions, &messages)
+        );
+
+        write_project(project(false, Some(false), "a"));
+        let messages = wait_for(&any_update);
+        assert_yaml_snapshot!(
+            "changed_metadata_metadata_only",
+            intern_messages(&mut redactions, &messages)
+        );
+
+        write_project(project(true, Some(true), "a"));
+        let messages = wait_for(&any_update);
+        assert_yaml_snapshot!(
+            "changed_metadata_property_and_metadata",
+            intern_messages(&mut redactions, &messages)
+        );
+
+        // Only internal metadata changes here, which the plugin never sees.
+        // The packet still arrives so the cursor advances, but it carries no
+        // messages that would make the plugin open an undo recording.
+        write_project(project(true, Some(true), "b"));
+        let messages = wait_for(&|_| true);
+        assert!(messages.is_empty(), "{messages:#?}");
+
+        // A later real change proves the cursor kept advancing.
+        write_project(project(false, Some(true), "b"));
+        wait_for(&any_update);
+    });
+}
+
+fn intern_messages(
+    redactions: &mut rojo_insta_ext::RedactionMap,
+    messages: &[SubscribeMessage<'static>],
+) -> serde_yaml::Value {
+    for message in messages {
+        for update in &message.updated {
+            redactions.intern(update.id);
+        }
+    }
+    redactions.redacted_yaml(messages)
 }

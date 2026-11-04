@@ -30,6 +30,8 @@ const ABSOLUTE_PATH_FAILED_ERR: &str = "Failed to turn relative path into absolu
 struct SourcemapNode<'a> {
     name: &'a str,
     class_name: Ustr,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    run_context: Option<String>,
 
     #[serde(
         default,
@@ -75,8 +77,11 @@ impl SourcemapCommand {
         let project_path = dunce::canonicalize(resolve_path(&self.project)?)?;
 
         log::trace!("Constructing filesystem with StdBackend");
-        let vfs = Vfs::new_default()?;
-        vfs.set_watch_enabled(self.watch);
+        let vfs = if self.watch {
+            Vfs::new_default()?
+        } else {
+            Vfs::new_default_without_watch()
+        };
 
         log::trace!("Setting up session for sourcemap generation");
         let session = ServeSession::new(vfs, project_path)?;
@@ -152,22 +157,23 @@ fn patch_set_affects_sourcemap(
         !set.removed.is_empty()
             // 2. A newly added instance passes the filter
             || set.added.iter().any(|referent| {
-                let instance = tree
-                    .get_instance(*referent)
-                    .expect("instance did not exist when updating sourcemap");
-                filter(&instance)
+                // A later patch may already have removed this instance. Rebuild
+                // conservatively when its class can no longer be checked.
+                tree.get_instance(*referent)
+                    .map(|instance| filter(&instance))
+                    .unwrap_or(true)
             })
             // 3. An existing instance has its class name, name,
             // or file paths changed, and passes the filter
             || set.updated.iter().any(|updated| {
                 let changed = updated.changed_class_name.is_some()
+                    || updated.changed_properties.contains_key(&rbx_dom_weak::ustr("RunContext"))
                     || updated.changed_name.is_some()
                     || updated.changed_metadata.is_some();
                 if changed {
-                    let instance = tree
-                        .get_instance(updated.id)
-                        .expect("instance did not exist when updating sourcemap");
-                    filter(&instance)
+                    tree.get_instance(updated.id)
+                        .map(|instance| filter(&instance))
+                        .unwrap_or(true)
                 } else {
                     false
                 }
@@ -227,6 +233,24 @@ fn recurse_create_node<'a>(
     Some(SourcemapNode {
         name: instance.name(),
         class_name: instance.class_name(),
+        run_context: if instance.class_name() == "Script" {
+            instance
+                .properties()
+                .get(&rbx_dom_weak::ustr("RunContext"))
+                .and_then(|value| {
+                    let rbx_dom_weak::types::Variant::Enum(context) = value else {
+                        return None;
+                    };
+                    let db = rbx_reflection_database::get().ok()?;
+                    db.enums
+                        .get("RunContext")?
+                        .items
+                        .iter()
+                        .find_map(|(name, id)| (*id == context.to_u32()).then(|| name.to_string()))
+                })
+        } else {
+            None
+        },
         file_paths: output_file_paths,
         children,
     })
@@ -270,6 +294,74 @@ mod test {
     use std::path::Path;
 
     #[test]
+    fn removed_historical_instances_still_invalidate_sourcemap() {
+        use crate::cli::sourcemap::{filter_non_scripts, patch_set_affects_sourcemap};
+        use crate::serve_session::ServeSession;
+        use crate::snapshot::{AppliedPatchSet, AppliedPatchUpdate};
+        use memofs::Vfs;
+        use rbx_dom_weak::types::Ref;
+
+        let project_path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("test-projects/relative_paths/project");
+        let session = ServeSession::new(Vfs::new_default_without_watch(), project_path).unwrap();
+        let missing = Ref::new();
+        let mut update = AppliedPatchUpdate::new(missing);
+        update.changed_name = Some("Renamed".into());
+
+        for patch in [
+            AppliedPatchSet {
+                removed: Vec::new(),
+                added: vec![missing],
+                updated: Vec::new(),
+            },
+            AppliedPatchSet {
+                removed: Vec::new(),
+                added: Vec::new(),
+                updated: vec![update],
+            },
+        ] {
+            assert!(patch_set_affects_sourcemap(
+                &session,
+                &[patch],
+                filter_non_scripts,
+            ));
+        }
+    }
+
+    #[test]
+    fn internal_metadata_change_still_invalidates_sourcemap() {
+        use crate::cli::sourcemap::{filter_nothing, patch_set_affects_sourcemap};
+        use crate::serve_session::ServeSession;
+        use crate::snapshot::{AppliedPatchSet, AppliedPatchUpdate, InstanceMetadata};
+        use memofs::Vfs;
+
+        let project_path = fs_err::canonicalize(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("test-projects")
+                .join("relative_paths")
+                .join("project"),
+        )
+        .unwrap();
+        let session = ServeSession::new(Vfs::new_default().unwrap(), project_path).unwrap();
+
+        let mut update = AppliedPatchUpdate::new(session.tree().get_root_id());
+        update.changed_metadata = Some(InstanceMetadata::new());
+        assert_eq!(update.changed_ignore_unknown_instances, None);
+
+        let patch_set = vec![AppliedPatchSet {
+            removed: Vec::new(),
+            added: Vec::new(),
+            updated: vec![update],
+        }];
+
+        assert!(patch_set_affects_sourcemap(
+            &session,
+            &patch_set,
+            filter_nothing
+        ));
+    }
+
+    #[test]
     fn maps_relative_paths() {
         let sourcemap_dir = tempfile::tempdir().unwrap();
         let sourcemap_output = sourcemap_dir.path().join("sourcemap.json");
@@ -278,6 +370,31 @@ mod test {
                 .join("test-projects")
                 .join("relative_paths")
                 .join("project"),
+        )
+        .unwrap();
+        let sourcemap_command = SourcemapCommand {
+            project: project_path,
+            output: Some(sourcemap_output.clone()),
+            include_non_scripts: false,
+            watch: false,
+            absolute: false,
+        };
+        assert!(sourcemap_command.run().is_ok());
+
+        let raw_sourcemap_contents = fs_err::read_to_string(sourcemap_output.as_path()).unwrap();
+        let sourcemap_contents =
+            serde_json::from_str::<SourcemapNode>(&raw_sourcemap_contents).unwrap();
+        insta::assert_json_snapshot!(sourcemap_contents);
+    }
+
+    #[test]
+    fn includes_script_run_contexts() {
+        let sourcemap_dir = tempfile::tempdir().unwrap();
+        let sourcemap_output = sourcemap_dir.path().join("sourcemap.json");
+        let project_path = fs_err::canonicalize(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("test-projects")
+                .join("run_contexts"),
         )
         .unwrap();
         let sourcemap_command = SourcemapCommand {

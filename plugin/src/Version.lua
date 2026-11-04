@@ -26,14 +26,44 @@ local function compare(a, b)
 	return 0
 end
 
+local RELEASES_URL = "https://api.github.com/repos/SenorLawyer/rojo/releases?per_page=10"
+
 local Version = {}
 
 --[[
-	Compares two versions of the form {major, minor, revision}.
+	Splits a version suffix into the community fork's build number and any real
+	prerelease tag. Fork releases are tagged like "7.7.2-fork.1"; that suffix
+	marks a release build of the fork on top of upstream 7.7.2, not a
+	prerelease, so "-fork.N" alone must not make a version count as older.
+]]
+local function splitSuffix(suffix: string?): (number, string?)
+	if suffix == nil or suffix == "" then
+		return 0, nil
+	end
+
+	local before, forkBuild, after = string.match(suffix, "^(.-)%-fork%.(%d+)(.*)$")
+	if forkBuild == nil then
+		return 0, suffix
+	end
+
+	local prerelease = before .. after
+	return tonumber(forkBuild) :: number, if prerelease == "" then nil else prerelease
+end
+
+function Version.isPrerelease(version): boolean
+	local _, prerelease = splitSuffix(version[4])
+	return prerelease ~= nil
+end
+
+--[[
+	Compares two versions of the form {major, minor, revision, suffix?}.
 
 	If a is newer than b, 1.
 	If a is older than b, -1.
 	If a and b are the same, 0.
+
+	A "-fork.N" suffix orders fork builds of the same upstream version after the
+	upstream release and each other; any remaining suffix is a prerelease tag.
 ]]
 function Version.compare(a, b)
 	local major = compare(a[1], b[1])
@@ -52,8 +82,13 @@ function Version.compare(a, b)
 		return revision
 	end
 
-	local aPrerelease = if a[4] == "" then nil else a[4]
-	local bPrerelease = if b[4] == "" then nil else b[4]
+	local aForkBuild, aPrerelease = splitSuffix(a[4])
+	local bForkBuild, bPrerelease = splitSuffix(b[4])
+
+	local forkBuild = compare(aForkBuild, bForkBuild)
+	if forkBuild ~= 0 then
+		return forkBuild
+	end
 
 	-- If neither are prerelease, they are the same
 	if aPrerelease == nil and bPrerelease == nil then
@@ -109,6 +144,7 @@ end
 Version._cachedLatestCompatible = nil :: {
 	value: LatestReleaseInfo?,
 	timestamp: number,
+	includePrereleases: boolean,
 }?
 
 --[[
@@ -119,28 +155,34 @@ Version._cachedLatestCompatible = nil :: {
 Version._apiBlocked = nil :: boolean?
 
 function Version.isApiBlocked(): boolean
-	if Version._apiBlocked == nil then
-		local isLocalInstall = string.find(debug.traceback(), "\n[^\n]-user_.-$") ~= nil
-		Version.retrieveLatestCompatible({
-			version = Config.version,
-			includePrereleases = isLocalInstall and Settings:get("checkForPrereleases"),
-		})
-	end
-	return Version._apiBlocked
+	-- The Http module still sees a denial that arrives after our request was
+	-- abandoned, such as when the plugin unloads while the prompt is open.
+	return Version._apiBlocked == true or Http.isPermissionDenied(RELEASES_URL)
 end
 
 function Version.retrieveLatestCompatible(options: {
 	version: { number },
 	includePrereleases: boolean?,
 }): LatestReleaseInfo?
-	if Version._cachedLatestCompatible and os.clock() - Version._cachedLatestCompatible.timestamp < 60 * 60 * 24 then
+	local includePrereleases = options.includePrereleases == true
+	local cached = Version._cachedLatestCompatible
+	-- The latest release depends on whether prereleases count, so a cached
+	-- answer for the other setting must not be reused.
+	if cached and cached.includePrereleases == includePrereleases and os.clock() - cached.timestamp < 60 * 60 * 24 then
 		Log.debug("Using cached latest compatible version")
-		return Version._cachedLatestCompatible.value
+		return cached.value
 	end
 
 	Log.debug("Retrieving latest compatible version from GitHub")
 
-	local success, releases = Http.get("https://api.github.com/repos/rojo-rbx/rojo/releases?per_page=10")
+	-- Http.timeout doesn't count time spent on Studio's permission prompt, so a
+	-- slow Allow or Deny is still observed and recorded below.
+	local success, releases = Http.timeout(
+		Http.get(RELEASES_URL),
+		RELEASES_URL,
+		15,
+		"Timed out checking for Rojo updates"
+	)
 		:andThen(function(response)
 			if response.code >= 400 then
 				local message = string.format("HTTP %s:\n%s", tostring(response.code), response.body)
@@ -155,7 +197,10 @@ function Version.retrieveLatestCompatible(options: {
 
 	if success == false or type(releases) ~= "table" or next(releases) ~= 1 then
 		-- Roblox's HTTP errors are weird!
-		if string.find(tostring(releases), "^Unknown HTTP error: HttpService permission denied") then
+		if
+			Http.isPermissionDenied(RELEASES_URL)
+			or string.find(tostring(releases), "^Unknown HTTP error: HttpService permission denied")
+		then
 			Version._apiBlocked = true
 		end
 		return nil
@@ -165,12 +210,16 @@ function Version.retrieveLatestCompatible(options: {
 	-- Iterate through releases, looking for the latest compatible version
 	local latestCompatible: LatestReleaseInfo? = nil
 	for _, release in releases do
-		-- Skip prereleases if they are not requested
-		if (not options.includePrereleases) and release.prerelease then
+		local releaseVersion = Version.parse(release.tag_name)
+		if releaseVersion[1] == nil then
 			continue
 		end
+		local isPrerelease = release.prerelease or Version.isPrerelease(releaseVersion)
 
-		local releaseVersion = Version.parse(release.tag_name)
+		-- Skip prereleases if they are not requested
+		if not includePrereleases and isPrerelease then
+			continue
+		end
 
 		-- Skip releases that are potentially incompatible
 		if releaseVersion[1] > options.version[1] then
@@ -184,7 +233,7 @@ function Version.retrieveLatestCompatible(options: {
 
 		latestCompatible = {
 			version = releaseVersion,
-			prerelease = release.prerelease,
+			prerelease = isPrerelease,
 			publishedUnixTimestamp = DateTime.fromIsoDate(release.published_at).UnixTimestamp,
 		}
 	end
@@ -195,6 +244,7 @@ function Version.retrieveLatestCompatible(options: {
 		Version._cachedLatestCompatible = {
 			value = nil,
 			timestamp = os.clock(),
+			includePrereleases = includePrereleases,
 		}
 
 		return nil
@@ -204,21 +254,13 @@ function Version.retrieveLatestCompatible(options: {
 	Version._cachedLatestCompatible = {
 		value = latestCompatible,
 		timestamp = os.clock(),
+		includePrereleases = includePrereleases,
 	}
 
 	return latestCompatible
 end
 
-function Version.getUpdateMessage(): string?
-	if not Settings:get("checkForUpdates") then
-		return
-	end
-
-	local isLocalInstall = string.find(debug.traceback(), "\n[^\n]-user_.-$") ~= nil
-	local latestCompatibleVersion = Version.retrieveLatestCompatible({
-		version = Config.version,
-		includePrereleases = isLocalInstall and Settings:get("checkForPrereleases"),
-	})
+local function formatUpdateMessage(latestCompatibleVersion): string?
 	if not latestCompatibleVersion then
 		return
 	end
@@ -228,6 +270,26 @@ function Version.getUpdateMessage(): string?
 		Version.display(latestCompatibleVersion.version),
 		timeUtil.elapsedToText(DateTime.now().UnixTimestamp - latestCompatibleVersion.publishedUnixTimestamp)
 	)
+end
+
+-- Render functions must never fetch releases or wait for network permission.
+function Version.getCachedUpdateMessage(): string?
+	if not Settings:get("checkForUpdates") or not Version._cachedLatestCompatible then
+		return nil
+	end
+	return formatUpdateMessage(Version._cachedLatestCompatible.value)
+end
+
+function Version.getUpdateMessage(): string?
+	if not Settings:get("checkForUpdates") then
+		return nil
+	end
+
+	local isLocalInstall = string.find(debug.traceback(), "\n[^\n]-user_.-$") ~= nil
+	return formatUpdateMessage(Version.retrieveLatestCompatible({
+		version = Config.version,
+		includePrereleases = isLocalInstall and Settings:get("checkForPrereleases"),
+	}))
 end
 
 return Version

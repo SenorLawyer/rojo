@@ -180,7 +180,11 @@ impl InstanceContext {
         }
 
         let rules = Arc::make_mut(&mut self.path_ignore_rules);
-        rules.extend(new_rules);
+        for rule in new_rules {
+            if !rules.contains(&rule) {
+                rules.push(rule);
+            }
+        }
     }
 
     /// Extend the list of syncing rules in the context with the given new rules.

@@ -79,7 +79,7 @@ function ServeSession.new(options)
 	end
 
 	local function onChangesFlushed(patch)
-		self.__apiContext:write(patch)
+		self:__sendChanges(patch)
 	end
 
 	local instanceMap = InstanceMap.new(onInstanceChanged)
@@ -96,9 +96,16 @@ function ServeSession.new(options)
 		end
 	end)
 	table.insert(connections, connection)
+	table.insert(
+		connections,
+		game:GetPropertyChangedSignal("PlaceId"):Connect(function()
+			self:__onPlaceIdChanged()
+		end)
+	)
 
 	self = {
 		__status = Status.NotStarted,
+		__expectedPlaceId = game.PlaceId,
 		__apiContext = options.apiContext,
 		__twoWaySync = options.twoWaySync,
 		__reconciler = reconciler,
@@ -190,16 +197,36 @@ function ServeSession:hookPostcommit(callback)
 end
 
 function ServeSession:start()
+	if self.__status ~= Status.NotStarted then
+		return
+	end
+
 	self:__setStatus(Status.Connecting)
+	if self.__status == Status.Disconnected then
+		return
+	end
 	self:setLoadingText("Connecting to server...")
 
 	self.__apiContext
-		:connect()
+		:connect(function()
+			if self.__status == Status.Connecting then
+				self:setLoadingText(
+					"Still waiting for the Rojo server...\nIf Studio is asking whether Rojo may access this address, choose Allow.\nOtherwise the server may be busy."
+				)
+			end
+		end)
 		:andThen(function(serverInfo)
+			if self.__status == Status.Disconnected then
+				return
+			end
+
 			self:setLoadingText("Loading initial data from server...")
 			return self:__initialSync(serverInfo):andThen(function()
+				if self.__status == Status.Disconnected then
+					return
+				end
+
 				self:setLoadingText("Starting sync loop...")
-				self:__setStatus(Status.Connected, serverInfo.projectName)
 				self:__applyGameAndPlaceId(serverInfo)
 
 				return self.__apiContext:connectWebSocket({
@@ -210,12 +237,25 @@ function ServeSession:start()
 
 						Log.debug("Received {} messages from Rojo server", #messagesPacket.messages)
 
+						-- Applying a patch can yield on fallback requests, during
+						-- which the user may cancel or the session may fail, so
+						-- the rest of the packet must not be applied afterwards.
 						for _, message in messagesPacket.messages do
+							if self.__status == Status.Disconnected then
+								return
+							end
 							self:__applyPatch(message)
+						end
+						if self.__status == Status.Disconnected then
+							return
 						end
 						self.__apiContext:setMessageCursor(messagesPacket.messageCursor)
 					end,
-				})
+				}, function()
+					if self.__status ~= Status.Disconnected then
+						self:__setStatus(Status.Connected, serverInfo.projectName)
+					end
+				end)
 			end)
 		end)
 		:catch(function(err)
@@ -235,7 +275,16 @@ function ServeSession:__applyGameAndPlaceId(serverInfo)
 	end
 
 	if serverInfo.placeId ~= nil then
+		self.__expectedPlaceId = serverInfo.placeId
 		game:SetPlaceId(serverInfo.placeId)
+	end
+end
+
+function ServeSession:__onPlaceIdChanged()
+	if game.PlaceId ~= self.__expectedPlaceId then
+		-- Publishing a local file invalidates the allowlist check and hydration
+		-- performed for the previous place identity.
+		self:__stopInternal("The place ID changed. Reconnect to sync this place with the Rojo server.")
 	end
 end
 
@@ -275,7 +324,31 @@ function ServeSession:__onActiveScriptChanged(activeScript)
 	end)
 
 	-- Notify the Rojo server to open this script
-	self.__apiContext:open(scriptId)
+	self.__apiContext:open(scriptId):catch(function(err)
+		Log.warn("Could not open {} externally: {}", activeScript:GetFullName(), err)
+	end)
+end
+
+function ServeSession:__sendChanges(patch)
+	self.__apiContext:write(patch):catch(function(err)
+		if self.__status == Status.Disconnected then
+			return
+		end
+
+		-- The batcher does not keep changes it has flushed, so a failed write
+		-- means the server and Studio now disagree. Continuing would sync on
+		-- top of that difference without the user knowing.
+		local count = PatchSet.countInstances(patch)
+		Log.warn("Could not send changes to {} instance(s) to the Rojo server: {}", count, err)
+		self:__stopInternal(
+			string.format("Couldn't send Studio's changes to the Rojo server: %s\nReconnect to resync.", tostring(err))
+		)
+	end)
+end
+
+-- Separate so specs can supply instances without a real serialized model.
+function ServeSession:__deserializeInstances(modelContents)
+	return SerializationService:DeserializeInstancesAsync(modelContents)
 end
 
 function ServeSession:__replaceInstances(idList)
@@ -290,15 +363,36 @@ function ServeSession:__replaceInstances(idList)
 	end
 
 	-- TODO: Should we do this in multiple requests so we can more granularly mark failures?
+	local presentIds = idList
 	local modelSuccess, replacements = self.__apiContext
 		:serialize(idList)
 		:andThen(function(response)
+			-- The server skips ids removed since the patch was sent. Those
+			-- instances are about to be removed by a later message, so they are
+			-- left alone here rather than counted as failures.
+			if response.missingIds ~= nil and #response.missingIds > 0 then
+				local missing = {}
+				for _, id in response.missingIds do
+					missing[id] = true
+				end
+				presentIds = {}
+				for _, id in idList do
+					if not missing[id] then
+						table.insert(presentIds, id)
+					end
+				end
+				Log.debug("Serialize endpoint skipped {} removed instances", #idList - #presentIds)
+			end
+			if #presentIds == 0 then
+				return {}
+			end
+
 			Log.debug("Deserializing results from serialize endpoint")
-			local objects = SerializationService:DeserializeInstancesAsync(response.modelContents)
+			local objects = self:__deserializeInstances(response.modelContents)
 			if not objects[1] then
 				return Promise.reject("Serialize endpoint did not deserialize into any Instances")
 			end
-			if #objects[1]:GetChildren() ~= #idList then
+			if #objects[1]:GetChildren() ~= #presentIds then
 				return Promise.reject("Serialize endpoint did not return the correct number of Instances")
 			end
 
@@ -309,15 +403,22 @@ function ServeSession:__replaceInstances(idList)
 			return instanceMap
 		end)
 		:await()
+	if not modelSuccess then
+		Log.warn("Could not replace instances through the sync fallback: {}", replacements)
+		return false
+	end
+	if #presentIds == 0 then
+		return true, PatchSet.newEmpty()
+	end
 
 	local refSuccess, refPatch = self.__apiContext
-		:refPatch(idList)
+		:refPatch(presentIds)
 		:andThen(function(response)
 			return response.patch
 		end)
 		:await()
-
-	if not (modelSuccess and refSuccess) then
+	if not refSuccess then
+		Log.warn("Could not fetch references for the sync fallback: {}", refPatch)
 		return false
 	end
 
@@ -395,13 +496,14 @@ function ServeSession:__replaceInstances(idList)
 		end
 	end
 
+	-- Restore the selection even if applying references fails, since the
+	-- swapped instances are already in place.
 	local patchApplySuccess, unappliedPatch = pcall(self.__reconciler.applyPatch, self.__reconciler, refPatch)
-	if patchApplySuccess then
-		Selection:Set(selection)
-		return true, unappliedPatch
-	else
-		error(unappliedPatch)
+	Selection:Set(selection)
+	if not patchApplySuccess then
+		error(unappliedPatch, 0)
 	end
+	return true, unappliedPatch
 end
 
 function ServeSession:__applyPatch(patch)
@@ -412,6 +514,19 @@ function ServeSession:__applyPatch(patch)
 		Log.debug("Failed to begin history recording for " .. patchTimestamp .. ". Another recording is in progress.")
 	end
 
+	-- A recording left open blocks every later recording in this Studio
+	-- session, so it must be finished however patch application exits. Partial
+	-- changes are committed so the user can still undo them.
+	local success, err = pcall(self.__applyPatchInRecording, self, patch)
+	if historyRecording then
+		ChangeHistoryService:FinishRecording(historyRecording, Enum.FinishRecordingOperation.Commit)
+	end
+	if not success then
+		error(err, 0)
+	end
+end
+
+function ServeSession:__applyPatchInRecording(patch)
 	Timer.start("precommitCallbacks")
 	-- Precommit callbacks must be serial in order to obey the contract that
 	-- they execute before commit
@@ -423,15 +538,7 @@ function ServeSession:__applyPatch(patch)
 	end
 	Timer.stop()
 
-	local patchApplySuccess, unappliedPatch = pcall(self.__reconciler.applyPatch, self.__reconciler, patch)
-	if not patchApplySuccess then
-		if historyRecording then
-			ChangeHistoryService:FinishRecording(historyRecording, Enum.FinishRecordingOperation.Commit)
-		end
-		-- This might make a weird stack trace but the only way applyPatch can
-		-- fail is if a bug occurs so it's probably fine.
-		error(unappliedPatch)
-	end
+	local unappliedPatch = self.__reconciler:applyPatch(patch)
 
 	if Settings:get("enableSyncFallback") and not PatchSet.isEmpty(unappliedPatch) then
 		-- Some changes did not apply, let's try replacing them instead
@@ -478,14 +585,14 @@ function ServeSession:__applyPatch(patch)
 		end)
 	end
 	Timer.stop()
-
-	if historyRecording then
-		ChangeHistoryService:FinishRecording(historyRecording, Enum.FinishRecordingOperation.Commit)
-	end
 end
 
 function ServeSession:__initialSync(serverInfo)
 	return self.__apiContext:read({ serverInfo.rootInstanceId }):andThen(function(readResponseBody)
+		if self.__status == Status.Disconnected then
+			return
+		end
+
 		-- Tell the API Context that we're up-to-date with the version of
 		-- the tree defined in this response.
 		self.__apiContext:setMessageCursor(readResponseBody.messageCursor)
@@ -525,6 +632,10 @@ function ServeSession:__initialSync(serverInfo)
 		local userDecision = "Accept"
 		if self.__userConfirmCallback ~= nil then
 			userDecision = self.__userConfirmCallback(self.__instanceMap, catchUpPatch, serverInfo)
+		end
+		-- Confirmation can yield while the user disconnects or unloads the plugin.
+		if self.__status == Status.Disconnected then
+			return
 		end
 
 		if userDecision == "Abort" then
@@ -569,7 +680,11 @@ function ServeSession:__initialSync(serverInfo)
 end
 
 function ServeSession:__stopInternal(err)
-	self:__setStatus(Status.Disconnected, err)
+	if self.__status == Status.Disconnected then
+		return
+	end
+
+	self.__status = Status.Disconnected
 	self.__apiContext:disconnect()
 	self.__instanceMap:stop()
 	self.__changeBatcher:stop()
@@ -578,6 +693,7 @@ function ServeSession:__stopInternal(err)
 		connection:Disconnect()
 	end
 	self.__connections = {}
+	self:__setStatus(Status.Disconnected, err)
 end
 
 function ServeSession:__setStatus(status, detail)

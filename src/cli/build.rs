@@ -4,9 +4,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use anyhow::{bail, Context};
-use clap::{CommandFactory, Parser};
-use fs_err::File;
+use anyhow::{anyhow, bail, Context};
+use clap::{CommandFactory, Parser, ValueEnum};
 use memofs::Vfs;
 use roblox_install::RobloxStudio;
 use tokio::runtime::Runtime;
@@ -38,6 +37,10 @@ pub struct BuildCommand {
     /// Should end in .rbxm or .rbxl.
     #[clap(long, short, conflicts_with = "output")]
     pub plugin: Option<PathBuf>,
+
+    /// Compression for binary models and places. Defaults to lz4.
+    #[clap(long, value_enum)]
+    pub compress: Option<Compression>,
 
     /// Whether to automatically rebuild when any input files change.
     #[clap(long)]
@@ -75,18 +78,31 @@ impl BuildCommand {
             _ => unreachable!(),
         };
 
+        if self.compress.is_some() && matches!(output_kind, OutputKind::Rbxlx | OutputKind::Rbxmx) {
+            bail!("--compress requires a binary output (.rbxl or .rbxm)");
+        }
         let project_path = resolve_path(&self.project)?;
 
         log::trace!("Constructing in-memory filesystem");
-        let vfs = Vfs::new_default()?;
-        vfs.set_watch_enabled(self.watch);
+        let vfs = if self.watch {
+            Vfs::new_default()?
+        } else {
+            Vfs::new_default_without_watch()
+        };
 
         let session = ServeSession::new(vfs, project_path)?;
         let mut cursor = session.message_queue().cursor();
 
-        write_model(&session, &output_path, output_kind)?;
+        let initial_build = write_model(&session, &output_path, output_kind, self.compress);
 
         if self.watch {
+            // The first build can fail for the same transient reasons as a
+            // rebuild, so watch mode reports it and waits for the next change
+            // instead of exiting.
+            if let Err(error) = &initial_build {
+                log::error!("Failed to build project: {error:?}");
+            }
+
             let rt = Runtime::new().context("Failed to start the async runtime for watch mode")?;
 
             loop {
@@ -99,7 +115,15 @@ impl BuildCommand {
                 };
                 cursor = new_cursor;
 
-                write_model(&session, &output_path, output_kind)?;
+                // A rebuild can fail because of an in-progress edit (for
+                // example, the root's class temporarily isn't a DataModel).
+                // Keep watching so that the next change can fix the build;
+                // write_model validates before touching the output, so the
+                // last good build stays in place.
+                if let Err(error) = write_model(&session, &output_path, output_kind, self.compress)
+                {
+                    log::error!("Failed to rebuild project: {error:?}");
+                }
             }
         }
 
@@ -107,7 +131,28 @@ impl BuildCommand {
         // and we're about to exit anyways.
         forget(session);
 
-        Ok(())
+        if self.watch {
+            Ok(())
+        } else {
+            initial_build
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum Compression {
+    Lz4,
+    Zstd,
+    None,
+}
+
+impl Compression {
+    fn serializer(self) -> rbx_binary::Serializer<'static> {
+        rbx_binary::Serializer::new().compression_type(match self {
+            Self::Lz4 => rbx_binary::CompressionType::Lz4,
+            Self::Zstd => rbx_binary::CompressionType::Zstd,
+            Self::None => rbx_binary::CompressionType::None,
+        })
     }
 }
 
@@ -160,43 +205,53 @@ fn write_model(
     session: &ServeSession,
     output: &Path,
     output_kind: OutputKind,
+    compression: Option<Compression>,
 ) -> anyhow::Result<()> {
     println!("Building project '{}'", session.project_name());
 
     let tree = session.tree();
     let root_id = tree.get_root_id();
 
-    log::trace!("Opening output file for write");
-    let mut file = BufWriter::new(File::create(output)?);
-
-    match output_kind {
-        OutputKind::Rbxm => {
-            rbx_binary::to_writer(&mut file, tree.inner(), &[root_id])?;
-        }
-        OutputKind::Rbxl => {
-            let root_instance = tree.get_instance(root_id).unwrap();
-            let top_level_ids = root_instance.children();
-
-            rbx_binary::to_writer(&mut file, tree.inner(), top_level_ids)?;
-        }
-        OutputKind::Rbxmx => {
-            // Model files include the root instance of the tree and all its
-            // descendants.
-
-            rbx_xml::to_writer(&mut file, tree.inner(), &[root_id], xml_encode_config())?;
-        }
-        OutputKind::Rbxlx => {
-            // Place files don't contain an entry for the DataModel, but our
-            // WeakDom representation does.
-
-            let root_instance = tree.get_instance(root_id).unwrap();
-            let top_level_ids = root_instance.children();
-
-            rbx_xml::to_writer(&mut file, tree.inner(), top_level_ids, xml_encode_config())?;
-        }
+    let class = tree.get_instance(root_id).unwrap().class_name();
+    if matches!(output_kind, OutputKind::Rbxl | OutputKind::Rbxlx) && class != "DataModel" {
+        bail!("Cannot build a {} root as a place. Use .rbxm or .rbxmx, or set the root class to DataModel.", class);
     }
+    log::trace!("Serializing to a staged output file");
+    write_file_atomically(output, |file| {
+        match output_kind {
+            OutputKind::Rbxm => {
+                compression
+                    .unwrap_or(Compression::Lz4)
+                    .serializer()
+                    .serialize(file, tree.inner(), &[root_id])?;
+            }
+            OutputKind::Rbxl => {
+                let root_instance = tree.get_instance(root_id).unwrap();
+                let top_level_ids = root_instance.children();
 
-    file.flush()?;
+                compression
+                    .unwrap_or(Compression::Lz4)
+                    .serializer()
+                    .serialize(file, tree.inner(), top_level_ids)?;
+            }
+            OutputKind::Rbxmx => {
+                // Model files include the root instance of the tree and all its
+                // descendants.
+
+                rbx_xml::to_writer(file, tree.inner(), &[root_id], xml_encode_config())?;
+            }
+            OutputKind::Rbxlx => {
+                // Place files don't contain an entry for the DataModel, but our
+                // WeakDom representation does.
+
+                let root_instance = tree.get_instance(root_id).unwrap();
+                let top_level_ids = root_instance.children();
+
+                rbx_xml::to_writer(file, tree.inner(), top_level_ids, xml_encode_config())?;
+            }
+        }
+        Ok(())
+    })?;
 
     let filename = output
         .file_name()
@@ -205,4 +260,254 @@ fn write_model(
     println!("Built project to {}", filename);
 
     Ok(())
+}
+
+/// Replaces `destination` with the bytes produced by `write`, leaving the
+/// previous file untouched if writing fails.
+///
+/// The output is staged in a temporary file next to `destination` and renamed
+/// over it once complete. Truncating the destination first would leave a
+/// corrupt file behind whenever serialization fails, and Studio may load a
+/// plugin or place file while it is half written.
+///
+/// If `destination` is a symlink, the file it points to is replaced instead,
+/// so the link keeps working. Hard links to the previous file are not
+/// updated, since the new contents are a different file.
+pub(super) fn write_file_atomically(
+    destination: &Path,
+    write: impl FnOnce(&mut dyn Write) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    // Renaming over a symlink would replace the link itself with a plain
+    // file, and whatever it pointed to would silently stop being updated.
+    let destination = &resolve_symlinks(destination)
+        .with_context(|| format!("Could not resolve symlink {}", destination.display()))?;
+
+    // The staged file must be on the same filesystem for the rename to be
+    // atomic, so it goes in the destination's directory.
+    let parent = match destination.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    let mut staged = tempfile::NamedTempFile::new_in(parent).with_context(|| {
+        format!(
+            "Could not create a temporary file in {} to write {}",
+            parent.display(),
+            destination.display()
+        )
+    })?;
+
+    {
+        let mut writer = BufWriter::new(staged.as_file_mut());
+        write(&mut writer)?;
+        writer.flush()?;
+    }
+
+    // Temporary files are created owner-only (0600) on Unix. Keep the
+    // permissions of the file being replaced so a rebuild doesn't change who
+    // can read it; a new file gets 0644, the usual mode for a file created
+    // under the default umask.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let permissions = match std::fs::metadata(destination) {
+            Ok(metadata) => metadata.permissions(),
+            Err(_) => std::fs::Permissions::from_mode(0o644),
+        };
+        staged.as_file().set_permissions(permissions)?;
+    }
+
+    // Without this, a crash shortly after the rename can leave an empty or
+    // partial file in place of the output on filesystems that reorder the
+    // rename before the data reaches the disk.
+    staged.as_file().sync_all().with_context(|| {
+        format!(
+            "Could not flush the staged output for {}",
+            destination.display()
+        )
+    })?;
+
+    // Dropping the staged file on error deletes it, so a failed rename leaves
+    // only the previous output behind.
+    staged.persist(destination).map_err(|error| {
+        anyhow!(
+            "Could not replace {}: {}. The previous file was left unchanged; \
+             if another program such as Roblox Studio has it open, close it and try again.",
+            destination.display(),
+            error.error
+        )
+    })?;
+
+    // Persist the rename itself. This is best-effort: some filesystems do not
+    // support syncing directories, and the output is already complete.
+    #[cfg(unix)]
+    if let Ok(directory) = std::fs::File::open(parent) {
+        let _ = directory.sync_all();
+    }
+
+    Ok(())
+}
+
+/// Follows `path` through any chain of symlinks to the path that would be
+/// opened for writing. Unlike `fs::canonicalize`, the final target does not
+/// need to exist, and other components of the path are left as they are.
+fn resolve_symlinks(path: &Path) -> std::io::Result<PathBuf> {
+    // Matches the usual limit on symlink hops, so a loop is reported rather
+    // than followed forever.
+    const MAX_HOPS: usize = 40;
+
+    let mut path = path.to_path_buf();
+    for _ in 0..MAX_HOPS {
+        match std::fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                let target = std::fs::read_link(&path)?;
+                path = match path.parent() {
+                    Some(parent) if target.is_relative() => parent.join(target),
+                    _ => target,
+                };
+            }
+            _ => return Ok(path),
+        }
+    }
+
+    Err(std::io::Error::other(format!(
+        "too many levels of symbolic links at {}",
+        path.display()
+    )))
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn failed_write_keeps_previous_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let destination = dir.path().join("place.rbxl");
+        std::fs::write(&destination, b"previous build").unwrap();
+
+        let result = write_file_atomically(&destination, |file| {
+            file.write_all(b"partial")?;
+            bail!("serialization failed")
+        });
+
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(&destination).unwrap(), b"previous build");
+        // The staged file is cleaned up rather than left next to the output.
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn successful_write_replaces_previous_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let destination = dir.path().join("place.rbxl");
+        std::fs::write(&destination, b"previous build").unwrap();
+
+        write_file_atomically(&destination, |file| Ok(file.write_all(b"new build")?)).unwrap();
+
+        assert_eq!(std::fs::read(&destination).unwrap(), b"new build");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    /// Creates a file symlink, or returns false where that needs privileges
+    /// the test does not have (Windows without Developer Mode).
+    fn symlink_file(target: &Path, link: &Path) -> bool {
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(target, link).unwrap();
+            true
+        }
+        #[cfg(windows)]
+        {
+            std::os::windows::fs::symlink_file(target, link).is_ok()
+        }
+    }
+
+    #[test]
+    fn write_through_symlink_replaces_link_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real.rbxl");
+        let link = dir.path().join("link.rbxl");
+        std::fs::write(&real, b"previous build").unwrap();
+        if !symlink_file(Path::new("real.rbxl"), &link) {
+            eprintln!("skipping: cannot create symlinks here");
+            return;
+        }
+
+        write_file_atomically(&link, |file| Ok(file.write_all(b"new build")?)).unwrap();
+
+        assert!(std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(std::fs::read(&real).unwrap(), b"new build");
+        assert_eq!(std::fs::read(&link).unwrap(), b"new build");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn write_through_dangling_symlink_creates_link_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real.rbxl");
+        let link = dir.path().join("link.rbxl");
+        if !symlink_file(&real, &link) {
+            eprintln!("skipping: cannot create symlinks here");
+            return;
+        }
+
+        write_file_atomically(&link, |file| Ok(file.write_all(b"new build")?)).unwrap();
+
+        assert!(std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(std::fs::read(&real).unwrap(), b"new build");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_loop_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.rbxl");
+        let b = dir.path().join("b.rbxl");
+        std::os::unix::fs::symlink(&b, &a).unwrap();
+        std::os::unix::fs::symlink(&a, &b).unwrap();
+
+        assert!(write_file_atomically(&a, |file| Ok(file.write_all(b"new build")?)).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn new_file_gets_default_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let destination = dir.path().join("place.rbxl");
+
+        write_file_atomically(&destination, |file| Ok(file.write_all(b"new build")?)).unwrap();
+
+        let mode = std::fs::metadata(&destination)
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o644);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rebuild_keeps_permissions_of_previous_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let destination = dir.path().join("place.rbxl");
+        std::fs::write(&destination, b"previous build").unwrap();
+        std::fs::set_permissions(&destination, std::fs::Permissions::from_mode(0o640)).unwrap();
+
+        write_file_atomically(&destination, |file| Ok(file.write_all(b"new build")?)).unwrap();
+
+        let mode = std::fs::metadata(&destination)
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o640);
+    }
 }

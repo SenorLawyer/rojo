@@ -1,0 +1,13 @@
+---
+source: tests/tests/serve.rs
+expression: "intern_messages(&mut redactions, &messages)"
+---
+- added: {}
+  removed: []
+  updated:
+    - changedClassName: ~
+      changedMetadata:
+        ignoreUnknownInstances: false
+      changedName: ~
+      changedProperties: {}
+      id: id-3

@@ -42,19 +42,14 @@ impl<T: Clone> MessageQueue<T> {
     pub fn subscribe(&self, cursor: u32) -> oneshot::Receiver<(u32, Vec<T>)> {
         let (sender, receiver) = oneshot::channel();
 
-        let listener = {
-            let listener = Listener { sender, cursor };
-
-            let messages = self.messages.read().unwrap();
-
-            match fire_listener_if_ready(&messages, listener) {
-                Ok(_) => return receiver,
-                Err(listener) => listener,
-            }
-        };
-
-        let mut message_listeners = self.message_listeners.lock().unwrap();
-        message_listeners.push(listener);
+        // Register while holding the same lock as push_messages: otherwise a
+        // push between checking the cursor and registration can go unnoticed.
+        let mut listeners = self.message_listeners.lock().unwrap();
+        listeners.retain(|listener| !listener.sender.is_canceled());
+        let messages = self.messages.read().unwrap();
+        if let Err(listener) = fire_listener_if_ready(&messages, Listener { sender, cursor }) {
+            listeners.push(listener);
+        }
 
         receiver
     }
@@ -88,6 +83,9 @@ fn fire_listener_if_ready<T: Clone>(
     messages: &[T],
     listener: Listener<T>,
 ) -> Result<(), Listener<T>> {
+    if listener.sender.is_canceled() {
+        return Ok(());
+    }
     let current_cursor = messages.len() as u32;
 
     if listener.cursor < current_cursor {
@@ -96,5 +94,25 @@ fn fire_listener_if_ready<T: Clone>(
         Ok(())
     } else {
         Err(listener)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resubscribing_after_disconnect_replaces_abandoned_waiters() {
+        let queue = MessageQueue::new();
+        for _ in 0..20 {
+            drop(queue.subscribe(0));
+        }
+        let mut first = queue.subscribe(0);
+        let mut second = queue.subscribe(0);
+        assert_eq!(queue.message_listeners.lock().unwrap().len(), 2);
+        queue.push_messages(&[11]);
+        assert_eq!(first.try_recv().unwrap(), Some((1, vec![11])));
+        assert_eq!(second.try_recv().unwrap(), Some((1, vec![11])));
+        assert_eq!(queue.subscribe(0).try_recv().unwrap(), Some((1, vec![11])));
     }
 }

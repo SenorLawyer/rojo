@@ -10,6 +10,7 @@ local Packages = Rojo.Packages
 local Roact = require(Packages.Roact)
 local Log = require(Packages.Log)
 local Promise = require(Packages.Promise)
+local Http = require(Packages.Http)
 
 local Assets = require(Plugin.Assets)
 local Version = require(Plugin.Version)
@@ -51,6 +52,7 @@ local e = Roact.createElement
 local App = Roact.Component:extend("App")
 
 function App:init()
+	self.activeProbes = {}
 	preloadAssets()
 
 	local priorSyncInfo = self:getPriorSyncInfo()
@@ -174,6 +176,7 @@ function App:init()
 end
 
 function App:willUnmount()
+	self.__unmounted = true
 	self:endSession()
 
 	self.waypointConnection:Disconnect()
@@ -186,6 +189,13 @@ function App:willUnmount()
 	end
 
 	self:stopSyncReminderPolling()
+	for context in self.activeProbes do
+		context:disconnect()
+	end
+	self.activeProbes = {}
+	if self.updateCheckThread and coroutine.status(self.updateCheckThread) ~= "dead" then
+		task.cancel(self.updateCheckThread)
+	end
 
 	self.autoConnectPlaytestServerListener()
 	self:clearRunningConnectionInfo()
@@ -238,21 +248,39 @@ function App:closeNotification(id: number)
 end
 
 function App:checkForUpdates()
-	local updateMessage = Version.getUpdateMessage()
-
-	if updateMessage then
-		self:addNotification({
-			text = updateMessage,
-			timeout = 500,
-			actions = {
-				Dismiss = {
-					text = "Dismiss",
-					style = "Bordered",
-					layoutOrder = 2,
-				},
-			},
-		})
+	if self.__unmounted then
+		return
 	end
+	if self.updateCheckThread and coroutine.status(self.updateCheckThread) ~= "dead" then
+		-- The running check read the settings before they changed, so check
+		-- again once it finishes rather than dropping this request.
+		self.updateCheckQueued = true
+		return
+	end
+	self.updateCheckQueued = false
+	self.updateCheckThread = task.defer(function()
+		local updateMessage = Version.getUpdateMessage()
+		if self.updateCheckQueued then
+			-- This result may reflect stale settings, so let the queued check
+			-- decide what to show.
+			self.updateCheckThread = nil
+			self:checkForUpdates()
+			return
+		end
+		if updateMessage and not self.__unmounted then
+			self:addNotification({
+				text = updateMessage,
+				timeout = 500,
+				actions = {
+					Dismiss = {
+						text = "Dismiss",
+						style = "Bordered",
+						layoutOrder = 2,
+					},
+				},
+			})
+		end
+	end)
 end
 
 function App:getPriorSyncInfo(): { host: string?, port: string?, projectName: string?, timestamp: number? }
@@ -386,19 +414,30 @@ function App:releaseSyncLock()
 	Log.trace("Could not relase sync lock because it is owned by {}", lock.Value)
 end
 
-function App:findActiveServer()
+function App:getBaseUrl()
 	local host, port = self:getHostAndPort()
 	local baseUrl = if string.find(host, "^https?://")
 		then string.format("%s:%s", host, port)
 		else string.format("http://%s:%s", host, port)
+	return baseUrl, host, port
+end
+
+function App:findActiveServer()
+	local baseUrl, host, port = self:getBaseUrl()
 
 	Log.trace("Checking for active sync server at {}", baseUrl)
 
 	local apiContext = ApiContext.new(baseUrl)
-	return apiContext:connect():andThen(function(serverInfo)
-		apiContext:disconnect()
-		return serverInfo, host, port
-	end)
+	self.activeProbes[apiContext] = true
+	return apiContext
+		:probe()
+		:andThen(function(serverInfo)
+			return serverInfo, host, port
+		end)
+		:finally(function()
+			apiContext:disconnect()
+			self.activeProbes[apiContext] = nil
+		end)
 end
 
 function App:tryAutoReconnect()
@@ -414,7 +453,10 @@ function App:tryAutoReconnect()
 
 	return self:findActiveServer()
 		:andThen(function(serverInfo)
-			-- change
+			if self.__unmounted or self.serveSession ~= nil then
+				return false
+			end
+
 			if serverInfo.projectName == priorSyncInfo.projectName then
 				Log.trace("Auto-reconnect found matching server, reconnecting...")
 				self:addNotification({
@@ -438,6 +480,10 @@ function App:checkSyncReminder()
 		return
 	end
 
+	if self:isProbeBlocked() then
+		return
+	end
+
 	if self.serveSession ~= nil or not self:isSyncLockAvailable() then
 		-- Already syncing or cannot sync, no reason to remind
 		return
@@ -447,12 +493,20 @@ function App:checkSyncReminder()
 
 	self:findActiveServer()
 		:andThen(function(serverInfo, host, port)
+			if self.__unmounted or self.serveSession ~= nil then
+				return
+			end
+
 			self:sendSyncReminder(
 				`Project '{serverInfo.projectName}' is serving at {host}:{port}.\nWould you like to connect?`,
 				{ "Connect", "Dismiss" }
 			)
 		end)
 		:catch(function()
+			if self.__unmounted or self.serveSession ~= nil then
+				return
+			end
+
 			if priorSyncInfo.timestamp and priorSyncInfo.projectName then
 				-- We didn't find an active server,
 				-- but this place has a prior sync
@@ -465,6 +519,20 @@ function App:checkSyncReminder()
 				)
 			end
 		end)
+end
+
+function App:isProbeBlocked(): boolean
+	if next(self.activeProbes) ~= nil then
+		-- A probe can take up to ApiContext's probe timeout against a stalled
+		-- server, so polling must not pile up more requests behind it.
+		return true
+	end
+
+	-- A probe gives up after its timeout, but its RequestAsync keeps waiting
+	-- while Studio's permission prompt is unanswered. Starting another probe
+	-- would only add one more blocked request.
+	local baseUrl = self:getBaseUrl()
+	return Http.isPermissionPending(baseUrl) and Http.hasOutstandingRequest(baseUrl)
 end
 
 function App:startSyncReminderPolling()
@@ -601,6 +669,10 @@ function App:useRunningConnectionInfo()
 end
 
 function App:startSession()
+	if self.serveSession ~= nil or self.__unmounted then
+		return
+	end
+
 	local claimedLock, priorOwner = self:claimSyncLock()
 	if not claimedLock then
 		local msg = string.format("Could not sync because user '%s' is already syncing", tostring(priorOwner))
@@ -630,6 +702,8 @@ function App:startSession()
 		apiContext = apiContext,
 		twoWaySync = Settings:get("twoWaySync"),
 	})
+	-- Publish ownership before start(), which can notify listeners immediately.
+	self.serveSession = serveSession
 
 	serveSession:setUpdateLoadingTextCallback(function(text: string)
 		self:setState({
@@ -671,6 +745,10 @@ function App:startSession()
 	end)
 
 	serveSession:onStatusChanged(function(status, details)
+		if self.serveSession ~= serveSession then
+			return
+		end
+
 		if status == ServeSession.Status.Connecting then
 			if self.dismissSyncReminder then
 				self.dismissSyncReminder()
@@ -701,6 +779,11 @@ function App:startSession()
 			})
 		elseif status == ServeSession.Status.Disconnected then
 			self.serveSession = nil
+			-- A session can stop on its own while the Confirming page is open,
+			-- for example when the place ID changes. Wake the confirmation so
+			-- its thread observes the stopped session instead of waiting for
+			-- the next session's answer. Firing with no waiter does nothing.
+			self.confirmationBindable:Fire("Abort")
 			self:releaseSyncLock()
 			self:clearRunningConnectionInfo()
 			self:setState({
@@ -821,12 +904,27 @@ function App:startSession()
 			timeout = 7,
 		})
 
-		return self.confirmationEvent:Wait()
+		return self:onConfirmationAnswered(serveSession, self.confirmationEvent:Wait())
 	end)
 
 	serveSession:start()
+end
 
-	self.serveSession = serveSession
+function App:onConfirmationAnswered(serveSession, decision)
+	-- The session keeps working after an answer: applying the patch, writing
+	-- the rejected changes back and opening the sync socket. The Confirming
+	-- page's buttons do nothing by then, so show the connecting page, whose
+	-- Cancel ends the session.
+	if self.serveSession == serveSession and decision ~= "Abort" then
+		self:setState({
+			appStatus = AppStatus.Connecting,
+			connectingText = if decision == "Reject"
+				then "Sending Studio's changes to the server..."
+				else "Applying changes...",
+		})
+	end
+
+	return decision
 end
 
 function App:endSession()
@@ -837,6 +935,8 @@ function App:endSession()
 	Log.trace("Disconnecting session")
 
 	self.serveSession:stop()
+	-- Wake any initial-sync confirmation so it can observe the stopped session.
+	self.confirmationBindable:Fire("Abort")
 	self.serveSession = nil
 	self:setState({
 		appStatus = AppStatus.NotConnected,
@@ -934,6 +1034,9 @@ function App:render()
 
 					Connecting = createPageElement(AppStatus.Connecting, {
 						text = self.state.connectingText,
+						onCancel = function()
+							self:endSession()
+						end,
 					}),
 
 					Connected = createPageElement(AppStatus.Connected, {

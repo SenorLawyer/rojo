@@ -82,6 +82,24 @@ pub trait VfsBackend: sealed::Sealed + Send + 'static {
     fn event_receiver(&self) -> crossbeam_channel::Receiver<VfsEvent>;
     fn watch(&mut self, path: &Path) -> io::Result<()>;
     fn unwatch(&mut self, path: &Path) -> io::Result<()>;
+
+    /// Called when a path is created or written so that watches lost when it
+    /// or one of its ancestors was removed can be registered again.
+    fn recover_watches(&mut self, _path: &Path) -> io::Result<()> {
+        Ok(())
+    }
+
+    /// Called after the backend reported that events may have been dropped,
+    /// so that watches on paths that disappeared unnoticed can be recovered.
+    fn revalidate_watches(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+
+    /// Called for a path that does not exist, but should be read once it is
+    /// created, so that its creation is reported.
+    fn watch_missing(&mut self, _path: &Path) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 /// Vfs equivalent to [`std::fs::DirEntry`][std::fs::DirEntry].
@@ -138,6 +156,9 @@ pub enum VfsEvent {
     Create(PathBuf),
     Write(PathBuf),
     Remove(PathBuf),
+    /// Events may have been dropped, so every watched path should be treated
+    /// as potentially changed.
+    Rescan,
 }
 
 /// Contains implementation details of the Vfs, wrapped by `Vfs` and `VfsLock`,
@@ -190,11 +211,19 @@ impl VfsInner {
 
     fn read_dir<P: AsRef<Path>>(&mut self, path: P) -> io::Result<ReadDir> {
         let path = path.as_ref();
-        let dir = self.backend.read_dir(path)?;
 
-        if self.watch_enabled {
-            self.backend.watch(path)?;
-        }
+        // Register the watch before listing so that entries created while the
+        // directory is being listed still produce an event.
+        let watch_result = if self.watch_enabled {
+            self.backend.watch(path)
+        } else {
+            Ok(())
+        };
+
+        // A missing directory fails to be watched too; report the listing's
+        // error so callers can still recognize `NotFound`.
+        let dir = self.backend.read_dir(path)?;
+        watch_result?;
 
         Ok(dir)
     }
@@ -235,9 +264,28 @@ impl VfsInner {
         self.backend.event_receiver()
     }
 
+    fn watch_missing(&mut self, path: &Path) -> io::Result<()> {
+        if self.watch_enabled {
+            self.backend.watch_missing(path)?;
+        }
+        Ok(())
+    }
+
     fn commit_event(&mut self, event: &VfsEvent) -> io::Result<()> {
-        if let VfsEvent::Remove(path) = event {
-            let _ = self.backend.unwatch(path);
+        match event {
+            VfsEvent::Remove(path) => {
+                let _ = self.backend.unwatch(path);
+            }
+            VfsEvent::Create(path) | VfsEvent::Write(path) => {
+                if self.watch_enabled {
+                    self.backend.recover_watches(path)?;
+                }
+            }
+            VfsEvent::Rescan => {
+                if self.watch_enabled {
+                    self.backend.revalidate_watches()?;
+                }
+            }
         }
 
         Ok(())
@@ -260,6 +308,14 @@ impl Vfs {
     /// which can happen in restricted or sandboxed environments.
     pub fn new_default() -> io::Result<Self> {
         Ok(Self::new(StdBackend::new()?))
+    }
+
+    /// Creates a default filesystem with watching disabled and no OS watcher.
+    /// Enabling watching later allocates the watcher on the next read.
+    pub fn new_default_without_watch() -> Self {
+        let vfs = Self::new(StdBackend::new_without_watch());
+        vfs.set_watch_enabled(false);
+        vfs
     }
 
     /// Creates a new `Vfs` with the given backend.
@@ -445,6 +501,16 @@ impl Vfs {
     #[inline]
     pub fn commit_event(&self, event: &VfsEvent) -> io::Result<()> {
         self.inner.lock().unwrap().commit_event(event)
+    }
+
+    /// Asks for an event once the given path, which does not exist, is
+    /// created. Paths that are read are watched already, but nothing reads a
+    /// missing path, so nothing would report it appearing.
+    ///
+    /// Does nothing while watching is disabled.
+    #[inline]
+    pub fn watch_missing<P: AsRef<Path>>(&self, path: P) -> io::Result<()> {
+        self.inner.lock().unwrap().watch_missing(path.as_ref())
     }
 }
 
@@ -695,5 +761,36 @@ mod test {
         let vfs = Vfs::new(StdBackend::new().unwrap());
         let err = vfs.canonicalize(&file_path).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn read_dir_of_a_missing_directory_reports_not_found_while_watching() {
+        let dir = tempfile::tempdir().unwrap();
+        let vfs = Vfs::new_default().unwrap();
+        let err = vfs.read_dir(dir.path().join("missing")).err().unwrap();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn filesystem_without_watch_can_enable_watching_later() {
+        let dir = tempfile::tempdir().unwrap();
+        let vfs = Vfs::new_default_without_watch();
+        assert!(!vfs.inner.lock().unwrap().watch_enabled);
+        vfs.read_dir(dir.path()).unwrap();
+        vfs.set_watch_enabled(true);
+        vfs.read_dir(dir.path()).unwrap();
+
+        let receiver = vfs.event_receiver();
+        let file = dir.path().join("created.txt");
+        fs_err::write(&file, "hello").unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let event = receiver.recv_deadline(deadline).unwrap();
+            if let crate::VfsEvent::Create(path) | crate::VfsEvent::Write(path) = event {
+                if path.file_name() == file.file_name() {
+                    break;
+                }
+            }
+        }
     }
 }

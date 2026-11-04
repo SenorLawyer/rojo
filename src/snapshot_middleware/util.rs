@@ -1,6 +1,10 @@
-use std::path::Path;
+use std::{
+    io,
+    path::{Path, PathBuf},
+};
 
 use anyhow::Context;
+use memofs::Vfs;
 
 /// If the given string ends up with the given suffix, returns the portion of
 /// the string before the suffix.
@@ -52,4 +56,118 @@ where
 // TEMP function until rojo 8.0, when it can be replaced with bool::default (aka false)
 pub fn emit_legacy_scripts_default() -> Option<bool> {
     Some(true)
+}
+
+/// Canonicalizes the deepest existing ancestor of `path` and appends the
+/// components below it, so that paths which do not exist (yet or anymore)
+/// still use the same form as the canonical paths stored in the tree.
+pub fn canonicalize_existing_ancestor(vfs: &Vfs, path: &Path) -> io::Result<PathBuf> {
+    let mut ancestor = path;
+    let mut suffix = Vec::new();
+
+    loop {
+        match vfs.canonicalize(ancestor) {
+            Ok(mut canonical) => {
+                for component in suffix.iter().rev() {
+                    canonical.push(component);
+                }
+                return Ok(canonical);
+            }
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+                ) =>
+            {
+                // A recursive delete can remove every parent before its first
+                // child event is handled. Resolve the deepest surviving parent
+                // so symlinked and Windows verbatim paths still match the tree.
+                match (ancestor.parent(), ancestor.file_name()) {
+                    (Some(parent), Some(name)) => {
+                        suffix.push(name.to_owned());
+                        ancestor = parent;
+                    }
+                    _ => return Err(err),
+                }
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+/// Returns the form of `path` to store as a relevant path while it is missing,
+/// and asks the Vfs to report its creation.
+///
+/// This is [`canonicalize_existing_ancestor`], except that a path which cannot
+/// be resolved, for example because of a permission error or a symlink loop,
+/// is kept as written. A missing optional path must not fail the snapshot of
+/// the whole project.
+pub fn missing_relevant_path(vfs: &Vfs, path: &Path) -> PathBuf {
+    let path = canonicalize_existing_ancestor(vfs, path).unwrap_or_else(|err| {
+        log::warn!(
+            "Could not resolve {}, so recreating it may not be noticed: {}",
+            path.display(),
+            err
+        );
+        path.to_owned()
+    });
+    // Nothing reads a missing path, so nothing else would watch for it. Its
+    // parent may be missing as well, like `lib` for `lib/Packages`.
+    if let Err(err) = vfs.watch_missing(&path) {
+        log::debug!("Could not watch for {}: {}", path.display(), err);
+    }
+    path
+}
+
+/// Calls [`missing_relevant_path`] for a `$path` that produced no instance, if
+/// that is because it is missing.
+///
+/// A path that exists but produces no instance, such as a file of an unknown
+/// type, would otherwise be watched recursively and reported as created.
+pub fn relevant_path_if_missing(vfs: &Vfs, path: &Path) -> Option<PathBuf> {
+    match vfs.metadata(path) {
+        Err(err)
+            if matches!(
+                err.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+            ) =>
+        {
+            Some(missing_relevant_path(vfs, path))
+        }
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn unresolvable_missing_paths_are_kept_as_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dunce::canonicalize(dir.path()).unwrap();
+        let link = root.join("loop");
+        std::os::unix::fs::symlink(&link, &link).unwrap();
+        let path = link.join("child");
+        let vfs = Vfs::new_default_without_watch();
+        let err = canonicalize_existing_ancestor(&vfs, &path).unwrap_err();
+        assert!(
+            !matches!(
+                err.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+            ),
+            "{err}"
+        );
+        assert_eq!(missing_relevant_path(&vfs, &path), path);
+    }
+
+    #[test]
+    fn missing_relevant_paths_resolve_their_existing_ancestor() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dunce::canonicalize(dir.path()).unwrap();
+        let vfs = Vfs::new_default_without_watch();
+        let missing = root.join("missing").join("child");
+        assert_eq!(missing_relevant_path(&vfs, &missing), missing);
+    }
 }

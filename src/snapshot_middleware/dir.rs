@@ -13,7 +13,7 @@ use crate::{
     syncback::{hash_instance, FsSnapshot, SyncbackReturn, SyncbackSnapshot},
 };
 
-use super::{meta_file::DirectoryMetadata, snapshot_from_vfs};
+use super::{is_init_file_name, meta_file::DirectoryMetadata, snapshot_from_vfs};
 
 const EMPTY_DIR_KEEP_NAME: &str = ".gitkeep";
 
@@ -31,6 +31,40 @@ pub fn snapshot_dir(
     DirectoryMetadata::read_and_apply_all(vfs, path, &mut snapshot)?;
 
     Ok(Some(snapshot))
+}
+
+/// Whether `path` is an init file, which is snapshotted as part of its
+/// containing directory rather than as a child of it.
+///
+/// A file that vanished after the directory was listed (a branch switch or a
+/// package reinstall) is reported as not being an init file instead of failing
+/// the whole directory snapshot, since `snapshot_from_vfs` already skips
+/// children that no longer exist.
+///
+/// Any other metadata error (for example, permission denied) falls back to the
+/// name alone, so the entry is skipped like any other init file. Treating it as
+/// a child instead would still fail the whole directory, because
+/// `snapshot_from_vfs` reads the same metadata and propagates the error.
+fn is_init_file(vfs: &Vfs, path: &Path) -> bool {
+    let has_init_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(is_init_file_name);
+    if !has_init_name {
+        return false;
+    }
+
+    match vfs.metadata(path) {
+        Ok(metadata) => metadata.is_file(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => {
+            log::debug!(
+                "Treating {} as an init file because its metadata could not be read: {error}",
+                path.display()
+            );
+            true
+        }
+    }
 }
 
 /// Snapshot a directory without applying meta files; useful for if the
@@ -52,6 +86,12 @@ pub fn snapshot_dir_no_meta(
         let entry = entry?;
 
         if !passes_filter_rules(&entry) {
+            continue;
+        }
+
+        // Init files represent their containing directory. Explicit $path values
+        // still need to be able to snapshot these files on their own.
+        if is_init_file(vfs, entry.path()) {
             continue;
         }
 
@@ -260,5 +300,53 @@ mod test {
                 .unwrap();
 
         insta::assert_yaml_snapshot!(instance_snapshot);
+    }
+
+    #[test]
+    fn vanished_init_file_is_not_an_init_file() {
+        let mut imfs = InMemoryFs::new();
+        imfs.load_snapshot(
+            "/foo",
+            VfsSnapshot::dir([("init.luau", VfsSnapshot::file("return nil"))]),
+        )
+        .unwrap();
+        let vfs = Vfs::new(imfs);
+
+        assert!(is_init_file(&vfs, Path::new("/foo/init.luau")));
+
+        // Listing a directory and then checking each entry is not atomic, so an
+        // init file removed in between must not fail the directory snapshot.
+        assert!(!is_init_file(&vfs, Path::new("/foo/init.server.luau")));
+        vfs.remove_file(Path::new("/foo/init.luau")).unwrap();
+        assert!(!is_init_file(&vfs, Path::new("/foo/init.luau")));
+    }
+
+    /// A self-referencing symlink makes metadata fail with an error other than
+    /// NotFound, standing in for errors such as permission denied.
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_init_file_does_not_fail_the_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("foo");
+        std::fs::create_dir(&dir).unwrap();
+        let init_path = dir.join("init.luau");
+        std::os::unix::fs::symlink(&init_path, &init_path).unwrap();
+        let vfs = Vfs::new_default_without_watch();
+
+        let error = vfs.metadata(&init_path).unwrap_err();
+        assert_ne!(error.kind(), std::io::ErrorKind::NotFound);
+        assert!(is_init_file(&vfs, &init_path));
+
+        let snapshot = snapshot_dir(&InstanceContext::default(), &vfs, &dir, "foo")
+            .unwrap()
+            .unwrap();
+        assert!(snapshot.children.is_empty());
+
+        // The entry point used for real projects must not fail on it either.
+        let snapshot = snapshot_from_vfs(&InstanceContext::default(), &vfs, &dir)
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshot.class_name, "Folder");
+        assert!(snapshot.children.is_empty());
     }
 }

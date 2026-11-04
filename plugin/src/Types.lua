@@ -67,6 +67,8 @@ local ApiSocketPacket = t.interface({
 local ApiSerializeResponse = t.interface({
 	sessionId = t.string,
 	modelContents = t.buffer,
+	-- Ids the server skipped because they no longer exist. Older servers omit it.
+	missingIds = t.optional(t.array(RbxId)),
 })
 
 local ApiRefPatchResponse = t.interface({

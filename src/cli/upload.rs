@@ -40,7 +40,7 @@ impl UploadCommand {
     pub fn run(self) -> Result<(), anyhow::Error> {
         let project_path = resolve_path(&self.project)?;
 
-        let vfs = Vfs::new_default()?;
+        let vfs = Vfs::new_default_without_watch();
 
         let session = ServeSession::new(vfs, project_path)?;
 

@@ -37,29 +37,106 @@ pub struct SubscribeMessage<'a> {
 }
 
 impl<'a> SubscribeMessage<'a> {
-    pub(crate) fn from_patch_update(tree: &'a RojoTree, patch: AppliedPatchSet) -> Self {
-        let removed = patch.removed;
+    /// Whether this message has no changes for the plugin to apply.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.removed.is_empty() && self.added.is_empty() && self.updated.is_empty()
+    }
 
+    /// Converts a single applied patch into a message using the current tree.
+    #[cfg(test)]
+    pub(crate) fn from_patch_update(tree: &'a RojoTree, patch: AppliedPatchSet) -> Self {
+        Self::from_patch_updates(tree, std::iter::once(patch))
+            .pop()
+            .unwrap()
+    }
+
+    /// Converts a batch of applied patches into messages using the current
+    /// tree.
+    ///
+    /// The tree is only read once every patch in the batch has already been
+    /// applied, so it can be ahead of any individual patch. Instances added by
+    /// one patch may have been removed by a later one (a save followed by a
+    /// delete, or a branch checkout), and those removals are always delivered
+    /// later in the same or a subsequent batch. Updates carry their own values
+    /// and never need the tree, so they are forwarded as-is even if the
+    /// instance is gone. The plugin skips removals of instances it does not
+    /// know about, but reports updates to them as unapplied, which can trigger
+    /// its sync fallback for those IDs; `/api/serialize` then leaves out the
+    /// IDs that no longer exist.
+    ///
+    /// The exception is an instance whose addition was skipped in this batch:
+    /// the client never hears of it, so updates and removals of it are
+    /// dropped too instead of making the plugin fall back for nothing.
+    /// Instances the client received earlier are not affected.
+    pub(crate) fn from_patch_updates(
+        tree: &'a RojoTree,
+        patches: impl IntoIterator<Item = AppliedPatchSet>,
+    ) -> Vec<Self> {
+        // Additions are serialized from the current tree including all of
+        // their current descendants, so a descendant that was itself added by a
+        // later patch in this batch has already been sent and can be skipped.
+        let mut sent = HashSet::new();
+        let mut skipped = HashSet::new();
+
+        patches
+            .into_iter()
+            .map(|patch| Self::from_patch_update_inner(tree, patch, &mut sent, &mut skipped))
+            .collect()
+    }
+
+    fn from_patch_update_inner(
+        tree: &'a RojoTree,
+        patch: AppliedPatchSet,
+        sent: &mut HashSet<Ref>,
+        skipped: &mut HashSet<Ref>,
+    ) -> Self {
         let mut added = HashMap::new();
         for id in patch.added {
-            let instance = tree.get_instance(id).unwrap();
+            if sent.contains(&id) {
+                continue;
+            }
+
+            let Some(instance) = tree.get_instance(id) else {
+                log::debug!(
+                    "Skipping addition of instance {id} because it was removed by a later patch"
+                );
+                // Every descendant of a skipped addition is listed in the
+                // patch too, and is gone as well, so each ends up here.
+                skipped.insert(id);
+                continue;
+            };
+
+            sent.insert(id);
             added.insert(id, Instance::from_rojo_instance(instance));
 
             for instance in tree.descendants(id) {
-                added.insert(instance.id(), Instance::from_rojo_instance(instance));
+                if sent.insert(instance.id()) {
+                    added.insert(instance.id(), Instance::from_rojo_instance(instance));
+                }
             }
         }
+
+        // An addition is always applied before any update or removal of the
+        // same instance, so `skipped` is complete for those by now.
+        let removed = patch
+            .removed
+            .into_iter()
+            .filter(|id| !skipped.contains(id))
+            .collect();
 
         let updated = patch
             .updated
             .into_iter()
+            .filter(|update| !skipped.contains(&update.id))
             .map(|update| {
-                let changed_metadata = update
-                    .changed_metadata
-                    .as_ref()
-                    .map(InstanceMetadata::from_rojo_metadata);
+                let changed_metadata =
+                    update
+                        .changed_ignore_unknown_instances
+                        .map(|ignore_unknown_instances| InstanceMetadata {
+                            ignore_unknown_instances,
+                        });
 
-                let changed_properties = update
+                let changed_properties: UstrMap<Option<Variant>> = update
                     .changed_properties
                     .into_iter()
                     .filter(|(_key, value)| property_filter(value.as_ref()))
@@ -72,6 +149,12 @@ impl<'a> SubscribeMessage<'a> {
                     changed_properties,
                     changed_metadata,
                 }
+            })
+            .filter(|update| {
+                update.changed_name.is_some()
+                    || update.changed_class_name.is_some()
+                    || !update.changed_properties.is_empty()
+                    || update.changed_metadata.is_some()
             })
             .collect();
 
@@ -251,6 +334,10 @@ pub struct SerializeResponse {
     pub session_id: SessionId,
     #[serde(with = "serde_bytes")]
     pub model_contents: Vec<u8>,
+    /// Requested IDs that are no longer in the tree and so are not part of
+    /// `model_contents`.
+    #[serde(default)]
+    pub missing_ids: Vec<Ref>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -311,4 +398,224 @@ pub enum ErrorResponseKind {
     BadRequest,
     Forbidden,
     InternalError,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use rbx_dom_weak::ustr;
+
+    use crate::snapshot::{AppliedPatchUpdate, InstanceSnapshot};
+
+    fn empty_tree() -> RojoTree {
+        RojoTree::new(InstanceSnapshot::new().name("ROOT").class_name("ROOT"))
+    }
+
+    fn update_for(mut update: AppliedPatchUpdate) -> Vec<InstanceUpdate> {
+        let tree = empty_tree();
+        update.id = tree.get_root_id();
+        let patch = AppliedPatchSet {
+            removed: Vec::new(),
+            added: Vec::new(),
+            updated: vec![update],
+        };
+
+        SubscribeMessage::from_patch_update(&tree, patch).updated
+    }
+
+    fn folder(name: &str) -> InstanceSnapshot {
+        InstanceSnapshot::new().name(name).class_name("Folder")
+    }
+
+    /// A save followed by a delete produces two patches that the websocket
+    /// task can receive in one batch, after both have been applied to the
+    /// tree. The update must still be forwarded instead of failing the batch
+    /// and dropping the plugin's connection.
+    #[test]
+    fn update_then_remove_in_one_batch_is_forwarded() {
+        let mut tree = empty_tree();
+        let child = tree.insert_instance(tree.get_root_id(), folder("Child"));
+        tree.remove(child);
+
+        let mut update = AppliedPatchUpdate::new(child);
+        update.changed_name = Some("Renamed".to_owned());
+
+        let messages = SubscribeMessage::from_patch_updates(
+            &tree,
+            [
+                AppliedPatchSet {
+                    removed: Vec::new(),
+                    added: Vec::new(),
+                    updated: vec![update],
+                },
+                AppliedPatchSet {
+                    removed: vec![child],
+                    added: Vec::new(),
+                    updated: Vec::new(),
+                },
+            ],
+        );
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].updated.len(), 1);
+        assert_eq!(messages[0].updated[0].id, child);
+        assert_eq!(messages[1].removed, vec![child]);
+    }
+
+    /// An instance created and then deleted before the websocket task reads
+    /// the tree cannot be serialized, so it is skipped, and so is its removal
+    /// since the client never heard of it.
+    #[test]
+    fn add_then_remove_in_one_batch_skips_addition() {
+        let mut tree = empty_tree();
+        let kept = tree.insert_instance(tree.get_root_id(), folder("Kept"));
+        let gone = tree.insert_instance(tree.get_root_id(), folder("Gone"));
+        tree.remove(gone);
+
+        let messages = SubscribeMessage::from_patch_updates(
+            &tree,
+            [
+                AppliedPatchSet {
+                    removed: Vec::new(),
+                    added: vec![gone, kept],
+                    updated: Vec::new(),
+                },
+                AppliedPatchSet {
+                    removed: vec![gone],
+                    added: Vec::new(),
+                    updated: Vec::new(),
+                },
+            ],
+        );
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].added.len(), 1);
+        assert!(messages[0].added.contains_key(&kept));
+        assert!(messages[1].is_empty());
+    }
+
+    /// Updates and removals of an instance whose addition was skipped would
+    /// only make the plugin report them as unapplied and fall back, so they
+    /// are dropped. Changes to instances the client already has still go out.
+    #[test]
+    fn add_update_remove_in_one_batch_sends_nothing_for_instance() {
+        let mut tree = empty_tree();
+        let known = tree.insert_instance(tree.get_root_id(), folder("Known"));
+        let gone = tree.insert_instance(tree.get_root_id(), folder("Gone"));
+        let gone_child = tree.insert_instance(gone, folder("GoneChild"));
+        tree.remove(gone);
+        tree.remove(known);
+
+        let rename = |id| {
+            let mut update = AppliedPatchUpdate::new(id);
+            update.changed_name = Some("Renamed".to_owned());
+            update
+        };
+
+        let messages = SubscribeMessage::from_patch_updates(
+            &tree,
+            [
+                AppliedPatchSet {
+                    removed: Vec::new(),
+                    added: vec![gone, gone_child],
+                    updated: Vec::new(),
+                },
+                AppliedPatchSet {
+                    removed: Vec::new(),
+                    added: Vec::new(),
+                    updated: vec![rename(gone), rename(gone_child), rename(known)],
+                },
+                AppliedPatchSet {
+                    removed: vec![gone, known],
+                    added: Vec::new(),
+                    updated: Vec::new(),
+                },
+            ],
+        );
+
+        assert_eq!(messages.len(), 3);
+        assert!(messages[0].is_empty());
+        // `known` was sent to the client by an earlier batch, so its update
+        // and removal are forwarded even though it is gone from the tree.
+        assert_eq!(messages[1].updated.len(), 1);
+        assert_eq!(messages[1].updated[0].id, known);
+        assert_eq!(messages[2].removed, vec![known]);
+    }
+
+    /// Additions are serialized with their current descendants, so a
+    /// descendant added by a later patch in the same batch is only sent once.
+    #[test]
+    fn descendant_added_later_in_batch_is_sent_once() {
+        let mut tree = empty_tree();
+        let parent = tree.insert_instance(tree.get_root_id(), folder("Parent"));
+        let child = tree.insert_instance(parent, folder("Child"));
+
+        let messages = SubscribeMessage::from_patch_updates(
+            &tree,
+            [
+                AppliedPatchSet {
+                    removed: Vec::new(),
+                    added: vec![parent],
+                    updated: Vec::new(),
+                },
+                AppliedPatchSet {
+                    removed: Vec::new(),
+                    added: vec![child],
+                    updated: Vec::new(),
+                },
+            ],
+        );
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].added.len(), 2);
+        assert!(messages[0].added.contains_key(&parent));
+        assert!(messages[0].added.contains_key(&child));
+        assert!(messages[1].added.is_empty());
+    }
+
+    #[test]
+    fn name_only_update_is_kept() {
+        let mut update = AppliedPatchUpdate::new(Ref::none());
+        update.changed_name = Some("Renamed".to_owned());
+
+        let updated = update_for(update);
+        assert_eq!(updated.len(), 1);
+        assert_eq!(updated[0].changed_name.as_deref(), Some("Renamed"));
+    }
+
+    #[test]
+    fn class_name_only_update_is_kept() {
+        let mut update = AppliedPatchUpdate::new(Ref::none());
+        update.changed_class_name = Some(ustr("Folder"));
+
+        let updated = update_for(update);
+        assert_eq!(updated.len(), 1);
+        assert_eq!(updated[0].changed_class_name, Some(ustr("Folder")));
+    }
+
+    #[test]
+    fn ignore_unknown_instances_change_is_reported() {
+        let mut update = AppliedPatchUpdate::new(Ref::none());
+        update.changed_metadata = Some(RojoInstanceMetadata::new().ignore_unknown_instances(true));
+        update.changed_ignore_unknown_instances = Some(true);
+
+        let updated = update_for(update);
+        assert_eq!(updated.len(), 1);
+        assert_eq!(
+            updated[0]
+                .changed_metadata
+                .as_ref()
+                .map(|metadata| metadata.ignore_unknown_instances),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn internal_metadata_only_update_is_dropped() {
+        let mut update = AppliedPatchUpdate::new(Ref::none());
+        update.changed_metadata = Some(RojoInstanceMetadata::new());
+
+        assert!(update_for(update).is_empty());
+    }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "rojo"
-version = "7.7.1"
+version = "7.7.2-fork.1"
 rust-version = "1.88"
 authors = [
     "Lucien Greathouse <me@lpghatguy.com>",
@@ -11,7 +11,7 @@ description = "Enables professional-grade development tools for Roblox developer
 license = "MPL-2.0"
 homepage = "https://rojo.space"
 documentation = "https://rojo.space/docs"
-repository = "https://github.com/rojo-rbx/rojo"
+repository = "https://github.com/SenorLawyer/rojo"
 readme = "README.md"
 edition = "2021"
 build = "build.rs"
@@ -31,7 +31,7 @@ default = []
 dev_live_assets = []
 
 # Run Rojo with this feature to open a Tracy session.
-# Currently uses protocol v63, last supported in Tracy 0.9.1.
+# Match the Tracy UI to tracy-client-sys in Cargo.lock (see FORK.md).
 profile-with-tracy = ["profiling/profile-with-tracy"]
 
 [workspace]
@@ -46,6 +46,7 @@ name = "build"
 harness = false
 
 [dependencies]
+tempfile = "3.10.1"
 memofs = { version = "0.4.0", path = "crates/memofs" }
 
 # These dependencies can be uncommented when working on rbx-dom simultaneously
@@ -130,5 +131,4 @@ insta = { version = "1.36.1", features = ["redactions", "yaml", "json"] }
 paste = "1.0.14"
 pretty_assertions = "1.4.0"
 serde_yaml = "0.8.26"
-tempfile = "3.10.1"
 walkdir = "2.5.0"
