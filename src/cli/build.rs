@@ -258,10 +258,19 @@ fn write_model(
 /// over it once complete. Truncating the destination first would leave a
 /// corrupt file behind whenever serialization fails, and Studio may load a
 /// plugin or place file while it is half written.
+///
+/// If `destination` is a symlink, the file it points to is replaced instead,
+/// so the link keeps working. Hard links to the previous file are not
+/// updated, since the new contents are a different file.
 pub(super) fn write_file_atomically(
     destination: &Path,
     write: impl FnOnce(&mut dyn Write) -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
+    // Renaming over a symlink would replace the link itself with a plain
+    // file, and whatever it pointed to would silently stop being updated.
+    let destination = &resolve_symlinks(destination)
+        .with_context(|| format!("Could not resolve symlink {}", destination.display()))?;
+
     // The staged file must be on the same filesystem for the rename to be
     // atomic, so it goes in the destination's directory.
     let parent = match destination.parent() {
@@ -296,6 +305,16 @@ pub(super) fn write_file_atomically(
         staged.as_file().set_permissions(permissions)?;
     }
 
+    // Without this, a crash shortly after the rename can leave an empty or
+    // partial file in place of the output on filesystems that reorder the
+    // rename before the data reaches the disk.
+    staged.as_file().sync_all().with_context(|| {
+        format!(
+            "Could not flush the staged output for {}",
+            destination.display()
+        )
+    })?;
+
     // Dropping the staged file on error deletes it, so a failed rename leaves
     // only the previous output behind.
     staged.persist(destination).map_err(|error| {
@@ -307,7 +326,42 @@ pub(super) fn write_file_atomically(
         )
     })?;
 
+    // Persist the rename itself. This is best-effort: some filesystems do not
+    // support syncing directories, and the output is already complete.
+    #[cfg(unix)]
+    if let Ok(directory) = std::fs::File::open(parent) {
+        let _ = directory.sync_all();
+    }
+
     Ok(())
+}
+
+/// Follows `path` through any chain of symlinks to the path that would be
+/// opened for writing. Unlike `fs::canonicalize`, the final target does not
+/// need to exist, and other components of the path are left as they are.
+fn resolve_symlinks(path: &Path) -> std::io::Result<PathBuf> {
+    // Matches the usual limit on symlink hops, so a loop is reported rather
+    // than followed forever.
+    const MAX_HOPS: usize = 40;
+
+    let mut path = path.to_path_buf();
+    for _ in 0..MAX_HOPS {
+        match std::fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                let target = std::fs::read_link(&path)?;
+                path = match path.parent() {
+                    Some(parent) if target.is_relative() => parent.join(target),
+                    _ => target,
+                };
+            }
+            _ => return Ok(path),
+        }
+    }
+
+    Err(std::io::Error::other(format!(
+        "too many levels of symbolic links at {}",
+        path.display()
+    )))
 }
 
 #[cfg(test)]
@@ -341,6 +395,90 @@ mod test {
 
         assert_eq!(std::fs::read(&destination).unwrap(), b"new build");
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    /// Creates a file symlink, or returns false where that needs privileges
+    /// the test does not have (Windows without Developer Mode).
+    fn symlink_file(target: &Path, link: &Path) -> bool {
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(target, link).unwrap();
+            true
+        }
+        #[cfg(windows)]
+        {
+            std::os::windows::fs::symlink_file(target, link).is_ok()
+        }
+    }
+
+    #[test]
+    fn write_through_symlink_replaces_link_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real.rbxl");
+        let link = dir.path().join("link.rbxl");
+        std::fs::write(&real, b"previous build").unwrap();
+        if !symlink_file(Path::new("real.rbxl"), &link) {
+            eprintln!("skipping: cannot create symlinks here");
+            return;
+        }
+
+        write_file_atomically(&link, |file| Ok(file.write_all(b"new build")?)).unwrap();
+
+        assert!(std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(std::fs::read(&real).unwrap(), b"new build");
+        assert_eq!(std::fs::read(&link).unwrap(), b"new build");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn write_through_dangling_symlink_creates_link_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real.rbxl");
+        let link = dir.path().join("link.rbxl");
+        if !symlink_file(&real, &link) {
+            eprintln!("skipping: cannot create symlinks here");
+            return;
+        }
+
+        write_file_atomically(&link, |file| Ok(file.write_all(b"new build")?)).unwrap();
+
+        assert!(std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(std::fs::read(&real).unwrap(), b"new build");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_loop_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.rbxl");
+        let b = dir.path().join("b.rbxl");
+        std::os::unix::fs::symlink(&b, &a).unwrap();
+        std::os::unix::fs::symlink(&a, &b).unwrap();
+
+        assert!(write_file_atomically(&a, |file| Ok(file.write_all(b"new build")?)).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn new_file_gets_default_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let destination = dir.path().join("place.rbxl");
+
+        write_file_atomically(&destination, |file| Ok(file.write_all(b"new build")?)).unwrap();
+
+        let mode = std::fs::metadata(&destination)
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o644);
     }
 
     #[cfg(unix)]

@@ -10,7 +10,9 @@ use crate::rojo_test::{
     serve_util::{deserialize_msgpack, run_serve_test, serialize_to_xml_model},
 };
 
-use librojo::web_api::{SerializeResponse, SocketPacketBody, SocketPacketType, SubscribeMessage};
+use librojo::web_api::{
+    ReadResponse, SerializeResponse, SocketPacketBody, SocketPacketType, SubscribeMessage,
+};
 
 #[test]
 fn rejects_dns_rebinding_requests() {
@@ -660,6 +662,62 @@ fn ref_properties_remove() {
     });
 }
 
+/// A target that is removed and later re-created, as a branch switch or a
+/// package reinstall can do in separate watcher events, must be pointed at
+/// again without the pointer's own file changing.
+#[test]
+fn ref_properties_restore_after_target_returns() {
+    run_serve_test("ref_properties_remove", |session, _redactions| {
+        let info = session.get_api_rojo().unwrap();
+        let root_id = info.root_instance_id;
+        let value = rbx_dom_weak::ustr("Value");
+
+        let read_response = session.get_api_read(root_id).unwrap();
+        let pointer_id = read_response
+            .instances
+            .values()
+            .find(|instance| instance.name == "pointer")
+            .unwrap()
+            .id;
+
+        let target_path = session.path().join("src/target.model.json");
+        let target_contents = fs::read_to_string(&target_path).unwrap();
+
+        let wait_until = |what: &str, done: &dyn Fn(&ReadResponse<'_>) -> bool| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                let read = session.get_api_read(root_id).unwrap();
+                if done(&read) {
+                    return;
+                }
+                assert!(std::time::Instant::now() < deadline, "timed out: {what}");
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        };
+
+        fs::remove_file(&target_path).unwrap();
+        wait_until("pointer cleared after target removal", &|read| {
+            !read.instances[&pointer_id].properties.contains_key(&value)
+        });
+
+        fs::write(&target_path, target_contents).unwrap();
+        wait_until("pointer restored after target returned", &|read| {
+            let Some(target) = read
+                .instances
+                .values()
+                .find(|instance| instance.name == "target")
+            else {
+                return false;
+            };
+            read.instances[&pointer_id]
+                .properties
+                .get(&value)
+                .map(|value| value.as_ref())
+                == Some(&rbx_dom_weak::types::Variant::Ref(target.id))
+        });
+    });
+}
+
 /// When Ref properties were first implemented, a mistake was made that resulted
 /// in Ref properties defined via attributes not being included in patch
 /// computation, which resulted in subsequent patches setting those properties
@@ -1023,8 +1081,15 @@ fn changed_metadata() {
         // snapshot only the messages that carry changes.
         let mut cursor = 0;
         let mut wait_for = |done: &dyn Fn(&[SubscribeMessage<'static>]) -> bool| {
+            // Packets that never satisfy `done` would otherwise keep this
+            // waiting forever instead of failing the test.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
             let mut received = Vec::new();
             loop {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "timed out waiting for messages, received: {received:#?}"
+                );
                 let packet = session
                     .get_api_socket_packet(SocketPacketType::Messages, cursor)
                     .unwrap();
