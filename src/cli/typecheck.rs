@@ -7,14 +7,14 @@ use std::{
     process::Command,
 };
 
-use anyhow::{bail, Context};
+use anyhow::{anyhow, bail, Context};
 use clap::Parser;
 use memofs::Vfs;
 use rbx_dom_weak::{types::Ref, types::Variant, ustr};
 
 use crate::{serve_session::ServeSession, snapshot_middleware::Middleware};
 
-use super::{resolve_path, sourcemap::write_sourcemap_json};
+use super::{resolve_path, sourcemap::write_sourcemap_json, UsageError};
 
 /// The install command suggested when luau-lsp cannot be found.
 const INSTALL_HINT: &str = "rokit add JohnnyMorganz/luau-lsp";
@@ -52,9 +52,11 @@ pub struct TypecheckCommand {
 
 impl TypecheckCommand {
     pub fn run(self) -> anyhow::Result<()> {
+        let luau_lsp = program_path(&self.luau_lsp)?;
+
         // Check for luau-lsp first, so a missing install does not wait for
         // the whole project to load.
-        let version = luau_lsp_version(&self.luau_lsp)?;
+        let version = luau_lsp_version(&luau_lsp)?;
         log::info!("Using luau-lsp {version}");
 
         let project_path = dunce::canonicalize(resolve_path(&self.project)?)?;
@@ -63,10 +65,11 @@ impl TypecheckCommand {
 
         let files = script_files(&session);
         if files.is_empty() {
-            bail!(
+            return Err(UsageError(anyhow!(
                 "The project at {} has no .lua or .luau scripts to check",
                 project_dir.display()
-            );
+            ))
+            .into());
         }
 
         // Holds the sourcemap and the Luau of generated modules. It is removed
@@ -104,12 +107,12 @@ impl TypecheckCommand {
 
         let mut failed = false;
         for args in invocations {
-            log::debug!("Running {} {:?}", self.luau_lsp.display(), args);
-            let status = Command::new(&self.luau_lsp)
+            log::debug!("Running {} {:?}", luau_lsp.display(), args);
+            let status = Command::new(&luau_lsp)
                 .args(&args)
                 .current_dir(&project_dir)
                 .status()
-                .with_context(|| format!("Could not run {}", self.luau_lsp.display()))?;
+                .with_context(|| format!("Could not run {}", luau_lsp.display()))?;
             failed |= !status.success();
         }
 
@@ -128,17 +131,32 @@ impl TypecheckCommand {
     }
 }
 
+/// Makes a `--luau-lsp` value that names a file by a relative path absolute.
+///
+/// luau-lsp's version is checked from the current directory but the analysis
+/// runs in the project's folder, and on Unix a relative program path is looked
+/// up from the folder the program runs in. A bare name like `luau-lsp` is
+/// left alone so that it is still looked up on `PATH`.
+fn program_path(program: &Path) -> anyhow::Result<PathBuf> {
+    if program.components().count() > 1 {
+        Ok(resolve_path(program)?.into_owned())
+    } else {
+        Ok(program.to_path_buf())
+    }
+}
+
 /// Runs `luau-lsp --version`, turning the ways it can be missing into errors
 /// that say how to install it.
 fn luau_lsp_version(luau_lsp: &Path) -> anyhow::Result<String> {
     let output = match Command::new(luau_lsp).arg("--version").output() {
         Ok(output) => output,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            bail!(
+            return Err(UsageError(anyhow!(
                 "Could not find luau-lsp ({}). Install it with `{INSTALL_HINT}`, \
                  or pass its location with --luau-lsp.",
                 luau_lsp.display()
-            );
+            ))
+            .into());
         }
         Err(error) => {
             return Err(error).with_context(|| format!("Could not run {}", luau_lsp.display()))
@@ -148,11 +166,12 @@ fn luau_lsp_version(luau_lsp: &Path) -> anyhow::Result<String> {
     // A Rokit shim exists even when the current project does not list the
     // tool, in which case it fails with an explanation on stderr.
     if !output.status.success() {
-        bail!(
+        return Err(UsageError(anyhow!(
             "{} --version failed: {}\nInstall luau-lsp with `{INSTALL_HINT}`.",
             luau_lsp.display(),
             String::from_utf8_lossy(&output.stderr).trim()
-        );
+        ))
+        .into());
     }
 
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
@@ -208,11 +227,24 @@ fn write_generated_modules(
             files.len(),
             file_safe(instance.name())
         ));
-        fs_err::write(&path, source)?;
+        fs_err::write(&path, nocheck_source(source))?;
         files.insert(instance.id(), path);
     }
 
     Ok(files)
+}
+
+/// Swaps the `--!strict` header of a generated module for `--!nocheck`.
+///
+/// luau-lsp still checks a module that is not on its list of files when a
+/// checked script requires it, and reports what it finds there. A data module
+/// with tens of thousands of rows makes it fail with "Code is too complex to
+/// typecheck!" once per few rows, in a temporary file the user cannot fix.
+/// With `--!nocheck` the module's body is not checked, but its annotated
+/// `Row` type and return type still reach the scripts that require it.
+fn nocheck_source(source: &str) -> String {
+    let body = source.strip_prefix("--!strict\n").unwrap_or(source);
+    format!("--!nocheck\n{body}")
 }
 
 /// Keeps the characters of an instance name that are safe in a file name on
@@ -395,10 +427,42 @@ mod test {
     }
 
     #[test]
+    fn relative_luau_lsp_paths_are_made_absolute() {
+        let current_dir = std::env::current_dir().unwrap();
+
+        // Looked up on PATH, so left as it is.
+        assert_eq!(
+            program_path(Path::new("luau-lsp")).unwrap(),
+            Path::new("luau-lsp")
+        );
+        assert_eq!(
+            program_path(Path::new("./tools/luau-lsp")).unwrap(),
+            current_dir.join("./tools/luau-lsp")
+        );
+        assert_eq!(
+            program_path(Path::new("tools/luau-lsp")).unwrap(),
+            current_dir.join("tools/luau-lsp")
+        );
+
+        let absolute = current_dir.join("luau-lsp");
+        assert_eq!(program_path(&absolute).unwrap(), absolute);
+    }
+
+    #[test]
+    fn generated_modules_are_not_checked() {
+        assert_eq!(
+            nocheck_source("--!strict\n-- Generated\nreturn {}\n"),
+            "--!nocheck\n-- Generated\nreturn {}\n"
+        );
+        assert_eq!(nocheck_source("return {}\n"), "--!nocheck\nreturn {}\n");
+    }
+
+    #[test]
     fn missing_luau_lsp_suggests_installing_it() {
-        let error = luau_lsp_version(Path::new("rojo-test-luau-lsp-that-does-not-exist"))
-            .unwrap_err()
-            .to_string();
+        let error =
+            luau_lsp_version(Path::new("rojo-test-luau-lsp-that-does-not-exist")).unwrap_err();
+        assert!(error.is::<UsageError>(), "{error:#}");
+        let error = error.to_string();
 
         assert!(error.contains("Could not find luau-lsp"), "{error}");
         assert!(
@@ -453,7 +517,10 @@ mod test {
                 else {
                     panic!("{} has no Source", instance.name());
                 };
-                assert_eq!(&fs_err::read_to_string(path).unwrap(), source);
+                let written = fs_err::read_to_string(path).unwrap();
+                assert_eq!(written, nocheck_source(source));
+                assert!(written.starts_with("--!nocheck\n"), "{written}");
+                assert!(!written.contains("--!strict"), "{written}");
                 instance.name().to_owned()
             })
             .collect();
@@ -489,24 +556,78 @@ mod test {
         assert_eq!(child("Settings")["filePaths"][0], "src/Settings.json");
     }
 
-    /// Runs the real luau-lsp when `ROJO_TEST_LUAU_LSP` names it, since CI
+    /// The luau-lsp to run tests against, from `ROJO_TEST_LUAU_LSP`, since CI
     /// does not install it.
-    #[test]
-    fn scripts_can_require_data_modules() {
-        let Some(luau_lsp) = std::env::var_os("ROJO_TEST_LUAU_LSP") else {
+    fn test_luau_lsp() -> Option<PathBuf> {
+        let luau_lsp = std::env::var_os("ROJO_TEST_LUAU_LSP");
+        if luau_lsp.is_none() {
             eprintln!("Skipping: set ROJO_TEST_LUAU_LSP to a luau-lsp executable to run");
-            return;
-        };
+        }
+        luau_lsp.map(PathBuf::from)
+    }
 
+    fn typecheck(project: PathBuf, luau_lsp: PathBuf) -> anyhow::Result<()> {
         TypecheckCommand {
-            project: Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("test-projects")
-                .join("typecheck_data_modules"),
+            project,
             definitions: Vec::new(),
-            luau_lsp: luau_lsp.into(),
+            luau_lsp,
             extra_args: Vec::new(),
         }
         .run()
+    }
+
+    #[test]
+    fn scripts_can_require_data_modules() {
+        let Some(luau_lsp) = test_luau_lsp() else {
+            return;
+        };
+
+        let project = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("test-projects")
+            .join("typecheck_data_modules");
+        typecheck(project, luau_lsp).unwrap();
+    }
+
+    /// luau-lsp gives up on a module this large with "Code is too complex to
+    /// typecheck!" unless the generated module is left unchecked.
+    #[test]
+    fn large_data_modules_do_not_fail_the_check() {
+        let Some(luau_lsp) = test_luau_lsp() else {
+            return;
+        };
+
+        let project = tempfile::tempdir().unwrap();
+        let src = project.path().join("src");
+        fs_err::create_dir(&src).unwrap();
+        fs_err::write(
+            project.path().join("default.project.json"),
+            r#"{ "name": "large", "tree": { "$path": "src" } }"#,
+        )
         .unwrap();
+
+        let mut csv = String::from("id,name,cost\n");
+        for i in 0..30_000 {
+            csv.push_str(&format!("item{i},Item {i},{i}\n"));
+        }
+        fs_err::write(src.join("Big.data.csv"), csv).unwrap();
+
+        let script = |result_type: &str| {
+            format!(
+                "--!strict\n\
+                 local Big = require(script.Parent.Big)\n\
+                 local function price(item: Big.Row): number\n\
+                 \treturn item.cost\n\
+                 end\n\
+                 local result: {result_type} = price(Big.item5)\n\
+                 return result\n"
+            )
+        };
+
+        fs_err::write(src.join("Use.luau"), script("number")).unwrap();
+        typecheck(project.path().to_path_buf(), luau_lsp.clone()).unwrap();
+
+        // The Row type still reaches the script, so its mistakes are caught.
+        fs_err::write(src.join("Use.luau"), script("string")).unwrap();
+        typecheck(project.path().to_path_buf(), luau_lsp).unwrap_err();
     }
 }

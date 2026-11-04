@@ -85,6 +85,8 @@ While `rojo serve` is running, the error is logged and the module keeps its last
 
 The CSV file is the source of truth. Two-way sync does not write a script edited in Studio back over the CSV file; the server logs a warning instead. `rojo syncback` leaves `.data.csv` files as they are, the same way it skips `.json` and `.toml` modules. In a directory with an `init.data.csv`, syncback still writes the module's children, but not its source, and logs a warning when the source was changed. Turning edited Luau back into CSV would lose what spreadsheet tools keep in the file, so it is not attempted.
 
+Deleting is different: like any other file, the CSV file is deleted when its module is deleted in Studio during two-way sync, or when `rojo syncback` runs against a place that no longer has the module.
+
 ## Type checking and editors
 
 `rojo typecheck` writes each data module's generated Luau to a temporary file, so scripts that require a data module, or use `Items.Row`, are checked against it. See [Type checking](typecheck.md).
