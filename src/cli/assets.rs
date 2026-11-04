@@ -287,8 +287,11 @@ struct LockFile {
     version: u32,
     assets: BTreeMap<String, LockEntry>,
     /// Uploads that Roblox accepted but that did not finish in an earlier
-    /// run, keyed like `assets`. Left out when empty, so lockfiles without
-    /// any stay as they were.
+    /// run, keyed by contents (see `pending_key`) rather than by path: a
+    /// path's next upload must never replace the record of an unfinished
+    /// upload whose contents have since moved to another path, or those
+    /// contents would be sent again. Left out when empty, so lockfiles
+    /// without any stay as they were.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pending: BTreeMap<String, PendingUpload>,
     /// Contents that Roblox rejected in moderation, keyed by BLAKE3 hash.
@@ -310,11 +313,22 @@ struct RejectedUpload {
     rejected: String,
 }
 
+/// The key of the pending upload of contents with `hash`, so that there is at
+/// most one per asset type, creator and contents.
+fn pending_key(asset_type: &str, creator: &str, hash: &str) -> String {
+    format!("{asset_type}/{creator}/{hash}")
+}
+
 /// An upload that Roblox accepted as an operation, recorded so that the next
 /// run polls the operation instead of creating a second asset.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct PendingUpload {
+    /// The path the file was sent from, for messages. Empty only while
+    /// reading a lockfile from before `pending` was keyed by contents, whose
+    /// keys were these paths.
+    #[serde(default)]
+    path: String,
     /// BLAKE3 hash of the file that was sent.
     hash: String,
     asset_type: String,
@@ -375,7 +389,29 @@ fn load_lock(path: &Path) -> anyhow::Result<LockFile> {
             lock.version
         );
     }
-    Ok(lock)
+    Ok(rekey_pending(lock))
+}
+
+/// Keys every pending upload by its contents. Earlier builds of this format
+/// keyed them by path and had no `path` field, so such a key moves into
+/// `path`. Two such entries with the same contents are both waiting on an
+/// asset of those contents, so keeping either one is enough.
+///
+/// This shape was never released, so reading it needs no version bump.
+fn rekey_pending(mut lock: LockFile) -> LockFile {
+    for (key, mut pending) in std::mem::take(&mut lock.pending) {
+        if pending.path.is_empty() {
+            pending.path = key;
+        }
+        lock.pending
+            .entry(pending_key(
+                &pending.asset_type,
+                &pending.creator,
+                &pending.hash,
+            ))
+            .or_insert(pending);
+    }
+    lock
 }
 
 fn render_lock(lock: &LockFile) -> String {
@@ -933,18 +969,10 @@ fn plan(sources: &[Source], lock: &LockFile, config: &Config, retry_rejected: bo
                         from: (*from).to_owned(),
                     },
                     None => {
-                        // The entry for this path first, then any other with
-                        // the same contents, such as before a rename.
+                        // Found by contents, so it follows a rename.
                         let resume = lock
                             .pending
-                            .get_key_value(&source.rel)
-                            .into_iter()
-                            .chain(&lock.pending)
-                            .find(|(_, pending)| {
-                                pending.hash == source.hash
-                                    && pending.creator == creator
-                                    && pending.asset_type == source.kind.name()
-                            })
+                            .get_key_value(&pending_key(source.kind.name(), &creator, &source.hash))
                             .map(|(key, pending)| Resume {
                                 key: key.clone(),
                                 operation: pending.operation.clone(),
@@ -1081,11 +1109,12 @@ fn describe_plan(
         }
     }
     for key in &plan.stale_pending {
+        let pending = &lock.pending[key];
         writeln!(
             out,
-            "  stale     unfinished upload of {key} ({}) is no longer needed and will be \
+            "  stale     unfinished upload of {} ({}) is no longer needed and will be \
              forgotten; if Roblox created an asset for it, that asset stays unused",
-            lock.pending[key].operation
+            pending.path, pending.operation
         )?;
     }
     Ok(())
@@ -1209,8 +1238,10 @@ struct SyncOptions {
 
 /// Held for the whole of a sync that may write, so that two syncs of one
 /// config cannot both read the lockfile and upload the same new files. The
-/// file is removed when the guard drops, including on errors and panics; only
-/// a killed process leaves it behind.
+/// file is removed when the guard drops, including on errors and panics; a
+/// killed process leaves it behind, and so does Ctrl+C, since Rojo installs
+/// no handler and the process ends without unwinding. The error for a
+/// leftover file explains how to remove it.
 struct SyncLock {
     path: PathBuf,
 }
@@ -1460,9 +1491,14 @@ fn upload(
         None => {
             let started = start_upload(client, config, source)?;
             let operation = started.operation.clone();
+            let key = pending_key(source.kind.name(), creator, &source.hash);
+            // `plan` resumes a pending upload of these contents rather than
+            // sending them again, so this never replaces another operation.
+            debug_assert!(!lock.pending.contains_key(&key));
             lock.pending.insert(
-                source.rel.clone(),
+                key.clone(),
                 PendingUpload {
+                    path: source.rel.clone(),
                     hash: source.hash.clone(),
                     asset_type: source.kind.name().to_owned(),
                     creator: creator.to_owned(),
@@ -1478,11 +1514,7 @@ fn upload(
                     source.rel
                 )
             })?;
-            (
-                source.rel.clone(),
-                operation,
-                client.finish_asset_upload(started),
-            )
+            (key, operation, client.finish_asset_upload(started))
         }
     };
     let uploaded = match result {
@@ -1501,7 +1533,7 @@ fn upload(
             "Could not finish uploading {}: {error}. Roblox accepted the file as {operation}, \
              which is recorded in {}; the next `rojo assets sync` checks on it instead of \
              uploading the file again. If that keeps failing, check the creator's assets, \
-             then remove the entry for {key} under \"pending\" in the lockfile to upload it \
+             then remove the entry {key} under \"pending\" in the lockfile to upload it \
              again.",
             source.rel,
             display_path(config, &config.lock)
@@ -2150,12 +2182,11 @@ mod tests {
         assert!(error.contains("checks on it instead"), "{error}");
         let lock = fixture.lock();
         assert!(lock.assets.is_empty());
-        let pending = &lock.pending["A.png"];
+        let hash = blake3::hash(&png(8, 8, "a")).to_hex();
+        let pending = &lock.pending[&format!("Image/user:42/{hash}")];
         assert_eq!(pending.operation, "operations/op1");
-        assert_eq!(
-            pending.hash,
-            blake3::hash(&png(8, 8, "a")).to_hex().as_str()
-        );
+        assert_eq!(pending.path, "A.png");
+        assert_eq!(pending.hash, hash.as_str());
         assert!(fixture
             .status()
             .contains("resume    A.png (Image, 34 B) to check on operations/op1"));
@@ -2227,6 +2258,64 @@ mod tests {
             "{out}"
         );
         assert_eq!(report.uploaded, ids(&[("C.png", 1002)]));
+        assert!(fixture.lock().pending.is_empty());
+    }
+
+    #[test]
+    fn a_new_upload_to_a_path_keeps_the_pending_upload_of_its_old_contents() {
+        let fixture = Fixture::new();
+        fixture.write("A.png", &png(8, 8, "a"));
+        let cloud = FakeCloud::start(None);
+        cloud.defer.store(true, Ordering::SeqCst);
+        cloud.refuse_polls.store(true, Ordering::SeqCst);
+        fixture.sync(&cloud).unwrap_err();
+        // The contents op1 is uploading move to Z.png, and A.png gets new
+        // contents, which sort first and are sent (as op2) before Z.png is
+        // reached. Following op2 fails as well.
+        fixture.rename("A.png", "Z.png");
+        fixture.write("A.png", &png(8, 8, "a2"));
+        let error = format!("{:#}", fixture.sync(&cloud).unwrap_err());
+        assert!(
+            error.contains("Could not finish uploading A.png"),
+            "{error}"
+        );
+        assert_eq!(fixture.lock().pending.len(), 2);
+
+        cloud.refuse_polls.store(false, Ordering::SeqCst);
+        let (report, out) = fixture.sync(&cloud).unwrap();
+
+        assert!(
+            out.contains("Checking on the earlier upload of Z.png (operations/op1)"),
+            "{out}"
+        );
+        assert_eq!(report.uploaded, ids(&[("A.png", 1002), ("Z.png", 1001)]));
+        // Each of the two contents was sent once.
+        assert_eq!(cloud.uploads(), ["test-A", "test-A"]);
+        assert!(fixture.lock().pending.is_empty());
+    }
+
+    #[test]
+    fn path_keyed_pending_uploads_are_read_and_resumed() {
+        let fixture = Fixture::new();
+        fixture.write("A.png", &png(8, 8, "a"));
+        let hash = blake3::hash(&png(8, 8, "a")).to_hex();
+        // The shape written by earlier builds of this format.
+        fs::write(
+            fixture.dir.path().join("assets.lock.json"),
+            format!(
+                r#"{{"version":1,"assets":{{}},"pending":{{"A.png":{{"hash":"{hash}","assetType":"Image","creator":"user:42","operation":"operations/op7","started":"2026-01-01T00:00:00Z"}}}}}}"#
+            ),
+        )
+        .unwrap();
+        let lock = fixture.lock();
+        let pending = &lock.pending[&format!("Image/user:42/{hash}")];
+        assert_eq!(pending.path, "A.png");
+
+        let cloud = FakeCloud::start(None);
+        let (report, _) = fixture.sync(&cloud).unwrap();
+
+        assert_eq!(report.uploaded, ids(&[("A.png", 1007)]));
+        assert!(cloud.uploads().is_empty());
         assert!(fixture.lock().pending.is_empty());
     }
 
