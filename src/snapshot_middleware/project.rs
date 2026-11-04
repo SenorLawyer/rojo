@@ -8,7 +8,7 @@ use anyhow::{bail, Context};
 use memofs::Vfs;
 use rbx_dom_weak::{
     types::{Attributes, Ref, Variant},
-    ustr, HashMapExt as _, Instance, Ustr, UstrMap,
+    ustr, HashMapExt as _, Instance, Ustr, UstrMap, UstrSet,
 };
 use rbx_reflection::ClassTag;
 
@@ -392,6 +392,7 @@ pub fn syncback_project<'sync>(
 
     while let Some((node, old_inst, new_inst)) = node_queue.pop_front() {
         log::debug!("Processing node {}", old_inst.name());
+        let untouched = snapshot.untouched_properties(new_inst.referent());
         if old_inst.class_name() != new_inst.class {
             anyhow::bail!(
                 "Cannot change the class of {} in project file {}.\n\
@@ -446,11 +447,11 @@ pub fn syncback_project<'sync>(
             // We only want to set properties if it needs it.
             if !middleware.handles_own_properties() {
                 removed_stale_properties |=
-                    project_node_property_syncback_path(snapshot, new_inst, node);
+                    project_node_property_syncback_path(snapshot, new_inst, node, &untouched);
             }
         } else {
             removed_stale_properties |=
-                project_node_property_syncback_no_path(snapshot, new_inst, node);
+                project_node_property_syncback_no_path(snapshot, new_inst, node, &untouched);
         }
 
         for child_ref in new_inst.children() {
@@ -548,14 +549,19 @@ pub fn syncback_project<'sync>(
             }
         }
         removed_descendants.extend(old_child_map.drain().map(|(_, v)| v));
-        node_changed_map.push((&node.properties, &node.attributes, old_inst))
+        node_changed_map.push((&node.properties, &node.attributes, old_inst, untouched))
     }
     let mut fs_snapshot = FsSnapshot::new();
 
     let mut needs_reserialize = removed_stale_properties;
     if !needs_reserialize {
-        for (node_properties, node_attributes, old_inst) in node_changed_map {
-            if project_node_should_reserialize(node_properties, node_attributes, old_inst)? {
+        for (node_properties, node_attributes, old_inst, untouched) in node_changed_map {
+            if project_node_should_reserialize(
+                node_properties,
+                node_attributes,
+                old_inst,
+                &untouched,
+            )? {
                 needs_reserialize = true;
                 break;
             }
@@ -575,11 +581,14 @@ pub fn syncback_project<'sync>(
 /// Syncs properties from the new instance into the project node.
 /// Returns `true` if any stale properties were removed (i.e. properties
 /// that existed in the project node but are now at their engine default).
+///
+/// Entries named in `untouched` (see
+/// [`SyncbackSnapshot::untouched_properties`]) are left as they are.
 fn project_node_property_syncback(
-    _snapshot: &SyncbackSnapshot,
     filtered_properties: UstrMap<&Variant>,
     new_inst: &Instance,
     node: &mut ProjectNode,
+    untouched: &UstrSet,
 ) -> bool {
     let class_data = rbx_reflection_database::get()
         .ok()
@@ -605,6 +614,12 @@ fn project_node_property_syncback(
         })
         .collect();
     for (legacy_name, content_name, migrated) in legacy_entries {
+        // The new DOM holds no value for an ignored or unreadable property,
+        // which must not be mistaken for a value reset to its default.
+        if untouched.contains(&legacy_name) || untouched.contains(&content_name) {
+            kept_legacy.insert(legacy_name);
+            continue;
+        }
         // A property at its default is left out of `filtered_properties`.
         let current = filtered_properties.get(&content_name).copied().or_else(|| {
             class_data.and_then(|data| data.default_properties.get(content_name.as_str()))
@@ -655,7 +670,10 @@ fn project_node_property_syncback(
     // to clean up the now-stale project entry.
     let len_before = properties.len();
     properties.retain(|prop_name, _| {
-        if filtered_properties.contains_key(prop_name) || kept_legacy.contains(prop_name) {
+        if filtered_properties.contains_key(prop_name)
+            || kept_legacy.contains(prop_name)
+            || untouched.contains(prop_name)
+        {
             return true;
         }
         // Only remove if the property has a known default value in the
@@ -685,28 +703,36 @@ fn project_node_property_syncback_path(
     snapshot: &SyncbackSnapshot,
     new_inst: &Instance,
     node: &mut ProjectNode,
+    untouched: &UstrSet,
 ) -> bool {
     let filtered_properties = snapshot
         .get_path_filtered_properties(new_inst.referent())
         .unwrap();
-    project_node_property_syncback(snapshot, filtered_properties, new_inst, node)
+    project_node_property_syncback(filtered_properties, new_inst, node, untouched)
 }
 
 fn project_node_property_syncback_no_path(
     snapshot: &SyncbackSnapshot,
     new_inst: &Instance,
     node: &mut ProjectNode,
+    untouched: &UstrSet,
 ) -> bool {
     let filtered_properties = filter_properties(snapshot.project(), new_inst);
-    project_node_property_syncback(snapshot, filtered_properties, new_inst, node)
+    project_node_property_syncback(filtered_properties, new_inst, node, untouched)
 }
 
 fn project_node_should_reserialize(
     node_properties: &BTreeMap<Ustr, UnresolvedValue>,
     node_attributes: &BTreeMap<String, UnresolvedValue>,
     instance: InstanceWithMeta,
+    untouched: &UstrSet,
 ) -> anyhow::Result<bool> {
     for (prop_name, unresolved_node_value) in node_properties {
+        // These entries were left as they are, and the old tree has no value
+        // for an ignored property to compare them with.
+        if untouched.contains(prop_name) {
+            continue;
+        }
         if let Some(inst_value) = instance.properties().get(prop_name) {
             let node_value = unresolved_node_value
                 .clone()
@@ -723,6 +749,7 @@ fn project_node_should_reserialize(
             // The old tree holds legacy asset properties under their `Content`
             // names, so a legacy entry is compared in that form.
             match instance.properties().get(&content_name) {
+                _ if untouched.contains(&content_name) => {}
                 Some(inst_value) if variant_eq(inst_value, &migrated) => {}
                 _ => return Ok(true),
             }

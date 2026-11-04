@@ -1,6 +1,9 @@
 use indexmap::IndexMap;
 use memofs::Vfs;
-use std::path::{Path, PathBuf};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+};
 
 use crate::{
     snapshot::{InstanceWithMeta, RojoTree},
@@ -9,10 +12,12 @@ use crate::{
 };
 use rbx_dom_weak::{
     types::{Ref, Variant},
-    Instance, Ustr, UstrMap, WeakDom,
+    Instance, Ustr, UstrMap, UstrSet, WeakDom,
 };
 
-use super::{get_best_middleware, name_for_inst, property_filter::filter_properties};
+use super::{
+    get_best_middleware, get_property_filter, name_for_inst, property_filter::filter_properties,
+};
 
 #[derive(Clone, Copy)]
 pub struct SyncbackData<'sync> {
@@ -20,6 +25,9 @@ pub struct SyncbackData<'sync> {
     pub(super) old_tree: &'sync RojoTree,
     pub(super) new_tree: &'sync WeakDom,
     pub(super) project: &'sync Project,
+    /// Properties removed from instances in the new tree because Rojo cannot
+    /// represent their values, keyed by the instance's referent.
+    pub(super) unreadable_properties: &'sync HashMap<Ref, UstrSet>,
 }
 
 pub struct SyncbackSnapshot<'sync> {
@@ -117,6 +125,23 @@ impl<'sync> SyncbackSnapshot<'sync> {
             .collect();
 
         Some(properties)
+    }
+
+    /// Returns the properties of an Instance from the 'new' tree that syncback
+    /// must leave as they are written in files: those ignored by the
+    /// project's `ignoreProperties` (under either name of an asset property)
+    /// and those whose value in the new tree Rojo could not represent. None
+    /// of them are present on the Instance, which does not mean they were
+    /// reset to their defaults.
+    pub fn untouched_properties(&self, new_ref: Ref) -> UstrSet {
+        let mut untouched = self
+            .get_new_instance(new_ref)
+            .and_then(|inst| get_property_filter(self.data.project, inst))
+            .unwrap_or_default();
+        if let Some(unreadable) = self.data.unreadable_properties.get(&new_ref) {
+            untouched.extend(unreadable);
+        }
+        untouched
     }
 
     /// Returns a path to the provided Instance in the new DOM. This path is

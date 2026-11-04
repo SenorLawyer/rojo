@@ -1,0 +1,16 @@
+---
+source: tests/tests/syncback.rs
+expression: unchanged.project.json
+---
+{
+  "name": "unchanged",
+  "tree": {
+    "$className": "Lighting",
+    "Ignored": {
+      "$className": "Sound",
+      "$properties": {
+        "SoundId": "rbxassetid://1"
+      }
+    }
+  }
+}

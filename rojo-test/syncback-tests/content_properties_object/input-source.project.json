@@ -1,0 +1,17 @@
+{
+  "name": "content_properties_object",
+  "tree": {
+    "$className": "DataModel",
+    "ReplicatedStorage": {
+      "Label": { "$className": "ImageLabel" }
+    },
+    "ServerStorage": {
+      "Label": { "$className": "ImageLabel", "$properties": { "BackgroundTransparency": 0.5 } },
+      "LabelNew": { "$className": "ImageLabel" }
+    },
+    "Lighting": {
+      "$className": "Lighting",
+      "Label": { "$className": "ImageLabel" }
+    }
+  }
+}

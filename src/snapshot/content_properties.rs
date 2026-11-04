@@ -20,7 +20,7 @@ use std::{
 
 use rbx_dom_weak::{
     types::{ContentType, Variant, VariantType},
-    ustr, Ustr,
+    ustr, Ustr, UstrMap,
 };
 use rbx_reflection::{DataType, PropertyKind, PropertyMigration, PropertySerialization};
 
@@ -42,24 +42,15 @@ fn normalize_instance(snapshot: &mut InstanceSnapshot) {
     // that a legacy value is never discarded in favour of a `Content` value
     // that is about to be dropped. Doing both in one pass would make the
     // result depend on the property map's iteration order.
-    let object_contents: Vec<Ustr> = snapshot
-        .properties
-        .iter()
-        .filter(|(_, value)| {
-            matches!(value, Variant::Content(content) if matches!(content.value(), ContentType::Object(_)))
-        })
-        .map(|(name, _)| *name)
-        .collect();
-
-    for name in object_contents {
+    for name in remove_object_contents(&mut snapshot.properties) {
         // An object reference only means something inside the place that
         // holds the object. Rojo's tree, the XML format and the plugin cannot
         // carry it, so it is dropped rather than left pointing at nothing.
-        warn_once(format!(
-            "{} '{}': {} refers to an object, which Rojo cannot sync.              The property was left out.",
-            snapshot.class_name, snapshot.name, name
+        warn_once(object_content_warning(
+            &snapshot.class_name,
+            &snapshot.name,
+            &name,
         ));
-        snapshot.properties.remove(&name);
     }
 
     // Only ContentId and Int64 values can be legacy asset properties, so most
@@ -87,9 +78,11 @@ fn normalize_instance(snapshot: &mut InstanceSnapshot) {
             // too, and so does rbx-dom when it reads a file.
             Some(existing) => {
                 if existing != &migrated {
-                    warn_once(format!(
-                        "{} '{}' sets both {} and {} to different values. Using {};                          remove {} to silence this warning.",
-                        snapshot.class_name, snapshot.name, name, new_name, new_name, name
+                    warn_once(conflict_warning(
+                        &snapshot.class_name,
+                        &snapshot.name,
+                        &name,
+                        &new_name,
                     ));
                 }
             }
@@ -98,6 +91,72 @@ fn normalize_instance(snapshot: &mut InstanceSnapshot) {
             }
         }
     }
+}
+
+/// Removes every `Content` value in `properties` that refers to an object,
+/// and returns the names of the removed properties.
+pub fn remove_object_contents(properties: &mut UstrMap<Variant>) -> Vec<Ustr> {
+    let names: Vec<Ustr> = properties
+        .iter()
+        .filter(|(_, value)| {
+            matches!(value, Variant::Content(content) if matches!(content.value(), ContentType::Object(_)))
+        })
+        .map(|(name, _)| *name)
+        .collect();
+
+    for name in &names {
+        properties.remove(name);
+    }
+    names
+}
+
+/// The warning for a `Content` property that refers to an object.
+pub fn object_content_warning(class_name: &str, name: &str, property_name: &str) -> String {
+    format!(
+        "{class_name} '{name}': {property_name} refers to an object, which Rojo cannot sync. \
+         The property was left out."
+    )
+}
+
+fn conflict_warning(class_name: &str, name: &str, legacy: &str, new: &str) -> String {
+    format!(
+        "{class_name} '{name}' sets both {legacy} and {new} to different values. \
+         Using {new}; remove {legacy} to silence this warning."
+    )
+}
+
+/// Returns the other names of the asset property `property_name` of
+/// `class_name`: the `Content` replacement of a legacy property, or the legacy
+/// properties that a `Content` property replaced. Returns nothing for any
+/// other property.
+pub fn content_property_aliases(class_name: &str, property_name: &str) -> Vec<Ustr> {
+    let mut aliases = Vec::new();
+    if let Some(migration) = content_migration(class_name, property_name) {
+        aliases.extend(migration.new_property_names().iter().map(|name| ustr(name)));
+    }
+
+    let Ok(database) = rbx_reflection_database::get() else {
+        return aliases;
+    };
+    let Some(class) = database.classes.get(class_name) else {
+        return aliases;
+    };
+    for class in database.superclasses_iter(class) {
+        for (legacy_name, descriptor) in &class.properties {
+            if let PropertyKind::Canonical {
+                serialization: PropertySerialization::Migrate(migration),
+            } = &descriptor.kind
+            {
+                if migration.new_property_names().contains(&property_name)
+                    && content_migration(class_name, legacy_name).is_some()
+                {
+                    aliases.push(ustr(legacy_name));
+                }
+            }
+        }
+    }
+
+    aliases
 }
 
 /// If `property_name` is a legacy asset property of `class_name` that Roblox
@@ -370,6 +429,41 @@ mod test {
         assert_eq!(
             migrate_content_property("Sound", "Volume", &Variant::Float32(1.0)),
             None
+        );
+    }
+
+    #[test]
+    fn finds_aliases_in_both_directions() {
+        assert_eq!(
+            content_property_aliases("Sound", "SoundId"),
+            vec![ustr("AudioContent")]
+        );
+        assert_eq!(
+            content_property_aliases("Sound", "AudioContent"),
+            vec![ustr("SoundId")]
+        );
+        // Tool inherits TextureId from BackpackItem.
+        assert_eq!(
+            content_property_aliases("ImageButton", "HoverImageContent"),
+            vec![ustr("HoverImage")]
+        );
+        assert_eq!(
+            content_property_aliases("Tool", "TextureId"),
+            vec![ustr("TextureContent")]
+        );
+        assert!(content_property_aliases("Sound", "Volume").is_empty());
+        assert!(content_property_aliases("TextLabel", "FontFace").is_empty());
+    }
+
+    #[test]
+    fn warnings_read_as_one_sentence_each() {
+        assert_eq!(
+            object_content_warning("ImageLabel", "Icon", "ImageContent"),
+            "ImageLabel 'Icon': ImageContent refers to an object, which Rojo cannot sync. The property was left out."
+        );
+        assert_eq!(
+            conflict_warning("Sound", "Music", "SoundId", "AudioContent"),
+            "Sound 'Music' sets both SoundId and AudioContent to different values. Using AudioContent; remove SoundId to silence this warning."
         );
     }
 

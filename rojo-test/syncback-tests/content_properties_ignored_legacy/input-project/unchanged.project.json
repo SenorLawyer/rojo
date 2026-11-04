@@ -1,0 +1,12 @@
+{
+  "name": "unchanged",
+  "tree": {
+    "$className": "Lighting",
+    "Ignored": {
+      "$className": "Sound",
+      "$properties": {
+        "SoundId": "rbxassetid://1"
+      }
+    }
+  }
+}

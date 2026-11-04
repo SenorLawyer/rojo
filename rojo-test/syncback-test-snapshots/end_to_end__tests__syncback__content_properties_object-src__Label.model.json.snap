@@ -1,0 +1,10 @@
+---
+source: tests/tests/syncback.rs
+expression: src/Label.model.json
+---
+{
+  "className": "ImageLabel",
+  "properties": {
+    "Image": "rbxassetid://7"
+  }
+}

@@ -1,0 +1,17 @@
+{
+  "name": "content_properties_ignored",
+  "tree": {
+    "$className": "DataModel",
+    "ReplicatedStorage": {
+      "Ignored": { "$className": "Sound", "$properties": { "AudioContent": "rbxassetid://2" } }
+    },
+    "ServerStorage": {
+      "Ignored": { "$className": "Sound", "$properties": { "AudioContent": "rbxassetid://2", "Volume": 0.25 } },
+      "IgnoredNew": { "$className": "Sound", "$properties": { "AudioContent": "rbxassetid://2" } }
+    },
+    "Lighting": {
+      "$className": "Lighting",
+      "Ignored": { "$className": "Sound", "$properties": { "AudioContent": "rbxassetid://2" } }
+    }
+  }
+}

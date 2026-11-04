@@ -36,6 +36,15 @@ syncback_tests! {
     // files using the legacy names alone while their values match, and writes
     // the new names when a value changes or an instance is added
     content_properties => ["default.project.json", "unchanged.project.json", "src/Unchanged.model.json", "src/Changed.model.json", "src/Cleared.model.json", "src/AlreadyNew.model.json", "src/Added.model.json", "src/AddedEmpty.model.json"],
+    // Ensures that ignoring a Content property also leaves entries that use
+    // its legacy name alone, rather than removing them as reset to default
+    content_properties_ignored => ["default.project.json", "unchanged.project.json", "src/Ignored.model.json"],
+    // Ensures that ignoring a legacy asset property also ignores the Content
+    // property that places hold in its place
+    content_properties_ignored_legacy => ["default.project.json", "unchanged.project.json", "src/Ignored.model.json"],
+    // Ensures that a Content property that refers to an object is neither
+    // written nor allowed to remove the asset files set
+    content_properties_object => ["default.project.json", "unchanged.project.json", "src/Label.model.json"],
     // Ensures that syncback works with CSVs
     csv => ["src/csv_init/init.csv", "src/csv.csv"],
     // Ensures that the children of a directory with an `init.data.csv` are

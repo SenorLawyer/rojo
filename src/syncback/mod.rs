@@ -22,9 +22,15 @@ use std::{
 
 use crate::{
     glob::{Glob, IgnorableGlob},
-    snapshot::{InstanceWithMeta, RojoTree},
+    snapshot::{
+        content_property_aliases, object_content_warning, remove_object_contents, InstanceWithMeta,
+        RojoTree,
+    },
     snapshot_middleware::Middleware,
-    syncback::ref_properties::{collect_referents, link_referents},
+    syncback::{
+        ref_properties::{collect_referents, link_referents},
+        snapshot::inst_path,
+    },
     Project,
 };
 
@@ -86,12 +92,29 @@ pub fn syncback_loop(
     // Remove any properties that are manually blocked from syncback via the
     // project file.
     log::debug!("Pre-filtering properties on DOMs");
+    let mut unreadable_properties = HashMap::new();
     for referent in descendants(&new_tree, new_tree.root_ref()) {
         let new_inst = new_tree.get_by_ref_mut(referent).unwrap();
         if let Some(filter) = get_property_filter(project, new_inst) {
             for prop in filter {
                 new_inst.properties.remove(&prop);
             }
+        }
+
+        // A `Content` value that refers to an object, such as an
+        // `EditableImage`, cannot be written to any file Rojo syncs back to
+        // (rbx_xml cannot even represent it). Such a property is treated as
+        // if `ignoreProperties` listed it for this instance: it is removed
+        // from both trees below and remembered, so that files which set it
+        // are left as they are instead of being treated as reset to default.
+        let removed = remove_object_contents(&mut new_inst.properties);
+        if !removed.is_empty() {
+            let class = new_inst.class;
+            let path = inst_path(&new_tree, referent);
+            for name in &removed {
+                log::warn!("{}", object_content_warning(&class, &path, name));
+            }
+            unreadable_properties.insert(referent, removed.into_iter().collect::<UstrSet>());
         }
     }
     for referent in descendants(old_tree.inner(), old_tree.get_root_id()) {
@@ -100,6 +123,16 @@ pub fn syncback_loop(
         if let Some(filter) = get_property_filter(project, old_inst) {
             for prop in filter {
                 old_inst.properties.remove(&prop);
+            }
+        }
+    }
+    for (new_ref, names) in &unreadable_properties {
+        // Without this, the file's own value would make the two trees differ
+        // and the file would be rewritten on every run.
+        if let Some(old_ref) = old_instance_at_same_path(&new_tree, *new_ref, old_tree) {
+            let mut old_inst = old_tree.get_instance_mut(old_ref).unwrap();
+            for name in names {
+                old_inst.inner_mut().properties.remove(name);
             }
         }
     }
@@ -153,6 +186,7 @@ pub fn syncback_loop(
         old_tree,
         new_tree: &new_tree,
         project,
+        unreadable_properties: &unreadable_properties,
     };
 
     let mut snapshots = vec![SyncbackSnapshot {
@@ -471,6 +505,11 @@ fn is_valid_path(globs: &Option<Vec<IgnorableGlob>>, base_path: &Path, path: &Pa
 /// one exists. This list is read directly from the Project and takes
 /// inheritance into effect.
 ///
+/// A legacy asset property and its `Content` replacement, such as
+/// `Sound.SoundId` and `Sound.AudioContent`, count as one property, so listing
+/// either name ignores both. Places only hold the `Content` name, and project
+/// files may use either.
+///
 /// It **does not** handle properties that should not serialize for other
 /// reasons, such as being defaults or being marked as not serializing in the
 /// ReflectionDatabase.
@@ -494,7 +533,42 @@ fn get_property_filter(project: &Project, new_inst: &Instance) -> Option<UstrSet
         }
     }
 
+    let aliases: Vec<Ustr> = set
+        .iter()
+        .flat_map(|name| content_property_aliases(&new_inst.class, name))
+        .collect();
+    set.extend(aliases);
+
     Some(set)
+}
+
+/// Finds the instance in `old` at the same path as `new_ref` in `new`, if
+/// every name along the path picks out exactly one child of the same class.
+fn old_instance_at_same_path(new: &WeakDom, new_ref: Ref, old: &RojoTree) -> Option<Ref> {
+    let mut path = Vec::new();
+    let mut current = new.get_by_ref(new_ref)?;
+    while current.parent().is_some() {
+        path.push(current);
+        current = new.get_by_ref(current.parent())?;
+    }
+
+    let old_dom = old.inner();
+    let mut old_ref = old.get_root_id();
+    for new_inst in path.into_iter().rev() {
+        let mut matches = old_dom
+            .get_by_ref(old_ref)?
+            .children()
+            .iter()
+            .filter_map(|child| old_dom.get_by_ref(*child))
+            .filter(|child| child.name == new_inst.name && child.class == new_inst.class);
+        let found = matches.next()?;
+        if matches.next().is_some() {
+            return None;
+        }
+        old_ref = found.referent();
+    }
+
+    Some(old_ref)
 }
 
 /// Produces a list of descendants in the WeakDom such that all children come

@@ -1,0 +1,31 @@
+---
+source: tests/tests/syncback.rs
+expression: default.project.json
+---
+{
+  "name": "content_properties_object",
+  "tree": {
+    "$className": "DataModel",
+    "Lighting": {
+      "$path": "unchanged.project.json"
+    },
+    "ReplicatedStorage": {
+      "$path": "src"
+    },
+    "ServerStorage": {
+      "Label": {
+        "$className": "ImageLabel",
+        "$properties": {
+          "BackgroundTransparency": 0.5,
+          "Image": "rbxassetid://7"
+        }
+      },
+      "LabelNew": {
+        "$className": "ImageLabel",
+        "$properties": {
+          "ImageContent": "rbxassetid://8"
+        }
+      }
+    }
+  }
+}
