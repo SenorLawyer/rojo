@@ -88,6 +88,9 @@ Options:
 - `--config <path>`: use another config file. Its lockfile is named after it: `ui.toml` uses `ui.lock.json`.
 - `--api-key-env <NAME>`: read the key from another environment variable. Defaults to `ROBLOX_API_KEY`.
 - `--dry-run`: list what would be uploaded and write nothing.
+- `--retry-rejected`: upload files again whose exact contents Roblox rejected in moderation before. See [Moderation and errors](#moderation-and-errors).
+
+Only one `sync` can run for a config at a time. While it runs, `sync` holds `assets.lock.json.lock` next to the lockfile, which records its process id and start time, and removes it when it finishes or fails. A second `sync` for the same config refuses to start and names the file. If a sync was killed and left the file behind, check that no sync is still running, then delete the file. `status` and `--dry-run` write nothing and do not need it. Add `*.lock.json.lock` to `.gitignore`.
 
 ## The module
 
@@ -107,6 +110,8 @@ Options:
 - As soon as Roblox accepts a file, the lockfile records the upload's operation under `pending`. If checking on it then fails (a network outage, a key without `asset:read`, or processing taking longer than five minutes), the next sync checks on that operation again instead of sending the file a second time, and prints `resume` for it. A pending upload whose file has since changed or gone is dropped from the lockfile after the next successful sync; any asset Roblox made for it stays unused.
 - If a pending upload keeps failing, for example because Roblox no longer knows the operation, check the creator's assets on Roblox, then delete that file's entry under `pending` in the lockfile to upload it again.
 - A file can only be uploaded twice if the sync stops after sending it and before Roblox's reply is recorded, such as a dropped connection during the upload request. The error says when that may have happened.
+- Contents that Roblox rejected in moderation are recorded under `rejected`, keyed by their hash, with the path, asset id, asset type, creator and time. See below.
+- The lockfile has a `version`. A Rojo that finds a version it does not know refuses the lockfile instead of rewriting it, so an older Rojo never drops what a newer one recorded.
 
 If two branches both add assets, keep both sides' entries when resolving the conflict and run `rojo assets status` to check.
 
@@ -118,7 +123,7 @@ If two branches both add assets, keep both sides' entries when resolving the con
 | `.mp3`, `.ogg`, `.flac`, `.wav` | Audio | Roblox limits audio to 7 minutes, and to 10 uploads a month (100 when ID-verified). |
 | `.fbx`, `.gltf`, `.glb` | Model | Imported as a Model with MeshParts and uploaded as a package. A `.gltf` must embed its buffers and textures. |
 
-Every file must be at most 20 MB. Rojo checks sizes, image dimensions and file signatures before uploading anything; a file that fails these checks stops the sync. Other extensions, including `.obj` (which Open Cloud does not accept), are skipped with a warning; add them to `exclude` to silence it.
+Every file must be at most 20 MB (20,971,520 bytes). Rojo checks sizes, image dimensions and file signatures before uploading anything; a file that fails these checks stops the sync. Other extensions, including `.obj` (which Open Cloud does not accept), are skipped with a warning; add them to `exclude` to silence it.
 
 Images are uploaded as `Image`, not `Decal`. A Decal's id does not load in `ImageLabel.Image` or `Texture.Texture`; an Image's id does.
 
@@ -128,7 +133,9 @@ Audio duration and upload quotas are only checked by Roblox, so such failures sh
 
 ## Moderation and errors
 
-- An asset that Roblox rejects in moderation stops the sync with an error naming the file. It is not recorded, so after replacing the file the next sync uploads it again.
+- An asset that Roblox rejects in moderation stops the sync with an error naming the file. Its id is not used, and the rejection is recorded under `rejected` in the lockfile.
+- A later sync does not upload those exact contents again, at any path, since each upload makes another rejected asset on the creator's account. Instead it stops before uploading anything, naming the file and the rejected asset. `rojo assets status` and `sync --dry-run` list such files as `rejected`. Replace the file (any change to its contents uploads it as usual) or add it to `exclude`. If you think the rejection was a mistake and want to try the same file again, pass `--retry-rejected`; if Roblox accepts it this time, the record is removed.
+- Rejection records stay in the lockfile after the file changes, so restoring the rejected contents does not upload them again. Delete an entry under `rejected` by hand to forget it.
 - An asset still under review (moderation state `Reviewing`) is recorded with a warning. Its id may not load until it is approved. `rojo assets status` lists assets that were not approved when they were uploaded.
 - The recorded moderation state is never refreshed. It is what Roblox reported when the upload finished; a later approval or rejection does not change the lockfile, and `rojo assets status` keeps listing the asset as `Reviewing`. Check the asset on the Creator Dashboard for its current state. If Roblox later rejects it, replace the file so the next sync uploads it again.
 - Rate-limited requests (HTTP 429) are retried with backoff. A failed upload request is not retried, since Roblox may already have created the asset; the error says so when that is possible. Failures while checking on an accepted upload are resumed by the next sync, as described under the lockfile above.

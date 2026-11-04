@@ -55,6 +55,9 @@ use crate::open_cloud::{
 /// The config file used when `--config` is not given.
 const DEFAULT_CONFIG: &str = "assets.toml";
 
+/// The lockfile format this build reads and writes. Builds refuse lockfiles
+/// with any other version instead of rewriting them, so bump this when adding
+/// a field that an older build must not silently drop.
 const LOCK_VERSION: u32 = 1;
 
 /// Open Cloud's per-request limit for asset files.
@@ -91,6 +94,10 @@ enum AssetsSubcommand {
         /// something needs uploading.
         #[clap(long, default_value = DEFAULT_API_KEY_VAR)]
         api_key_env: String,
+        /// Upload files again whose exact contents Roblox rejected in
+        /// moderation before. Without it such files stop the sync.
+        #[clap(long)]
+        retry_rejected: bool,
     },
     /// Show which files are new, changed, renamed or missing, without network
     /// access.
@@ -110,11 +117,15 @@ impl AssetsCommand {
                 config,
                 dry_run,
                 api_key_env,
+                retry_rejected,
             } => {
                 let config = resolve_path(&config)?;
                 sync(
                     &config,
-                    dry_run,
+                    SyncOptions {
+                        dry_run,
+                        retry_rejected,
+                    },
                     || OpenCloud::from_env(&api_key_env),
                     &mut out,
                 )?;
@@ -280,6 +291,23 @@ struct LockFile {
     /// any stay as they were.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pending: BTreeMap<String, PendingUpload>,
+    /// Contents that Roblox rejected in moderation, keyed by BLAKE3 hash.
+    /// Kept so that a rejected file is not sent again on every run, since
+    /// each upload creates another rejected asset on the creator's account.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    rejected: BTreeMap<String, RejectedUpload>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RejectedUpload {
+    /// The path the contents were uploaded from.
+    path: String,
+    asset_id: u64,
+    asset_type: String,
+    creator: String,
+    /// RFC 3339 time Roblox reported the rejection.
+    rejected: String,
 }
 
 /// An upload that Roblox accepted as an operation, recorded so that the next
@@ -332,6 +360,14 @@ fn load_lock(path: &Path) -> anyhow::Result<LockFile> {
             path.display()
         )
     })?;
+    if lock.version > LOCK_VERSION {
+        bail!(
+            "{} has version {}, which a newer Rojo wrote; this Rojo only reads version \
+             {LOCK_VERSION}. Upgrade Rojo to sync with it.",
+            path.display(),
+            lock.version
+        );
+    }
     if lock.version != LOCK_VERSION {
         bail!(
             "{} has version {}, but this Rojo only reads version {LOCK_VERSION}",
@@ -601,9 +637,11 @@ fn check_size(size: u64) -> Result<(), String> {
         return Err("the file is empty".to_owned());
     }
     if size > MAX_FILE_BYTES {
+        // Exact byte counts, since a rounded size just over the limit reads
+        // as if it were within it.
         return Err(format!(
-            "the file is {:.1} MB; Open Cloud accepts files up to 20 MB",
-            size as f64 / (1024.0 * 1024.0)
+            "the file is {size} bytes; Open Cloud accepts files up to {MAX_FILE_BYTES} bytes \
+             (20 MB)"
         ));
     }
     Ok(())
@@ -824,6 +862,9 @@ enum Action {
     SameAs {
         from: String,
     },
+    /// Not uploaded, because Roblox rejected these exact contents in
+    /// moderation before and `--retry-rejected` was not given.
+    Rejected(RejectedUpload),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -849,9 +890,19 @@ impl Plan {
             .filter(|(_, action)| matches!(action, Action::Upload { .. }))
             .count()
     }
+
+    fn rejected(&self) -> Vec<(&Source, &RejectedUpload)> {
+        self.items
+            .iter()
+            .filter_map(|(source, action)| match action {
+                Action::Rejected(rejected) => Some((source, rejected)),
+                _ => None,
+            })
+            .collect()
+    }
 }
 
-fn plan(sources: &[Source], lock: &LockFile, config: &Config) -> Plan {
+fn plan(sources: &[Source], lock: &LockFile, config: &Config, retry_rejected: bool) -> Plan {
     let creator = config.creator_key();
     let reusable = |entry: &LockEntry, source: &Source| {
         entry.creator == creator && entry.asset_type == source.kind.name()
@@ -882,7 +933,6 @@ fn plan(sources: &[Source], lock: &LockFile, config: &Config) -> Plan {
                         from: (*from).to_owned(),
                     },
                     None => {
-                        uploading.insert(&source.hash, &source.rel);
                         // The entry for this path first, then any other with
                         // the same contents, such as before a rename.
                         let resume = lock
@@ -899,9 +949,23 @@ fn plan(sources: &[Source], lock: &LockFile, config: &Config) -> Plan {
                                 key: key.clone(),
                                 operation: pending.operation.clone(),
                             });
-                        Action::Upload {
-                            changed: existing.is_some(),
-                            resume,
+                        // Checking on a pending upload sends nothing, so it
+                        // goes ahead even for rejected contents.
+                        let rejected = lock.rejected.get(&source.hash).filter(|rejected| {
+                            !retry_rejected
+                                && resume.is_none()
+                                && rejected.creator == creator
+                                && rejected.asset_type == source.kind.name()
+                        });
+                        match rejected {
+                            Some(rejected) => Action::Rejected(rejected.clone()),
+                            None => {
+                                uploading.insert(&source.hash, &source.rel);
+                                Action::Upload {
+                                    changed: existing.is_some(),
+                                    resume,
+                                }
+                            }
                         }
                     }
                 },
@@ -988,6 +1052,15 @@ fn describe_plan(
                 "  copy      {} (same contents as {from}, reuses its upload)",
                 source.rel
             )?,
+            Action::Rejected(rejected) => writeln!(
+                out,
+                "  rejected  {} ({}) was rejected in moderation as asset {} on {} and is not \
+                 uploaded again; replace the file or pass --retry-rejected",
+                source.rel,
+                source.kind.name(),
+                rejected.asset_id,
+                rejected.rejected
+            )?,
         }
     }
     let renamed: BTreeSet<&str> = plan
@@ -1072,7 +1145,7 @@ fn status(config_path: &Path, out: &mut dyn Write) -> anyhow::Result<()> {
         writeln!(out, "warning: {warning}")?;
     }
     let lock = load_lock(&config.lock)?;
-    let plan = plan(&scan.sources, &lock, &config);
+    let plan = plan(&scan.sources, &lock, &config, false);
     describe_plan(&plan, &lock, false, out)?;
     for (rel, entry) in &lock.assets {
         if let Some(state) = entry
@@ -1094,17 +1167,24 @@ fn status(config_path: &Path, out: &mut dyn Write) -> anyhow::Result<()> {
         .filter(|(_, action)| *action == Action::Unchanged)
         .count();
     let uploads = plan.uploads();
+    let rejected = plan.rejected().len();
     writeln!(
         out,
-        "{} file(s): {unchanged} unchanged, {uploads} to upload, {} reusing an id, {} removed.",
+        "{} file(s): {unchanged} unchanged, {uploads} to upload, {} reusing an id, {rejected} \
+         rejected, {} removed.",
         plan.items.len(),
-        plan.items.len() - unchanged - uploads,
+        plan.items.len() - unchanged - uploads - rejected,
         plan.removed.len()
     )?;
     let output = display_path(&config, &config.output);
     let module = module_for(&scan.sources, &offline_lock(&plan, &lock));
     let current = fs::read_to_string(&config.output).ok();
     match module {
+        _ if rejected > 0 => writeln!(
+            out,
+            "Replace the rejected file(s), or pass --retry-rejected to `rojo assets sync`, to \
+             update {output}."
+        )?,
         _ if uploads > 0 => writeln!(out, "Run `rojo assets sync` to upload and update {output}.")?,
         Some(module) if current.as_deref() == Some(module.as_str()) => {
             writeln!(out, "{output} is up to date.")?
@@ -1121,28 +1201,130 @@ struct SyncReport {
     module_written: bool,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+struct SyncOptions {
+    dry_run: bool,
+    retry_rejected: bool,
+}
+
+/// Held for the whole of a sync that may write, so that two syncs of one
+/// config cannot both read the lockfile and upload the same new files. The
+/// file is removed when the guard drops, including on errors and panics; only
+/// a killed process leaves it behind.
+struct SyncLock {
+    path: PathBuf,
+}
+
+impl SyncLock {
+    fn acquire(config: &Config) -> anyhow::Result<SyncLock> {
+        let mut name = config.lock.file_name().unwrap_or_default().to_owned();
+        name.push(".lock");
+        let path = config.lock.with_file_name(name);
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(mut file) => {
+                let guard = SyncLock { path };
+                // The contents only help someone deciding whether the lock is
+                // stale, so failing to write them is not an error.
+                let _ = write!(
+                    file,
+                    "pid {}\nstarted {}\n",
+                    std::process::id(),
+                    humantime::format_rfc3339_seconds(SystemTime::now())
+                );
+                Ok(guard)
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                let holder = fs::read_to_string(&path).unwrap_or_default();
+                let holder = holder.split_whitespace().collect::<Vec<_>>().join(" ");
+                let display = display_path(config, &path);
+                bail!(
+                    "Another `rojo assets sync` is running for this config: {display} exists{}. \
+                     Wait for it to finish. If no sync is running, for example because one was \
+                     killed, delete {display} and run sync again.",
+                    if holder.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" ({holder})")
+                    }
+                )
+            }
+            Err(error) => Err(error).with_context(|| format!("Cannot create {}", path.display())),
+        }
+    }
+}
+
+impl Drop for SyncLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
 fn sync(
     config_path: &Path,
-    dry_run: bool,
+    options: SyncOptions,
     connect: impl FnOnce() -> anyhow::Result<OpenCloud>,
     out: &mut dyn Write,
 ) -> anyhow::Result<SyncReport> {
+    let SyncOptions {
+        dry_run,
+        retry_rejected,
+    } = options;
     let config = load_config(config_path)?;
+    // Taken before the lockfile is read, since a second sync that read it
+    // while this one uploads would upload the same files. A dry run writes
+    // nothing, so it does not need the lock.
+    let _sync_lock = if dry_run {
+        None
+    } else {
+        Some(SyncLock::acquire(&config)?)
+    };
     let scan = scan(&config)?;
     for warning in &scan.warnings {
         writeln!(out, "warning: {warning}")?;
     }
     let old_lock = load_lock(&config.lock)?;
-    let plan = plan(&scan.sources, &old_lock, &config);
+    let plan = plan(&scan.sources, &old_lock, &config, retry_rejected);
     describe_plan(&plan, &old_lock, dry_run, out)?;
     let total = plan.uploads();
     let output = display_path(&config, &config.output);
+    let rejected = plan.rejected();
     if dry_run {
         writeln!(
             out,
             "Dry run: {total} file(s) would be uploaded. Nothing was uploaded or written."
         )?;
+        if !rejected.is_empty() {
+            writeln!(
+                out,
+                "A sync would stop before uploading: {} file(s) were rejected in moderation \
+                 before.",
+                rejected.len()
+            )?;
+        }
         return Ok(SyncReport::default());
+    }
+    // Like a file that fails the size checks, this stops the run before
+    // anything is uploaded, since the module needs an id for every file.
+    if !rejected.is_empty() {
+        let list: Vec<String> = rejected
+            .iter()
+            .map(|(source, rejected)| {
+                format!(
+                    "{} (asset {}, rejected on {})",
+                    source.rel, rejected.asset_id, rejected.rejected
+                )
+            })
+            .collect();
+        bail!(
+            "Roblox rejected the contents of {} in moderation in an earlier sync, so they are not \
+             uploaded again: each upload would create another rejected asset. Replace or \
+             exclude the file(s), or pass --retry-rejected to upload them again.",
+            list.join(", ")
+        );
     }
 
     let mut report = SyncReport::default();
@@ -1215,6 +1397,8 @@ fn sync(
                 }
             }
             report.uploaded.push((source.rel.clone(), entry.asset_id));
+            // Contents retried with --retry-rejected that passed this time.
+            lock.rejected.remove(&source.hash);
             lock.assets.insert(source.rel.clone(), entry);
             write_atomic(&config.lock, &render_lock(&lock))?;
         }
@@ -1324,12 +1508,25 @@ fn upload(
         ),
     };
     if uploaded.moderation_state.as_deref() == Some("Rejected") {
+        // Recorded so that later runs do not send the same contents again.
+        lock.rejected.insert(
+            source.hash.clone(),
+            RejectedUpload {
+                path: source.rel.clone(),
+                asset_id: uploaded.asset_id,
+                asset_type: source.kind.name().to_owned(),
+                creator: creator.to_owned(),
+                rejected: humantime::format_rfc3339_seconds(SystemTime::now()).to_string(),
+            },
+        );
         write_atomic(&config.lock, &render_lock(lock))?;
         bail!(
-            "Roblox rejected {} in moderation (asset {}). It was not recorded; replace the file \
-             and sync again.",
+            "Roblox rejected {} in moderation (asset {}). The rejection is recorded in {}, so \
+             later syncs do not upload these contents again; replace the file and sync again, \
+             or pass --retry-rejected.",
             source.rel,
-            uploaded.asset_id
+            uploaded.asset_id,
+            display_path(config, &config.lock)
         );
     }
     Ok(LockEntry {
@@ -1634,16 +1831,26 @@ mod tests {
         }
 
         fn sync(&self, cloud: &FakeCloud) -> anyhow::Result<(SyncReport, String)> {
-            self.sync_with(cloud, false)
+            self.sync_with(cloud, SyncOptions::default())
+        }
+
+        fn dry_run(&self, cloud: &FakeCloud) -> anyhow::Result<(SyncReport, String)> {
+            self.sync_with(
+                cloud,
+                SyncOptions {
+                    dry_run: true,
+                    ..SyncOptions::default()
+                },
+            )
         }
 
         fn sync_with(
             &self,
             cloud: &FakeCloud,
-            dry_run: bool,
+            options: SyncOptions,
         ) -> anyhow::Result<(SyncReport, String)> {
             let mut out = Vec::new();
-            let report = sync(&self.config(), dry_run, || cloud.client(), &mut out)?;
+            let report = sync(&self.config(), options, || cloud.client(), &mut out)?;
             Ok((report, String::from_utf8(out).unwrap()))
         }
 
@@ -1728,7 +1935,7 @@ mod tests {
         let mut out = Vec::new();
         let report = sync(
             &fixture.config(),
-            false,
+            SyncOptions::default(),
             || Err(anyhow::anyhow!("must not connect")),
             &mut out,
         )
@@ -1884,7 +2091,7 @@ mod tests {
         fixture.write("Coin.png", &png(8, 8, "coin"));
         let cloud = FakeCloud::start(None);
 
-        let (report, out) = fixture.sync_with(&cloud, true).unwrap();
+        let (report, out) = fixture.dry_run(&cloud).unwrap();
 
         assert_eq!(report, SyncReport::default());
         assert!(
@@ -2039,7 +2246,10 @@ mod tests {
         let error = format!("{:#}", fixture.sync(&cloud).unwrap_err());
 
         assert!(
-            error.contains("Huge.png: the file is 20.0 MB; Open Cloud accepts files up to 20 MB"),
+            error.contains(
+                "Huge.png: the file is 20971521 bytes; Open Cloud accepts files up to 20971520 \
+                 bytes (20 MB)"
+            ),
             "{error}"
         );
         assert!(cloud.uploads().is_empty());
@@ -2067,6 +2277,172 @@ mod tests {
         assert!(fixture
             .status()
             .contains("moderation InReview.png (asset 1001 was Reviewing"));
+    }
+
+    #[test]
+    fn rejected_contents_are_not_uploaded_again_until_they_change() {
+        let fixture = Fixture::new();
+        fixture.write("Good.png", &png(8, 8, "good"));
+        fixture.write("Bad.png", &png(8, 8, "REJECTME"));
+        let cloud = FakeCloud::start(None);
+
+        let error = format!("{:#}", fixture.sync(&cloud).unwrap_err());
+        assert!(
+            error.contains("The rejection is recorded in assets.lock.json"),
+            "{error}"
+        );
+        let bad_hash = blake3::hash(&png(8, 8, "REJECTME")).to_hex().to_string();
+        let rejected = fixture.lock().rejected[&bad_hash].clone();
+        assert_eq!(rejected.path, "Bad.png");
+        assert_eq!(rejected.asset_id, 1001);
+        assert_eq!(rejected.asset_type, "Image");
+        assert_eq!(rejected.creator, "user:42");
+
+        let status = fixture.status();
+        assert!(
+            status.contains("rejected  Bad.png (Image) was rejected in moderation as asset 1001"),
+            "{status}"
+        );
+        assert!(status.contains("1 to upload"), "{status}");
+        assert!(status.contains("1 rejected"), "{status}");
+        let (_, out) = fixture.dry_run(&cloud).unwrap();
+        assert!(out.contains("rejected  Bad.png"), "{out}");
+        assert!(out.contains("A sync would stop before uploading"), "{out}");
+
+        // The run stops before connecting, so Good.png waits too: the module
+        // needs an id for every file.
+        let mut out = Vec::new();
+        let error = sync(
+            &fixture.config(),
+            SyncOptions::default(),
+            || Err(anyhow::anyhow!("must not connect")),
+            &mut out,
+        )
+        .unwrap_err();
+        let error = format!("{error:#}");
+        assert!(
+            error.contains("Roblox rejected the contents of Bad.png (asset 1001, rejected on"),
+            "{error}"
+        );
+        assert!(error.contains("--retry-rejected"), "{error}");
+        // A copy of the rejected contents is held back too.
+        fixture.write("BadCopy.png", &png(8, 8, "REJECTME"));
+        let error = format!("{:#}", fixture.sync(&cloud).unwrap_err());
+        assert!(error.contains("BadCopy.png (asset 1001"), "{error}");
+        fs::remove_file(fixture.dir.path().join("assets/BadCopy.png")).unwrap();
+        assert_eq!(cloud.uploads(), ["test-Bad"]);
+
+        // --retry-rejected sends it again, and a second rejection replaces
+        // the record.
+        let retry = SyncOptions {
+            retry_rejected: true,
+            ..SyncOptions::default()
+        };
+        fixture.sync_with(&cloud, retry).unwrap_err();
+        assert_eq!(cloud.uploads(), ["test-Bad", "test-Bad"]);
+        assert_eq!(fixture.lock().rejected[&bad_hash].asset_id, 1002);
+
+        // New contents are uploaded as usual.
+        fixture.write("Bad.png", &png(8, 8, "fixed"));
+        let (report, _) = fixture.sync(&cloud).unwrap();
+        assert_eq!(
+            report.uploaded,
+            ids(&[("Bad.png", 1003), ("Good.png", 1004)])
+        );
+        assert!(fixture.module().contains("Bad = \"rbxassetid://1003\""));
+    }
+
+    #[test]
+    fn retried_rejected_contents_that_pass_drop_their_record() {
+        let fixture = Fixture::new();
+        fixture.write("Coin.png", &png(8, 8, "coin"));
+        let hash = blake3::hash(&png(8, 8, "coin")).to_hex().to_string();
+        let mut lock = LockFile {
+            version: LOCK_VERSION,
+            ..LockFile::default()
+        };
+        lock.rejected.insert(
+            hash.clone(),
+            RejectedUpload {
+                path: "Coin.png".to_owned(),
+                asset_id: 900,
+                asset_type: "Image".to_owned(),
+                creator: "user:42".to_owned(),
+                rejected: "2026-01-01T00:00:00Z".to_owned(),
+            },
+        );
+        let lock_path = fixture.dir.path().join("assets.lock.json");
+        fs::write(&lock_path, render_lock(&lock)).unwrap();
+        let cloud = FakeCloud::start(None);
+
+        fixture.sync(&cloud).unwrap_err();
+        assert!(cloud.uploads().is_empty());
+
+        let (report, _) = fixture
+            .sync_with(
+                &cloud,
+                SyncOptions {
+                    retry_rejected: true,
+                    ..SyncOptions::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(report.uploaded, ids(&[("Coin.png", 1001)]));
+        assert!(fixture.lock().rejected.is_empty());
+        assert!(!fs::read_to_string(&lock_path).unwrap().contains("rejected"));
+    }
+
+    #[test]
+    fn a_second_sync_is_refused_while_one_holds_the_lock() {
+        let fixture = Fixture::new();
+        fixture.write("Coin.png", &png(8, 8, "coin"));
+        let sync_lock = fixture.dir.path().join("assets.lock.json.lock");
+        fs::write(&sync_lock, "pid 1234\nstarted 2026-01-01T00:00:00Z\n").unwrap();
+        let cloud = FakeCloud::start(None);
+
+        let error = format!("{:#}", fixture.sync(&cloud).unwrap_err());
+
+        assert!(
+            error.contains(
+                "Another `rojo assets sync` is running for this config: assets.lock.json.lock \
+                 exists (pid 1234 started 2026-01-01T00:00:00Z)"
+            ),
+            "{error}"
+        );
+        assert!(error.contains("delete assets.lock.json.lock"), "{error}");
+        assert!(cloud.uploads().is_empty());
+        // The other sync's lock is left alone.
+        assert!(sync_lock.exists());
+        // Neither status nor a dry run writes, so neither needs the lock.
+        assert!(fixture.status().contains("1 to upload"));
+        fixture.dry_run(&cloud).unwrap();
+
+        fs::remove_file(&sync_lock).unwrap();
+        fixture.sync(&cloud).unwrap();
+        assert!(!sync_lock.exists());
+
+        // A failed sync releases the lock too.
+        fixture.write("Gem.png", &png(8, 8, "gem"));
+        let failing = FakeCloud::start(Some(1));
+        fixture.sync(&failing).unwrap_err();
+        assert!(!sync_lock.exists());
+    }
+
+    #[test]
+    fn lockfiles_from_a_newer_rojo_are_refused() {
+        let fixture = Fixture::new();
+        let lock_path = fixture.dir.path().join("assets.lock.json");
+        fs::write(
+            &lock_path,
+            "{\"version\": 2, \"assets\": {}, \"future\": {}}\n",
+        )
+        .unwrap();
+        let cloud = FakeCloud::start(None);
+
+        let error = format!("{:#}", fixture.sync(&cloud).unwrap_err());
+
+        assert!(error.contains("which a newer Rojo wrote"), "{error}");
+        assert!(fs::read_to_string(&lock_path).unwrap().contains("future"));
     }
 
     #[test]
