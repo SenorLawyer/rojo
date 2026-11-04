@@ -104,6 +104,9 @@ Options:
 - Changing the creator uploads every file again under the new creator.
 - A file that is gone is dropped from the lockfile and the module, and reported. The asset is never deleted on Roblox, since the Assets API cannot delete assets and published places may still use it.
 - The lockfile is rewritten after every successful upload, through a temporary file and a rename. If a sync is interrupted or an upload fails, what was uploaded so far is kept and the next sync continues from there. The module is only written once every upload has succeeded.
+- As soon as Roblox accepts a file, the lockfile records the upload's operation under `pending`. If checking on it then fails (a network outage, a key without `asset:read`, or processing taking longer than five minutes), the next sync checks on that operation again instead of sending the file a second time, and prints `resume` for it. A pending upload whose file has since changed or gone is dropped from the lockfile after the next successful sync; any asset Roblox made for it stays unused.
+- If a pending upload keeps failing, for example because Roblox no longer knows the operation, check the creator's assets on Roblox, then delete that file's entry under `pending` in the lockfile to upload it again.
+- A file can only be uploaded twice if the sync stops after sending it and before Roblox's reply is recorded, such as a dropped connection during the upload request. The error says when that may have happened.
 
 If two branches both add assets, keep both sides' entries when resolving the conflict and run `rojo assets status` to check.
 
@@ -119,10 +122,13 @@ Every file must be at most 20 MB. Rojo checks sizes, image dimensions and file s
 
 Images are uploaded as `Image`, not `Decal`. A Decal's id does not load in `ImageLabel.Image` or `Texture.Texture`; an Image's id does.
 
+Models are uploaded as `Model` assets, and the module holds the Model's id as `rbxassetid://<id>` like every other entry. That id is not a mesh id: setting it as a `MeshPart.MeshId` does not work. Load the model with `InsertService:LoadAsset(id)` on the server (strip the `rbxassetid://` prefix and convert it with `tonumber`), which returns a `Model` holding the imported MeshParts, or insert it in Studio from the Toolbox under your creations. Reuse the MeshParts from there rather than their individual mesh ids.
+
 Audio duration and upload quotas are only checked by Roblox, so such failures show up as an upload error.
 
 ## Moderation and errors
 
 - An asset that Roblox rejects in moderation stops the sync with an error naming the file. It is not recorded, so after replacing the file the next sync uploads it again.
 - An asset still under review (moderation state `Reviewing`) is recorded with a warning. Its id may not load until it is approved. `rojo assets status` lists assets that were not approved when they were uploaded.
-- Rate-limited requests (HTTP 429) are retried with backoff. Other failed uploads are not retried, since Roblox may already have created the asset; the error says so when that is possible.
+- The recorded moderation state is never refreshed. It is what Roblox reported when the upload finished; a later approval or rejection does not change the lockfile, and `rojo assets status` keeps listing the asset as `Reviewing`. Check the asset on the Creator Dashboard for its current state. If Roblox later rejects it, replace the file so the next sync uploads it again.
+- Rate-limited requests (HTTP 429) are retried with backoff. A failed upload request is not retried, since Roblox may already have created the asset; the error says so when that is possible. Failures while checking on an accepted upload are resumed by the next sync, as described under the lockfile above.

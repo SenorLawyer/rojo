@@ -22,8 +22,14 @@
 //!   hundreds of megabytes per second, so this stays fast without caching
 //!   modification times.
 //! - The lockfile is written atomically (temporary file and rename) after
-//!   every successful upload. An interrupted run never uploads a finished
-//!   file again. The module is only written once every upload succeeded.
+//!   every successful upload, so a later run does not upload a file whose
+//!   upload finished. Once Roblox has accepted an upload and returned its
+//!   operation, the operation is recorded under `pending` before polling
+//!   starts; if polling then fails or times out, the next run polls that
+//!   operation instead of sending the file again. Only an upload interrupted
+//!   between sending the file and recording the operation can be repeated,
+//!   and its error says so. The module is only written once every upload
+//!   succeeded.
 //! - A run that has nothing to upload never reads the API key, so it works
 //!   on machines and CI jobs without one.
 
@@ -42,7 +48,9 @@ use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 use serde::{Deserialize, Serialize};
 
 use super::{resolve_path, UsageError};
-use crate::open_cloud::{AssetType, Creator, OpenCloud, DEFAULT_API_KEY_VAR};
+use crate::open_cloud::{
+    AssetType, Creator, OpenCloud, OpenCloudError, StartedUpload, DEFAULT_API_KEY_VAR,
+};
 
 /// The config file used when `--config` is not given.
 const DEFAULT_CONFIG: &str = "assets.toml";
@@ -267,6 +275,26 @@ fn normalize(path: &Path) -> PathBuf {
 struct LockFile {
     version: u32,
     assets: BTreeMap<String, LockEntry>,
+    /// Uploads that Roblox accepted but that did not finish in an earlier
+    /// run, keyed like `assets`. Left out when empty, so lockfiles without
+    /// any stay as they were.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pending: BTreeMap<String, PendingUpload>,
+}
+
+/// An upload that Roblox accepted as an operation, recorded so that the next
+/// run polls the operation instead of creating a second asset.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PendingUpload {
+    /// BLAKE3 hash of the file that was sent.
+    hash: String,
+    asset_type: String,
+    creator: String,
+    /// The Assets API operation, such as `operations/abc`.
+    operation: String,
+    /// RFC 3339 time the file was sent.
+    started: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -292,7 +320,7 @@ fn load_lock(path: &Path) -> anyhow::Result<LockFile> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             return Ok(LockFile {
                 version: LOCK_VERSION,
-                assets: BTreeMap::new(),
+                ..LockFile::default()
             })
         }
         Err(error) => return Err(error).with_context(|| format!("Cannot read {}", path.display())),
@@ -332,6 +360,12 @@ fn write_atomic(path: &Path, contents: &str) -> anyhow::Result<()> {
     file.persist(path)
         .map_err(|error| error.error)
         .with_context(|| format!("Cannot write {}", path.display()))?;
+    // On Unix the rename itself is only durable once the folder is synced.
+    // Failing to sync is not worth failing the write over.
+    #[cfg(unix)]
+    if let Ok(dir) = fs::File::open(dir) {
+        let _ = dir.sync_all();
+    }
     Ok(())
 }
 
@@ -457,6 +491,15 @@ fn scan(config: &Config) -> anyhow::Result<Scan> {
                 continue;
             }
         };
+        // Checking the size first keeps a stray multi-gigabyte file from
+        // being read into memory only to be refused.
+        let size = fs::metadata(&path)
+            .with_context(|| format!("Cannot read {}", path.display()))?
+            .len();
+        if let Err(problem) = check_size(size) {
+            errors.push(format!("{rel}: {problem}"));
+            continue;
+        }
         let bytes = fs::read(&path).with_context(|| format!("Cannot read {}", path.display()))?;
         if let Err(problem) = check_file(&extension, &bytes) {
             errors.push(format!("{rel}: {problem}"));
@@ -519,16 +562,9 @@ fn walk(dir: &Path, prefix: &str, files: &mut Vec<(String, PathBuf)>) -> anyhow:
 /// Checks a file against Open Cloud's limits and its format's signature, so
 /// that problems show up before anything is uploaded.
 fn check_file(extension: &str, bytes: &[u8]) -> Result<(), String> {
-    let size = bytes.len() as u64;
-    if size == 0 {
-        return Err("the file is empty".to_owned());
-    }
-    if size > MAX_FILE_BYTES {
-        return Err(format!(
-            "the file is {:.1} MB; Open Cloud accepts files up to 20 MB",
-            size as f64 / (1024.0 * 1024.0)
-        ));
-    }
+    // Checked again since the file may have changed after its metadata was
+    // read.
+    check_size(bytes.len() as u64)?;
     let not_valid = |format: &str| Err(format!("the file is not a valid {format} file"));
     match extension {
         "png" | "jpg" | "jpeg" | "bmp" | "tga" => {
@@ -556,6 +592,19 @@ fn check_file(extension: &str, bytes: &[u8]) -> Result<(), String> {
         "glb" if !bytes.starts_with(b"glTF") => return not_valid("GLB"),
         "gltf" => check_gltf(bytes)?,
         _ => {}
+    }
+    Ok(())
+}
+
+fn check_size(size: u64) -> Result<(), String> {
+    if size == 0 {
+        return Err("the file is empty".to_owned());
+    }
+    if size > MAX_FILE_BYTES {
+        return Err(format!(
+            "the file is {:.1} MB; Open Cloud accepts files up to 20 MB",
+            size as f64 / (1024.0 * 1024.0)
+        ));
     }
     Ok(())
 }
@@ -762,6 +811,9 @@ enum Action {
     /// Upload because the path is new, or because its contents changed.
     Upload {
         changed: bool,
+        /// An earlier run's unfinished upload of the same contents, which is
+        /// polled instead of sending the file again.
+        resume: Option<Resume>,
     },
     /// Reuse an id from the lockfile for the same contents at another path.
     Reuse {
@@ -774,10 +826,20 @@ enum Action {
     },
 }
 
+#[derive(Debug, Clone, PartialEq)]
+struct Resume {
+    /// The key of the entry in the lockfile's `pending`.
+    key: String,
+    operation: String,
+}
+
 struct Plan {
     items: Vec<(Source, Action)>,
     /// Lockfile paths whose files are gone.
     removed: Vec<String>,
+    /// Pending uploads that no file resumes, because the file changed, is
+    /// gone or got an id another way. Dropped after a successful sync.
+    stale_pending: Vec<String>,
 }
 
 impl Plan {
@@ -821,8 +883,25 @@ fn plan(sources: &[Source], lock: &LockFile, config: &Config) -> Plan {
                     },
                     None => {
                         uploading.insert(&source.hash, &source.rel);
+                        // The entry for this path first, then any other with
+                        // the same contents, such as before a rename.
+                        let resume = lock
+                            .pending
+                            .get_key_value(&source.rel)
+                            .into_iter()
+                            .chain(&lock.pending)
+                            .find(|(_, pending)| {
+                                pending.hash == source.hash
+                                    && pending.creator == creator
+                                    && pending.asset_type == source.kind.name()
+                            })
+                            .map(|(key, pending)| Resume {
+                                key: key.clone(),
+                                operation: pending.operation.clone(),
+                            });
                         Action::Upload {
                             changed: existing.is_some(),
+                            resume,
                         }
                     }
                 },
@@ -837,7 +916,27 @@ fn plan(sources: &[Source], lock: &LockFile, config: &Config) -> Plan {
         .filter(|rel| !present.contains(rel.as_str()))
         .cloned()
         .collect();
-    Plan { items, removed }
+    let resumed: BTreeSet<&str> = items
+        .iter()
+        .filter_map(|(_, action)| match action {
+            Action::Upload {
+                resume: Some(resume),
+                ..
+            } => Some(resume.key.as_str()),
+            _ => None,
+        })
+        .collect();
+    let stale_pending = lock
+        .pending
+        .keys()
+        .filter(|key| !resumed.contains(key.as_str()))
+        .cloned()
+        .collect();
+    Plan {
+        items,
+        removed,
+        stale_pending,
+    }
 }
 
 fn describe_plan(
@@ -850,7 +949,23 @@ fn describe_plan(
     for (source, action) in &plan.items {
         match action {
             Action::Unchanged => {}
-            Action::Upload { changed } => writeln!(
+            Action::Upload {
+                resume: Some(resume),
+                ..
+            } => writeln!(
+                out,
+                "  resume    {} ({}, {}) {} {}, which an earlier sync started",
+                source.rel,
+                source.kind.name(),
+                format_size(source.size),
+                if dry_run {
+                    "would check on"
+                } else {
+                    "to check on"
+                },
+                resume.operation
+            )?,
+            Action::Upload { changed, .. } => writeln!(
                 out,
                 "  {:<9} {} ({}, {}) {upload_verb}",
                 if *changed { "changed" } else { "new" },
@@ -891,6 +1006,14 @@ fn describe_plan(
                 lock.assets[rel].asset_id
             )?;
         }
+    }
+    for key in &plan.stale_pending {
+        writeln!(
+            out,
+            "  stale     unfinished upload of {key} ({}) is no longer needed and will be \
+             forgotten; if Roblox created an asset for it, that asset stays unused",
+            lock.pending[key].operation
+        )?;
     }
     Ok(())
 }
@@ -1041,18 +1164,38 @@ fn sync(
         let uploads = plan
             .items
             .iter()
-            .filter(|(_, action)| matches!(action, Action::Upload { .. }));
-        for (index, (source, _)) in uploads.enumerate() {
-            write!(
-                out,
-                "[{}/{total}] Uploading {} ({}, {})... ",
-                index + 1,
-                source.rel,
-                source.kind.name(),
-                format_size(source.size)
-            )?;
+            .filter_map(|(source, action)| match action {
+                Action::Upload { resume, .. } => Some((source, resume)),
+                _ => None,
+            });
+        for (index, (source, resume)) in uploads.enumerate() {
+            match resume {
+                Some(resume) => write!(
+                    out,
+                    "[{}/{total}] Checking on the earlier upload of {} ({})... ",
+                    index + 1,
+                    source.rel,
+                    resume.operation
+                )?,
+                None => write!(
+                    out,
+                    "[{}/{total}] Uploading {} ({}, {})... ",
+                    index + 1,
+                    source.rel,
+                    source.kind.name(),
+                    format_size(source.size)
+                )?,
+            }
             out.flush()?;
-            let entry = upload(&client, &config, source, &creator).map_err(|error| {
+            let entry = upload(
+                &client,
+                &config,
+                source,
+                resume.as_ref(),
+                &creator,
+                &mut lock,
+            )
+            .map_err(|error| {
                 let saved = report.uploaded.len();
                 error.context(format!(
                     "{saved} earlier upload(s) in this run were saved to {}",
@@ -1086,6 +1229,9 @@ fn sync(
     for rel in &plan.removed {
         lock.assets.remove(rel);
     }
+    for key in &plan.stale_pending {
+        lock.pending.remove(key);
+    }
     write_if_changed(&config.lock, &render_lock(&lock))?;
 
     let module = module_for(&scan.sources, &lock).expect("every file has a lockfile entry");
@@ -1104,14 +1250,105 @@ fn sync(
     Ok(report)
 }
 
-/// Uploads one file and returns its lockfile entry. Fails when Roblox
-/// rejects it in moderation, since its id would not load.
+/// Uploads one file, or finishes the earlier upload `resume` names, and
+/// returns its lockfile entry. Fails when Roblox rejects it in moderation,
+/// since its id would not load.
+///
+/// Once Roblox has accepted the file, the operation is written to `lock`'s
+/// `pending` (and to disk) before polling, so an upload that cannot be
+/// followed to the end is resumed by the next run rather than repeated. On
+/// success the pending entry is removed from `lock`, and the caller writes
+/// it together with the new asset entry.
 fn upload(
     client: &OpenCloud,
     config: &Config,
     source: &Source,
+    resume: Option<&Resume>,
     creator: &str,
+    lock: &mut LockFile,
 ) -> anyhow::Result<LockEntry> {
+    let (key, operation, result) = match resume {
+        Some(resume) => (
+            resume.key.clone(),
+            resume.operation.clone(),
+            client.resume_asset_upload(&resume.operation),
+        ),
+        None => {
+            let started = start_upload(client, config, source)?;
+            let operation = started.operation.clone();
+            lock.pending.insert(
+                source.rel.clone(),
+                PendingUpload {
+                    hash: source.hash.clone(),
+                    asset_type: source.kind.name().to_owned(),
+                    creator: creator.to_owned(),
+                    operation: operation.clone(),
+                    started: humantime::format_rfc3339_seconds(SystemTime::now()).to_string(),
+                },
+            );
+            write_atomic(&config.lock, &render_lock(lock)).with_context(|| {
+                format!(
+                    "Roblox accepted the upload of {} as {operation}, but it could not be \
+                     recorded; check the creator's assets before running sync again, since a \
+                     rerun uploads the file again",
+                    source.rel
+                )
+            })?;
+            (
+                source.rel.clone(),
+                operation,
+                client.finish_asset_upload(started),
+            )
+        }
+    };
+    let uploaded = match result {
+        Ok(uploaded) => {
+            lock.pending.remove(&key);
+            uploaded
+        }
+        // Roblox finished the operation and created nothing, so the next
+        // run should send the file again.
+        Err(error @ OpenCloudError::Failed(_)) => {
+            lock.pending.remove(&key);
+            write_atomic(&config.lock, &render_lock(lock))?;
+            bail!("Could not upload {}: {error}.", source.rel);
+        }
+        Err(error) => bail!(
+            "Could not finish uploading {}: {error}. Roblox accepted the file as {operation}, \
+             which is recorded in {}; the next `rojo assets sync` checks on it instead of \
+             uploading the file again. If that keeps failing, check the creator's assets, \
+             then remove the entry for {key} under \"pending\" in the lockfile to upload it \
+             again.",
+            source.rel,
+            display_path(config, &config.lock)
+        ),
+    };
+    if uploaded.moderation_state.as_deref() == Some("Rejected") {
+        write_atomic(&config.lock, &render_lock(lock))?;
+        bail!(
+            "Roblox rejected {} in moderation (asset {}). It was not recorded; replace the file \
+             and sync again.",
+            source.rel,
+            uploaded.asset_id
+        );
+    }
+    Ok(LockEntry {
+        hash: source.hash.clone(),
+        asset_id: uploaded.asset_id,
+        asset_type: source.kind.name().to_owned(),
+        creator: creator.to_owned(),
+        moderation_state: uploaded.moderation_state,
+        uploaded: humantime::format_rfc3339_seconds(SystemTime::now()).to_string(),
+    })
+}
+
+/// Reads the file again, checks that it did not change since the scan and
+/// sends it.
+fn start_upload(
+    client: &OpenCloud,
+    config: &Config,
+    source: &Source,
+) -> anyhow::Result<StartedUpload> {
     let bytes =
         fs::read(&source.path).with_context(|| format!("Cannot read {}", source.path.display()))?;
     if blake3::hash(&bytes).to_hex().as_str() != source.hash {
@@ -1133,19 +1370,35 @@ fn upload(
         .clone()
         .unwrap_or_else(|| format!("Uploaded by rojo assets sync from {}", source.rel));
     let description: String = description.chars().take(MAX_DESCRIPTION_CHARS).collect();
-    let file_name = source.rel.rsplit('/').next().unwrap_or(&source.rel);
+    // The name only labels the upload, so characters that cannot go in a
+    // multipart header are replaced instead of failing the upload.
+    let file_name: String = source
+        .rel
+        .rsplit('/')
+        .next()
+        .unwrap_or(&source.rel)
+        .chars()
+        .map(|c| {
+            if c == '"' || c == '\\' || c.is_control() {
+                '_'
+            } else {
+                c
+            }
+        })
+        .collect();
 
-    let uploaded = client
-        .upload_asset(
+    client
+        .start_asset_upload(
             source.kind.asset_type(),
             &display_name,
             &description,
             config.creator,
-            file_name,
+            &file_name,
             source.content_type,
             &bytes,
         )
         .map_err(|error| {
+            // Without an operation there is nothing to resume.
             let hint = if error.may_have_applied() {
                 " Roblox may still have created the asset; check the creator's assets before \
                  running sync again, since a rerun uploads the file again."
@@ -1153,23 +1406,7 @@ fn upload(
                 ""
             };
             anyhow::anyhow!("Could not upload {}: {error}.{hint}", source.rel)
-        })?;
-    if uploaded.moderation_state.as_deref() == Some("Rejected") {
-        bail!(
-            "Roblox rejected {} in moderation (asset {}). It was not recorded; replace the file \
-             and sync again.",
-            source.rel,
-            uploaded.asset_id
-        );
-    }
-    Ok(LockEntry {
-        hash: source.hash.clone(),
-        asset_id: uploaded.asset_id,
-        asset_type: source.kind.name().to_owned(),
-        creator: creator.to_owned(),
-        moderation_state: uploaded.moderation_state,
-        uploaded: humantime::format_rfc3339_seconds(SystemTime::now()).to_string(),
-    })
+        })
 }
 
 #[cfg(test)]
@@ -1178,16 +1415,26 @@ mod tests {
     use std::{
         io::Read,
         net::TcpListener,
-        sync::{Arc, Mutex},
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc, Mutex,
+        },
         time::Duration,
     };
 
     /// A fake Open Cloud Assets API. Each upload gets the next id from 1001
-    /// and finishes at once. A file containing `REJECTME` or `REVIEWME` is
-    /// rejected or left under review, and the upload numbered `fail_at` returns 400.
+    /// and finishes at once, unless `defer` is set: then the upload returns
+    /// an unfinished operation that a later poll finishes, and polls are
+    /// refused with 403 while `refuse_polls` is set. A file containing
+    /// `REJECTME` or `REVIEWME` is rejected or left under review, and the
+    /// upload numbered `fail_at` returns 400.
     struct FakeCloud {
         base: String,
         uploads: Arc<Mutex<Vec<String>>>,
+        /// Every request line, such as `GET /assets/v1/operations/op1`.
+        requests: Arc<Mutex<Vec<String>>>,
+        defer: Arc<AtomicBool>,
+        refuse_polls: Arc<AtomicBool>,
     }
 
     impl FakeCloud {
@@ -1195,7 +1442,13 @@ mod tests {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let base = format!("http://{}", listener.local_addr().unwrap());
             let uploads = Arc::new(Mutex::new(Vec::new()));
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let defer = Arc::new(AtomicBool::new(false));
+            let refuse_polls = Arc::new(AtomicBool::new(false));
             let log = Arc::clone(&uploads);
+            let request_log = Arc::clone(&requests);
+            let deferring = Arc::clone(&defer);
+            let refusing = Arc::clone(&refuse_polls);
             std::thread::spawn(move || {
                 for stream in listener.incoming() {
                     let mut stream = stream.unwrap();
@@ -1203,6 +1456,37 @@ mod tests {
                         .set_read_timeout(Some(Duration::from_secs(5)))
                         .unwrap();
                     let (head, body) = read_request(&mut stream);
+                    let request_line = head.lines().next().unwrap_or("");
+                    let request_line = request_line
+                        .rsplit_once(' ')
+                        .map_or(request_line, |(line, _)| line)
+                        .to_owned();
+                    request_log.lock().unwrap().push(request_line.clone());
+                    if let Some(number) = request_line.strip_prefix("GET /assets/v1/operations/op")
+                    {
+                        let (status, reply) = if refusing.load(Ordering::SeqCst) {
+                            (
+                                "403 Forbidden",
+                                r#"{"message":"missing scope asset:read"}"#.to_owned(),
+                            )
+                        } else {
+                            let number: u64 = number.parse().unwrap();
+                            (
+                                "200 OK",
+                                format!(
+                                    r#"{{"path":"operations/op{number}","done":true,"response":{{"assetId":"{}","moderationResult":{{"moderationState":"Approved"}}}}}}"#,
+                                    1000 + number
+                                ),
+                            )
+                        };
+                        write!(
+                            stream,
+                            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+                            reply.len()
+                        )
+                        .unwrap();
+                        continue;
+                    }
                     assert!(
                         head.starts_with("POST /assets/v1/assets "),
                         "unexpected request {head}"
@@ -1227,6 +1511,11 @@ mod tests {
                     };
                     let (status, reply) = if Some(number) == fail_at {
                         ("400 Bad Request", r#"{"message":"bad file"}"#.to_owned())
+                    } else if deferring.load(Ordering::SeqCst) {
+                        (
+                            "200 OK",
+                            format!(r#"{{"path":"operations/op{number}","done":false}}"#),
+                        )
                     } else {
                         let state = if body_text.contains("REJECTME") {
                             "Rejected"
@@ -1251,15 +1540,25 @@ mod tests {
                     .unwrap();
                 }
             });
-            FakeCloud { base, uploads }
+            FakeCloud {
+                base,
+                uploads,
+                requests,
+                defer,
+                refuse_polls,
+            }
         }
 
         fn client(&self) -> anyhow::Result<OpenCloud> {
-            OpenCloud::with_base_url("fixture-key", &self.base)
+            Ok(OpenCloud::with_base_url("fixture-key", &self.base)?.with_fast_timing())
         }
 
         fn uploads(&self) -> Vec<String> {
             self.uploads.lock().unwrap().clone()
+        }
+
+        fn requests(&self) -> Vec<String> {
+            self.requests.lock().unwrap().clone()
         }
     }
 
@@ -1620,6 +1919,130 @@ mod tests {
         let (report, _) = fixture.sync(&cloud).unwrap();
         assert_eq!(report.uploaded, ids(&[("B.png", 1001), ("C.png", 1002)]));
         assert_eq!(cloud.uploads(), ["test-B", "test-C"]);
+    }
+
+    #[test]
+    fn uploads_whose_polling_failed_are_resumed_instead_of_sent_again() {
+        let fixture = Fixture::new();
+        fixture.write("A.png", &png(8, 8, "a"));
+        fixture.write("B.png", &png(8, 8, "b"));
+        let cloud = FakeCloud::start(None);
+        // A key with asset:write but not asset:read creates the asset, then
+        // every poll is refused.
+        cloud.defer.store(true, Ordering::SeqCst);
+        cloud.refuse_polls.store(true, Ordering::SeqCst);
+
+        let error = format!("{:#}", fixture.sync(&cloud).unwrap_err());
+
+        assert!(
+            error.contains("Could not finish uploading A.png"),
+            "{error}"
+        );
+        assert!(error.contains("operations/op1"), "{error}");
+        assert!(error.contains("403"), "{error}");
+        assert!(error.contains("checks on it instead"), "{error}");
+        let lock = fixture.lock();
+        assert!(lock.assets.is_empty());
+        let pending = &lock.pending["A.png"];
+        assert_eq!(pending.operation, "operations/op1");
+        assert_eq!(
+            pending.hash,
+            blake3::hash(&png(8, 8, "a")).to_hex().as_str()
+        );
+        assert!(fixture
+            .status()
+            .contains("resume    A.png (Image, 34 B) to check on operations/op1"));
+
+        cloud.refuse_polls.store(false, Ordering::SeqCst);
+        let (report, out) = fixture.sync(&cloud).unwrap();
+
+        assert!(
+            out.contains(
+                "[1/2] Checking on the earlier upload of A.png (operations/op1)... asset 1001"
+            ),
+            "{out}"
+        );
+        assert_eq!(report.uploaded, ids(&[("A.png", 1001), ("B.png", 1002)]));
+        // A was sent once, in the first run.
+        assert_eq!(cloud.uploads(), ["test-A", "test-B"]);
+        let posts = cloud
+            .requests()
+            .iter()
+            .filter(|line| line.starts_with("POST"))
+            .count();
+        assert_eq!(posts, 2);
+        let lock = fixture.lock();
+        assert!(lock.pending.is_empty());
+        assert!(
+            !fs::read_to_string(fixture.dir.path().join("assets.lock.json"))
+                .unwrap()
+                .contains("pending")
+        );
+        assert!(fixture.module().contains("A = \"rbxassetid://1001\""));
+    }
+
+    #[test]
+    fn pending_uploads_follow_renames_and_are_dropped_when_the_file_changes() {
+        let fixture = Fixture::new();
+        fixture.write("A.png", &png(8, 8, "a"));
+        fixture.write("B.png", &png(8, 8, "b"));
+        let cloud = FakeCloud::start(None);
+        cloud.defer.store(true, Ordering::SeqCst);
+        cloud.refuse_polls.store(true, Ordering::SeqCst);
+        fixture.sync(&cloud).unwrap_err();
+        cloud.refuse_polls.store(false, Ordering::SeqCst);
+        // The pending upload is found by contents, so it survives a rename.
+        fixture.rename("A.png", "Icons/A.png");
+
+        let (report, _) = fixture.sync(&cloud).unwrap();
+
+        assert_eq!(
+            report.uploaded,
+            ids(&[("B.png", 1002), ("Icons/A.png", 1001)])
+        );
+        assert_eq!(cloud.uploads(), ["test-A", "test-B"]);
+        assert!(fixture.lock().pending.is_empty());
+
+        // A pending upload of contents that no file has any more is dropped.
+        let fixture = Fixture::new();
+        fixture.write("C.png", &png(8, 8, "c"));
+        let cloud = FakeCloud::start(None);
+        cloud.defer.store(true, Ordering::SeqCst);
+        cloud.refuse_polls.store(true, Ordering::SeqCst);
+        fixture.sync(&cloud).unwrap_err();
+        cloud.refuse_polls.store(false, Ordering::SeqCst);
+        fixture.write("C.png", &png(8, 8, "c2"));
+
+        let (report, out) = fixture.sync(&cloud).unwrap();
+
+        assert!(
+            out.contains("stale     unfinished upload of C.png (operations/op1)"),
+            "{out}"
+        );
+        assert_eq!(report.uploaded, ids(&[("C.png", 1002)]));
+        assert!(fixture.lock().pending.is_empty());
+    }
+
+    #[test]
+    fn oversized_files_are_refused_by_size() {
+        let fixture = Fixture::new();
+        fixture.write("Huge.png", b"");
+        // Sparse on most file systems, so the test stays cheap.
+        fs::OpenOptions::new()
+            .write(true)
+            .open(fixture.dir.path().join("assets/Huge.png"))
+            .unwrap()
+            .set_len(MAX_FILE_BYTES + 1)
+            .unwrap();
+        let cloud = FakeCloud::start(None);
+
+        let error = format!("{:#}", fixture.sync(&cloud).unwrap_err());
+
+        assert!(
+            error.contains("Huge.png: the file is 20.0 MB; Open Cloud accepts files up to 20 MB"),
+            "{error}"
+        );
+        assert!(cloud.uploads().is_empty());
     }
 
     #[test]

@@ -180,6 +180,11 @@ pub(super) fn run(
         "Luau task {}{ran_on} finished as {:?}.",
         task.path, task.state
     ));
+    if let Some(error) = &task.logs_error {
+        progress(format!(
+            "Could not fetch all of the task's logs, so some are missing: {error}"
+        ));
+    }
     run.report = task_report(
         &task.state,
         &task.results,

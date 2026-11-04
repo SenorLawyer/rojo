@@ -57,7 +57,11 @@
 //!   `response.assetId` (a decimal string), `response.assetType` (such as
 //!   `Image`), `response.moderationResult.moderationState` (such as
 //!   `Approved`) or `error` is set. Scopes:
-//!   `asset:read` and `asset:write`. Files may be up to 20 MB.
+//!   `asset:read` and `asset:write`. Files may be up to 20 MB. Once the
+//!   `POST` has returned an operation, the asset may exist even if polling
+//!   fails (for example with 403 when the key lacks `asset:read`), so such
+//!   errors are [`OpenCloudError::Unfollowed`] and the operation can be
+//!   polled again later with [`OpenCloud::resume_asset_upload`].
 //!
 //! # Image or Decal
 //!
@@ -248,8 +252,12 @@ pub struct LuauTaskResult {
     pub error_code: Option<String>,
     pub error_message: Option<String>,
     pub logs: Vec<LogMessage>,
-    /// Set when logs were left out because they exceeded the size cap.
+    /// Set when logs were left out because they exceeded the size cap or
+    /// could not all be fetched.
     pub logs_truncated: bool,
+    /// Why the logs could not all be fetched. The task's result is still
+    /// complete; only `logs` is partial.
+    pub logs_error: Option<String>,
 }
 
 /// A finished asset upload.
@@ -263,6 +271,15 @@ pub struct UploadedAsset {
     pub asset_type: Option<String>,
     /// As Roblox reports it, such as `Approved`.
     pub moderation_state: Option<String>,
+}
+
+/// An asset upload that Roblox accepted and is still processing.
+#[derive(Debug)]
+pub struct StartedUpload {
+    /// The operation's path, such as `operations/abc`, for
+    /// [`OpenCloud::resume_asset_upload`].
+    pub operation: String,
+    state: Operation,
 }
 
 /// Why an Open Cloud call failed. None of these contain the API key.
@@ -292,6 +309,14 @@ pub enum OpenCloudError {
     /// Roblox finished the work and reported that it failed.
     #[error("Open Cloud reported a failure: {0}")]
     Failed(String),
+    /// Roblox accepted the work as `path` (an asset operation or a Luau
+    /// task), but a later request to follow it failed. The work exists and
+    /// may still finish, whatever kind of error `error` is.
+    #[error("Open Cloud accepted the request as {path}, but following it failed: {error}")]
+    Unfollowed {
+        path: String,
+        error: Box<OpenCloudError>,
+    },
 }
 
 impl OpenCloudError {
@@ -306,7 +331,23 @@ impl OpenCloudError {
             OpenCloudError::Status { status, .. } => {
                 !status.is_client_error() || matches!(status.as_u16(), 408 | 409 | 499)
             }
-            OpenCloudError::Unconfirmed(_) | OpenCloudError::TimedOut(_) => true,
+            OpenCloudError::Unconfirmed(_)
+            | OpenCloudError::TimedOut(_)
+            | OpenCloudError::Unfollowed { .. } => true,
+        }
+    }
+
+    /// Marks an error from following `path` after Roblox accepted the work.
+    /// A poll that was refused (say, a key without the read scope) or never
+    /// sent says nothing about the work itself, which already exists.
+    fn following(path: &str, error: OpenCloudError) -> OpenCloudError {
+        match error {
+            // Already says the work may have applied, and callers match on it.
+            OpenCloudError::TimedOut(_) | OpenCloudError::Unfollowed { .. } => error,
+            error => OpenCloudError::Unfollowed {
+                path: path.to_owned(),
+                error: Box::new(error),
+            },
         }
     }
 }
@@ -476,16 +517,26 @@ impl OpenCloud {
             }
             sleep(delay.min(deadline - now));
             delay = (delay * 3 / 2).min(self.timing.poll_max);
-            let body = self.send(
-                Method::GET,
-                &format!("/cloud/v2/{task_path}"),
-                None,
-                REQUEST_TIMEOUT,
-            )?;
-            task = self.parse(&body, "a Luau execution task")?;
+            // The task exists from here on, so a failed poll must not read as
+            // "nothing happened".
+            task = self
+                .send(
+                    Method::GET,
+                    &format!("/cloud/v2/{task_path}"),
+                    None,
+                    REQUEST_TIMEOUT,
+                )
+                .and_then(|body| self.parse(&body, "a Luau execution task"))
+                .map_err(|error| OpenCloudError::following(&task_path, error))?;
         };
 
-        let (logs, logs_truncated) = self.task_logs(&task_path)?;
+        // The task has finished, so failing to read its logs must not throw
+        // away its result.
+        let mut logs = Vec::new();
+        let (logs_truncated, logs_error) = match self.task_logs(&task_path, &mut logs) {
+            Ok(truncated) => (truncated, None),
+            Err(error) => (true, Some(error.to_string())),
+        };
         Ok(LuauTaskResult {
             path: task_path,
             state,
@@ -494,12 +545,14 @@ impl OpenCloud {
             error_message: task.error.and_then(|error| error.message),
             logs,
             logs_truncated,
+            logs_error,
         })
     }
 
-    /// Fetches every page of a task's logs, up to [`MAX_LOG_BYTES`].
-    fn task_logs(&self, task_path: &str) -> Result<(Vec<LogMessage>, bool)> {
-        let mut logs = Vec::new();
+    /// Fetches every page of a task's logs into `logs`, up to
+    /// [`MAX_LOG_BYTES`], and returns whether some were left out. On an error,
+    /// `logs` keeps the pages fetched before it.
+    fn task_logs(&self, task_path: &str, logs: &mut Vec<LogMessage>) -> Result<bool> {
         let mut total = 0;
         let mut token = String::new();
         for _ in 0..MAX_LOG_PAGES {
@@ -521,7 +574,7 @@ impl OpenCloud {
                 for message in structured.chain(flat) {
                     total += message.message.len();
                     if total > MAX_LOG_BYTES {
-                        return Ok((logs, true));
+                        return Ok(true);
                     }
                     logs.push(LogMessage {
                         message: message.message,
@@ -531,14 +584,17 @@ impl OpenCloud {
             }
             match page.next_page_token {
                 Some(next) if !next.is_empty() => token = next,
-                _ => return Ok((logs, false)),
+                _ => return Ok(false),
             }
         }
-        Ok((logs, true))
+        Ok(true)
     }
 
     /// Uploads a new asset, waits for Roblox to process it and returns its id.
-    #[allow(clippy::too_many_arguments)]
+    /// Callers that want to resume an interrupted upload later use
+    /// [`OpenCloud::start_asset_upload`] and [`OpenCloud::resume_asset_upload`]
+    /// instead.
+    #[allow(clippy::too_many_arguments, dead_code)]
     pub fn upload_asset(
         &self,
         asset_type: AssetType,
@@ -549,6 +605,35 @@ impl OpenCloud {
         content_type: &str,
         bytes: &[u8],
     ) -> Result<UploadedAsset> {
+        let started = self.start_asset_upload(
+            asset_type,
+            display_name,
+            description,
+            creator,
+            file_name,
+            content_type,
+            bytes,
+        )?;
+        self.finish_asset_upload(started)
+    }
+
+    /// Sends a new asset and returns the operation Roblox created for it,
+    /// without waiting for processing. From a successful return on, the asset
+    /// may exist: a caller that wants to avoid duplicates records
+    /// [`StartedUpload::operation`] before calling
+    /// [`OpenCloud::finish_asset_upload`], and passes it to
+    /// [`OpenCloud::resume_asset_upload`] if that is interrupted.
+    #[allow(clippy::too_many_arguments)]
+    pub fn start_asset_upload(
+        &self,
+        asset_type: AssetType,
+        display_name: &str,
+        description: &str,
+        creator: Creator,
+        file_name: &str,
+        content_type: &str,
+        bytes: &[u8],
+    ) -> Result<StartedUpload> {
         let creator = match creator {
             Creator::User(id) => serde_json::json!({ "userId": id.to_string() }),
             Creator::Group(id) => serde_json::json!({ "groupId": id.to_string() }),
@@ -572,11 +657,24 @@ impl OpenCloud {
             Some((&body, &content_type)),
             upload_timeout(body.len()),
         )?;
-        let mut operation: Operation = self.parse(&response, "an asset operation")?;
-        let operation_path = checked_path(&operation.path, "operations/")
+        let operation: Operation = self.parse(&response, "an asset operation")?;
+        let path = checked_path(&operation.path, "operations/")
             .map_err(|error| self.unconfirmed(error))?
             .to_owned();
+        Ok(StartedUpload {
+            operation: path,
+            state: operation,
+        })
+    }
 
+    /// Waits for an upload from [`OpenCloud::start_asset_upload`] to finish
+    /// processing and returns its asset. Errors other than
+    /// [`OpenCloudError::Failed`] leave the operation to be resumed.
+    pub fn finish_asset_upload(&self, started: StartedUpload) -> Result<UploadedAsset> {
+        let StartedUpload {
+            operation: operation_path,
+            state: mut operation,
+        } = started;
         let deadline = Instant::now() + self.timing.asset_timeout;
         let mut delay = self.timing.poll_initial;
         while !operation.done {
@@ -589,13 +687,17 @@ impl OpenCloud {
             }
             sleep(delay.min(deadline - now));
             delay = (delay * 3 / 2).min(self.timing.poll_max);
-            let response = self.send(
-                Method::GET,
-                &format!("/assets/v1/{operation_path}"),
-                None,
-                REQUEST_TIMEOUT,
-            )?;
-            operation = self.parse(&response, "an asset operation")?;
+            // The asset may exist from here on, so a refused or unsent poll
+            // must not read as "nothing happened".
+            operation = self
+                .send(
+                    Method::GET,
+                    &format!("/assets/v1/{operation_path}"),
+                    None,
+                    REQUEST_TIMEOUT,
+                )
+                .and_then(|response| self.parse(&response, "an asset operation"))
+                .map_err(|error| OpenCloudError::following(&operation_path, error))?;
         }
 
         if let Some(error) = operation.error.filter(|error| !error.is_null()) {
@@ -623,6 +725,28 @@ impl OpenCloud {
             moderation_state: asset["moderationResult"]["moderationState"]
                 .as_str()
                 .map(str::to_owned),
+        })
+    }
+
+    /// Picks up an asset upload whose operation path (such as
+    /// `operations/abc`) was recorded by an earlier, interrupted run, and
+    /// waits for it like [`OpenCloud::finish_asset_upload`]. The path is
+    /// checked the same way as one Roblox returned, so a damaged or crafted
+    /// record cannot send the key anywhere but an asset operation.
+    pub fn resume_asset_upload(&self, operation: &str) -> Result<UploadedAsset> {
+        let path = checked_path(operation, "operations/")
+            .map_err(|error| {
+                OpenCloudError::NotSent(format!("cannot resume asset upload: {error}"))
+            })?
+            .to_owned();
+        self.finish_asset_upload(StartedUpload {
+            state: Operation {
+                path: path.clone(),
+                done: false,
+                error: None,
+                response: None,
+            },
+            operation: path,
         })
     }
 
@@ -774,7 +898,7 @@ struct StructuredMessage {
     message_type: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 struct Operation {
     path: String,
     #[serde(default)]
@@ -841,7 +965,13 @@ fn multipart(
     content_type: &str,
     bytes: &[u8],
 ) -> std::result::Result<(Vec<u8>, String), String> {
-    let header_safe = |value: &str| !value.bytes().any(|b| b.is_ascii_control() || b == b'"');
+    // Quotes and backslashes are refused rather than escaped, since servers
+    // disagree on how a quoted filename is unescaped.
+    let header_safe = |value: &str| {
+        !value
+            .bytes()
+            .any(|b| b.is_ascii_control() || b == b'"' || b == b'\\')
+    };
     if !header_safe(file_name) || file_name.is_empty() {
         return Err(format!(
             "file name {file_name:?} cannot be used in an upload"
@@ -1441,10 +1571,127 @@ mod tests {
     }
 
     #[test]
+    fn refused_asset_polls_still_report_that_the_asset_may_exist() {
+        // A key with asset:write but not asset:read can create assets but
+        // gets 403 for every poll.
+        let (base, recorded) = serve(vec![
+            reply("200 OK", r#"{"path":"operations/op-1","done":false}"#),
+            reply("403 Forbidden", r#"{"message":"missing scope asset:read"}"#),
+        ]);
+        let error = upload(&client(&base)).unwrap_err();
+        assert!(
+            matches!(&error, OpenCloudError::Unfollowed { path, .. } if path == "operations/op-1"),
+            "{error:?}"
+        );
+        assert!(error.may_have_applied());
+        let message = error.to_string();
+        assert!(message.contains("operations/op-1"), "{message}");
+        assert!(message.contains("403"), "{message}");
+        assert_eq!(received(&recorded).len(), 2);
+
+        // Likewise when polling cannot reach Roblox at all.
+        let (base, _) = serve(vec![reply(
+            "200 OK",
+            r#"{"path":"operations/op-2","done":false}"#,
+        )]);
+        let client = client(&base);
+        let started = client
+            .start_asset_upload(
+                AssetType::Image,
+                "icon",
+                "",
+                Creator::User(1),
+                "icon.png",
+                "image/png",
+                b"x",
+            )
+            .unwrap();
+        assert_eq!(started.operation, "operations/op-2");
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let gone = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+        let mut client = client;
+        client.base_url = gone;
+        let error = client.finish_asset_upload(started).unwrap_err();
+        assert!(
+            matches!(&error, OpenCloudError::Unfollowed { error, .. } if matches!(**error, OpenCloudError::NotSent(_))),
+            "{error:?}"
+        );
+        assert!(error.may_have_applied());
+    }
+
+    #[test]
+    fn resumed_asset_uploads_poll_without_sending_the_file_again() {
+        let (base, recorded) = serve(vec![reply(
+            "200 OK",
+            r#"{"path":"operations/op-9","done":true,"response":{"assetId":"99","moderationResult":{"moderationState":"Approved"}}}"#,
+        )]);
+        let asset = client(&base)
+            .resume_asset_upload("operations/op-9")
+            .unwrap();
+        assert_eq!(asset.asset_id, 99);
+        let requests = received(&recorded);
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            (requests[0].method.as_str(), requests[0].target.as_str()),
+            ("GET", "/assets/v1/operations/op-9")
+        );
+
+        let client = client("http://127.0.0.1:1");
+        for path in [
+            "operations/../assets",
+            "https://x/operations/1",
+            "other/1",
+            "",
+        ] {
+            let error = client.resume_asset_upload(path).unwrap_err();
+            assert!(matches!(error, OpenCloudError::NotSent(_)), "{path}");
+        }
+    }
+
+    #[test]
+    fn refused_luau_polls_still_report_that_the_task_may_have_run() {
+        let (base, _) = serve(vec![
+            task("QUEUED", ""),
+            reply("403 Forbidden", r#"{"message":"missing read scope"}"#),
+        ]);
+        let error = client(&base)
+            .run_luau(1, 2, Some(9), "return 1", Duration::from_secs(5))
+            .unwrap_err();
+        assert!(
+            matches!(&error, OpenCloudError::Unfollowed { path, .. } if path == TASK),
+            "{error:?}"
+        );
+        assert!(error.may_have_applied());
+    }
+
+    #[test]
+    fn failed_log_fetches_keep_the_finished_task_result() {
+        let (base, _) = serve(vec![
+            task("COMPLETE", r#","output":{"results":[true]}"#),
+            reply(
+                "200 OK",
+                r#"{"luauExecutionSessionTaskLogs":[{"messages":["first page"]}],"nextPageToken":"p2"}"#,
+            ),
+            reply("403 Forbidden", r#"{"message":"no logs for you"}"#),
+        ]);
+        let result = client(&base)
+            .run_luau(1, 2, Some(9), "return true", Duration::from_secs(5))
+            .unwrap();
+        assert_eq!(result.state, TaskState::Complete);
+        assert_eq!(result.results, vec![Value::Bool(true)]);
+        assert_eq!(result.logs[0].message, "first page");
+        assert!(result.logs_truncated);
+        let logs_error = result.logs_error.unwrap();
+        assert!(logs_error.contains("403"), "{logs_error}");
+    }
+
+    #[test]
     fn unsafe_multipart_names_are_refused_before_sending() {
         let client = client("http://127.0.0.1:1");
         for (file_name, content_type) in [
             ("a\".png", "image/png"),
+            ("a\\b.png", "image/png"),
             ("a\r\nX: y", "image/png"),
             ("", "image/png"),
             ("a.png", "image/png\r\nX: y"),

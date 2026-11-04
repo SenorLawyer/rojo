@@ -1757,6 +1757,7 @@ fn smoke_outcome(result: Result<LuauTaskResult, OpenCloudError>) -> serde_json::
         "results": results, "results_truncated": results_truncated,
         "error_code": task.error_code, "logs": logs,
         "logs_omitted": skip > 0 || task.logs_truncated,
+        "logs_error": task.logs_error,
     })
 }
 
@@ -5505,6 +5506,7 @@ mod tests {
                 error_message: None,
                 logs: Vec::new(),
                 logs_truncated: false,
+                logs_error: None,
             })
         };
         let status = |result| smoke_outcome(result)["status"].clone();
@@ -5539,6 +5541,12 @@ mod tests {
         let error = smoke_outcome(Err(OpenCloudError::TimedOut("still PROCESSING".into())));
         assert_eq!(error["status"], "error");
         assert_eq!(error["task_may_have_run"], true);
+        // A poll refused after the task was created still means it may run.
+        let error = smoke_outcome(Err(OpenCloudError::Unfollowed {
+            path: TASK_PATH.into(),
+            error: Box::new(OpenCloudError::NotSent("connection refused".into())),
+        }));
+        assert_eq!(error["task_may_have_run"], true);
         let logs = smoke_outcome(Ok(LuauTaskResult {
             path: TASK_PATH.into(),
             state: TaskState::Complete,
@@ -5552,6 +5560,7 @@ mod tests {
                 })
                 .collect(),
             logs_truncated: false,
+            logs_error: None,
         }));
         assert_eq!(logs["logs"].as_array().unwrap().len(), SMOKE_LOG_TAIL);
         assert_eq!(logs["logs"][0]["message"], "line 10");
