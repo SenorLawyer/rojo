@@ -357,6 +357,23 @@ impl OpenCloud {
         })
     }
 
+    /// Retries and polls within milliseconds and gives Luau tasks no extra
+    /// time past their timeout, so tests of callers against a fake server
+    /// finish quickly.
+    #[cfg(test)]
+    pub(crate) fn with_fast_timing(mut self) -> OpenCloud {
+        self.timing = Timing {
+            max_attempts: 3,
+            retry_base: Duration::from_millis(10),
+            retry_max: Duration::from_millis(50),
+            poll_initial: Duration::from_millis(10),
+            poll_max: Duration::from_millis(20),
+            luau_margin: Duration::ZERO,
+            asset_timeout: Duration::from_millis(300),
+        };
+        self
+    }
+
     /// Uploads a place file as a new version and returns its version number.
     pub fn publish_place(
         &self,

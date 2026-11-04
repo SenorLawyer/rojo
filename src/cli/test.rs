@@ -3,10 +3,16 @@
 //!
 //! The runner itself is the plugin's `SpecRunner` module. Callers only pass
 //! options as data. [`SpecOptions`], [`TestReport`] and
-//! [`standalone_runner_source`] are independent of the bridge, so a runner
-//! that is not Studio, such as Open Cloud Luau Execution, can share them.
+//! [`standalone_runner_source`] are independent of the bridge, so `--cloud`
+//! (see [`cloud`]) runs the same runner with Open Cloud Luau Execution.
 
-use std::{fmt::Write as _, path::PathBuf, time::Duration};
+mod cloud;
+
+use std::{
+    fmt::Write as _,
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 use anyhow::Context;
 use clap::{ArgEnum, Parser};
@@ -18,19 +24,53 @@ use super::{
     studio::{local_address, read_response},
     ExitStatus, UsageError,
 };
-use crate::web::studio::{max_command_request, read_token_file, studio_deadline, MAX_SPEC_SECONDS};
+use crate::{
+    open_cloud::{OpenCloud, DEFAULT_API_KEY_VAR},
+    web::studio::{max_command_request, read_token_file, studio_deadline, MAX_SPEC_SECONDS},
+};
 
 /// The runner module the Studio plugin copies into Run mode. It is plain Luau
 /// with no dependencies, so it also runs as a standalone script.
 const SPEC_RUNNER: &str = include_str!("../../plugin/src/SpecRunner.lua");
 
-/// Run the place's *.spec modules in Studio's Run mode and report the results.
+/// Run the place's *.spec modules in Studio's Run mode, or with --cloud in
+/// Open Cloud Luau Execution, and report the results.
 ///
-/// Requires `rojo serve --studio-token-file` and a connected Studio. Exits with
-/// 0 when every test passed, 1 when a test failed or the run could not finish,
-/// and 2 when the command could not reach Studio or was used incorrectly.
+/// Studio mode requires `rojo serve --studio-token-file` and a connected
+/// Studio. Exits with 0 when every test passed, 1 when a test failed or the
+/// run could not finish, and 2 when the command could not reach Studio or
+/// Open Cloud or was used incorrectly.
 #[derive(Debug, Parser)]
 pub struct TestCommand {
+    /// Run headlessly with Open Cloud Luau Execution instead of Studio: build
+    /// the project, save it as a new (unpublished) version of --place-id and
+    /// run the specs against that version.
+    #[clap(long, conflicts_with_all = &["token-file", "session", "request-id"])]
+    pub cloud: bool,
+    /// With --cloud: the place project to build. Defaults to the current
+    /// directory.
+    #[clap(
+        value_name = "PROJECT",
+        requires = "cloud",
+        conflicts_with = "no-upload"
+    )]
+    pub project: Option<PathBuf>,
+    /// With --cloud: the universe (experience) that holds the place.
+    #[clap(long, requires = "cloud")]
+    pub universe_id: Option<u64>,
+    /// With --cloud: the place to save the build to and run the specs in.
+    /// Use a place set aside for testing.
+    #[clap(long, requires = "cloud")]
+    pub place_id: Option<u64>,
+    /// With --cloud: the environment variable that holds the Open Cloud API
+    /// key. Defaults to ROBLOX_API_KEY.
+    #[clap(long, value_name = "VAR", requires = "cloud")]
+    pub api_key_env: Option<String>,
+    /// With --cloud: save nothing and run against the place's current
+    /// published version. This tests what was uploaded before, not the local
+    /// files.
+    #[clap(long, requires = "cloud")]
+    pub no_upload: bool,
     /// Local rojo serve address. Remote control is intentionally unsupported.
     #[clap(long, default_value = "http://127.0.0.1:34872")]
     pub address: String,
@@ -119,7 +159,6 @@ impl SpecOptions {
 /// Luau source that runs the specs in the DataModel it executes in and
 /// returns the report, for runners without the plugin, such as Open Cloud
 /// Luau Execution. Options are embedded as JSON data, not as code.
-#[allow(dead_code)] // For a runner other than Studio; see the module docs.
 pub(crate) fn standalone_runner_source(options: &SpecOptions) -> String {
     let data = options.to_args().to_string();
     // A long bracket string cannot contain its own closing bracket, so pick a
@@ -449,6 +488,9 @@ struct Output<'a> {
 
 impl TestCommand {
     pub fn run(self) -> anyhow::Result<()> {
+        if self.cloud {
+            return self.run_cloud();
+        }
         let (session, request_id, report) = self.execute().map_err(UsageError)?;
         if self.json {
             let output = Output {
@@ -466,13 +508,82 @@ impl TestCommand {
         }
     }
 
-    /// Everything up to the report. Errors here are usage or connection
-    /// problems; a run that fails is a report.
-    fn execute(&self) -> anyhow::Result<(String, String, TestReport)> {
+    fn spec_options(&self) -> SpecOptions {
+        SpecOptions {
+            roots: self.roots.clone(),
+            framework: self.framework,
+            module: self.module.clone(),
+            filter: self.filter.clone(),
+            timeout_seconds: self.timeout,
+        }
+    }
+
+    fn check_timeout(&self) -> anyhow::Result<()> {
         anyhow::ensure!(
             (1..=MAX_SPEC_SECONDS).contains(&self.timeout),
             "--timeout must be from 1 to {MAX_SPEC_SECONDS} seconds"
         );
+        Ok(())
+    }
+
+    /// The universe and place for --cloud. Both are required, so a test run
+    /// never picks a place on its own.
+    fn cloud_target(&self) -> anyhow::Result<(u64, u64)> {
+        match (self.universe_id, self.place_id) {
+            (Some(universe), Some(place)) if universe > 0 && place > 0 => Ok((universe, place)),
+            (Some(_), Some(_)) => anyhow::bail!("--universe-id and --place-id must be positive"),
+            _ => anyhow::bail!(
+                "--cloud needs both --universe-id and --place-id. Use a place set aside for testing:                  the build is saved to it as a new version."
+            ),
+        }
+    }
+
+    fn run_cloud(self) -> anyhow::Result<()> {
+        let run = self.execute_cloud().map_err(UsageError)?;
+        if self.json {
+            println!("{}", serde_json::to_string(&run.output())?);
+        } else {
+            print!("{}", run.render());
+        }
+        match run.report.exit_code() {
+            0 => Ok(()),
+            code => Err(ExitStatus(code).into()),
+        }
+    }
+
+    /// Everything up to the cloud run's report. As for Studio, errors are
+    /// usage or connection problems.
+    fn execute_cloud(&self) -> anyhow::Result<cloud::CloudRun> {
+        self.check_timeout()?;
+        let (universe_id, place_id) = self.cloud_target()?;
+        let client =
+            OpenCloud::from_env(self.api_key_env.as_deref().unwrap_or(DEFAULT_API_KEY_VAR))?;
+        let place = if self.no_upload {
+            None
+        } else {
+            let project = super::resolve_path(self.project.as_deref().unwrap_or(Path::new("")))?;
+            let (name, bytes) = cloud::build_place(&project)?;
+            eprintln!("Built project '{name}'.");
+            Some(bytes)
+        };
+        let options = self.spec_options();
+        cloud::run(
+            &client,
+            &cloud::CloudRequest {
+                universe_id,
+                place_id,
+                place: place.as_deref(),
+                options: &options,
+                task_timeout: cloud::task_timeout(self.timeout),
+            },
+            &mut |line| eprintln!("{line}"),
+        )
+    }
+
+    /// Everything up to the report. Errors here are usage or connection
+    /// problems; a run that fails is a report.
+    fn execute(&self) -> anyhow::Result<(String, String, TestReport)> {
+        self.check_timeout()?;
         if let Some(id) = &self.request_id {
             uuid::Uuid::parse_str(id).context("--request-id must be a UUID")?;
         }
@@ -497,13 +608,7 @@ impl TestCommand {
                 .context(unreachable)?;
             choose_session(&read_response(response)?, None)?
         };
-        let options = SpecOptions {
-            roots: self.roots.clone(),
-            framework: self.framework,
-            module: self.module.clone(),
-            filter: self.filter.clone(),
-            timeout_seconds: self.timeout,
-        };
+        let options = self.spec_options();
         let request_id = self
             .request_id
             .clone()
@@ -771,5 +876,78 @@ mod tests {
         assert_eq!(command.framework, Framework::Testez);
         assert_eq!(command.timeout, 120);
         assert!(command.json && command.session.is_none());
+    }
+
+    fn parse_test(args: &[&str]) -> Result<TestCommand, clap::Error> {
+        use crate::cli::{Options, Subcommand};
+        let options = Options::try_parse_from(["rojo", "test"].iter().chain(args))?;
+        let Subcommand::Test(command) = options.subcommand else {
+            panic!("expected the test subcommand");
+        };
+        Ok(command)
+    }
+
+    #[test]
+    fn cloud_options_parse_and_need_cloud() {
+        let command = parse_test(&[
+            "--cloud",
+            "places/test.project.json",
+            "--universe-id",
+            "1",
+            "--place-id",
+            "2",
+            "--api-key-env",
+            "MY_KEY",
+        ])
+        .unwrap();
+        assert!(command.cloud && !command.no_upload);
+        assert_eq!(
+            command.project,
+            Some(PathBuf::from("places/test.project.json"))
+        );
+        assert_eq!(command.cloud_target().unwrap(), (1, 2));
+        assert_eq!(command.api_key_env.as_deref(), Some("MY_KEY"));
+
+        // Cloud options without --cloud, and Studio options with it, are refused.
+        assert!(parse_test(&["--place-id", "2"]).is_err());
+        assert!(parse_test(&["--no-upload"]).is_err());
+        assert!(parse_test(&["some.project.json"]).is_err());
+        assert!(parse_test(&["--cloud", "--token-file", "token"]).is_err());
+        assert!(parse_test(&["--cloud", "--session", "a"]).is_err());
+        // --no-upload builds nothing, so a project would be ignored.
+        assert!(parse_test(&["--cloud", "--no-upload", "x.project.json"]).is_err());
+        assert!(parse_test(&["--cloud", "--no-upload"]).unwrap().no_upload);
+    }
+
+    #[test]
+    fn cloud_runs_need_both_ids() {
+        for args in [
+            &["--cloud"][..],
+            &["--cloud", "--universe-id", "1"],
+            &["--cloud", "--place-id", "2"],
+        ] {
+            let error = parse_test(args).unwrap().cloud_target().unwrap_err();
+            assert!(
+                error.to_string().contains("--universe-id and --place-id"),
+                "{error}"
+            );
+        }
+        let error = parse_test(&["--cloud", "--universe-id", "0", "--place-id", "2"])
+            .unwrap()
+            .cloud_target()
+            .unwrap_err();
+        assert!(error.to_string().contains("positive"));
+    }
+
+    #[test]
+    fn a_cloud_run_without_ids_stops_before_reading_the_key() {
+        // The variable is never set, so reaching it would give a different error.
+        let mut command = parse_test(&["--cloud", "--place-id", "2"]).unwrap();
+        command.api_key_env = Some("ROJO_TEST_UNSET_KEY_VARIABLE".into());
+        let error = command.execute_cloud().unwrap_err().to_string();
+        assert!(error.contains("--universe-id"), "{error}");
+        command.universe_id = Some(1);
+        let error = command.execute_cloud().unwrap_err().to_string();
+        assert!(error.contains("ROJO_TEST_UNSET_KEY_VARIABLE"), "{error}");
     }
 }

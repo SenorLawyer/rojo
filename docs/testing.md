@@ -122,7 +122,88 @@ rojo serve --studio-token-file <token> &
 rojo test --token-file <token> --json > test-report.json
 ```
 
-Hosted runners without Studio need a different runner, such as Open Cloud's Luau Execution. The runner module and the report format do not depend on Studio, so they can be shared with one.
+Hosted runners without Studio can use [`rojo test --cloud`](#cloud) instead.
+
+## Cloud
+
+`rojo test --cloud` runs the specs without Studio, through Open Cloud's [Luau Execution](https://create.roblox.com/docs/cloud/reference/features/luau-execution) API. It suits hosted CI runners.
+
+```text
+rojo test --cloud --universe-id <universe> --place-id <place> [PROJECT]
+```
+
+It does three things:
+
+1. Builds the project (by default the one in the current directory) into a place in memory. The project's root must be a `DataModel`.
+2. Saves the place as a new **Saved** version of `--place-id`. It is never published: players keep joining the current published version. Rojo prints the version number it saved.
+3. Runs the same spec runner as Studio mode as a Luau Execution task against exactly that version, and prints the report and exits as Studio mode does.
+
+Use a place set aside for testing, since every run adds a version to its history. Both `--universe-id` and `--place-id` are required; Rojo never picks a place on its own.
+
+| Option | Meaning |
+| --- | --- |
+| `--universe-id <id>`, `--place-id <id>` | The experience and the place to save to and run in. Required. |
+| `PROJECT` | The place project to build. Defaults to the current directory. |
+| `--api-key-env <var>` | The environment variable holding the Open Cloud API key. Defaults to `ROBLOX_API_KEY`. The key is never printed. |
+| `--no-upload` | Save nothing and run against the version Open Cloud picks when none is named, which Roblox documents as the place's current published version. This tests what was uploaded before, not your local files. Rojo prints the version the task ran on. |
+| `--root`, `--filter`, `--framework`, `--module`, `--timeout`, `--json` | As in Studio mode. |
+
+The API key needs the `universe-places:write` scope (not needed with `--no-upload`) and the `universe.place.luau-execution-session:read` and `:write` scopes, for the experience you test in.
+
+Progress (the build, the saved version, the Luau task's path) goes to stderr, so `--json` output on stdout stays one object. In human mode, messages the task logged as errors are printed before the report. With `--json`, the object also has `universeId`, `placeId`, `placeVersion` (the version the task ran on), `uploaded`, `taskPath`, `logs` (every `{ "message", "kind" }` the task logged, where `kind` is `OUTPUT`, `INFO`, `WARNING` or `ERROR`) and `logsTruncated`.
+
+The exit codes are those of Studio mode. A task that fails (for example a script error), is cancelled, or runs out of time is reported with status `error` or `timedOut` and exits with 1. A missing ID or API key, a refused save or a request that Open Cloud refuses exits with 2.
+
+### How a cloud run differs from Studio
+
+Luau Execution starts a server, loads the place and runs the script there. According to Roblox's documentation:
+
+- The place's own Server and Local scripts do not run automatically. Specs only see what they set up themselves (ModuleScripts can still be required).
+- Physics simulation does not run.
+- Changes to the DataModel stay inside the task and are not saved.
+- Engine APIs that reach the experience's cloud data, such as DataStores, are available and Roblox advises caution with them: specs should not write to real data.
+- A task runs for at most five minutes, and a place allows at most ten unfinished tasks. Task creation is limited to five per minute per API key owner. Roblox keeps up to 450 KB of logs per task.
+
+No player joins the task's server, so specs that need `Players`, characters or client scripts do not behave as they do in Studio's Run mode. Use Studio mode for those.
+
+The task's timeout is `--timeout` plus 30 seconds, at most five minutes, so the runner's own timeout reports a slow spec first. With `--timeout` above 270, the task's limit can end the run first, which is reported as `timedOut` without a list of failures.
+
+While the place is open in Team Create, Roblox refuses to save new versions (HTTP 409). Close it in Studio first, or use `--no-upload`.
+
+### GitHub Actions
+
+Store the API key as a repository secret, here `ROBLOX_API_KEY`, and the IDs as repository variables:
+
+```yaml
+name: Tests
+on: [push, pull_request]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    # Secrets are not given to workflows run from forks.
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
+    # One run at a time keeps within Luau Execution's limits.
+    concurrency: roblox-cloud-tests
+    steps:
+      - uses: actions/checkout@v4
+      - uses: CompeyDev/setup-rokit@v0.1.2
+      - name: Run specs
+        env:
+          ROBLOX_API_KEY: ${{ secrets.ROBLOX_API_KEY }}
+        run: >
+          rojo test --cloud
+          --universe-id ${{ vars.TEST_UNIVERSE_ID }}
+          --place-id ${{ vars.TEST_PLACE_ID }}
+          --json > test-report.json
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-report
+          path: test-report.json
+```
+
+This assumes Rojo is installed with Rokit from your `rokit.toml`. Install your packages (for example with `wally install`) before running the specs if the project maps them in.
 
 ## For agents
 
