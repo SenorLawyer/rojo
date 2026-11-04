@@ -123,7 +123,7 @@ return function()
 		session:setUpdateLoadingTextCallback(function(text)
 			loadingText = text
 		end)
-		api.connect = function(onWaitingForPermission)
+		api.connect = function(_, onWaitingForPermission)
 			return Promise.new(function()
 				onWaitingForPermission()
 			end)
