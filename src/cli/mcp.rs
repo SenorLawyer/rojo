@@ -889,9 +889,9 @@ mod tests {
             "after": 41,
             "limit": 5,
         });
-        let (command, _) =
-            command(&options, "studio_logs", arguments.as_object().unwrap()).unwrap();
-        let args: Vec<_> = command
+        let prepared = command(&options, "studio_logs", arguments.as_object().unwrap()).unwrap();
+        let args: Vec<_> = prepared
+            .command
             .get_args()
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect();
