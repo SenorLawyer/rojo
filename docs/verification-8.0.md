@@ -15,7 +15,7 @@ Plugin specs re-run in Studio for 8.0.0-dev.5, after the child-process import ch
 
 ## 8.0.0-dev.6 (PR #4)
 
-Measured on November 4, 2026, on Windows x64 with Studio, against private test experiences set aside for this (no game players use was touched):
+Measured on November 4, 2026, on Windows x64 with Studio, against private test experiences set aside for this; no game that players use was touched:
 
 - **Bridge stall.** With the installed 8.0.0-dev.5 plugin connected to a scratch place, `rojo studio status` every 5 seconds returned HTTP 504 within the first minute, and the session then expired. A diagnostic build logged each `RequestAsync`: only one bridge request was ever in flight, yet each took longer than the last (about 2, 4, 7, 9 and 13 seconds) while the server answered the same requests in 2 seconds (polls) and 1 millisecond (results) when sent from outside Studio. A fresh plugin sent 25 quick requests in 0.6 seconds; once it alternated 2-second held requests with quick ones, every later request was delayed further. The same pattern over a `RawStream` client stayed at 2.02 and 0.02 seconds for all 12 rounds. With the dev.6 plugin, which polls over its own stream, the same 5-minute soak passed 57 of 57 commands (median 0.21 seconds, slowest 1.1 seconds). Instance names and log lines with non-ASCII text round-tripped intact over the stream.
 - **`rojo test`.** In Studio, a fixture with two passing tests, one failing test and one spec that fails to load reported exactly that and exited 1; `--root nope` exited 2. `--cloud` saved the built place as a new unpublished version of the test place, ran the specs there with Luau Execution and gave the same result.
