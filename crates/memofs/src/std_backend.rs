@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::io;
-use std::path::{Path, PathBuf};
-use std::sync::mpsc;
+use std::path::{Component, Path, PathBuf};
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -32,6 +32,20 @@ const PATH_BASED_WATCHES: bool = cfg!(target_os = "macos");
 /// Watching a path again adds to its existing watch instead of replacing it.
 const INOTIFY_WATCHES: bool = cfg!(target_os = "linux");
 
+/// notify's Windows backend never reports a rescan: when ReadDirectoryChangesW
+/// overflows, it parses an empty buffer and the debouncer drops the result.
+/// Degraded paths would then stay unwatched forever, so they are polled.
+const POLL_DEGRADED: bool = cfg!(windows);
+
+/// How often degraded paths are polled where the watcher cannot ask for a
+/// rescan. Each poll snapshots every degraded path again.
+const DEGRADED_POLL_INTERVAL: Duration = Duration::from_secs(30);
+
+/// How often a recursive watch is retried when part of the tree disappears
+/// while notify walks it, such as during a package reinstall.
+const TRANSIENT_WATCH_RETRIES: u32 = 3;
+const TRANSIENT_WATCH_RETRY_DELAY: Duration = Duration::from_millis(10);
+
 /// `VfsBackend` that uses `std::fs` and the `notify` crate.
 pub struct StdBackend {
     watcher: Option<RecommendedWatcher>,
@@ -54,6 +68,11 @@ pub struct StdBackend {
     degraded: HashSet<PathBuf>,
     /// Degraded paths that were already logged, so retries do not spam.
     reported_degraded: HashSet<PathBuf>,
+    /// The degraded paths, shared with the thread that polls them.
+    polled_degraded: Arc<Mutex<Vec<PathBuf>>>,
+    /// Ancestors that could not be watched for the creation of a path. They
+    /// are not retried, or logged again, until the watcher asks for a rescan.
+    failed_creation_watches: HashSet<PathBuf>,
 }
 
 impl StdBackend {
@@ -76,6 +95,8 @@ impl StdBackend {
             anchors: HashSet::new(),
             degraded: HashSet::new(),
             reported_degraded: HashSet::new(),
+            polled_degraded: Arc::new(Mutex::new(Vec::new())),
+            failed_creation_watches: HashSet::new(),
         }
     }
 
@@ -98,18 +119,55 @@ impl StdBackend {
             Result::<(), crossbeam_channel::SendError<VfsEvent>>::Ok(())
         });
 
+        if POLL_DEGRADED {
+            let degraded = Arc::downgrade(&self.polled_degraded);
+            let tx = self.watcher_sender.clone();
+            thread::spawn(move || loop {
+                thread::sleep(DEGRADED_POLL_INTERVAL);
+                // The backend is gone once nothing else holds the list.
+                let Some(degraded) = degraded.upgrade() else {
+                    return;
+                };
+                let paths = degraded.lock().unwrap().clone();
+                for path in paths {
+                    // Handling the write retries the watch, and resyncs the
+                    // path in case it changed while it was not watched.
+                    if tx.send(VfsEvent::Write(path)).is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+
         self.watcher = Some(watcher);
         Ok(())
     }
 
     fn is_covered(&self, path: &Path) -> bool {
-        path.ancestors()
-            .any(|ancestor| self.watches.contains(ancestor))
+        containing_ancestors(path).any(|ancestor| self.watches.contains(ancestor))
     }
 
     fn is_anchored(&self, path: &Path) -> bool {
-        path.ancestors()
-            .any(|ancestor| self.anchors.contains(ancestor))
+        containing_ancestors(path).any(|ancestor| self.anchors.contains(ancestor))
+    }
+
+    /// Whether `path` is at or below a path that could not be watched. Its
+    /// descendants are read without watches as well, instead of each one
+    /// failing, and warning, on its own.
+    fn is_degraded(&self, path: &Path) -> bool {
+        containing_ancestors(path).any(|ancestor| self.degraded.contains(ancestor))
+    }
+
+    fn publish_degraded(&self) {
+        if POLL_DEGRADED {
+            *self.polled_degraded.lock().unwrap() = self.degraded.iter().cloned().collect();
+        }
+    }
+
+    /// Forgets lost watch roots at or below `path`, which is watched, or
+    /// degraded and read without a watch, now.
+    fn forget_lost_watches(&mut self, path: &Path) {
+        self.lost_watches.retain(|lost| !is_within(lost, path));
     }
 
     /// Makes sure that the creation of `path` is reported by watching its
@@ -135,7 +193,10 @@ impl StdBackend {
             if previous.as_deref() == Some(ancestor) {
                 return;
             }
-            if self.parent_watches.contains(ancestor) || self.is_covered(ancestor) {
+            if self.parent_watches.contains(ancestor)
+                || self.is_covered(ancestor)
+                || self.failed_creation_watches.contains(ancestor)
+            {
                 return;
             }
             // Only the parent of a path, or a directory inside something that
@@ -153,6 +214,8 @@ impl StdBackend {
                 return;
             };
             if let Err(err) = watcher.watch(ancestor, RecursiveMode::NonRecursive) {
+                // Every path below the ancestor would fail the same way.
+                self.failed_creation_watches.insert(ancestor.to_owned());
                 log::warn!(
                     "Could not watch {} for changes to {}; it will not be resynced if it is deleted and recreated: {}",
                     ancestor.display(),
@@ -169,10 +232,10 @@ impl StdBackend {
 
     /// Registers lost watch roots again once they exist.
     ///
-    /// `trigger` is the path whose event led here. Roots other than it are
-    /// reported as created, because the snapshot caused by that event does not
-    /// necessarily reach them.
-    fn recover_lost_watches(&mut self, roots: Vec<PathBuf>, trigger: Option<&Path>) {
+    /// With `Report::ExceptTrigger`, recovered roots other than the path whose
+    /// event led here are reported as created, because the snapshot caused by
+    /// that event does not necessarily reach them.
+    fn recover_lost_watches(&mut self, roots: Vec<PathBuf>, report: Report<'_>) {
         for root in roots {
             self.ensure_creation_watch(&root);
             if fs_err::metadata(&root).is_err() {
@@ -180,7 +243,11 @@ impl StdBackend {
             }
             match self.watch(&root) {
                 Ok(()) => {
-                    if trigger != Some(root.as_path()) {
+                    let reported = match report {
+                        Report::ExceptTrigger(trigger) => trigger != Some(root.as_path()),
+                        Report::Nothing => false,
+                    };
+                    if reported {
                         let _ = self.watcher_sender.send(VfsEvent::Create(root));
                     }
                 }
@@ -195,6 +262,10 @@ impl StdBackend {
     /// succeed and later events do not retry the registration each time.
     fn degrade(&mut self, path: &Path, err: &io::Error) {
         self.degraded.insert(path.to_owned());
+        self.publish_degraded();
+        // Otherwise every event above a lost root would report it as created
+        // again, since it never gets a watch.
+        self.forget_lost_watches(path);
         if !self.reported_degraded.insert(path.to_owned()) {
             log::debug!("Could not watch {} again: {}", path.display(), err);
             return;
@@ -231,6 +302,71 @@ impl StdBackend {
             log::debug!("Could not watch {} again: {}", path.display(), err);
         }
     }
+}
+
+/// Which recovered watch roots `recover_lost_watches` reports as created.
+#[derive(Clone, Copy)]
+enum Report<'a> {
+    /// Every root except the one whose own event led to the recovery.
+    ExceptTrigger(Option<&'a Path>),
+    /// None, because the whole tree is snapshotted again anyway.
+    Nothing,
+}
+
+/// Why a recursive watch could not be registered.
+#[derive(Debug, PartialEq, Eq)]
+enum WatchFailure {
+    /// The path, or the target of a symlink at it, does not exist.
+    Missing,
+    /// The path exists, but something below it disappeared while notify
+    /// walked the tree to watch every directory.
+    Transient,
+    /// The path cannot be watched, such as when the inotify watch limit is
+    /// reached or permission is denied.
+    Unwatchable,
+}
+
+fn classify_watch_failure(path: &Path, err: &io::Error) -> WatchFailure {
+    // Follow symlinks: notify watches the target, so a link whose target is
+    // briefly missing is as missing as the target.
+    match fs_err::metadata(path) {
+        Err(meta_err)
+            if matches!(
+                meta_err.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+            ) =>
+        {
+            WatchFailure::Missing
+        }
+        Ok(_) if err.kind() == io::ErrorKind::NotFound => WatchFailure::Transient,
+        _ => WatchFailure::Unwatchable,
+    }
+}
+
+/// Returns the ancestors of `path`, starting with itself, that contain it.
+///
+/// Paths are compared as written, so `P/..` would otherwise count as inside
+/// `P`, and a `$path` such as `../shared` could put a watch on the parent of
+/// the project. Resolving `..` lexically instead could pick the wrong
+/// directory when the component before it is a symlink.
+fn containing_ancestors(path: &Path) -> impl Iterator<Item = &Path> {
+    let mut escaped = false;
+    path.ancestors().take_while(move |ancestor| {
+        if escaped {
+            return false;
+        }
+        escaped = matches!(
+            ancestor.components().next_back(),
+            Some(Component::ParentDir)
+        );
+        true
+    })
+}
+
+/// Whether `path` is `ancestor` or inside it, comparing paths as written.
+fn is_within(path: &Path, ancestor: &Path) -> bool {
+    path.strip_prefix(ancestor)
+        .is_ok_and(|rest| !rest.components().any(|c| c == Component::ParentDir))
 }
 
 /// Converts a debounced notify event into the events the Vfs understands.
@@ -371,10 +507,11 @@ impl VfsBackend for StdBackend {
     fn watch(&mut self, path: &Path) -> io::Result<()> {
         if self.is_covered(path) {
             // The covering watch reports these roots coming back.
-            self.lost_watches.retain(|lost| !lost.starts_with(path));
+            self.forget_lost_watches(path);
             return Ok(());
         }
-        if self.degraded.contains(path) {
+        if self.is_degraded(path) {
+            self.forget_lost_watches(path);
             return Ok(());
         }
         if let Err(err) = self.initialize_watcher() {
@@ -387,26 +524,39 @@ impl VfsBackend for StdBackend {
             // The recursive watch below replaces it, so a failure is harmless.
             let _ = watcher.unwatch(path);
         }
-        if let Err(err) = watcher.watch(path, RecursiveMode::Recursive) {
+        let mut retries = 0;
+        while let Err(err) = watcher.watch(path, RecursiveMode::Recursive) {
             let err = notify_io_error(err);
-            // Failed registrations of missing paths stay retryable after a
-            // transient deletion.
-            if is_missing(path) {
-                return Err(io::Error::new(io::ErrorKind::NotFound, err));
+            match classify_watch_failure(path, &err) {
+                // Failed registrations of missing paths stay retryable after
+                // a transient deletion.
+                WatchFailure::Missing => {
+                    return Err(io::Error::new(io::ErrorKind::NotFound, err));
+                }
+                // inotify gives up on the whole tree when one directory in it
+                // disappears mid-walk. Degrading the root for that would leave
+                // it unwatched during exactly the churn that caused it.
+                WatchFailure::Transient if retries < TRANSIENT_WATCH_RETRIES => {
+                    retries += 1;
+                    log::debug!("Retrying the watch of {}: {}", path.display(), err);
+                    thread::sleep(TRANSIENT_WATCH_RETRY_DELAY);
+                }
+                WatchFailure::Transient | WatchFailure::Unwatchable => {
+                    self.degrade(path, &err);
+                    return Ok(());
+                }
             }
-            self.degrade(path, &err);
-            return Ok(());
         }
         self.watches.insert(path.to_path_buf());
         self.anchors.insert(path.to_path_buf());
         // Lost roots below this path are covered by its recursive watch now.
-        self.lost_watches.retain(|lost| !lost.starts_with(path));
+        self.forget_lost_watches(path);
         // So are parent watches below it. inotify replaced them while walking
         // the tree, but other backends keep each registration separately.
         let nested: Vec<_> = self
             .parent_watches
             .iter()
-            .filter(|parent| parent.starts_with(path))
+            .filter(|parent| is_within(parent, path))
             .cloned()
             .collect();
         for parent in nested {
@@ -428,19 +578,24 @@ impl VfsBackend for StdBackend {
         }
         // A root registered above `path` keeps reporting it, and its watches
         // below `path` belong to that root as well.
-        let covered_by_ancestor = path
-            .ancestors()
+        let covered_by_ancestor = containing_ancestors(path)
             .skip(1)
             .any(|ancestor| self.watches.contains(ancestor));
         let removed_watches: Vec<_> = self
             .watches
             .iter()
             .chain(self.parent_watches.iter())
-            .filter(|watched| watched.starts_with(path))
+            .filter(|watched| is_within(watched, path))
             .cloned()
             .collect();
         // Whatever is created here next deserves a fresh attempt.
-        self.degraded.retain(|degraded| !degraded.starts_with(path));
+        let degraded_count = self.degraded.len();
+        self.degraded.retain(|degraded| !is_within(degraded, path));
+        if self.degraded.len() != degraded_count {
+            self.publish_degraded();
+        }
+        self.failed_creation_watches
+            .retain(|failed| !is_within(failed, path));
         let mut result = Ok(());
         for watched in removed_watches {
             if self.watches.remove(&watched) && !covered_by_ancestor {
@@ -465,7 +620,7 @@ impl VfsBackend for StdBackend {
         let lost: Vec<_> = self
             .lost_watches
             .iter()
-            .filter(|lost| lost.starts_with(path))
+            .filter(|lost| is_within(lost, path))
             .cloned()
             .collect();
         for root in lost {
@@ -477,22 +632,45 @@ impl VfsBackend for StdBackend {
     }
 
     fn recover_watches(&mut self, path: &Path) -> io::Result<()> {
+        // A poll of a degraded path, or an event for it, retries its watch.
+        if POLL_DEGRADED && self.degraded.remove(path) {
+            self.publish_degraded();
+            let _ = self.watch(path);
+        }
         let roots: Vec<_> = self
             .lost_watches
             .iter()
-            .filter(|lost| lost.starts_with(path))
+            .filter(|lost| is_within(lost, path))
             .cloned()
             .collect();
-        self.recover_lost_watches(roots, Some(path));
+        self.recover_lost_watches(roots, Report::ExceptTrigger(Some(path)));
+        Ok(())
+    }
+
+    /// Reports the creation of `path`, which does not exist yet, by treating
+    /// it like a watch root that was lost.
+    fn watch_missing(&mut self, path: &Path) -> io::Result<()> {
+        if PATH_BASED_WATCHES || self.is_covered(path) || self.is_degraded(path) {
+            return Ok(());
+        }
+        if self.initialize_watcher().is_err() {
+            return Ok(());
+        }
+        self.lost_watches.insert(path.to_owned());
+        // It may have been created after the caller found it missing, without
+        // an event from the creation watch registered here.
+        self.recover_lost_watches(vec![path.to_owned()], Report::ExceptTrigger(None));
         Ok(())
     }
 
     fn revalidate_watches(&mut self) -> io::Result<()> {
+        // Whatever kept these from being watched may have been resolved.
+        self.degraded.clear();
+        self.publish_degraded();
+        self.failed_creation_watches.clear();
         if PATH_BASED_WATCHES {
             return Ok(());
         }
-        // Whatever kept these from being watched may have been resolved.
-        self.degraded.clear();
         // Removals reported while events were dropped never reached
         // `unwatch`, so find the roots that disappeared.
         let missing: Vec<_> = self
@@ -516,7 +694,8 @@ impl VfsBackend for StdBackend {
             self.rewatch(&parent, RecursiveMode::NonRecursive);
         }
         let roots = self.lost_watches.iter().cloned().collect();
-        self.recover_lost_watches(roots, None);
+        // The rescan resyncs the whole tree, which includes these roots.
+        self.recover_lost_watches(roots, Report::Nothing);
         Ok(())
     }
 }
@@ -894,6 +1073,197 @@ mod test {
             backend.watch(&root).unwrap();
             assert!(backend.watches.contains(&root));
         }
+    }
+
+    #[test]
+    fn watch_failures_degrade_only_paths_that_cannot_be_watched() {
+        let (_dir, dir) = tempdir();
+        let not_found = || io::Error::from(io::ErrorKind::NotFound);
+        assert_eq!(
+            classify_watch_failure(&dir.join("missing"), &not_found()),
+            WatchFailure::Missing
+        );
+        // A directory below the root disappeared while notify walked it.
+        assert_eq!(
+            classify_watch_failure(&dir, &not_found()),
+            WatchFailure::Transient
+        );
+        assert_eq!(
+            classify_watch_failure(&dir, &io::Error::from_raw_os_error(28)),
+            WatchFailure::Unwatchable
+        );
+        assert_eq!(
+            classify_watch_failure(&dir, &io::Error::from(io::ErrorKind::PermissionDenied)),
+            WatchFailure::Unwatchable
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinks_whose_target_is_missing_are_missing() {
+        let (_dir, dir) = tempdir();
+        let link = dir.join("Packages");
+        std::os::unix::fs::symlink(dir.join("target"), &link).unwrap();
+        let err = io::Error::from(io::ErrorKind::NotFound);
+        assert_eq!(classify_watch_failure(&link, &err), WatchFailure::Missing);
+        let mut backend = StdBackend::new().unwrap();
+        assert_eq!(
+            backend.watch(&link).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+        assert!(backend.degraded.is_empty());
+    }
+
+    #[test]
+    fn paths_below_a_degraded_root_are_not_watched() {
+        let mut backend = StdBackend::new_without_watch();
+        let (_dir, dir) = tempdir();
+        let root = dir.join("Packages");
+        let module = root.join("module.luau");
+        fs_err::create_dir(&root).unwrap();
+        fs_err::write(&module, "return 1").unwrap();
+        backend.degraded.insert(root.clone());
+        backend.watch(&module).unwrap();
+        backend.watch(&root.join("nested")).unwrap();
+        assert!(backend.watcher.is_none());
+        assert!(backend.watches.is_empty());
+        assert!(backend.parent_watches.is_empty());
+        assert!(backend.anchors.is_empty());
+    }
+
+    #[test]
+    fn failed_creation_watches_are_retried_only_after_a_rescan() {
+        let mut backend = StdBackend::new().unwrap();
+        let (_dir, dir) = tempdir();
+        let missing = dir.join("missing");
+        backend.failed_creation_watches.insert(dir.clone());
+        backend.ensure_creation_watch(&missing);
+        assert!(backend.parent_watches.is_empty());
+        backend.revalidate_watches().unwrap();
+        assert!(backend.failed_creation_watches.is_empty());
+        backend.ensure_creation_watch(&missing);
+        assert_eq!(backend.parent_watches.contains(&dir), !PATH_BASED_WATCHES);
+    }
+
+    #[test]
+    fn degraded_lost_roots_are_reported_once() {
+        let mut backend = StdBackend::new_without_watch();
+        let (_dir, dir) = tempdir();
+        let root = dir.join("Packages");
+        fs_err::create_dir(&root).unwrap();
+        backend.degraded.insert(root.clone());
+        backend.lost_watches.insert(root.clone());
+        let receiver = backend.event_receiver();
+
+        backend.recover_watches(&dir).unwrap();
+        assert!(backend.lost_watches.is_empty());
+        assert!(matches!(receiver.try_recv(), Ok(VfsEvent::Create(path)) if path == root));
+        backend.recover_watches(&dir).unwrap();
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn parent_directory_components_do_not_count_as_inside_a_path() {
+        let project = Path::new("/project");
+        let shared = project.join("..").join("shared");
+        assert!(!is_within(&shared, project));
+        assert!(is_within(&shared.join("src"), &shared));
+        assert!(is_within(project, project));
+        let src = shared.join("src");
+        let parent = project.join("..");
+        assert_eq!(
+            containing_ancestors(&src).collect::<Vec<_>>(),
+            [src.as_path(), shared.as_path(), parent.as_path()]
+        );
+
+        let mut backend = StdBackend::new_without_watch();
+        backend.watches.insert(project.to_owned());
+        backend.anchors.insert(project.to_owned());
+        assert!(!backend.is_covered(&shared));
+        assert!(!backend.is_anchored(&parent));
+        assert!(backend.is_covered(&project.join("src")));
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn creation_watches_do_not_climb_out_through_parent_directory_components() {
+        let mut backend = StdBackend::new().unwrap();
+        let (_dir, dir) = tempdir();
+        let project = dir.join("project");
+        fs_err::create_dir(&project).unwrap();
+        let project_file = project.join("default.project.json");
+        fs_err::write(&project_file, "{}").unwrap();
+        backend.watch(&project_file).unwrap();
+        assert!(backend.parent_watches.contains(&project));
+
+        // Like `$path: "../shared/src"` while `shared` is missing.
+        let missing = project.join("..").join("shared").join("src");
+        assert!(backend.watch(&missing).is_err());
+        assert_eq!(backend.parent_watches.len(), 1);
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn roots_recovered_by_a_rescan_are_not_reported_again() {
+        let mut backend = StdBackend::new().unwrap();
+        let (_dir, dir) = tempdir();
+        let root = dir.join("Packages");
+        fs_err::create_dir(&root).unwrap();
+        backend.watch(&root).unwrap();
+        settle(&mut backend, Duration::from_millis(300));
+        backend.unwatch(&root).unwrap();
+        assert!(backend.lost_watches.contains(&root));
+
+        // The rescan resyncs the whole tree after recovering watches.
+        backend.revalidate_watches().unwrap();
+        assert!(backend.watches.contains(&root));
+        let receiver = backend.event_receiver();
+        while let Ok(event) = receiver.recv_timeout(Duration::from_millis(300)) {
+            assert!(
+                !matches!(&event, VfsEvent::Create(path) if *path == root),
+                "{:?}",
+                event
+            );
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn creation_of_a_missing_path_below_a_missing_parent_is_reported() {
+        let mut backend = StdBackend::new().unwrap();
+        let (_dir, dir) = tempdir();
+        let project_file = dir.join("default.project.json");
+        fs_err::write(&project_file, "{}").unwrap();
+        backend.watch(&project_file).unwrap();
+        settle(&mut backend, Duration::from_millis(300));
+
+        // Like `$path: "lib/Packages"` before `lib` exists.
+        let lib = dir.join("lib");
+        let packages = lib.join("Packages");
+        backend.watch_missing(&packages).unwrap();
+        fs_err::create_dir(&lib).unwrap();
+        wait_for_event(&mut backend, &lib);
+        fs_err::create_dir(&packages).unwrap();
+        wait_for_event(&mut backend, &packages);
+        assert!(backend.watches.contains(&packages));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn polling_a_degraded_path_retries_its_watch() {
+        let mut backend = StdBackend::new().unwrap();
+        let (_dir, dir) = tempdir();
+        backend.degraded.insert(dir.clone());
+        backend.publish_degraded();
+        assert_eq!(
+            *backend.polled_degraded.lock().unwrap(),
+            std::slice::from_ref(&dir)
+        );
+        // What the polling thread's write leads to.
+        backend.recover_watches(&dir).unwrap();
+        assert!(backend.degraded.is_empty());
+        assert!(backend.polled_degraded.lock().unwrap().is_empty());
+        assert!(backend.watches.contains(&dir));
     }
 
     #[test]

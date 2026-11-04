@@ -1,9 +1,10 @@
 use std::{
     fs,
+    io::{BufRead, BufReader},
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
     sync::atomic::{AtomicUsize, Ordering},
-    thread,
+    thread::{self, JoinHandle},
     time::Duration,
 };
 
@@ -62,6 +63,9 @@ pub struct TestServeSession {
     // Drop order is important here: we want the process to be killed before the
     // directory it's operating on is destroyed.
     rojo_process: KillOnDrop,
+    /// Collects what Rojo writes to stderr, so a startup failure can tell a
+    /// port collision apart from a crash.
+    rojo_stderr: Option<JoinHandle<String>>,
     _dir: TempDir,
 
     port: usize,
@@ -101,10 +105,11 @@ impl TestServeSession {
         std::thread::sleep(Duration::from_millis(100));
 
         let port = get_port_number();
-        let rojo_process = spawn_rojo_serve(&working_dir, &project_path, port);
+        let (rojo_process, rojo_stderr) = spawn_rojo_serve(&working_dir, &project_path, port);
 
         TestServeSession {
             rojo_process,
+            rojo_stderr: Some(rojo_stderr),
             _dir: dir,
             port,
             project_path,
@@ -132,19 +137,34 @@ impl TestServeSession {
         while i < MAX_TRIES {
             i += 1;
             match self.rojo_process.0.try_wait() {
-                Ok(Some(status)) if restarts < MAX_RESTARTS => {
+                Ok(Some(status)) => {
+                    // The process has exited, so its stderr is complete.
+                    let stderr = self
+                        .rojo_stderr
+                        .take()
+                        .and_then(|reader| reader.join().ok())
+                        .unwrap_or_default();
                     // Test ports come from a range that the OS also hands out
                     // to outgoing connections, so something else can briefly
                     // hold one. Rojo exits when it cannot bind, so try another.
-                    log::warn!("Rojo process exited with status {}, restarting", status);
+                    // Any other exit is a real failure, such as a panic, and
+                    // restarting would hide it.
+                    if restarts >= MAX_RESTARTS || !is_bind_failure(&stderr) {
+                        panic!(
+                            "Rojo process exited with status {} during startup:\n{}",
+                            status, stderr
+                        );
+                    }
+                    log::warn!("Rojo could not bind port {}, restarting", self.port);
                     restarts += 1;
                     i = 0;
                     self.port = get_port_number();
-                    self.rojo_process =
+                    let (rojo_process, rojo_stderr) =
                         spawn_rojo_serve(&get_working_dir_path(), &self.project_path, self.port);
+                    self.rojo_process = rojo_process;
+                    self.rojo_stderr = Some(rojo_stderr);
                     continue;
                 }
-                Ok(Some(status)) => panic!("Rojo process exited with status {}", status),
                 Ok(None) => { /* The process is still running, as expected */ }
                 Err(err) => panic!("Failed to wait on Rojo process: {}", err),
             }
@@ -302,9 +322,18 @@ pub fn deserialize_msgpack<'a, T: Deserialize<'a>>(
     T::deserialize(&mut deserializer)
 }
 
-fn spawn_rojo_serve(working_dir: &Path, project_path: &Path, port: usize) -> KillOnDrop {
+/// Starts `rojo serve`, and returns it along with a thread that passes its
+/// stderr through and returns what it read once Rojo exits.
+fn spawn_rojo_serve(
+    working_dir: &Path,
+    project_path: &Path,
+    port: usize,
+) -> (KillOnDrop, JoinHandle<String>) {
+    // Only the start of the output is needed to recognize a startup failure.
+    const MAX_CAPTURED_BYTES: usize = 64 * 1024;
+
     let port_string = port.to_string();
-    let rojo_process = Command::new(ROJO_PATH)
+    let mut rojo_process = Command::new(ROJO_PATH)
         .args([
             "serve",
             project_path.to_str().unwrap(),
@@ -312,9 +341,43 @@ fn spawn_rojo_serve(working_dir: &Path, project_path: &Path, port: usize) -> Kil
             port_string.as_str(),
         ])
         .current_dir(working_dir)
+        .stderr(Stdio::piped())
         .spawn()
         .expect("Couldn't start Rojo");
-    KillOnDrop(rojo_process)
+    let stderr = rojo_process.stderr.take().unwrap();
+    // The pipe is drained for the life of the process, since Rojo would block
+    // once it filled up.
+    let reader = thread::spawn(move || {
+        let mut captured = String::new();
+        let mut reader = BufReader::new(stderr);
+        let mut line = Vec::new();
+        while matches!(reader.read_until(b'\n', &mut line), Ok(read) if read > 0) {
+            let text = String::from_utf8_lossy(&line);
+            eprint!("{}", text);
+            if captured.len() < MAX_CAPTURED_BYTES {
+                captured.push_str(&text);
+            }
+            line.clear();
+        }
+        captured
+    });
+    (KillOnDrop(rojo_process), reader)
+}
+
+/// Whether Rojo's stderr says that it exited because it could not bind its
+/// port.
+fn is_bind_failure(stderr: &str) -> bool {
+    let stderr = stderr.to_lowercase();
+    [
+        "could not start the rojo server",
+        "address already in use",
+        "addrinuse",
+        // WSAEADDRINUSE, and WSAEACCES for ports Windows reserved.
+        "os error 10048",
+        "os error 10013",
+    ]
+    .iter()
+    .any(|marker| stderr.contains(marker))
 }
 
 /// Probably-okay way to generate random enough port numbers for running the
@@ -347,4 +410,20 @@ pub fn serialize_to_xml_model(response: &SerializeResponse, redactions: &Redacti
     let mut data = Vec::new();
     rbx_xml::to_writer_default(&mut data, &dom, dom.root().children()).unwrap();
     String::from_utf8(data).expect("rbx_xml should never produce invalid utf-8")
+}
+
+#[test]
+fn only_bind_failures_restart_rojo() {
+    assert!(is_bind_failure(
+        "Error: Could not start the Rojo server on 127.0.0.1:35103.\n\
+         Caused by: error creating server listener: Only one usage of each socket address \
+         (protocol/network address/port) is normally permitted. (os error 10048)"
+    ));
+    assert!(is_bind_failure(
+        "error creating server listener: Address already in use (os error 98)"
+    ));
+    assert!(!is_bind_failure(
+        "thread 'main' panicked at src/serve_session.rs:99:1:\ncalled `Option::unwrap()` on a `None` value"
+    ));
+    assert!(!is_bind_failure(""));
 }

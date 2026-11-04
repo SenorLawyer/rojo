@@ -95,21 +95,28 @@ pub fn canonicalize_existing_ancestor(vfs: &Vfs, path: &Path) -> io::Result<Path
     }
 }
 
-/// Returns the form of `path` to store as a relevant path while it is missing.
+/// Returns the form of `path` to store as a relevant path while it is missing,
+/// and asks the Vfs to report its creation.
 ///
 /// This is [`canonicalize_existing_ancestor`], except that a path which cannot
 /// be resolved, for example because of a permission error or a symlink loop,
 /// is kept as written. A missing optional path must not fail the snapshot of
 /// the whole project.
 pub fn missing_relevant_path(vfs: &Vfs, path: &Path) -> PathBuf {
-    canonicalize_existing_ancestor(vfs, path).unwrap_or_else(|err| {
+    let path = canonicalize_existing_ancestor(vfs, path).unwrap_or_else(|err| {
         log::warn!(
             "Could not resolve {}, so recreating it may not be noticed: {}",
             path.display(),
             err
         );
         path.to_owned()
-    })
+    });
+    // Nothing reads a missing path, so nothing else would watch for it. Its
+    // parent may be missing as well, like `lib` for `lib/Packages`.
+    if let Err(err) = vfs.watch_missing(&path) {
+        log::debug!("Could not watch for {}: {}", path.display(), err);
+    }
+    path
 }
 
 #[cfg(test)]

@@ -17,6 +17,12 @@
 * After a rescan, existing watch roots are registered again, so on Linux a root replaced while events were dropped, and directories created meanwhile, are watched again.
 * On Linux, removing a watch root nested inside another watch root no longer removes the outer root's watches below it.
 * Parent watches used to notice recreated roots are only placed inside directories that were watched before, so a missing path cannot put a watch on the home directory or filesystem root.
+* Paths below a path that could not be watched are read without watches, and without a warning each. Directories that could not be watched for the creation of a path are not retried until a rescan.
+* On Windows, where `notify` never reports a rescan, paths that could not be watched are retried every 30 seconds, reported with `VfsEvent::Write`.
+* A recursive watch that fails because a directory below it disappeared mid-walk is retried, and a symlink whose target is missing reports `io::ErrorKind::NotFound` instead of counting as unwatchable.
+* Paths are no longer considered inside a directory through a `..` component, so a missing `../shared` path cannot put a parent watch above the directories watched before.
+* Added `Vfs::watch_missing`, which reports the creation of a path that does not exist yet, even when its parent is missing too.
+* Watch roots recovered during a rescan are no longer also reported with `VfsEvent::Create`, since the rescan resyncs everything.
 * On macOS, watches survive the removal of their path, since FSEvents reports the path again once it is recreated, and no parent watches are added. Parent watches made FSEvents report every change in the parent's subtree, and each watch change restarted its event stream.
 
 # 0.4.0 (2026-07-01)

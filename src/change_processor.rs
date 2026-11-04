@@ -183,6 +183,11 @@ impl JobThreadContext {
         };
 
         for id in affected_ids {
+            // Resyncing an earlier node can resync its parent instead, which
+            // may remove later nodes mapped to the same path.
+            if tree.get_instance(id).is_none() {
+                continue;
+            }
             if let Some(patch) = compute_and_apply_changes(&mut tree, &self.vfs, id) {
                 if !patch.is_empty() {
                     applied_patches.push(patch);
@@ -436,9 +441,12 @@ fn canonicalize_event_path(vfs: &Vfs, event: &VfsEvent) -> Option<io::Result<Pat
 }
 
 fn compute_and_apply_changes(tree: &mut RojoTree, vfs: &Vfs, id: Ref) -> Option<AppliedPatchSet> {
-    let metadata = tree
-        .get_metadata(id)
-        .expect("metadata missing for instance present in tree");
+    let Some(metadata) = tree.get_metadata(id) else {
+        // Panicking here would stop the processor thread, and every later
+        // change with it.
+        log::warn!("Instance {:?} was removed before it could be updated", id);
+        return None;
+    };
 
     let instigating_source = match &metadata.instigating_source {
         Some(path) => path,
@@ -734,6 +742,69 @@ mod test {
             let event = receiver
                 .recv_deadline(deadline)
                 .expect("recreated roots were never resynced");
+            task.handle_vfs_event(event);
+        }
+    }
+
+    #[test]
+    fn removing_a_path_shared_by_optional_nodes_keeps_processing() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dunce::canonicalize(dir.path()).unwrap();
+        let shared = root.join("Shared");
+        fs::create_dir(&shared).unwrap();
+        fs::write(shared.join("module.luau"), "return 1").unwrap();
+        let project = write_project(
+            &root,
+            r#"{"$className":"Folder","A":{"$path":{"optional":"Shared"}},"B":{"$path":{"optional":"Shared"}}}"#,
+        );
+        let task = context(&project);
+        assert_eq!(task.tree.lock().unwrap().get_ids_at_path(&shared).len(), 2);
+
+        // Resyncing the first node resyncs the root, which removes the second
+        // node before it is handled.
+        fs::remove_dir_all(&shared).unwrap();
+        task.handle_vfs_event(VfsEvent::Remove(shared.clone()));
+        assert!(task.tree.lock().unwrap().root().children().is_empty());
+
+        fs::create_dir(&shared).unwrap();
+        task.handle_vfs_event(VfsEvent::Create(shared.clone()));
+        assert_eq!(task.tree.lock().unwrap().get_ids_at_path(&shared).len(), 2);
+    }
+
+    #[test]
+    fn updating_a_removed_instance_does_not_panic() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dunce::canonicalize(dir.path()).unwrap();
+        let task = context(&root);
+        let mut tree = task.tree.lock().unwrap();
+        assert!(compute_and_apply_changes(&mut tree, &task.vfs, Ref::new()).is_none());
+    }
+
+    // FSEvents cannot watch a path before it exists, and Rojo does not watch
+    // the project folder recursively there.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn creating_a_project_path_whose_parent_was_missing_syncs_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dunce::canonicalize(dir.path()).unwrap();
+        let project = write_project(
+            &root,
+            r#"{"$className":"Folder","Packages":{"$path":{"optional":"lib/Packages"}}}"#,
+        );
+        let task = context_with_vfs(Vfs::new_default().unwrap(), &project);
+        let receiver = task.vfs.event_receiver();
+
+        // A package manager creates `lib` and then `lib/Packages`, neither of
+        // which existed when the project was first snapshotted.
+        let added = root.join("lib").join("Packages").join("module.luau");
+        fs::create_dir(root.join("lib")).unwrap();
+        fs::create_dir(root.join("lib").join("Packages")).unwrap();
+        fs::write(&added, "return 1").unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while task.tree.lock().unwrap().get_ids_at_path(&added).is_empty() {
+            let event = receiver
+                .recv_deadline(deadline)
+                .expect("the created project path was never synced");
             task.handle_vfs_event(event);
         }
     }

@@ -94,6 +94,12 @@ pub trait VfsBackend: sealed::Sealed + Send + 'static {
     fn revalidate_watches(&mut self) -> io::Result<()> {
         Ok(())
     }
+
+    /// Called for a path that does not exist, but should be read once it is
+    /// created, so that its creation is reported.
+    fn watch_missing(&mut self, _path: &Path) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 /// Vfs equivalent to [`std::fs::DirEntry`][std::fs::DirEntry].
@@ -256,6 +262,13 @@ impl VfsInner {
 
     fn event_receiver(&self) -> crossbeam_channel::Receiver<VfsEvent> {
         self.backend.event_receiver()
+    }
+
+    fn watch_missing(&mut self, path: &Path) -> io::Result<()> {
+        if self.watch_enabled {
+            self.backend.watch_missing(path)?;
+        }
+        Ok(())
     }
 
     fn commit_event(&mut self, event: &VfsEvent) -> io::Result<()> {
@@ -488,6 +501,16 @@ impl Vfs {
     #[inline]
     pub fn commit_event(&self, event: &VfsEvent) -> io::Result<()> {
         self.inner.lock().unwrap().commit_event(event)
+    }
+
+    /// Asks for an event once the given path, which does not exist, is
+    /// created. Paths that are read are watched already, but nothing reads a
+    /// missing path, so nothing would report it appearing.
+    ///
+    /// Does nothing while watching is disabled.
+    #[inline]
+    pub fn watch_missing<P: AsRef<Path>>(&self, path: P) -> io::Result<()> {
+        self.inner.lock().unwrap().watch_missing(path.as_ref())
     }
 }
 

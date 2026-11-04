@@ -1,5 +1,6 @@
 import json
 import os
+from collections import Counter
 import shutil
 import socket
 import subprocess
@@ -56,13 +57,33 @@ def package_files(label):
     (module / "init.luau").write_text(f"return '{label}-init'\n", encoding="utf-8")
 
 
-def expected_scripts():
-    result = {}
-    for path in [*(ROOT / "src").rglob("*.luau"), *(ROOT / "Packages").rglob("*.luau")]:
-        name = path.parent.name if path.stem == "init" else path.stem
-        assert name not in result
-        result[name] = path.read_text(encoding="utf-8")
-    return result
+# The project maps these folders to these children of the root instance.
+MAPPED = {"Branches": "src", "Packages": "Packages"}
+
+
+def expected_entries(path, instance_path):
+    """Yields the (path, Source) of every instance Rojo should make from the
+    folder or script at `path`, where Source is None for folders."""
+    if path.is_file():
+        yield instance_path, path.read_text(encoding="utf-8")
+        return
+    init = path / "init.luau"
+    yield instance_path, init.read_text(encoding="utf-8") if init.exists() else None
+    for child in path.iterdir():
+        if child == init:
+            continue
+        name = child.stem if child.is_file() else child.name
+        yield from expected_entries(child, f"{instance_path}/{name}")
+
+
+def expected_tree():
+    """Counts every instance expected below the root, keyed by its path and
+    Source. Folders count too, so a stale folder left behind is noticed."""
+    return Counter(
+        entry
+        for name, folder in MAPPED.items()
+        for entry in expected_entries(ROOT / folder, name)
+    )
 
 
 class Server:
@@ -109,26 +130,46 @@ class Server:
     def read(self):
         return self.request("/api/read/" + self.root_id)
 
+    def tree(self, read):
+        """Counts every instance below the root like `expected_tree`.
+
+        Sibling instances with the same name share a path, so duplicates show
+        up as a count above one instead of collapsing into one entry."""
+        instances = read["instances"]
+        entries = Counter()
+
+        def visit(instance_id, path):
+            inst = instances[instance_id]
+            source = inst["Properties"].get("Source")
+            entries[(path, None if source is None else source["String"])] += 1
+            for child in inst["Children"]:
+                visit(child, f"{path}/{instances[child]['Name']}")
+
+        for child in instances[self.root_id]["Children"]:
+            visit(child, instances[child]["Name"])
+        return entries
+
     def converge(self, label, expected):
         start = time.perf_counter()
-        actual = {}
+        actual = Counter()
         while time.perf_counter() - start < 12:
             read = self.read()
-            actual = {}
-            for inst in read["instances"].values():
-                source = inst["Properties"].get("Source")
-                if source is not None:
-                    actual[inst["Name"]] = source["String"]
+            actual = self.tree(read)
             if actual == expected:
-                stage = {"label": label, "converged_ms": round((time.perf_counter() - start) * 1000, 2), "scripts": len(actual), "cursor": read["messageCursor"]}
+                scripts = sum(count for (_, source), count in actual.items() if source is not None)
+                stage = {"label": label, "converged_ms": round((time.perf_counter() - start) * 1000, 2), "scripts": scripts, "instances": sum(actual.values()), "cursor": read["messageCursor"]}
                 REPORT["stages"].append(stage)
                 print(json.dumps(stage), flush=True)
                 return read
             time.sleep(0.025)
-        missing = sorted(set(expected) - set(actual))[:10]
-        extra = sorted(set(actual) - set(expected))[:10]
-        changed = [key for key in expected.keys() & actual.keys() if expected[key] != actual[key]][:10]
-        raise AssertionError(f"{label}: missing={missing}, extra={extra}, changed={changed}")
+        expected_sources = {path: source for path, source in expected}
+        actual_sources = {path: source for path, source in actual}
+        missing = sorted(expected_sources.keys() - actual_sources.keys())[:10]
+        extra = sorted(actual_sources.keys() - expected_sources.keys())[:10]
+        changed = sorted(path for path in expected_sources.keys() & actual_sources.keys() if expected_sources[path] != actual_sources[path])[:10]
+        paths = Counter(path for (path, _), count in actual.items() for _ in range(count))
+        duplicates = sorted(path for path, count in paths.items() if count > 1)[:10]
+        raise AssertionError(f"{label}: missing={missing}, extra={extra}, changed={changed}, duplicates={duplicates}")
 
     def stop(self):
         if self.process.poll() is None:
@@ -156,19 +197,19 @@ try:
     server = Server("serve-first")
     REPORT["first_startup_ms"] = server.startup_ms
     REPORT["server_version"] = server.info["serverVersion"]
-    server.converge("initial_read", expected_scripts())
+    server.converge("initial_read", expected_tree())
 
     for i in range(10):
         branch = "amber" if i % 2 == 0 else "blue"
         start = time.perf_counter()
         git("checkout", branch)
-        server.converge(f"checkout_{i}_{branch}", expected_scripts())
+        server.converge(f"checkout_{i}_{branch}", expected_tree())
         REPORT["stages"][-1]["checkout_and_converge_ms"] = round((time.perf_counter() - start) * 1000, 2)
 
     start = time.perf_counter()
     for i in range(12):
         package_files(f"burst{i}")
-    server.converge("package_burst_12_replacements", expected_scripts())
+    server.converge("package_burst_12_replacements", expected_tree())
     REPORT["stages"][-1]["replace_and_converge_ms"] = round((time.perf_counter() - start) * 1000, 2)
 
     # Replacing Packages faster than the watcher debounce leaves no separate
@@ -176,12 +217,12 @@ try:
     # these edits, so they must converge too.
     (ROOT / "Packages" / "package00" / "nested" / "Dep000.luau").write_text("return 'edited-after-burst'\n", encoding="utf-8")
     (ROOT / "Packages" / "package01" / "nested" / "AddedAfterBurst.luau").write_text("return 'added-after-burst'\n", encoding="utf-8")
-    server.converge("edit_inside_packages_after_burst", expected_scripts())
+    server.converge("edit_inside_packages_after_burst", expected_tree())
 
     remove_tree(ROOT / "Packages")
     time.sleep(0.5)
     package_files("delayed-recreate")
-    server.converge("mapped_root_recreated_after_deletion_settles", expected_scripts())
+    server.converge("mapped_root_recreated_after_deletion_settles", expected_tree())
 
     read = server.read()
     init_id = next(key for key, inst in read["instances"].items() if inst["Name"] == "InitModule")
@@ -192,13 +233,13 @@ try:
     while init_path.read_text(encoding="utf-8") != source and time.perf_counter() < deadline:
         time.sleep(0.01)
     assert init_path.read_text(encoding="utf-8") == source
-    server.converge("two_way_init_write", expected_scripts())
+    server.converge("two_way_init_write", expected_tree())
     server.stop()
     server = Server("serve-restarted-verbatim", verbatim=True)
     REPORT["restart_startup_ms"] = server.startup_ms
-    server.converge("restart_initial_read_verbatim_path", expected_scripts())
+    server.converge("restart_initial_read_verbatim_path", expected_tree())
     (ROOT / "src" / "Shared.luau").write_text("return 'post-restart'\n", encoding="utf-8")
-    server.converge("write_after_restart", expected_scripts())
+    server.converge("write_after_restart", expected_tree())
     REPORT["success"] = True
 finally:
     stop_error = None
