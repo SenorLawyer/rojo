@@ -12,6 +12,7 @@ mod change_processor;
 mod glob;
 mod json;
 mod lua_ast;
+pub mod memory_cap;
 mod message_queue;
 mod multimap;
 mod path_serializer;

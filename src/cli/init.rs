@@ -95,6 +95,8 @@ impl InitCommand {
             }
         }
 
+        write_if_not_exists(&base_path.join("ROJO_AGENT.md"), super::doc::AGENT_GUIDE)?;
+
         if !self.skip_git && should_git_init(&base_path) {
             log::debug!("Initializing Git repository...");
 
@@ -226,4 +228,36 @@ fn write_if_not_exists(path: &Path, contents: &str) -> Result<(), anyhow::Error>
     file.write_all(contents.as_bytes())?;
 
     Ok(())
+}
+
+#[test]
+fn init_ships_agent_guide_without_replacing_existing_instructions() {
+    for kind in [InitKind::Place, InitKind::Model, InitKind::Plugin] {
+        let dir = tempfile::tempdir().unwrap();
+        InitCommand {
+            path: dir.path().to_owned(),
+            kind,
+            skip_git: true,
+        }
+        .run()
+        .unwrap();
+        assert_eq!(
+            fs::read_to_string(dir.path().join("ROJO_AGENT.md")).unwrap(),
+            super::doc::AGENT_GUIDE
+        );
+        let preserved = dir.path().join("custom");
+        fs::create_dir(&preserved).unwrap();
+        fs::write(preserved.join("ROJO_AGENT.md"), "project instructions").unwrap();
+        InitCommand {
+            path: preserved.clone(),
+            kind,
+            skip_git: true,
+        }
+        .run()
+        .unwrap();
+        assert_eq!(
+            fs::read_to_string(preserved.join("ROJO_AGENT.md")).unwrap(),
+            "project instructions"
+        );
+    }
 }

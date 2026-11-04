@@ -1,0 +1,2316 @@
+//! Opt-in, authenticated local transport between a CLI and connected Studio plugins.
+
+use std::{
+    collections::{HashMap, VecDeque},
+    fs, io,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    path::{Path, PathBuf},
+    process::Command,
+    sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
+
+use anyhow::Context;
+use hyper::{body::HttpBody, header::HOST, Body, Method, Request, Response, StatusCode};
+use rbx_dom_weak::WeakDom;
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use tokio::sync::{oneshot, Notify, Semaphore};
+use uuid::Uuid;
+
+use super::{model_check, origin::canonical, untrusted_model, util::json as json_response};
+use crate::serve_session::ServeSession;
+
+pub(super) const MAX_BODY: usize = 8 * 1024 * 1024;
+const SESSION_TTL: Duration = Duration::from_secs(30);
+const MAX_SESSIONS: usize = 16;
+const COMMAND_TIMEOUT: Duration = Duration::from_secs(15);
+/// How long a pending command outlives its timeout. The command handler
+/// removes it once its own timeout fires.
+const PENDING_GRACE: Duration = Duration::from_secs(1);
+/// Checkouts hold `index.lock` only briefly. A lock that stays unchanged for
+/// longer is stale (a crashed Git) or held by an interactive command such as
+/// `git commit` waiting on an editor, and must not stall sync indefinitely.
+const GIT_LOCK_WAIT: Duration = Duration::from_secs(10);
+/// Git releases `index.lock` before it rewrites `HEAD` during a checkout, so
+/// the lock must stay released for a moment before identity is trusted.
+const GIT_LOCK_SETTLE: Duration = Duration::from_millis(200);
+const GIT_POLL_INTERVAL: Duration = Duration::from_millis(50);
+/// The longest a request waits for Git in total. Each lock is bounded by
+/// [`GIT_LOCK_WAIT`], but a series of Git commands can take one lock after
+/// another, and callers' own deadlines must cover this wait.
+pub(crate) const GIT_WAIT_LIMIT: Duration = Duration::from_secs(15);
+/// The longest an import waits for a check slot and its check together.
+pub(crate) const IMPORT_CHECK_LIMIT: Duration = Duration::from_secs(15);
+/// The longest the server holds a Studio command request: waiting for Git
+/// (15 s), reading the body (10 s), checking an import (15 s) and waiting for
+/// Studio (15 s), with a margin. Clients must wait longer than this so they see
+/// the server's answer.
+pub(crate) const MAX_COMMAND_REQUEST: Duration = Duration::from_secs(60);
+/// How long a checkout read through Git (for the reftable backend) is reused,
+/// so frequent requests do not each start Git processes.
+const GIT_OBSERVE_CACHE: Duration = Duration::from_millis(250);
+/// Directories Git keeps while a rebase, cherry-pick or revert is in progress.
+/// HEAD is detached or moves through rewritten commits until it finishes.
+const GIT_OPERATION_DIRS: [&str; 3] = ["rebase-merge", "rebase-apply", "sequencer"];
+/// Transient read failures (such as a Windows sharing violation while Git
+/// replaces a file) are retried this many times before the result is unknown.
+const GIT_READ_ATTEMPTS: usize = 3;
+/// Stack size of the thread that decodes a model. Nesting is bounded before
+/// decoding, but the decoders recurse once per level and need more than the
+/// default stack.
+pub(crate) const DECODE_STACK_BYTES: usize = 64 * 1024 * 1024;
+/// Bounds concurrent import checks. Each runs a child process that may use
+/// up to its memory cap.
+const MAX_CONCURRENT_DECODES: usize = 2;
+/// How long a cancelled request ID is remembered, so a command still waiting
+/// for Git or its import check when it was cancelled is not queued afterwards.
+const CANCELLED_TTL: Duration = MAX_COMMAND_REQUEST;
+/// Bounds the remembered cancellations.
+const MAX_CANCELLED: usize = 1024;
+/// The plugin rejects responses over 8MiB, so leave headroom for the envelope.
+const MAX_POLL_BYTES: usize = 6 * 1024 * 1024;
+/// The largest command a poll can deliver alone without exceeding the
+/// plugin's 8MiB response limit, leaving room for the envelope.
+const MAX_COMMAND_BYTES: usize = MAX_BODY - 64 * 1024;
+/// Bounds memory used by commands queued for one Studio session.
+const MAX_SESSION_PENDING_BYTES: usize = 64 * 1024 * 1024;
+pub(crate) const MAX_MODEL_BYTES: usize = 5 * 1024 * 1024;
+const MAX_MODEL_INSTANCES: usize = 10_000;
+
+/// Why requests and sync stop after the checkout changes. Returning to the
+/// accepted branch and commit lets the same server continue. It also fits in a
+/// WebSocket close reason (123 bytes).
+pub(crate) const IDENTITY_CHANGED: &str = "Project Git checkout changed. Restart rojo serve, or return to the original branch/commit, then reconnect Studio.";
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Identity {
+    pub project_path: PathBuf,
+    pub workspace_path: PathBuf,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub git_head: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub git_branch: Option<String>,
+    pub server_session: String,
+}
+
+fn git_value(path: &Path, args: &[&str]) -> Option<String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(args)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let value = String::from_utf8(output.stdout).ok()?.trim().to_owned();
+    (!value.is_empty()).then_some(value)
+}
+
+/// Runs a Git query that exits with 1 when the answer is "none", such as
+/// `symbolic-ref --quiet` on a detached HEAD. Other failures are errors.
+fn git_query(path: &Path, args: &[&str]) -> io::Result<Option<String>> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(args)
+        .output()?;
+    match output.status.code() {
+        Some(0) => String::from_utf8(output.stdout)
+            .map(|value| Some(value.trim().to_owned()))
+            .map_err(|_| io::Error::other("Git printed invalid UTF-8")),
+        Some(1) => Ok(None),
+        _ => Err(io::Error::other(format!(
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))),
+    }
+}
+
+/// Accepts a full SHA-1 or SHA-256 object name. Values read from Git's files
+/// are passed to Git as arguments, so anything else (such as a corrupt file
+/// starting with `-`) is treated as unreadable.
+fn object_id(value: String) -> io::Result<String> {
+    if matches!(value.len(), 40 | 64) && value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        Ok(value)
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Git file does not hold an object name",
+        ))
+    }
+}
+
+/// Reads a small Git file, retrying transient errors. `Ok(None)` means the
+/// file does not exist (Git replaces files by renaming, so they never vanish
+/// briefly); `Err` means it could not be read, which callers treat as unknown
+/// rather than as a change.
+fn read_git_file(path: &Path) -> io::Result<Option<String>> {
+    let mut attempt = 1;
+    loop {
+        match fs::read_to_string(path) {
+            Ok(contents) => return Ok(Some(contents.trim().to_owned())),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) if attempt >= GIT_READ_ATTEMPTS => return Err(error),
+            Err(_) => {
+                attempt += 1;
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
+}
+
+/// Finds a ref in the contents of a `packed-refs` file.
+fn packed_ref(packed: &str, name: &str) -> Option<String> {
+    packed
+        .lines()
+        .filter(|line| !line.starts_with('#') && !line.starts_with('^'))
+        .find_map(|line| {
+            let (object, reference) = line.split_once(' ')?;
+            (reference.trim() == name).then(|| object.to_owned())
+        })
+}
+
+/// Reads and validates a token file, warning when other users can read it.
+pub(crate) fn read_token_file(path: &Path) -> anyhow::Result<String> {
+    let token = fs::read_to_string(path).with_context(|| {
+        format!(
+            "Could not read Studio authentication token {}",
+            path.display()
+        )
+    })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if fs::metadata(path).is_ok_and(|metadata| metadata.permissions().mode() & 0o077 != 0) {
+            log::warn!(
+                "{} can be read by other users. Restrict it with `chmod 600`.",
+                path.display()
+            );
+        }
+    }
+    Ok(token.trim().to_owned())
+}
+
+/// Parses an `address:port` field of `/proc/net/tcp` or `/proc/net/tcp6`.
+/// The kernel prints each 32-bit word of the address in host byte order.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn parse_proc_address(text: &str) -> Option<SocketAddr> {
+    let (address, port) = text.split_once(':')?;
+    let port = u16::from_str_radix(port, 16).ok()?;
+    let word = |index: usize| -> Option<[u8; 4]> {
+        let hex = address.get(index * 8..index * 8 + 8)?;
+        Some(u32::from_str_radix(hex, 16).ok()?.to_ne_bytes())
+    };
+    let ip = match address.len() {
+        8 => IpAddr::V4(Ipv4Addr::from(word(0)?)),
+        32 => {
+            let mut bytes = [0u8; 16];
+            for index in 0..4 {
+                bytes[index * 4..index * 4 + 4].copy_from_slice(&word(index)?);
+            }
+            IpAddr::V6(Ipv6Addr::from(bytes))
+        }
+        _ => return None,
+    };
+    Some(SocketAddr::new(canonical(ip), port))
+}
+
+/// Finds the user owning the client end of a TCP connection from `peer` to
+/// `local` in a `/proc/net/tcp`-format listing.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn socket_owner(listing: &str, peer: SocketAddr, local: SocketAddr) -> Option<u32> {
+    let peer = SocketAddr::new(canonical(peer.ip()), peer.port());
+    let local = SocketAddr::new(canonical(local.ip()), local.port());
+    listing.lines().skip(1).find_map(|line| {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        let from = parse_proc_address(fields.get(1)?)?;
+        let to = parse_proc_address(fields.get(2)?)?;
+        if from == peer && to == local {
+            fields.get(7)?.parse().ok()
+        } else {
+            None
+        }
+    })
+}
+
+/// The server-side address of the connection a request arrived on. The HTTP
+/// server stores it in the request's extensions.
+#[derive(Clone, Copy, Debug)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) struct LocalAddr(pub SocketAddr);
+
+/// Whether a loopback peer is known to belong to another OS user. Only Linux
+/// exposes socket owners without extra dependencies, through `/proc`. Other
+/// platforms (and unknown owners) are not distinguished.
+async fn foreign_peer(remote: SocketAddr, request: &Request<Body>) -> bool {
+    #[cfg(target_os = "linux")]
+    if let Some(LocalAddr(local)) = request.extensions().get::<LocalAddr>().copied() {
+        // The listings grow with every socket on the machine, so read them
+        // off the async workers.
+        return tokio::task::spawn_blocking(move || {
+            use std::os::unix::fs::MetadataExt;
+            let owner = ["/proc/net/tcp", "/proc/net/tcp6"]
+                .iter()
+                .filter_map(|listing| fs::read_to_string(listing).ok())
+                .find_map(|listing| socket_owner(&listing, remote, local));
+            // `/proc/self` is owned by this process's effective user.
+            let current = fs::metadata("/proc/self")
+                .ok()
+                .map(|metadata| metadata.uid());
+            matches!((owner, current), (Some(owner), Some(current)) if owner != current)
+        })
+        .await
+        .unwrap_or(false);
+    }
+    let _ = (remote, request);
+    false
+}
+
+/// Canonical lowercase hyphenated form of a `sessionId` field, so different
+/// spellings of one UUID name the same session.
+fn session_id(value: &Value) -> Option<String> {
+    value
+        .get("sessionId")
+        .and_then(Value::as_str)
+        .and_then(|id| Uuid::parse_str(id).ok())
+        .map(|id| id.hyphenated().to_string())
+}
+
+fn unix_millis(time: SystemTime) -> u64 {
+    time.duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+/// Validates a native model before it is sent to Studio. The plugin repeats
+/// these checks, but the server must not rely on every caller using the CLI.
+pub(crate) fn validate_import_model(bytes: &[u8], allow_scripts: bool) -> anyhow::Result<WeakDom> {
+    anyhow::ensure!(
+        bytes.len() <= MAX_MODEL_BYTES,
+        "Import exceeds the 5MiB model limit"
+    );
+    let tree = if bytes.starts_with(b"<roblox!") {
+        untrusted_model::check_binary(bytes, MAX_MODEL_INSTANCES)
+            .context("Import is not a valid binary model")?;
+        rbx_binary::from_reader(bytes).context("Import is not a valid binary model")?
+    } else {
+        untrusted_model::check_xml_depth(bytes)?;
+        rbx_xml::from_reader(bytes, rbx_xml::DecodeOptions::default())
+            .context("Import is not a valid model")?
+    };
+    anyhow::ensure!(!tree.root().children().is_empty(), "Import model is empty");
+    let database = rbx_reflection_database::get()?;
+    let script = database.classes.get("LuaSourceContainer");
+    let mut count = 0usize;
+    for instance in tree.descendants() {
+        if instance.referent() == tree.root_ref() {
+            continue;
+        }
+        count += 1;
+        anyhow::ensure!(
+            count <= MAX_MODEL_INSTANCES,
+            "Import exceeds 10,000 instances"
+        );
+        let descriptor = database
+            .classes
+            .get(instance.class.as_str())
+            .context("Import contains an unknown Roblox class")?;
+        anyhow::ensure!(
+            instance.class.as_str() != "DataModel"
+                && !descriptor.tags.contains(&rbx_reflection::ClassTag::Service),
+            "Import cannot contain services or DataModel"
+        );
+        anyhow::ensure!(
+            allow_scripts
+                || !script.is_some_and(|script| database.has_superclass(descriptor, script)),
+            "Import contains scripts. Pass --allow-scripts to import their source; executable scripts remain disabled."
+        );
+    }
+    Ok(tree)
+}
+
+struct Session {
+    /// The description exactly as registered, so a retried registration can
+    /// be recognised.
+    registered: Value,
+    description: Value,
+    last_seen: Instant,
+    queue: VecDeque<String>,
+}
+
+enum Outcome {
+    Completed(Value),
+    Cancelled,
+}
+
+struct Pending {
+    session: String,
+    command: Value,
+    bytes: usize,
+    deadline: Instant,
+    /// Distinguishes a request from a later one reusing its caller-chosen ID.
+    generation: u64,
+    result: oneshot::Sender<Outcome>,
+}
+
+#[derive(Default)]
+struct State {
+    sessions: HashMap<String, Session>,
+    pending: HashMap<String, Pending>,
+    /// Request IDs cancelled before they were queued, with their session and
+    /// when the cancellation lapses.
+    cancelled: HashMap<String, (String, Instant)>,
+    next_generation: u64,
+}
+
+/// Modification times of Git's locks and in-progress operation directories,
+/// with `None` for each that is absent.
+type LockKey = Vec<Option<Option<SystemTime>>>;
+
+struct LockObservation {
+    key: LockKey,
+    since: Instant,
+    warned: bool,
+}
+
+#[derive(Default)]
+struct LockState {
+    observation: Option<LockObservation>,
+    /// When the last observed lock disappeared.
+    released: Option<Instant>,
+}
+
+/// HEAD's contents and, when HEAD names a branch, that branch's commit.
+#[derive(Clone, PartialEq, Eq)]
+struct Checkout {
+    head: Option<String>,
+    tip: Option<String>,
+}
+
+struct GitWatch {
+    git_dir: PathBuf,
+    /// Where branch refs live. Linked worktrees keep only HEAD in `git_dir`.
+    common_dir: PathBuf,
+    workspace: PathBuf,
+    /// HEAD as serve started with it. Set by the first successful read, which
+    /// is a later one if Git could not be read at startup.
+    initial_head: OnceLock<Option<String>>,
+    /// The newest branch commit accepted as a continuation of the history
+    /// serve started from.
+    accepted_tip: Mutex<Option<String>>,
+    lock_wait: Duration,
+    /// Whether refs use the reftable backend. Its HEAD file is a placeholder,
+    /// so the checkout must be read through Git.
+    reftable: bool,
+    /// The last checkout read through Git, and when.
+    observed: Mutex<Option<(Instant, Checkout)>>,
+    /// The last observed checkout and whether it matched. HEAD and the branch
+    /// ref only change on checkout, commit or reset, so most requests are two
+    /// small file reads.
+    verdict: Mutex<Option<(Checkout, bool)>>,
+    lock: Mutex<LockState>,
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    // A panic elsewhere must not permanently disable the bridge or sync.
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+impl GitWatch {
+    fn git(&self, args: &[&str]) -> Option<String> {
+        git_value(&self.workspace, args)
+    }
+
+    /// Whether a Git transaction is in progress. Blocks on file system calls.
+    fn busy(&self) -> bool {
+        let modified = |path: PathBuf| fs::metadata(path).ok().map(|m| m.modified().ok());
+        let key: LockKey = ["index.lock", "HEAD.lock"]
+            .iter()
+            .chain(&GIT_OPERATION_DIRS)
+            .map(|name| modified(self.git_dir.join(name)))
+            .chain([modified(self.common_dir.join("reftable/tables.list.lock"))])
+            .collect();
+        let mut state = lock(&self.lock);
+        if key.iter().all(Option::is_none) {
+            if state.observation.take().is_some() {
+                state.released = Some(Instant::now());
+            }
+            return state
+                .released
+                .is_some_and(|released| released.elapsed() < GIT_LOCK_SETTLE);
+        }
+        match state.observation.as_mut() {
+            Some(observed) if observed.key == key => {
+                if observed.since.elapsed() < self.lock_wait {
+                    return true;
+                }
+                if !observed.warned {
+                    observed.warned = true;
+                    log::warn!(
+                        "A Git lock or operation in {} has been unchanged for over {} seconds; \
+                         it looks stale or is waiting on you, such as a paused rebase. \
+                         Continuing to sync.",
+                        self.git_dir.display(),
+                        self.lock_wait.as_secs()
+                    );
+                }
+                false
+            }
+            _ => {
+                state.observation = Some(LockObservation {
+                    key,
+                    since: Instant::now(),
+                    warned: false,
+                });
+                true
+            }
+        }
+    }
+
+    /// Resolves a branch ref without running Git in the common case.
+    fn read_ref(&self, name: &str) -> io::Result<Option<String>> {
+        // The name is passed to Git below, so it must not read as an option.
+        if !name.starts_with("refs/") {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "HEAD does not name a branch",
+            ));
+        }
+        match read_git_file(&self.common_dir.join(name))? {
+            Some(value) if !value.starts_with("ref:") => return object_id(value).map(Some),
+            Some(_) => {}
+            None => {
+                if let Some(packed) = read_git_file(&self.common_dir.join("packed-refs"))? {
+                    if let Some(object) = packed_ref(&packed, name) {
+                        return object_id(object).map(Some);
+                    }
+                }
+                // An unborn branch has no commit yet.
+                return Ok(None);
+            }
+        }
+        // Symbolic refs need Git itself.
+        self.git(&["rev-parse", "--verify", "--quiet", name])
+            .map(Some)
+            .ok_or_else(|| io::Error::other("Could not resolve the branch"))
+    }
+
+    fn observe(&self) -> io::Result<Checkout> {
+        if self.reftable {
+            return self.observe_with_git();
+        }
+        let head = read_git_file(&self.git_dir.join("HEAD"))?;
+        let tip = match head.as_deref().and_then(|head| head.strip_prefix("ref:")) {
+            Some(name) => self.read_ref(name.trim())?,
+            None => head.clone().map(object_id).transpose()?,
+        };
+        Ok(Checkout { head, tip })
+    }
+
+    /// Reads the checkout through Git, for the reftable backend, whose HEAD
+    /// file always holds `ref: refs/heads/.invalid`. The result is reused for
+    /// a moment, since this starts Git processes.
+    fn observe_with_git(&self) -> io::Result<Checkout> {
+        if let Some((at, checkout)) = lock(&self.observed).as_ref() {
+            if at.elapsed() < GIT_OBSERVE_CACHE {
+                return Ok(checkout.clone());
+            }
+        }
+        let resolve = || {
+            git_query(
+                &self.workspace,
+                &["rev-parse", "--verify", "--quiet", "HEAD"],
+            )?
+            .map(object_id)
+            .transpose()
+        };
+        let checkout = match git_query(&self.workspace, &["symbolic-ref", "--quiet", "HEAD"])? {
+            // Written like a HEAD file so both backends compare the same way.
+            Some(name) => Checkout {
+                head: Some(format!("ref: {name}")),
+                tip: resolve()?,
+            },
+            None => {
+                let commit = resolve()?;
+                Checkout {
+                    head: commit.clone(),
+                    tip: commit,
+                }
+            }
+        };
+        *lock(&self.observed) = Some((Instant::now(), checkout.clone()));
+        Ok(checkout)
+    }
+
+    /// Whether a rebase, cherry-pick or revert is in progress. HEAD moves
+    /// through intermediate commits until it finishes, so it says nothing
+    /// about where the workspace will end up.
+    fn operation_in_progress(&self) -> bool {
+        GIT_OPERATION_DIRS
+            .iter()
+            .any(|name| self.git_dir.join(name).is_dir())
+    }
+
+    /// Whether `new` continues the history of `old`: a descendant (commits,
+    /// merges and fast-forwards) or an amend (a commit with the same parent).
+    fn continues(&self, old: &str, new: &str) -> bool {
+        let ancestor = Command::new("git")
+            .arg("-C")
+            .arg(&self.workspace)
+            .args(["merge-base", "--is-ancestor", old, new])
+            .output()
+            .is_ok_and(|output| output.status.success());
+        ancestor || {
+            let parents = self.git(&["rev-parse", &format!("{old}^"), &format!("{new}^")]);
+            parents.is_some_and(|parents| {
+                let mut lines = parents.lines();
+                matches!((lines.next(), lines.next()), (Some(a), Some(b)) if a == b)
+            })
+        }
+    }
+
+    fn judge(&self, checkout: &Checkout) -> bool {
+        let initial = self.initial_head.get_or_init(|| {
+            *lock(&self.accepted_tip) = checkout.tip.clone();
+            checkout.head.clone()
+        });
+        match (initial, &checkout.head) {
+            (Some(initial), Some(head)) if initial == head => {
+                if !initial.starts_with("ref:") {
+                    return true;
+                }
+                let mut accepted = lock(&self.accepted_tip);
+                let continues = match (accepted.as_deref(), checkout.tip.as_deref()) {
+                    (None, None) => true,
+                    (Some(old), Some(new)) if old == new => true,
+                    // The first commit on a branch that had none.
+                    (None, Some(_)) => true,
+                    (Some(old), Some(new)) => self.continues(old, new),
+                    // The branch was deleted.
+                    (Some(_), None) => false,
+                };
+                if continues {
+                    accepted.clone_from(&checkout.tip);
+                }
+                continues
+            }
+            // A detached HEAD may only move forward from where serve started.
+            (Some(initial), Some(head))
+                if !initial.starts_with("ref:") && !head.starts_with("ref:") =>
+            {
+                Command::new("git")
+                    .arg("-C")
+                    .arg(&self.workspace)
+                    .args(["merge-base", "--is-ancestor", initial, head])
+                    .output()
+                    .is_ok_and(|output| output.status.success())
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether the checkout still matches, or `None` when it could not be read.
+    /// Blocks on file system calls and possibly Git.
+    fn matches(&self) -> Option<bool> {
+        if self.operation_in_progress() {
+            log::debug!(
+                "A Git rebase or cherry-pick is in progress; judging the checkout after it"
+            );
+            return None;
+        }
+        let checkout = match self.observe() {
+            Ok(checkout) => checkout,
+            Err(error) => {
+                log::debug!("Could not read the Git checkout; assuming it is unchanged: {error}");
+                return None;
+            }
+        };
+        if let Some((observed, verdict)) = lock(&self.verdict).as_ref() {
+            if *observed == checkout {
+                return Some(*verdict);
+            }
+        }
+        let verdict = self.judge(&checkout);
+        *lock(&self.verdict) = Some((checkout, verdict));
+        Some(verdict)
+    }
+}
+
+pub struct StudioBridge {
+    token: String,
+    plugin_token: String,
+    identity_json: Value,
+    /// An opaque stand-in for the identity, sent before authentication, so
+    /// unauthenticated responses do not reveal local paths.
+    plugin_identity: Value,
+    git: Option<Arc<GitWatch>>,
+    state: Mutex<State>,
+    changed: Notify,
+    decodes: Arc<Semaphore>,
+}
+
+fn reply(status: StatusCode, value: Value) -> Response<Body> {
+    json_response(value, status)
+}
+fn failure(status: StatusCode, message: impl Into<String>) -> Response<Body> {
+    reply(status, json!({"error": message.into()}))
+}
+
+/// Whether the Host header names the loopback interface literally. A DNS
+/// rebinding page reaches the server under its own host name, so this keeps
+/// pairing secrets away from it even when Host validation is disabled.
+fn loopback_host(request: &Request<Body>) -> bool {
+    let Some(host) = request
+        .headers()
+        .get(HOST)
+        .and_then(|host| host.to_str().ok())
+    else {
+        return false;
+    };
+    let (name, port) = match host.strip_prefix('[') {
+        Some(rest) => match rest.split_once(']') {
+            Some((name, port)) => (format!("[{name}]"), port),
+            None => return false,
+        },
+        None => {
+            let split = host.find(':').unwrap_or(host.len());
+            (host[..split].to_owned(), &host[split..])
+        }
+    };
+    let port_valid = port.is_empty()
+        || port
+            .strip_prefix(':')
+            .is_some_and(|port| !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()));
+    port_valid && (name.eq_ignore_ascii_case("localhost") || name == "127.0.0.1" || name == "[::1]")
+}
+
+impl StudioBridge {
+    pub fn new(session: &ServeSession, token_file: &Path) -> anyhow::Result<Arc<Self>> {
+        Self::with_lock_wait(session, token_file, GIT_LOCK_WAIT)
+    }
+
+    fn with_lock_wait(
+        session: &ServeSession,
+        token_file: &Path,
+        lock_wait: Duration,
+    ) -> anyhow::Result<Arc<Self>> {
+        let token = read_token_file(token_file)?;
+        anyhow::ensure!(
+            token.len() >= 32
+                && token.len() <= 256
+                && token
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-'),
+            "Studio token must contain 32-256 ASCII letters, numbers or hyphens"
+        );
+        let root = dunce::canonicalize(session.root_dir())?;
+        let project_path = dunce::canonicalize(&session.root_project().file_location)?;
+        // Identity is serialized as JSON for every client, which requires UTF-8.
+        anyhow::ensure!(
+            root.to_str().is_some() && project_path.to_str().is_some(),
+            "The Studio bridge requires project and workspace paths that are valid UTF-8"
+        );
+        let git_dir = git_value(&root, &["rev-parse", "--absolute-git-dir"]).map(PathBuf::from);
+        let git = git_dir.map(|git_dir| {
+            // Older Git prints this relative to the working directory.
+            let common_dir = git_value(&root, &["rev-parse", "--git-common-dir"])
+                .map_or_else(|| git_dir.clone(), |dir| root.join(dir));
+            // `extensions.refStorage = reftable` always comes with this
+            // directory, which Git creates when the repository is set up.
+            let reftable = common_dir.join("reftable").is_dir();
+            let watch = GitWatch {
+                initial_head: OnceLock::new(),
+                accepted_tip: Mutex::new(None),
+                lock_wait,
+                reftable,
+                observed: Mutex::new(None),
+                git_dir,
+                common_dir,
+                workspace: root.clone(),
+                verdict: Mutex::new(None),
+                lock: Mutex::new(LockState::default()),
+            };
+            match watch.observe() {
+                Ok(checkout) => {
+                    let _ = watch.initial_head.set(checkout.head);
+                    *lock(&watch.accepted_tip) = checkout.tip;
+                }
+                Err(error) => log::warn!(
+                    "Could not read the Git checkout at startup ({error}); \
+                     sync follows the first checkout that can be read"
+                ),
+            }
+            Arc::new(watch)
+        });
+        let identity = Identity {
+            project_path,
+            workspace_path: root.clone(),
+            git_head: git_value(&root, &["rev-parse", "HEAD"]),
+            git_branch: git_value(&root, &["symbolic-ref", "--quiet", "--short", "HEAD"]),
+            server_session: session.session_id().to_string(),
+        };
+        let identity_json =
+            serde_json::to_value(&identity).context("Could not serialize Studio identity")?;
+        let plugin_identity = json!({
+            "serverSession": identity.server_session,
+            "digest": blake3::hash(identity_json.to_string().as_bytes()).to_hex().to_string(),
+        });
+        Ok(Arc::new(Self {
+            token,
+            plugin_token: Uuid::new_v4().to_string(),
+            identity_json,
+            plugin_identity,
+            git,
+            state: Mutex::new(State::default()),
+            changed: Notify::new(),
+            decodes: Arc::new(Semaphore::new(MAX_CONCURRENT_DECODES)),
+        }))
+    }
+
+    fn state(&self) -> MutexGuard<'_, State> {
+        lock(&self.state)
+    }
+
+    /// Whether a Git transaction (such as a checkout) is in progress or ended
+    /// less than [`GIT_LOCK_SETTLE`] ago. Locks held longer than
+    /// [`GIT_LOCK_WAIT`] are treated as stale.
+    pub async fn git_busy(&self) -> bool {
+        let Some(git) = self.git.clone() else {
+            return false;
+        };
+        tokio::task::spawn_blocking(move || git.busy())
+            .await
+            .unwrap_or(false)
+    }
+
+    pub async fn wait_for_git(&self) {
+        // Retain the request body while Git is busy. In particular, rejecting a
+        // two-way write here would discard a change already flushed by Studio.
+        // `git_busy` stops reporting one lock after GIT_LOCK_WAIT, but Git can
+        // take a new lock after each, so the total wait has its own bound.
+        let started = Instant::now();
+        while self.git_busy().await {
+            if started.elapsed() >= GIT_WAIT_LIMIT {
+                log::debug!("Git stayed busy for {GIT_WAIT_LIMIT:?}; continuing");
+                break;
+            }
+            tokio::time::sleep(GIT_POLL_INTERVAL).await;
+        }
+    }
+
+    /// Whether the workspace is still on the checkout that serve started from.
+    /// Commits, merges, fast-forwards and amends on the starting branch keep
+    /// the identity. Switching branches, detaching, moving the branch to a
+    /// commit that does not continue its history, or moving a detached HEAD to
+    /// a non-descendant does not. A checkout that cannot be read is assumed
+    /// unchanged and re-read on the next call.
+    ///
+    /// Call only after waiting for the index transaction to finish. Staging alone
+    /// does not change workspace identity and must not disconnect an idle client.
+    pub async fn identity_matches(&self) -> bool {
+        let Some(git) = self.git.clone() else {
+            return true;
+        };
+        tokio::task::spawn_blocking(move || git.matches())
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or(true)
+    }
+
+    pub async fn pairing(&self, remote: SocketAddr, request: &Request<Body>) -> Option<Value> {
+        if !canonical(remote.ip()).is_loopback()
+            || request.headers().contains_key("origin")
+            || !loopback_host(request)
+            || foreign_peer(remote, request).await
+        {
+            return None;
+        }
+        Some(
+            json!({"protocolVersion":1,"pluginToken":self.plugin_token,"identity":self.plugin_identity}),
+        )
+    }
+
+    fn authorized(&self, request: &Request<Body>, plugin: bool) -> bool {
+        let expected = if plugin {
+            &self.plugin_token
+        } else {
+            &self.token
+        };
+        let Some(given) = request
+            .headers()
+            .get("x-rojo-studio-token")
+            .and_then(|value| value.to_str().ok())
+        else {
+            return false;
+        };
+        // Do not expose token-prefix matches through an early-exit comparison.
+        given.len() == expected.len()
+            && given
+                .bytes()
+                .zip(expected.bytes())
+                .fold(0u8, |different, (a, b)| different | (a ^ b))
+                == 0
+    }
+
+    fn prune(state: &mut State) {
+        let now = Instant::now();
+        state
+            .sessions
+            .retain(|_, session| now.duration_since(session.last_seen) < SESSION_TTL);
+        state.pending.retain(|_, pending| {
+            pending.deadline > now
+                && !pending.result.is_closed()
+                && state.sessions.contains_key(&pending.session)
+        });
+        for session in state.sessions.values_mut() {
+            session.queue.retain(|id| state.pending.contains_key(id));
+        }
+        state.cancelled.retain(|_, (_, until)| *until > now);
+    }
+
+    pub async fn call(
+        self: Arc<Self>,
+        remote: SocketAddr,
+        request: Request<Body>,
+    ) -> Response<Body> {
+        if !canonical(remote.ip()).is_loopback() || request.headers().contains_key("origin") {
+            return failure(
+                StatusCode::FORBIDDEN,
+                "Studio control accepts local clients without an Origin header only",
+            );
+        }
+        if foreign_peer(remote, &request).await {
+            return failure(
+                StatusCode::FORBIDDEN,
+                "Studio control accepts clients run by the same OS user only",
+            );
+        }
+        let path = request.uri().path().to_owned();
+        let plugin = matches!(
+            path.as_str(),
+            "/api/studio/register"
+                | "/api/studio/poll"
+                | "/api/studio/result"
+                | "/api/studio/disconnect"
+                | "/api/studio/validate"
+        );
+        if !self.authorized(&request, plugin) {
+            return failure(StatusCode::UNAUTHORIZED, "Invalid Studio control token");
+        }
+        self.wait_for_git().await;
+        if !self.identity_matches().await {
+            return failure(StatusCode::CONFLICT, IDENTITY_CHANGED);
+        }
+        if request.method() == Method::GET && path == "/api/studio/sessions" {
+            let mut state = self.state();
+            Self::prune(&mut state);
+            let mut sessions: Vec<_> = state
+                .sessions
+                .values()
+                .map(|session| {
+                    let mut description = session.description.clone();
+                    description["lastSeenMs"] =
+                        json!(session.last_seen.elapsed().as_millis() as u64);
+                    description
+                })
+                .collect();
+            sessions.sort_by_key(|session| session["registeredAt"].as_u64());
+            return reply(
+                StatusCode::OK,
+                json!({"protocolVersion":1,"identity":self.identity_json,"sessions":sessions}),
+            );
+        }
+        if request.method() != Method::POST {
+            return failure(StatusCode::NOT_FOUND, "Unknown Studio control route");
+        }
+        let value = match read_json(request.into_body()).await {
+            Ok(value) => value,
+            Err(response) => return *response,
+        };
+        if plugin && value.get("identity") != Some(&self.plugin_identity) {
+            return failure(
+                StatusCode::CONFLICT,
+                "Studio session is paired to a different project/workspace identity",
+            );
+        }
+        match path.as_str() {
+            "/api/studio/register" => self.register(value),
+            "/api/studio/disconnect" => {
+                let Some(id) = session_id(&value) else {
+                    return failure(StatusCode::BAD_REQUEST, "A UUID sessionId is required");
+                };
+                let mut state = self.state();
+                state.sessions.remove(&id);
+                Self::prune(&mut state);
+                reply(StatusCode::OK, json!({"disconnected":true}))
+            }
+            "/api/studio/poll" => self.poll(value).await,
+            "/api/studio/result" => self.result(value),
+            "/api/studio/validate" => {
+                let mut state = self.state();
+                Self::prune(&mut state);
+                let pending = value
+                    .get("requestId")
+                    .and_then(Value::as_str)
+                    .and_then(|id| state.pending.get(id));
+                if pending
+                    .is_some_and(|pending| session_id(&value) == Some(pending.session.clone()))
+                {
+                    reply(StatusCode::OK, json!({"active":true}))
+                } else {
+                    failure(StatusCode::GONE, "Request expired or was cancelled")
+                }
+            }
+            "/api/studio/cancel" => {
+                let Some(id) = value.get("requestId").and_then(Value::as_str) else {
+                    return failure(StatusCode::BAD_REQUEST, "requestId is required");
+                };
+                let mut state = self.state();
+                Self::prune(&mut state);
+                if state
+                    .pending
+                    .get(id)
+                    .is_some_and(|pending| session_id(&value) == Some(pending.session.clone()))
+                {
+                    if let Some(pending) = state.pending.remove(id) {
+                        let _ = pending.result.send(Outcome::Cancelled);
+                    }
+                    Self::prune(&mut state);
+                    reply(StatusCode::OK, json!({"cancelled":true,"requestId":id}))
+                } else {
+                    // The command may still be waiting for Git or its import
+                    // check, so it must not be queued once it gets there. A
+                    // command that already finished cannot be told apart from
+                    // one whose request has not been read yet, so the ID is
+                    // refused either way until the cancellation lapses.
+                    if let Some(session) = session_id(&value) {
+                        remember(&mut state.cancelled, id, session);
+                    }
+                    failure(
+                        StatusCode::NOT_FOUND,
+                        "No pending request for this target session. If it is still being prepared, it will not be sent to Studio.",
+                    )
+                }
+            }
+            "/api/studio/command" => self.command(value).await,
+            _ => failure(StatusCode::NOT_FOUND, "Unknown Studio control route"),
+        }
+    }
+
+    fn register(&self, value: Value) -> Response<Body> {
+        let Some(id) = session_id(&value) else {
+            return failure(StatusCode::BAD_REQUEST, "A UUID sessionId is required");
+        };
+        let id = id.as_str();
+        let Some(description) = value.get("description").filter(|value| value.is_object()) else {
+            return failure(StatusCode::BAD_REQUEST, "description is required");
+        };
+        if description.to_string().len() > 16 * 1024 {
+            return failure(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "Session description exceeds 16KiB",
+            );
+        }
+        let mut state = self.state();
+        Self::prune(&mut state);
+        if let Some(existing) = state.sessions.get_mut(id) {
+            // A retry after a lost response must not fail the plugin's bridge.
+            if existing.registered == *description {
+                existing.last_seen = Instant::now();
+                return reply(StatusCode::OK, json!({"registered":true,"sessionId":id}));
+            }
+            return failure(
+                StatusCode::CONFLICT,
+                "This Studio session is already registered",
+            );
+        }
+        if state.sessions.len() >= MAX_SESSIONS {
+            // Evict instead of rejecting, so stale sessions or sessions that
+            // another local process registered cannot permanently lock a new
+            // Studio out. An evicted Studio's next poll fails with 404.
+            let oldest = state
+                .sessions
+                .iter()
+                .min_by_key(|(_, session)| session.last_seen)
+                .map(|(id, _)| id.clone());
+            if let Some(oldest) = oldest {
+                log::warn!(
+                    "More than {MAX_SESSIONS} Studio sessions registered; evicting {oldest}"
+                );
+                state.sessions.remove(&oldest);
+                Self::prune(&mut state);
+            }
+        }
+        let mut stored = description.clone();
+        stored["sessionId"] = json!(id);
+        stored["identity"] = self.identity_json.clone();
+        stored["registeredAt"] = json!(unix_millis(SystemTime::now()));
+        state.sessions.insert(
+            id.to_owned(),
+            Session {
+                registered: description.clone(),
+                description: stored,
+                last_seen: Instant::now(),
+                queue: VecDeque::new(),
+            },
+        );
+        reply(StatusCode::OK, json!({"registered":true,"sessionId":id}))
+    }
+
+    async fn poll(&self, value: Value) -> Response<Body> {
+        let Some(id) = session_id(&value) else {
+            return failure(StatusCode::BAD_REQUEST, "A UUID sessionId is required");
+        };
+        let id = id.as_str();
+        // Leave room for Studio's HTTP queue and background UI scheduling before
+        // the plugin's request deadline, even when no agent is issuing commands.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let notification = self.changed.notified();
+            tokio::pin!(notification);
+            notification.as_mut().enable();
+            {
+                let mut state = self.state();
+                Self::prune(&mut state);
+                let State {
+                    sessions, pending, ..
+                } = &mut *state;
+                let Some(session) = sessions.get_mut(id) else {
+                    return failure(
+                        StatusCode::NOT_FOUND,
+                        "Studio session expired; reconnect Studio",
+                    );
+                };
+                session.last_seen = Instant::now();
+                // Commands are delivered at most once: a delivered command is
+                // never resent, so a lost poll response surfaces as a timeout
+                // instead of a duplicated import. Larger batches stay queued for
+                // the next poll to keep the response under the plugin's limit.
+                let mut commands = Vec::new();
+                let mut total = 0;
+                while let Some(next) = session.queue.front() {
+                    let Some(command) = pending.get(next) else {
+                        session.queue.pop_front();
+                        continue;
+                    };
+                    if !commands.is_empty() && total + command.bytes > MAX_POLL_BYTES {
+                        break;
+                    }
+                    total += command.bytes;
+                    commands.push(command.command.clone());
+                    session.queue.pop_front();
+                }
+                if !commands.is_empty() {
+                    return reply(StatusCode::OK, json!({"commands":commands}));
+                }
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if tokio::time::timeout(remaining, notification).await.is_err() {
+                return reply(StatusCode::OK, json!({"commands":[]}));
+            }
+        }
+    }
+
+    fn result(&self, value: Value) -> Response<Body> {
+        let Some(id) = value.get("requestId").and_then(Value::as_str) else {
+            return failure(StatusCode::BAD_REQUEST, "requestId is required");
+        };
+        let mut state = self.state();
+        Self::prune(&mut state);
+        match state.pending.get(id) {
+            Some(pending) if session_id(&value).as_ref() != Some(&pending.session) => {
+                return failure(
+                    StatusCode::FORBIDDEN,
+                    "Result belongs to another Studio session",
+                );
+            }
+            Some(_) => {}
+            None => return failure(StatusCode::GONE, "Request expired or was cancelled"),
+        }
+        if let Some(pending) = state.pending.remove(id) {
+            let _ = pending.result.send(Outcome::Completed(
+                value
+                    .get("result")
+                    .cloned()
+                    .unwrap_or(json!({"ok":false,"error":"Missing result"})),
+            ));
+        }
+        reply(StatusCode::OK, json!({"accepted":true}))
+    }
+
+    async fn command(&self, value: Value) -> Response<Body> {
+        let Some(session_id) = session_id(&value) else {
+            return failure(
+                StatusCode::BAD_REQUEST,
+                "An explicit target UUID sessionId is required",
+            );
+        };
+        let session_id = session_id.as_str();
+        let Some(action) = value.get("action").and_then(Value::as_str) else {
+            return failure(StatusCode::BAD_REQUEST, "action is required");
+        };
+        if !matches!(
+            action,
+            "status" | "tree" | "properties" | "selection" | "logs" | "export" | "import" | "test"
+        ) {
+            return failure(StatusCode::BAD_REQUEST, "Unsupported action. Arbitrary Luau execution, whole-place save, publish and play control are unavailable through this bridge.");
+        }
+        let id = match value.get("requestId") {
+            Some(Value::String(id)) if Uuid::parse_str(id).is_ok() => id.clone(),
+            None => Uuid::new_v4().to_string(),
+            _ => return failure(StatusCode::BAD_REQUEST, "requestId must be a UUID"),
+        };
+        let args = value.get("args").cloned().unwrap_or(json!({}));
+        if action == "import" {
+            // Checking an import is the expensive step, so fail fast when
+            // there is no session to deliver it to.
+            {
+                let mut state = self.state();
+                Self::prune(&mut state);
+                if !state.sessions.contains_key(session_id) {
+                    return failure(
+                        StatusCode::NOT_FOUND,
+                        "Target Studio session does not exist or expired",
+                    );
+                }
+            }
+            if let Err(response) = self.check_import(&args).await {
+                return *response;
+            }
+        }
+        let expires = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+            + COMMAND_TIMEOUT.as_millis();
+        let command =
+            json!({"requestId":id,"action":action,"args":args,"expiresAt":expires as u64});
+        let bytes = command.to_string().len();
+        // A poll always delivers at least one command, so a larger one would
+        // exceed the plugin's response limit and be lost.
+        if bytes > MAX_COMMAND_BYTES {
+            return failure(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "Studio command is too large to deliver to the plugin",
+            );
+        }
+        let (sender, receiver) = oneshot::channel();
+        let generation;
+        {
+            let mut state = self.state();
+            Self::prune(&mut state);
+            if !state.sessions.contains_key(session_id) {
+                return failure(
+                    StatusCode::NOT_FOUND,
+                    "Target Studio session does not exist or expired",
+                );
+            }
+            if state.pending.contains_key(&id) {
+                return failure(StatusCode::CONFLICT, "requestId is already pending");
+            }
+            if state
+                .cancelled
+                .get(&id)
+                .is_some_and(|(session, _)| session == session_id)
+            {
+                state.cancelled.remove(&id);
+                return reply(
+                    StatusCode::GONE,
+                    json!({"error":"The Studio command was cancelled before it completed.","cancelled":true,"requestId":id}),
+                );
+            }
+            if state.pending.len() >= 32 {
+                return failure(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "Studio request queue is full",
+                );
+            }
+            let queued: usize = state
+                .pending
+                .values()
+                .filter(|pending| pending.session == session_id)
+                .map(|pending| pending.bytes)
+                .sum();
+            if queued + bytes > MAX_SESSION_PENDING_BYTES {
+                return failure(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "Studio session has too much pending command data; wait for earlier commands",
+                );
+            }
+            generation = state.next_generation;
+            state.next_generation += 1;
+            state.pending.insert(
+                id.clone(),
+                Pending {
+                    session: session_id.to_owned(),
+                    command,
+                    bytes,
+                    // `prune` must not drop this before the timeout below
+                    // fires, or the caller would see a disconnect (503)
+                    // instead of a timeout (504).
+                    deadline: Instant::now() + COMMAND_TIMEOUT + PENDING_GRACE,
+                    generation,
+                    result: sender,
+                },
+            );
+            if let Some(session) = state.sessions.get_mut(session_id) {
+                session.queue.push_back(id.clone());
+            }
+        }
+        self.changed.notify_waiters();
+        let response = match tokio::time::timeout(COMMAND_TIMEOUT, receiver).await {
+            Ok(Ok(Outcome::Completed(result))) => reply(StatusCode::OK, json!({"sessionId":session_id,"requestId":id,"result":result})),
+            Ok(Ok(Outcome::Cancelled)) => reply(StatusCode::GONE, json!({"error":"The Studio command was cancelled before it completed.","cancelled":true,"requestId":id})),
+            Ok(Err(_)) => failure(StatusCode::SERVICE_UNAVAILABLE, "The Studio session disconnected or expired before completing the command. Reconnect Studio and retry."),
+            Err(_) => failure(StatusCode::GATEWAY_TIMEOUT, "Studio did not complete the command within 15 seconds. Reconnect Studio and retry."),
+        };
+        let mut state = self.state();
+        if state
+            .pending
+            .get(&id)
+            .is_some_and(|pending| pending.generation == generation)
+        {
+            state.pending.remove(&id);
+        }
+        response
+    }
+}
+
+/// Records a request ID for [`CANCELLED_TTL`], evicting the entry that lapses
+/// first once [`MAX_CANCELLED`] are held.
+fn remember(ids: &mut HashMap<String, (String, Instant)>, id: &str, session: String) {
+    if ids.len() >= MAX_CANCELLED && !ids.contains_key(id) {
+        let oldest = ids
+            .iter()
+            .min_by_key(|(_, (_, until))| *until)
+            .map(|(id, _)| id.clone());
+        if let Some(oldest) = oldest {
+            ids.remove(&oldest);
+        }
+    }
+    ids.insert(id.to_owned(), (session, Instant::now() + CANCELLED_TTL));
+}
+
+impl StudioBridge {
+    /// Validates an import's model in a child process (see `model_check`),
+    /// within [`IMPORT_CHECK_LIMIT`] including the wait for a check slot.
+    async fn check_import(&self, args: &Value) -> Result<(), Box<Response<Body>>> {
+        let bad_request = |message: String| Box::new(failure(StatusCode::BAD_REQUEST, message));
+        let bytes = import_model_bytes(args).map_err(|error| bad_request(format!("{error:#}")))?;
+        let allow_scripts = args.get("allowScripts") == Some(&json!(true));
+        let started = Instant::now();
+        let slot = match tokio::time::timeout(
+            IMPORT_CHECK_LIMIT,
+            Arc::clone(&self.decodes).acquire_owned(),
+        )
+        .await
+        {
+            Ok(Ok(slot)) => slot,
+            Ok(Err(_)) => {
+                return Err(Box::new(failure(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Import validation stopped",
+                )))
+            }
+            Err(_) => {
+                return Err(Box::new(failure(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Other imports are still being checked. Retry shortly.",
+                )))
+            }
+        };
+        let remaining = IMPORT_CHECK_LIMIT.saturating_sub(started.elapsed());
+        // The slot is released when the check ends, which its time limit
+        // bounds even if this request is abandoned first.
+        let checked = tokio::task::spawn_blocking(move || {
+            let _slot = slot;
+            model_check::check_untrusted_model(bytes, allow_scripts, false, remaining)
+        })
+        .await;
+        match checked {
+            Ok(Ok(_)) => Ok(()),
+            Ok(Err(error)) => Err(bad_request(format!("{error:#}"))),
+            Err(_) => Err(bad_request("Import model could not be decoded".to_owned())),
+        }
+    }
+}
+
+fn import_model_bytes(args: &Value) -> anyhow::Result<Vec<u8>> {
+    let model = args
+        .get("model")
+        .and_then(Value::as_str)
+        .context("Import requires base64 model bytes")?;
+    anyhow::ensure!(
+        model.len() <= MAX_MODEL_BYTES.div_ceil(3) * 4,
+        "Import exceeds the 5MiB model limit"
+    );
+    data_encoding::BASE64
+        .decode(model.as_bytes())
+        .context("Import model is not valid base64")
+}
+
+async fn read_json(mut body: Body) -> Result<Value, Box<Response<Body>>> {
+    let read = async {
+        let mut bytes = Vec::new();
+        while let Some(chunk) = body.data().await {
+            let chunk = chunk.map_err(|_| {
+                Box::new(failure(StatusCode::BAD_REQUEST, "Could not read request"))
+            })?;
+            if bytes.len() + chunk.len() > MAX_BODY {
+                return Err(Box::new(failure(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "Studio request exceeds 8MiB",
+                )));
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        serde_json::from_slice(&bytes)
+            .map_err(|_| Box::new(failure(StatusCode::BAD_REQUEST, "Expected a JSON object")))
+    };
+    tokio::time::timeout(Duration::from_secs(10), read)
+        .await
+        .unwrap_or_else(|_| {
+            Err(Box::new(failure(
+                StatusCode::REQUEST_TIMEOUT,
+                "Studio request body timed out",
+            )))
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::poll;
+    use memofs::Vfs;
+    use rbx_dom_weak::InstanceBuilder;
+
+    const PEER: &str = "127.0.0.1:1234";
+
+    fn project_dir() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("default.project.json"),
+            r#"{"name":"bridge","tree":{"$className":"Folder"}}"#,
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("token"), "0123456789abcdef0123456789abcdef").unwrap();
+        dir
+    }
+
+    fn bridge_for(dir: &Path, lock_wait: Duration) -> Arc<StudioBridge> {
+        let session = ServeSession::new(Vfs::new_default().unwrap(), dir).unwrap();
+        StudioBridge::with_lock_wait(&session, &dir.join("token"), lock_wait).unwrap()
+    }
+
+    fn fixture() -> (tempfile::TempDir, Arc<StudioBridge>) {
+        let dir = project_dir();
+        let bridge = bridge_for(dir.path(), GIT_LOCK_WAIT);
+        (dir, bridge)
+    }
+
+    fn git(dir: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args([
+                "-c",
+                "user.name=Rojo Test",
+                "-c",
+                "user.email=rojo@example.com",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn git_fixture(lock_wait: Duration) -> (tempfile::TempDir, Arc<StudioBridge>) {
+        let dir = project_dir();
+        git(dir.path(), &["init", "--quiet", "--initial-branch=main"]);
+        git(dir.path(), &["add", "default.project.json"]);
+        git(dir.path(), &["commit", "--quiet", "-m", "initial"]);
+        let bridge = bridge_for(dir.path(), lock_wait);
+        (dir, bridge)
+    }
+
+    fn request(method: &str, path: &str, token: &str, body: Option<Value>) -> Request<Body> {
+        Request::builder()
+            .method(method)
+            .uri(path)
+            .header(HOST, "127.0.0.1:34872")
+            .header("x-rojo-studio-token", token)
+            .body(body.map_or_else(Body::empty, |body| Body::from(body.to_string())))
+            .unwrap()
+    }
+
+    async fn into_value(response: Response<Body>) -> (StatusCode, Value) {
+        let status = response.status();
+        let bytes = hyper::body::to_bytes(response.into_body()).await.unwrap();
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+        )
+    }
+
+    async fn cli(bridge: &Arc<StudioBridge>, route: &str, body: Value) -> (StatusCode, Value) {
+        let request = request("POST", route, &bridge.token, Some(body));
+        into_value(bridge.clone().call(PEER.parse().unwrap(), request).await).await
+    }
+
+    async fn sessions(bridge: &Arc<StudioBridge>) -> StatusCode {
+        let request = request("GET", "/api/studio/sessions", &bridge.token, None);
+        bridge
+            .clone()
+            .call(PEER.parse().unwrap(), request)
+            .await
+            .status()
+    }
+
+    async fn plugin(
+        bridge: &Arc<StudioBridge>,
+        route: &str,
+        mut body: Value,
+    ) -> (StatusCode, Value) {
+        body["identity"] = bridge.plugin_identity.clone();
+        let request = request("POST", route, &bridge.plugin_token, Some(body));
+        into_value(bridge.clone().call(PEER.parse().unwrap(), request).await).await
+    }
+
+    async fn register(bridge: &Arc<StudioBridge>) -> String {
+        let session = Uuid::new_v4().to_string();
+        let (status, _) = plugin(
+            bridge,
+            "/api/studio/register",
+            json!({"sessionId":session,"description":{"placeName":"test"}}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        session
+    }
+
+    fn command_future(
+        bridge: &Arc<StudioBridge>,
+        body: Value,
+    ) -> std::pin::Pin<Box<impl std::future::Future<Output = Response<Body>>>> {
+        let request = request("POST", "/api/studio/command", &bridge.token, Some(body));
+        Box::pin(bridge.clone().call(PEER.parse().unwrap(), request))
+    }
+
+    fn model(children: &[&str]) -> String {
+        let mut dom = WeakDom::new(InstanceBuilder::new("DataModel"));
+        let root = dom.root_ref();
+        let folder = dom.insert(root, InstanceBuilder::new("Folder"));
+        for class in children {
+            dom.insert(folder, InstanceBuilder::new(*class));
+        }
+        let mut bytes = Vec::new();
+        rbx_binary::to_writer(&mut bytes, &dom, &[folder]).unwrap();
+        data_encoding::BASE64.encode(&bytes)
+    }
+
+    #[tokio::test]
+    async fn rejects_missing_token_remote_peers_and_browser_origins() {
+        let (_dir, bridge) = fixture();
+        for (peer, origin, token, expected) in [
+            ("127.0.0.1:1234", None, None, StatusCode::UNAUTHORIZED),
+            (
+                "192.168.1.2:1234",
+                None,
+                Some(bridge.token.as_str()),
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                "127.0.0.1:1234",
+                Some("http://localhost"),
+                Some(bridge.token.as_str()),
+                StatusCode::FORBIDDEN,
+            ),
+        ] {
+            let mut request = Request::builder().uri("/api/studio/sessions");
+            if let Some(token) = token {
+                request = request.header("x-rojo-studio-token", token);
+            }
+            if let Some(origin) = origin {
+                request = request.header("origin", origin);
+            }
+            assert_eq!(
+                bridge
+                    .clone()
+                    .call(peer.parse().unwrap(), request.body(Body::empty()).unwrap())
+                    .await
+                    .status(),
+                expected
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn plugin_token_cannot_issue_commands_or_list_sessions() {
+        let (_dir, bridge) = fixture();
+        let request = request("GET", "/api/studio/sessions", &bridge.plugin_token, None);
+        assert_eq!(
+            bridge.call(PEER.parse().unwrap(), request).await.status(),
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
+    #[tokio::test]
+    async fn pairing_requires_a_literal_loopback_host_and_hides_paths() {
+        let (dir, bridge) = fixture();
+        let peer = PEER.parse().unwrap();
+        for (host, allowed) in [
+            ("localhost:34872", true),
+            ("LOCALHOST", true),
+            ("127.0.0.1:34872", true),
+            ("[::1]:34872", true),
+            ("evil.example:34872", false),
+            ("127.0.0.1.evil.example", false),
+            ("localhost:", false),
+            ("[::1", false),
+        ] {
+            let request = Request::builder()
+                .header(HOST, host)
+                .body(Body::empty())
+                .unwrap();
+            assert_eq!(
+                bridge.pairing(peer, &request).await.is_some(),
+                allowed,
+                "{host}"
+            );
+        }
+        let request = Request::builder().body(Body::empty()).unwrap();
+        assert!(bridge.pairing(peer, &request).await.is_none());
+        let request = Request::builder()
+            .header(HOST, "localhost:34872")
+            .body(Body::empty())
+            .unwrap();
+        let pairing = bridge.pairing(peer, &request).await.unwrap().to_string();
+        let name = dir.path().file_name().unwrap().to_str().unwrap();
+        assert!(!pairing.contains(name), "{pairing}");
+    }
+
+    #[tokio::test]
+    async fn rejects_mismatched_result_ownership() {
+        let (_dir, bridge) = fixture();
+        let session = register(&bridge).await;
+        let other = register(&bridge).await;
+        let id = Uuid::new_v4().to_string();
+        let mut pending = command_future(
+            &bridge,
+            json!({"sessionId":session,"action":"status","requestId":id}),
+        );
+        assert!(poll!(&mut pending).is_pending());
+        let (status, _) = plugin(
+            &bridge,
+            "/api/studio/result",
+            json!({"requestId":id,"sessionId":other,"result":{"ok":true}}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn targets_commands_and_delivers_plugin_results() {
+        let (_dir, bridge) = fixture();
+        let session = register(&bridge).await;
+        let mut pending = command_future(&bridge, json!({"sessionId":session,"action":"status"}));
+        assert!(poll!(&mut pending).is_pending());
+        let (_, value) = plugin(&bridge, "/api/studio/poll", json!({"sessionId":session})).await;
+        let id = value["commands"][0]["requestId"].as_str().unwrap();
+        let (status, _) = plugin(
+            &bridge,
+            "/api/studio/result",
+            json!({"requestId":id,"sessionId":session,"result":{"ok":true,"value":{"mode":"Edit"}}}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, value) = into_value(pending.await).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(value["result"]["value"]["mode"], "Edit");
+        assert!(bridge.state().pending.is_empty());
+    }
+
+    #[tokio::test]
+    async fn retried_registration_is_idempotent() {
+        let (_dir, bridge) = fixture();
+        let session = Uuid::new_v4().to_string();
+        let body = json!({"sessionId":session,"description":{"placeName":"test"}});
+        for _ in 0..2 {
+            assert_eq!(
+                plugin(&bridge, "/api/studio/register", body.clone())
+                    .await
+                    .0,
+                StatusCode::OK
+            );
+        }
+        let changed = json!({"sessionId":session,"description":{"placeName":"other"}});
+        assert_eq!(
+            plugin(&bridge, "/api/studio/register", changed).await.0,
+            StatusCode::CONFLICT
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_commands_are_removed_before_plugin_commit_validation() {
+        let (_dir, bridge) = fixture();
+        let session = register(&bridge).await;
+        let id = Uuid::new_v4().to_string();
+        let mut pending = command_future(
+            &bridge,
+            json!({"sessionId":session,"action":"import","requestId":id,"args":{"parent":"game/Workspace","model":model(&[])}}),
+        );
+        // Import validation runs on another thread before the command is queued.
+        while !bridge.state().pending.contains_key(&id) {
+            assert!(poll!(&mut pending).is_pending());
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let (status, _) = cli(
+            &bridge,
+            "/api/studio/cancel",
+            json!({"sessionId":session,"requestId":id}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _) = plugin(
+            &bridge,
+            "/api/studio/validate",
+            json!({"sessionId":session,"requestId":id}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::GONE);
+        let (status, value) = into_value(pending.await).await;
+        assert_eq!(status, StatusCode::GONE);
+        assert_eq!(value["cancelled"], true);
+    }
+
+    #[tokio::test]
+    async fn cancelled_command_cleanup_keeps_a_newer_request_with_the_same_id() {
+        let (_dir, bridge) = fixture();
+        let session = register(&bridge).await;
+        let id = Uuid::new_v4().to_string();
+        let body = json!({"sessionId":session,"action":"status","requestId":id});
+        let mut first = command_future(&bridge, body.clone());
+        assert!(poll!(&mut first).is_pending());
+        let (status, _) = cli(
+            &bridge,
+            "/api/studio/cancel",
+            json!({"sessionId":session,"requestId":id}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        // Queue the retry before the cancelled caller runs its cleanup.
+        let mut second = command_future(&bridge, body);
+        assert!(poll!(&mut second).is_pending());
+        assert_eq!(first.await.status(), StatusCode::GONE);
+        let (_, value) = plugin(&bridge, "/api/studio/poll", json!({"sessionId":session})).await;
+        assert_eq!(value["commands"][0]["requestId"], id.as_str());
+        let (status, _) = plugin(
+            &bridge,
+            "/api/studio/result",
+            json!({"requestId":id,"sessionId":session,"result":{"ok":true}}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(second.await.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn poll_responses_are_capped_and_leave_the_rest_queued() {
+        let (_dir, bridge) = fixture();
+        let session = register(&bridge).await;
+        let padding = "x".repeat(5 * 1024 * 1024 / 2);
+        let mut pending = Vec::new();
+        for _ in 0..3 {
+            let mut command = command_future(
+                &bridge,
+                json!({"sessionId":session,"action":"tree","args":{"padding":padding}}),
+            );
+            assert!(poll!(&mut command).is_pending());
+            pending.push(command);
+        }
+        let (_, first) = plugin(&bridge, "/api/studio/poll", json!({"sessionId":session})).await;
+        assert_eq!(first["commands"].as_array().unwrap().len(), 2);
+        assert!(first.to_string().len() <= MAX_POLL_BYTES + 1024);
+        let (_, second) = plugin(&bridge, "/api/studio/poll", json!({"sessionId":session})).await;
+        assert_eq!(second["commands"].as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn pending_command_bytes_are_bounded_per_session() {
+        let (_dir, bridge) = fixture();
+        let session = register(&bridge).await;
+        let padding = "x".repeat(7 * 1024 * 1024);
+        let mut pending = Vec::new();
+        let mut rejected = None;
+        for _ in 0..10 {
+            let mut command = command_future(
+                &bridge,
+                json!({"sessionId":session,"action":"tree","args":{"padding":padding}}),
+            );
+            match poll!(&mut command) {
+                std::task::Poll::Pending => pending.push(command),
+                std::task::Poll::Ready(response) => {
+                    rejected = Some(response.status());
+                    break;
+                }
+            }
+        }
+        assert_eq!(pending.len(), 9);
+        assert_eq!(rejected, Some(StatusCode::TOO_MANY_REQUESTS));
+    }
+
+    #[tokio::test]
+    async fn commands_too_large_for_one_poll_are_rejected() {
+        let (_dir, bridge) = fixture();
+        let session = register(&bridge).await;
+        // Fits in a request body, but not in a poll response with its envelope.
+        let padding = "x".repeat(MAX_BODY - 1024);
+        let (status, _) = cli(
+            &bridge,
+            "/api/studio/command",
+            json!({"sessionId":session,"action":"tree","args":{"padding":padding}}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(bridge.state().pending.is_empty());
+    }
+
+    #[tokio::test]
+    async fn import_contents_are_validated_by_the_server() {
+        let (_dir, bridge) = fixture();
+        let session = register(&bridge).await;
+        let mut huge_header = b"<roblox!\x89\xff\r\n\x1a\n\0\0".to_vec();
+        huge_header.extend_from_slice(&[0xff; 8]);
+        huge_header.extend_from_slice(&[0; 8]);
+        let deep_xml = format!(
+            "<roblox version=\"4\">{}{}</roblox>",
+            "<Item class=\"Folder\">".repeat(100_000),
+            "</Item>".repeat(100_000)
+        );
+        for (args, expected) in [
+            (json!({"parent":"game/Workspace"}), "base64 model"),
+            (json!({"parent":"game/Workspace","model":"%%%"}), "base64"),
+            (
+                json!({"parent":"game/Workspace","model":data_encoding::BASE64.encode(b"junk")}),
+                "valid model",
+            ),
+            (
+                json!({"parent":"game/Workspace","model":model(&["Script"])}),
+                "scripts",
+            ),
+            (
+                json!({"parent":"game/Workspace","model":model(&["ModuleScript"]),"allowScripts":false}),
+                "scripts",
+            ),
+            (
+                json!({"parent":"game/Workspace","model":model(&["Workspace"])}),
+                "services",
+            ),
+            // A binary header declaring four billion types and instances, which
+            // would make the decoder abort the process allocating for them.
+            (
+                json!({"parent":"game/Workspace","model":data_encoding::BASE64.encode(&huge_header)}),
+                "too many instances",
+            ),
+            (
+                json!({"parent":"game/Workspace","model":data_encoding::BASE64.encode(deep_xml.as_bytes())}),
+                "levels deep",
+            ),
+        ] {
+            let (status, value) = cli(
+                &bridge,
+                "/api/studio/command",
+                json!({"sessionId":session,"action":"import","args":args}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+            assert!(
+                value["error"].as_str().unwrap().contains(expected),
+                "{value}"
+            );
+        }
+        assert!(bridge.state().pending.is_empty());
+        let mut accepted = command_future(
+            &bridge,
+            json!({"sessionId":session,"action":"import","args":{"parent":"game/Workspace","model":model(&["Script"]),"allowScripts":true}}),
+        );
+        assert!(poll!(&mut accepted).is_pending());
+    }
+
+    #[tokio::test]
+    async fn bounds_request_bodies_before_parsing() {
+        let response = read_json(Body::from(vec![b' '; MAX_BODY + 1]))
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn commits_on_the_same_branch_keep_identity_but_checkouts_do_not() {
+        let (dir, bridge) = git_fixture(GIT_LOCK_WAIT);
+        assert_eq!(sessions(&bridge).await, StatusCode::OK);
+        std::fs::write(dir.path().join("file.txt"), "one").unwrap();
+        git(dir.path(), &["add", "file.txt"]);
+        git(dir.path(), &["commit", "--quiet", "-m", "second"]);
+        assert_eq!(sessions(&bridge).await, StatusCode::OK);
+        git(
+            dir.path(),
+            &["commit", "--quiet", "--amend", "-m", "amended"],
+        );
+        assert_eq!(sessions(&bridge).await, StatusCode::OK);
+        git(dir.path(), &["checkout", "--quiet", "-b", "other"]);
+        assert_eq!(sessions(&bridge).await, StatusCode::CONFLICT);
+        git(dir.path(), &["checkout", "--quiet", "main"]);
+        assert_eq!(sessions(&bridge).await, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn reftable_checkouts_are_read_through_git() {
+        let dir = project_dir();
+        let init = Command::new("git")
+            .arg("-C")
+            .arg(dir.path())
+            .args([
+                "init",
+                "--quiet",
+                "--ref-format=reftable",
+                "--initial-branch=main",
+            ])
+            .output()
+            .unwrap();
+        if !init.status.success() {
+            eprintln!("Skipping: this Git does not support the reftable backend");
+            return;
+        }
+        git(dir.path(), &["add", "default.project.json"]);
+        git(dir.path(), &["commit", "--quiet", "-m", "initial"]);
+        let bridge = bridge_for(dir.path(), GIT_LOCK_WAIT);
+        assert!(bridge.git.as_ref().unwrap().reftable);
+        assert_eq!(sessions(&bridge).await, StatusCode::OK);
+        commit(dir.path(), "second");
+        tokio::time::sleep(GIT_OBSERVE_CACHE * 2).await;
+        assert_eq!(sessions(&bridge).await, StatusCode::OK);
+        git(dir.path(), &["checkout", "--quiet", "-b", "other"]);
+        tokio::time::sleep(GIT_OBSERVE_CACHE * 2).await;
+        assert_eq!(sessions(&bridge).await, StatusCode::CONFLICT);
+        git(dir.path(), &["checkout", "--quiet", "main"]);
+        tokio::time::sleep(GIT_OBSERVE_CACHE * 2).await;
+        assert_eq!(sessions(&bridge).await, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn rebases_in_progress_are_not_judged_until_they_finish() {
+        // A short lock wait, so the paused rebase stops holding requests.
+        let (dir, _) = git_fixture(Duration::from_millis(100));
+        git(dir.path(), &["checkout", "--quiet", "-b", "side"]);
+        std::fs::write(dir.path().join("shared.txt"), "side").unwrap();
+        git(dir.path(), &["add", "shared.txt"]);
+        git(dir.path(), &["commit", "--quiet", "-m", "side"]);
+        git(dir.path(), &["checkout", "--quiet", "main"]);
+        std::fs::write(dir.path().join("shared.txt"), "main").unwrap();
+        git(dir.path(), &["add", "shared.txt"]);
+        git(dir.path(), &["commit", "--quiet", "-m", "main"]);
+        git(dir.path(), &["checkout", "--quiet", "side"]);
+        let bridge = bridge_for(dir.path(), Duration::from_millis(100));
+        assert_eq!(sessions(&bridge).await, StatusCode::OK);
+
+        // The rebase stops on a conflict with HEAD detached.
+        let rebase = Command::new("git")
+            .arg("-C")
+            .arg(dir.path())
+            .args([
+                "-c",
+                "user.name=Rojo Test",
+                "-c",
+                "user.email=rojo@example.com",
+            ])
+            .args(["-c", "commit.gpgsign=false", "rebase", "main"])
+            .output()
+            .unwrap();
+        assert!(!rebase.status.success());
+        assert!(dir.path().join(".git/rebase-merge").is_dir());
+        assert_eq!(sessions(&bridge).await, StatusCode::OK);
+
+        // Aborting returns to the starting commit.
+        git(dir.path(), &["rebase", "--abort"]);
+        assert_eq!(sessions(&bridge).await, StatusCode::OK);
+
+        // A finished rebase onto new commits rewrites the branch.
+        git(dir.path(), &["rebase", "--quiet", "-X", "theirs", "main"]);
+        assert_eq!(sessions(&bridge).await, StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn refs_that_are_not_object_names_are_unknown() {
+        let (dir, bridge) = git_fixture(GIT_LOCK_WAIT);
+        let main = dir.path().join(".git/refs/heads/main");
+        assert!(bridge.identity_matches().await);
+        let contents = std::fs::read(&main).unwrap();
+        // Never passed to Git, where it would read as an option.
+        std::fs::write(&main, "--output=pwned").unwrap();
+        assert!(bridge.git.as_ref().unwrap().observe().is_err());
+        assert!(bridge.identity_matches().await);
+        std::fs::write(&main, contents).unwrap();
+        assert!(bridge.identity_matches().await);
+    }
+
+    #[tokio::test]
+    async fn detached_heads_may_only_advance_to_descendants() {
+        let dir = project_dir();
+        git(dir.path(), &["init", "--quiet", "--initial-branch=main"]);
+        git(dir.path(), &["add", "default.project.json"]);
+        git(dir.path(), &["commit", "--quiet", "-m", "initial"]);
+        std::fs::write(dir.path().join("file.txt"), "one").unwrap();
+        git(dir.path(), &["add", "file.txt"]);
+        git(dir.path(), &["commit", "--quiet", "-m", "second"]);
+        git(dir.path(), &["checkout", "--quiet", "--detach", "HEAD~1"]);
+        let bridge = bridge_for(dir.path(), GIT_LOCK_WAIT);
+        assert!(bridge.identity_matches().await);
+        git(dir.path(), &["checkout", "--quiet", "--detach", "main"]);
+        assert!(bridge.identity_matches().await);
+        git(
+            dir.path(),
+            &["checkout", "--quiet", "--orphan", "unrelated"],
+        );
+        git(dir.path(), &["commit", "--quiet", "-m", "unrelated"]);
+        git(
+            dir.path(),
+            &["checkout", "--quiet", "--detach", "unrelated"],
+        );
+        assert!(!bridge.identity_matches().await);
+    }
+
+    #[tokio::test]
+    async fn staging_pauses_sync_without_changing_identity() {
+        let (dir, bridge) = git_fixture(Duration::from_secs(5));
+        assert!(bridge.identity_matches().await);
+        let lock = dir.path().join(".git/index.lock");
+        std::fs::write(&lock, b"").unwrap();
+        assert!(bridge.git_busy().await);
+        assert!(bridge.identity_matches().await);
+        let waiting = tokio::spawn({
+            let bridge = bridge.clone();
+            async move { bridge.wait_for_git().await }
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!waiting.is_finished());
+        std::fs::remove_file(&lock).unwrap();
+        waiting.await.unwrap();
+        assert!(bridge.identity_matches().await);
+        std::fs::write(dir.path().join(".git/HEAD"), b"ref: refs/heads/other\n").unwrap();
+        assert!(!bridge.identity_matches().await);
+    }
+
+    #[tokio::test]
+    async fn stale_index_locks_stop_blocking_after_the_bound() {
+        let lock_wait = Duration::from_millis(300);
+        let (dir, bridge) = git_fixture(lock_wait);
+        let lock = dir.path().join(".git/index.lock");
+        let file = std::fs::File::create(&lock).unwrap();
+        file.set_modified(SystemTime::now() - Duration::from_secs(60))
+            .unwrap();
+        let started = Instant::now();
+        tokio::time::timeout(Duration::from_secs(5), bridge.wait_for_git())
+            .await
+            .expect("a stale index.lock must not block indefinitely");
+        assert!(started.elapsed() >= lock_wait);
+        // The same stale lock does not delay later requests again.
+        let started = Instant::now();
+        bridge.wait_for_git().await;
+        assert!(started.elapsed() < lock_wait);
+        assert_eq!(sessions(&bridge).await, StatusCode::OK);
+        // A new Git transaction is waited on again.
+        file.set_modified(SystemTime::now()).unwrap();
+        assert!(bridge.git_busy().await);
+    }
+
+    fn commit(dir: &Path, name: &str) {
+        let file = format!("{name}.txt");
+        std::fs::write(dir.join(&file), name).unwrap();
+        git(dir, &["add", &file]);
+        git(dir, &["commit", "--quiet", "-m", name]);
+    }
+
+    #[tokio::test]
+    async fn rewriting_the_starting_branch_changes_identity() {
+        let (dir, bridge) = git_fixture(GIT_LOCK_WAIT);
+        let dir = dir.path();
+        git(dir, &["branch", "base"]);
+        git(dir, &["checkout", "--quiet", "--orphan", "unrelated"]);
+        commit(dir, "unrelated");
+        git(dir, &["checkout", "--quiet", "main"]);
+        commit(dir, "second");
+        git(dir, &["tag", "second"]);
+        assert!(bridge.identity_matches().await);
+
+        // reset --hard to an unrelated commit keeps HEAD's text unchanged.
+        git(dir, &["reset", "--quiet", "--hard", "unrelated"]);
+        assert_eq!(sessions(&bridge).await, StatusCode::CONFLICT);
+        git(dir, &["reset", "--quiet", "--hard", "second"]);
+        assert_eq!(sessions(&bridge).await, StatusCode::OK);
+
+        // Resetting backwards also abandons history the place was synced from.
+        git(dir, &["checkout", "--quiet", "-B", "main", "base"]);
+        assert_eq!(sessions(&bridge).await, StatusCode::CONFLICT);
+        git(dir, &["checkout", "--quiet", "-B", "main", "second"]);
+        assert_eq!(sessions(&bridge).await, StatusCode::OK);
+
+        // Moving the branch from elsewhere (as a forced pull would) is caught.
+        git(dir, &["checkout", "--quiet", "--detach"]);
+        git(dir, &["branch", "--force", "main", "unrelated"]);
+        git(dir, &["checkout", "--quiet", "main"]);
+        assert_eq!(sessions(&bridge).await, StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn merges_and_amends_continue_packed_branches() {
+        let (dir, bridge) = git_fixture(GIT_LOCK_WAIT);
+        let dir = dir.path();
+        commit(dir, "second");
+        // Packed refs have no loose ref file to read.
+        git(dir, &["pack-refs", "--all"]);
+        assert!(!dir.join(".git/refs/heads/main").exists());
+        assert!(bridge.identity_matches().await);
+        git(dir, &["checkout", "--quiet", "-b", "feature"]);
+        commit(dir, "feature");
+        git(dir, &["checkout", "--quiet", "main"]);
+        commit(dir, "third");
+        git(dir, &["merge", "--quiet", "--no-edit", "feature"]);
+        assert!(bridge.identity_matches().await);
+        git(
+            dir,
+            &["commit", "--quiet", "--amend", "-m", "amended merge"],
+        );
+        assert!(bridge.identity_matches().await);
+        git(dir, &["pack-refs", "--all"]);
+        assert!(bridge.identity_matches().await);
+    }
+
+    #[tokio::test]
+    async fn unreadable_heads_are_unknown_rather_than_a_branch_change() {
+        let (dir, bridge) = git_fixture(GIT_LOCK_WAIT);
+        let head = dir.path().join(".git/HEAD");
+        let contents = std::fs::read(&head).unwrap();
+        // Reading a directory fails with an error other than NotFound.
+        std::fs::remove_file(&head).unwrap();
+        std::fs::create_dir(&head).unwrap();
+        assert!(bridge.identity_matches().await);
+        std::fs::remove_dir(&head).unwrap();
+        std::fs::write(&head, contents).unwrap();
+        assert!(bridge.identity_matches().await);
+        std::fs::write(&head, b"ref: refs/heads/other\n").unwrap();
+        assert!(!bridge.identity_matches().await);
+    }
+
+    #[tokio::test]
+    async fn released_locks_settle_before_identity_is_trusted() {
+        let (dir, bridge) = git_fixture(GIT_LOCK_WAIT);
+        let head_lock = dir.path().join(".git/HEAD.lock");
+        std::fs::write(&head_lock, b"").unwrap();
+        assert!(bridge.git_busy().await);
+        std::fs::remove_file(&head_lock).unwrap();
+        // Git may still be about to replace HEAD.
+        assert!(bridge.git_busy().await);
+        let started = Instant::now();
+        bridge.wait_for_git().await;
+        assert!(started.elapsed() >= GIT_LOCK_SETTLE / 2);
+        assert!(!bridge.git_busy().await);
+    }
+
+    #[tokio::test]
+    async fn the_least_recently_seen_session_is_evicted_at_the_cap() {
+        let (_dir, bridge) = fixture();
+        let mut sessions = Vec::new();
+        for _ in 0..MAX_SESSIONS {
+            sessions.push(register(&bridge).await);
+        }
+        // The first session stopped polling a while ago.
+        bridge
+            .state()
+            .sessions
+            .get_mut(&sessions[0])
+            .unwrap()
+            .last_seen = Instant::now() - Duration::from_secs(10);
+        let newest = register(&bridge).await;
+        {
+            let state = bridge.state();
+            assert_eq!(state.sessions.len(), MAX_SESSIONS);
+            assert!(!state.sessions.contains_key(&sessions[0]));
+            assert!(state.sessions.contains_key(&newest));
+        }
+        let (status, _) = plugin(
+            &bridge,
+            "/api/studio/poll",
+            json!({"sessionId":sessions[0]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn a_cancel_that_arrives_before_queueing_stops_the_command() {
+        let (_dir, bridge) = fixture();
+        let session = register(&bridge).await;
+        let other = register(&bridge).await;
+        let id = Uuid::new_v4().to_string();
+        // The command is still waiting for Git or its import check.
+        let (status, _) = cli(
+            &bridge,
+            "/api/studio/cancel",
+            json!({"sessionId":session,"requestId":id}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        // Another session's command with the same ID is unaffected.
+        let mut unrelated = command_future(
+            &bridge,
+            json!({"sessionId":other,"action":"status","requestId":id}),
+        );
+        assert!(poll!(&mut unrelated).is_pending());
+        drop(unrelated);
+        let (status, value) = cli(
+            &bridge,
+            "/api/studio/command",
+            json!({"sessionId":session,"action":"status","requestId":id}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::GONE, "{value}");
+        assert_eq!(value["cancelled"], true);
+        assert!(bridge
+            .state()
+            .pending
+            .values()
+            .all(|pending| pending.session != session));
+        // The cancellation is used up, so the ID can be retried.
+        let mut retry = command_future(
+            &bridge,
+            json!({"sessionId":session,"action":"status","requestId":id}),
+        );
+        assert!(poll!(&mut retry).is_pending());
+    }
+
+    #[tokio::test]
+    async fn imports_for_unknown_sessions_fail_before_their_check() {
+        let (_dir, bridge) = fixture();
+        let (status, value) = cli(
+            &bridge,
+            "/api/studio/command",
+            json!({"sessionId":Uuid::new_v4().to_string(),"action":"import","args":{"parent":"game/Workspace","model":"not base64"}}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{value}");
+    }
+
+    #[tokio::test]
+    async fn a_checkout_unreadable_at_startup_is_adopted_on_first_read() {
+        let (dir, mut bridge) = git_fixture(GIT_LOCK_WAIT);
+        // As if the startup read had failed.
+        let watch = Arc::get_mut(&mut bridge)
+            .unwrap()
+            .git
+            .as_mut()
+            .and_then(Arc::get_mut)
+            .unwrap();
+        watch.initial_head = OnceLock::new();
+        *lock(&watch.accepted_tip) = None;
+        *lock(&watch.verdict) = None;
+        assert_eq!(sessions(&bridge).await, StatusCode::OK);
+        git(dir.path(), &["checkout", "--quiet", "-b", "other"]);
+        assert_eq!(sessions(&bridge).await, StatusCode::CONFLICT);
+        git(dir.path(), &["checkout", "--quiet", "main"]);
+        assert_eq!(sessions(&bridge).await, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn sessions_report_registration_time_and_activity() {
+        let (_dir, bridge) = fixture();
+        let session = register(&bridge).await;
+        let request = request("GET", "/api/studio/sessions", &bridge.token, None);
+        let (_, value) =
+            into_value(bridge.clone().call(PEER.parse().unwrap(), request).await).await;
+        let listed = &value["sessions"][0];
+        assert_eq!(listed["sessionId"], session.as_str());
+        assert!(listed["registeredAt"].as_u64().unwrap() > 0);
+        assert!(listed["lastSeenMs"].is_u64());
+    }
+
+    #[tokio::test]
+    async fn session_ids_are_canonicalized() {
+        let (_dir, bridge) = fixture();
+        let session = Uuid::new_v4();
+        let upper = session.hyphenated().to_string().to_uppercase();
+        let (status, value) = plugin(
+            &bridge,
+            "/api/studio/register",
+            json!({"sessionId":upper,"description":{"placeName":"test"}}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(value["sessionId"], session.hyphenated().to_string());
+        let simple = session.simple().to_string();
+        let mut pending = command_future(&bridge, json!({"sessionId":simple,"action":"status"}));
+        assert!(poll!(&mut pending).is_pending());
+        let braced = session.braced().to_string();
+        let (_, value) = plugin(&bridge, "/api/studio/poll", json!({"sessionId":braced})).await;
+        let id = value["commands"][0]["requestId"].as_str().unwrap();
+        let (status, _) = plugin(
+            &bridge,
+            "/api/studio/result",
+            json!({"requestId":id,"sessionId":upper,"result":{"ok":true}}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(pending.await.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn packed_refs_are_resolved() {
+        let packed = "# pack-refs with: peeled fully-peeled sorted\n\
+                      1111111111111111111111111111111111111111 refs/heads/main\n\
+                      2222222222222222222222222222222222222222 refs/tags/v1\n\
+                      ^3333333333333333333333333333333333333333\n";
+        assert_eq!(
+            packed_ref(packed, "refs/heads/main").as_deref(),
+            Some("1111111111111111111111111111111111111111")
+        );
+        assert_eq!(packed_ref(packed, "refs/heads/other"), None);
+    }
+
+    // `/proc/net/tcp` prints address words in host byte order, so this sample
+    // is what a little-endian kernel prints.
+    #[cfg(target_endian = "little")]
+    #[test]
+    fn proc_net_tcp_owners_are_matched_by_both_endpoints() {
+        let listing = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n\
+           0: 0100007F:8828 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 1 1\n\
+           1: 0100007F:D431 0100007F:8828 01 00000000:00000000 00:00000000 00000000  1001        0 2 1\n\
+           2: 0100007F:8828 0100007F:D431 01 00000000:00000000 00:00000000 00000000  1000        0 3 1\n";
+        let server: SocketAddr = "127.0.0.1:34856".parse().unwrap();
+        let peer: SocketAddr = "127.0.0.1:54321".parse().unwrap();
+        assert_eq!(socket_owner(listing, peer, server), Some(1001));
+        assert_eq!(socket_owner(listing, server, peer), Some(1000));
+        let other: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        assert_eq!(socket_owner(listing, other, server), None);
+
+        let listing6 = "  sl  local_address                         remote_address                        st\n\
+           0: 0000000000000000FFFF00000100007F:D431 0000000000000000FFFF00000100007F:8828 01 00000000:00000000 00:00000000 00000000  1002        0 4 1\n\
+           1: 00000000000000000000000001000000:D432 00000000000000000000000001000000:8828 01 00000000:00000000 00:00000000 00000000  1003        0 5 1\n";
+        // An IPv4 client of a dual-stack socket appears as an IPv4-mapped peer.
+        assert_eq!(socket_owner(listing6, peer, server), Some(1002));
+        let peer6: SocketAddr = "[::1]:54322".parse().unwrap();
+        let server6: SocketAddr = "[::1]:34856".parse().unwrap();
+        assert_eq!(socket_owner(listing6, peer6, server6), Some(1003));
+    }
+}

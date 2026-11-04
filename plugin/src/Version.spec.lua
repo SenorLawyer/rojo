@@ -1,6 +1,43 @@
 return function()
 	local Version = require(script.Parent.Version)
 	local Settings = require(script.Parent.Settings)
+	local Http = require(script.Parent.Parent.Packages.Http)
+	local Promise = require(script.Parent.Parent.Packages.Promise)
+
+	it("checks this repository and refreshes releases when prerelease preferences change", function()
+		local originalGet = Http.get
+		local originalCache = Version._cachedLatestCompatible
+		local originalBlocked = Version._apiBlocked
+		local calls = 0
+		Http.get = function(url)
+			assert(
+				url == "https://api.github.com/repos/SenorLawyer/rojo/releases?per_page=10",
+				"Update check must use this repository"
+			)
+			calls += 1
+			return Promise.resolve({
+				code = 200,
+				body = Http.jsonEncode({
+					{ tag_name = "v8.1.0-dev.1", prerelease = true, published_at = "2026-11-04T00:00:00Z" },
+					{ tag_name = "v8.0.1", prerelease = false, published_at = "2026-11-03T00:00:00Z" },
+				}),
+			})
+		end
+		Version._cachedLatestCompatible = nil
+		local ok, err = pcall(function()
+			local stable = Version.retrieveLatestCompatible({ version = { 8, 0, 0 }, includePrereleases = false })
+			expect(Version.display(stable.version)).to.equal("8.0.1")
+			Version.retrieveLatestCompatible({ version = { 8, 0, 0 }, includePrereleases = false })
+			expect(calls).to.equal(1)
+			local preview = Version.retrieveLatestCompatible({ version = { 8, 0, 0 }, includePrereleases = true })
+			expect(Version.display(preview.version)).to.equal("8.1.0-dev.1")
+			expect(calls).to.equal(2)
+		end)
+		Http.get = originalGet
+		Version._cachedLatestCompatible = originalCache
+		Version._apiBlocked = originalBlocked
+		assert(ok, err)
+	end)
 
 	describe("cached update state", function()
 		local originalRetrieve
@@ -42,9 +79,6 @@ return function()
 	end)
 
 	describe("retrieveLatestCompatible cache", function()
-		local Packages = script.Parent.Parent.Packages
-		local Http = require(Packages.Http)
-		local Promise = require(Packages.Promise)
 		local originalGet
 		local originalCache
 		local originalBlocked

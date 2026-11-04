@@ -3,7 +3,11 @@ use std::{env, panic, process};
 use backtrace::Backtrace;
 use clap::Parser;
 
-use librojo::cli::Options;
+use librojo::{cli::Options, memory_cap::CappedAllocator};
+
+// Uncapped unless this process is checking an untrusted model.
+#[global_allocator]
+static ALLOCATOR: CappedAllocator = CappedAllocator;
 
 fn main() {
     #[cfg(feature = "profile-with-tracy")]

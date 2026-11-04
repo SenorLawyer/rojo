@@ -148,16 +148,19 @@ function Setting:render()
 			}),
 
 			Text = e("Frame", {
-				Size = UDim2.new(1, 0, 1, 0),
+				Size = self.inputSize:map(function(value)
+					return UDim2.new(1, -value.X - 10, 1, 0)
+				end),
 				BackgroundTransparency = 1,
 			}, {
 				Heading = e("Frame", {
-					Size = UDim2.new(1, 0, 0, theme.TextSize.Medium),
+					Size = UDim2.new(1, 0, 0, 0),
+					AutomaticSize = Enum.AutomaticSize.Y,
 					BackgroundTransparency = 1,
 				}, {
 					Layout = e("UIListLayout", {
 						VerticalAlignment = Enum.VerticalAlignment.Center,
-						FillDirection = Enum.FillDirection.Horizontal,
+						FillDirection = Enum.FillDirection.Vertical,
 						SortOrder = Enum.SortOrder.LayoutOrder,
 						Padding = UDim.new(0, 5),
 					}),
@@ -180,8 +183,10 @@ function Setting:render()
 						TextXAlignment = Enum.TextXAlignment.Left,
 						TextTransparency = self.props.transparency,
 						RichText = true,
+						TextWrapped = true,
+						AutomaticSize = Enum.AutomaticSize.Y,
 
-						Size = UDim2.new(1, 0, 0, theme.TextSize.Medium),
+						Size = UDim2.new(1, 0, 0, 0),
 
 						LayoutOrder = 2,
 						BackgroundTransparency = 1,
@@ -203,15 +208,15 @@ function Setting:render()
 						containerSize = self.containerSize,
 						inputSize = self.inputSize,
 					}):map(function(values)
-						local offset = values.inputSize.X + 5
+						local offset = values.inputSize.X + 10
 						local textBounds = getTextBoundsWithLineHeight(
 							self.props.description,
 							theme.Font.Main,
 							theme.TextSize.Body,
-							values.containerSize.X - offset,
+							math.max(1, values.containerSize.X - offset),
 							1.2
 						)
-						return UDim2.new(1, -offset, 0, textBounds.Y)
+						return UDim2.new(1, 0, 0, textBounds.Y)
 					end),
 
 					LayoutOrder = 3,

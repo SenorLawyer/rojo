@@ -20,6 +20,7 @@ local strict = require(Plugin.strict)
 local Dictionary = require(Plugin.Dictionary)
 local ServeSession = require(Plugin.ServeSession)
 local ApiContext = require(Plugin.ApiContext)
+local AgentControl = require(Plugin.AgentControl)
 local PatchSet = require(Plugin.PatchSet)
 local PatchTree = require(Plugin.PatchTree)
 local preloadAssets = require(Plugin.preloadAssets)
@@ -139,6 +140,7 @@ function App:init()
 		toolbarIcon = Assets.Images.PluginButton,
 	})
 
+	self.agentController = AgentControl.mount(self)
 	if RunService:IsEdit() then
 		self:checkForUpdates()
 
@@ -178,6 +180,9 @@ end
 function App:willUnmount()
 	self.__unmounted = true
 	self:endSession()
+	if self.agentController then
+		self.agentController:Destroy()
+	end
 
 	self.waypointConnection:Disconnect()
 	self.confirmationBindable:Destroy()
@@ -672,9 +677,20 @@ function App:startSession()
 	if self.serveSession ~= nil or self.__unmounted then
 		return
 	end
+	if not AgentControl.tryClaim(self) then
+		self:setState({
+			appStatus = AppStatus.Error,
+			errorMessage = "Disconnect the active Rojo controller before switching versions",
+			toolbarIcon = Assets.Images.PluginButtonWarning,
+		})
+		return
+	end
 
 	local claimedLock, priorOwner = self:claimSyncLock()
 	if not claimedLock then
+		if self.agentController then
+			self.agentController:SetAttribute("SyncActive", false)
+		end
 		local msg = string.format("Could not sync because user '%s' is already syncing", tostring(priorOwner))
 
 		Log.warn(msg)
@@ -696,14 +712,31 @@ function App:startSession()
 	local baseUrl = if string.find(host, "^https?://")
 		then string.format("%s:%s", host, port)
 		else string.format("http://%s:%s", host, port)
-	local apiContext = ApiContext.new(baseUrl)
-
-	local serveSession = ServeSession.new({
-		apiContext = apiContext,
-		twoWaySync = Settings:get("twoWaySync"),
-	})
+	local created, serveSession = pcall(function()
+		return ServeSession.new({
+			apiContext = ApiContext.new(baseUrl),
+			twoWaySync = Settings:get("twoWaySync"),
+		})
+	end)
+	if not created then
+		-- Release the claims taken above, or other plugin versions stay
+		-- blocked until Studio reloads.
+		if self.agentController then
+			self.agentController:SetAttribute("SyncActive", false)
+		end
+		self:releaseSyncLock()
+		self:setState({
+			appStatus = AppStatus.Error,
+			errorMessage = tostring(serveSession),
+			toolbarIcon = Assets.Images.PluginButtonWarning,
+		})
+		return
+	end
 	-- Publish ownership before start(), which can notify listeners immediately.
 	self.serveSession = serveSession
+	if self.agentController then
+		self.agentController:SetAttribute("SyncActive", true)
+	end
 
 	serveSession:setUpdateLoadingTextCallback(function(text: string)
 		self:setState({
@@ -779,10 +812,16 @@ function App:startSession()
 			})
 		elseif status == ServeSession.Status.Disconnected then
 			self.serveSession = nil
+			self.agentConfirmation = nil
+			if self.agentController then
+				self.agentController:SetAttribute("SyncActive", false)
+			end
 			-- A session can stop on its own while the Confirming page is open,
 			-- for example when the place ID changes. Wake the confirmation so
 			-- its thread observes the stopped session instead of waiting for
-			-- the next session's answer. Firing with no waiter does nothing.
+			-- the next session's answer. Agent answers arrive through the same
+			-- event, so this also ends a confirmation an agent was asked for.
+			-- Firing with no waiter does nothing.
 			self.confirmationBindable:Fire("Abort")
 			self:releaseSyncLock()
 			self:clearRunningConnectionInfo()
@@ -904,7 +943,10 @@ function App:startSession()
 			timeout = 7,
 		})
 
-		return self:onConfirmationAnswered(serveSession, self.confirmationEvent:Wait())
+		self.agentConfirmation = AgentControl.confirmation(patch, serverInfo.projectName)
+		local decision = self.confirmationEvent:Wait()
+		self.agentConfirmation = nil
+		return self:onConfirmationAnswered(serveSession, decision)
 	end)
 
 	serveSession:start()

@@ -240,6 +240,31 @@ function SettingsPage:render()
 				layoutOrder = layoutIncrement(),
 			}),
 
+			AgentControlEnabled = e(Setting, {
+				id = "agentControlEnabled",
+				name = "Agent Control",
+				description = "Let other plugins, the command bar and Studio MCP tools connect, disconnect and change settings through Rojo's controller",
+				transparency = self.props.transparency,
+				layoutOrder = layoutIncrement(),
+			}),
+
+			AgentControlCanChangeConfirmation = e(Setting, {
+				id = "agentControlCanChangeConfirmation",
+				name = "Agent Can Skip Confirmation",
+				description = "Allow agent control to accept or reject sync confirmations, loosen Confirmation Behavior, raise the confirmation threshold and turn on Two-Way Sync",
+				transparency = self.props.transparency,
+				layoutOrder = layoutIncrement(),
+				visible = Settings:getBinding("agentControlEnabled"),
+			}),
+
+			StudioBridgeAutoEnable = e(Setting, {
+				id = "studioBridgeAutoEnable",
+				name = "Auto Enable Studio Bridge",
+				description = "Start the agent Studio bridge when the connected server offers one. When off, it only starts after an explicit agent retry.",
+				transparency = self.props.transparency,
+				layoutOrder = layoutIncrement(),
+			}),
+
 			LogLevel = e(Setting, {
 				id = "logLevel",
 				name = "Log Level",

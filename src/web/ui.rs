@@ -55,7 +55,7 @@ impl UiService {
     fn handle_home(&self) -> Response<Body> {
         let page = self.normal_page(html! {
             <div class="button-list">
-                { Self::button("Rojo Documentation", "https://rojo.space/docs") }
+                { Self::button("Rojo Documentation", "https://github.com/SenorLawyer/rojo/tree/master/docs") }
                 { Self::button("View instance tree state", "/show-instances") }
             </div>
         });

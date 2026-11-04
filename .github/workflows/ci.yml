@@ -6,12 +6,12 @@ on:
     - master
 
   pull_request:
-    branches:
-    - master
 
 concurrency:
   group: ci-${{ github.ref }}
-  # Superseded PR runs are wasted work, but every push to master must finish.
+  # Superseded PR runs are wasted work, so they are cancelled. Runs for master
+  # are not cancelled once started, but GitHub still drops a pending run when
+  # a newer one queues behind it, so a release may need CI re-run on its commit.
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
@@ -38,7 +38,9 @@ jobs:
     - name: Install Rust
       uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
       with:
-        toolchain: stable
+        # Pinned so lints and release builds match. Keep in sync with
+        # release.yml.
+        toolchain: 1.99.1
 
     - name: Restore Rust Cache
       uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
@@ -48,6 +50,7 @@ jobs:
           ~/.cargo/git
           target
         key: ${{ matrix.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: ${{ matrix.os }}-cargo-
 
     - name: Build and test
       run: cargo test --workspace --locked --verbose ${{ matrix.os == 'windows-latest' && '--release' || '' }}
@@ -62,6 +65,26 @@ jobs:
         python -m pip install msgpack==1.2.4
         python scripts/watcher-smoke.py target/release/rojo.exe
 
+    - name: Cache pinned semantic merge engine
+      if: matrix.os == 'windows-latest'
+      uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+      with:
+        path: ${{ runner.temp }}/rbx-merge-d6375bde1bdc1f08437324ebfbd6bfcc655e90d0
+        key: Windows-x64-rbx-merge-d6375bde1bdc1f08437324ebfbd6bfcc655e90d0
+
+    - name: Test semantic merges and linked worktree Git drivers
+      if: matrix.os == 'windows-latest'
+      shell: pwsh
+      run: |
+        $engineRoot = Join-Path $env:RUNNER_TEMP 'rbx-merge-d6375bde1bdc1f08437324ebfbd6bfcc655e90d0'
+        $engine = Join-Path $engineRoot 'bin/rbx-merge.exe'
+        if (-not (Test-Path -LiteralPath $engine)) {
+          & .\target\release\rojo.exe merge install-engine --root $engineRoot
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        }
+        $env:ROJO_TEST_RBX_MERGE = $engine
+        cargo test --release --locked --test merge_backend -- --ignored
+
     - name: Upload Windows CLI and Studio plugin
       if: matrix.os == 'windows-latest'
       uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -71,7 +94,7 @@ jobs:
           target/release/rojo.exe
           artifacts/RojoManagedPlugin.rbxm
           LICENSE.txt
-          FORK.md
+          DEVELOPMENT.md
 
     - name: Save Rust Cache
       uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
@@ -105,6 +128,7 @@ jobs:
           ~/.cargo/git
           target
         key: ${{ runner.os }}-${{ github.job }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: ${{ runner.os }}-${{ github.job }}-cargo-
 
     - name: Build
       run: cargo build --locked --verbose
@@ -131,7 +155,9 @@ jobs:
     - name: Install Rust
       uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
       with:
-        toolchain: stable
+        # Pinned so lints and release builds match. Keep in sync with
+        # release.yml.
+        toolchain: 1.99.1
         components: rustfmt, clippy
 
     - name: Restore Rust Cache
@@ -142,6 +168,7 @@ jobs:
           ~/.cargo/git
           target
         key: ${{ runner.os }}-${{ github.job }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: ${{ runner.os }}-${{ github.job }}-cargo-
 
     - name: Setup Rokit
       uses: CompeyDev/setup-rokit@d49be92bd9502180218c3f43e7988faa945217b0 # v0.1.2
@@ -149,10 +176,10 @@ jobs:
         version: 'v1.1.0'
 
     - name: Stylua
-      run: stylua --check plugin/src
+      run: stylua --check plugin/src plugin/http plugin/log plugin/fmt plugin/run-tests.server.lua
 
     - name: Selene
-      run: selene plugin/src
+      run: selene plugin/src plugin/http plugin/log plugin/fmt plugin/run-tests.server.lua
 
     - name: Rustfmt
       run: cargo fmt -- --check

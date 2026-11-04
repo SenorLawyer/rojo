@@ -130,7 +130,7 @@
 | [885](https://github.com/rojo-rbx/rojo/issues/885) | Add support for passing authorization data through the studio plugin | Proposal or workflow change. Not implemented in this fork. |
 | [876](https://github.com/rojo-rbx/rojo/issues/876) | Default project does not build/sync correctly | Open report. No verified fix for this individual reproduction. |
 | [874](https://github.com/rojo-rbx/rojo/issues/874) | Plugin doesn't report `Workspace.PlayerCharacterDestroyBehavior` failing to be set | Open report. No verified fix for this individual reproduction. |
-| [860](https://github.com/rojo-rbx/rojo/issues/860) | Add documentation about how to set up and use Tracy to CONTRIBUTING.md | Added fork profiling instructions in FORK.md. |
+| [860](https://github.com/rojo-rbx/rojo/issues/860) | Add documentation about how to set up and use Tracy to CONTRIBUTING.md | Added fork profiling instructions in DEVELOPMENT.md. |
 | [812](https://github.com/rojo-rbx/rojo/issues/812) | Full managed rojo workflow tutorial | Proposal or workflow change. Not implemented in this fork. |
 | [791](https://github.com/rojo-rbx/rojo/issues/791) | Support gradual adoption of RunContext for individual scripts | Proposal or workflow change. Not implemented in this fork. |
 | [789](https://github.com/rojo-rbx/rojo/issues/789) | Adding a more human-accessible representation of a BinaryString is breaking | Open format/engine issue. Needs a round trip with the reported asset or property. |

@@ -28,7 +28,7 @@ pub(crate) const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const PROTOCOL_VERSION: u64 = 5;
 
 /// Message returned by Rojo API when a change has occurred.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SubscribeMessage<'a> {
     pub removed: Vec<Ref>,
@@ -37,13 +37,79 @@ pub struct SubscribeMessage<'a> {
 }
 
 impl<'a> SubscribeMessage<'a> {
+    pub(crate) fn into_owned(self) -> SubscribeMessage<'static> {
+        SubscribeMessage {
+            removed: self.removed,
+            added: self
+                .added
+                .into_iter()
+                .map(|(id, instance)| {
+                    (
+                        id,
+                        Instance {
+                            id: instance.id,
+                            parent: instance.parent,
+                            name: Cow::Owned(instance.name.into_owned()),
+                            class_name: instance.class_name,
+                            properties: instance
+                                .properties
+                                .into_iter()
+                                .map(|(name, value)| (name, Cow::Owned(value.into_owned())))
+                                .collect(),
+                            children: Cow::Owned(instance.children.into_owned()),
+                            metadata: instance.metadata,
+                        },
+                    )
+                })
+                .collect(),
+            updated: self.updated,
+        }
+    }
+
+    /// Estimates the memory this message keeps alive. Only the parts that can
+    /// grow large, such as script sources, are measured precisely.
+    pub(crate) fn approximate_size(&self) -> usize {
+        let removed = self.removed.len() * std::mem::size_of::<Ref>();
+        let added: usize = self
+            .added
+            .values()
+            .map(|instance| {
+                std::mem::size_of_val(instance)
+                    + instance.name.len()
+                    + instance.children.len() * std::mem::size_of::<Ref>()
+                    + instance
+                        .properties
+                        .values()
+                        .map(|value| approximate_variant_size(value))
+                        .sum::<usize>()
+            })
+            .sum();
+        let updated: usize = self
+            .updated
+            .iter()
+            .map(|update| {
+                std::mem::size_of_val(update)
+                    + update.changed_name.as_ref().map_or(0, String::len)
+                    + update
+                        .changed_properties
+                        .values()
+                        .map(|value| value.as_ref().map_or(0, approximate_variant_size))
+                        .sum::<usize>()
+            })
+            .sum();
+        std::mem::size_of_val(self) + removed + added + updated
+    }
+
     /// Whether this message has no changes for the plugin to apply.
     pub(crate) fn is_empty(&self) -> bool {
         self.removed.is_empty() && self.added.is_empty() && self.updated.is_empty()
     }
 
     /// Converts a single applied patch into a message using the current tree.
-    #[cfg(test)]
+    ///
+    /// The change processor calls this right after applying the patch while
+    /// still holding the tree lock, so the tree normally matches the patch
+    /// exactly. It still never fails: see [`Self::from_patch_updates`].
     pub(crate) fn from_patch_update(tree: &'a RojoTree, patch: AppliedPatchSet) -> Self {
         Self::from_patch_updates(tree, std::iter::once(patch))
             .pop()
@@ -166,7 +232,24 @@ impl<'a> SubscribeMessage<'a> {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+/// Estimates the memory a property value keeps alive, counting the contents
+/// of variable-length values.
+pub(crate) fn approximate_variant_size(value: &Variant) -> usize {
+    let contents = match value {
+        Variant::String(value) => value.len(),
+        Variant::BinaryString(value) => AsRef::<[u8]>::as_ref(value).len(),
+        Variant::SharedString(value) => value.data().len(),
+        Variant::Tags(tags) => tags.iter().map(str::len).sum(),
+        Variant::Attributes(attributes) => attributes
+            .iter()
+            .map(|(name, value)| name.len() + approximate_variant_size(value))
+            .sum(),
+        _ => 0,
+    };
+    std::mem::size_of::<Variant>() + contents
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct InstanceUpdate {
     pub id: Ref,
@@ -180,7 +263,7 @@ pub struct InstanceUpdate {
     pub changed_metadata: Option<InstanceMetadata>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct InstanceMetadata {
     pub ignore_unknown_instances: bool,
@@ -194,7 +277,7 @@ impl InstanceMetadata {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct Instance<'a> {
     pub id: Ref,
@@ -239,6 +322,8 @@ fn property_filter(value: Option<&Variant>) -> bool {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ServerInfoResponse {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub studio_bridge: Option<serde_json::Value>,
     pub session_id: SessionId,
     pub server_version: String,
     pub protocol_version: u64,

@@ -1,16 +1,17 @@
 [package]
 name = "rojo"
-version = "7.7.2-fork.1"
+version = "8.0.0-dev.5"
 rust-version = "1.88"
 authors = [
+    "SenorLawyer",
     "Lucien Greathouse <me@lpghatguy.com>",
     "Micah Reid <git@dekkonot.com>",
     "Ken Loeffler <kenloef@gmail.com>",
 ]
-description = "Enables professional-grade development tools for Roblox developers"
+description = "Filesystem tools, workspaces and Studio automation for Roblox developers"
 license = "MPL-2.0"
-homepage = "https://rojo.space"
-documentation = "https://rojo.space/docs"
+homepage = "https://github.com/SenorLawyer/rojo"
+documentation = "https://github.com/SenorLawyer/rojo/tree/master/docs"
 repository = "https://github.com/SenorLawyer/rojo"
 readme = "README.md"
 edition = "2021"
@@ -31,7 +32,7 @@ default = []
 dev_live_assets = []
 
 # Run Rojo with this feature to open a Tracy session.
-# Match the Tracy UI to tracy-client-sys in Cargo.lock (see FORK.md).
+# Match the Tracy UI to tracy-client-sys in Cargo.lock (see DEVELOPMENT.md).
 profile-with-tracy = ["profiling/profile-with-tracy"]
 
 [workspace]
@@ -79,6 +80,9 @@ hyper = { version = "0.14.28", features = ["server", "tcp", "http1"] }
 hyper-tungstenite = "0.11.0"
 jod-thread = "0.1.2"
 log = "0.4.21"
+# Already used by rbx_binary. Untrusted models are decompressed to check the
+# sizes they declare before rbx_binary allocates for them.
+lz4_flex = "0.13.1"
 num_cpus = "1.16.0"
 opener = "0.5.2"
 rayon = "1.9.0"
@@ -103,6 +107,7 @@ profiling = "1.0.15"
 yaml-rust2 = "0.10.3"
 data-encoding = "2.8.0"
 pathdiff = "0.2.3"
+zstd = "0.13.2"
 
 blake3 = "1.5.0"
 float-cmp = "0.9.0"

@@ -10,9 +10,13 @@ return function()
 	local originalGetUpdateMessage = Version.getUpdateMessage
 	local created
 	local failOnStart
+	local controllers
 
 	local function fakeApp()
+		local controller = Instance.new("BindableFunction")
+		controller.Parent = controllers
 		return {
+			agentController = controller,
 			knownProjects = {},
 			claimSyncLock = function()
 				return true
@@ -29,6 +33,7 @@ return function()
 	end
 
 	beforeEach(function()
+		controllers = Instance.new("Folder")
 		created = {}
 		failOnStart = false
 		ApiContext.new = function()
@@ -62,6 +67,7 @@ return function()
 	end)
 
 	afterEach(function()
+		controllers:Destroy()
 		ServeSession.new = originalSessionNew
 		ApiContext.new = originalApiNew
 		Version.getUpdateMessage = originalGetUpdateMessage

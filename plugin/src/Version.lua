@@ -144,7 +144,7 @@ end
 Version._cachedLatestCompatible = nil :: {
 	value: LatestReleaseInfo?,
 	timestamp: number,
-	includePrereleases: boolean,
+	key: string?,
 }?
 
 --[[
@@ -165,10 +165,11 @@ function Version.retrieveLatestCompatible(options: {
 	includePrereleases: boolean?,
 }): LatestReleaseInfo?
 	local includePrereleases = options.includePrereleases == true
+	-- The latest release depends on the running version and on whether
+	-- prereleases count, so a cached answer for other inputs must not be reused.
+	local key = Version.display(options.version) .. ":" .. tostring(includePrereleases)
 	local cached = Version._cachedLatestCompatible
-	-- The latest release depends on whether prereleases count, so a cached
-	-- answer for the other setting must not be reused.
-	if cached and cached.includePrereleases == includePrereleases and os.clock() - cached.timestamp < 60 * 60 * 24 then
+	if cached and cached.key == key and os.clock() - cached.timestamp < 60 * 60 * 24 then
 		Log.debug("Using cached latest compatible version")
 		return cached.value
 	end
@@ -242,9 +243,9 @@ function Version.retrieveLatestCompatible(options: {
 	if latestCompatible == nil or Version.compare(latestCompatible.version, options.version) <= 0 then
 		-- Cache as nil so we don't try again for a day
 		Version._cachedLatestCompatible = {
+			key = key,
 			value = nil,
 			timestamp = os.clock(),
-			includePrereleases = includePrereleases,
 		}
 
 		return nil
@@ -252,9 +253,9 @@ function Version.retrieveLatestCompatible(options: {
 
 	-- Cache the latest compatible version
 	Version._cachedLatestCompatible = {
+		key = key,
 		value = latestCompatible,
 		timestamp = os.clock(),
-		includePrereleases = includePrereleases,
 	}
 
 	return latestCompatible

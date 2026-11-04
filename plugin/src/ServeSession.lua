@@ -19,6 +19,7 @@ local Reconciler = require(script.Parent.Reconciler)
 local strict = require(script.Parent.strict)
 local Settings = require(script.Parent.Settings)
 local orderSwaps = require(script.Parent.orderSwaps)
+local StudioBridge = require(script.Parent.StudioBridge)
 
 local Status = strict("Session.Status", {
 	NotStarted = "NotStarted",
@@ -151,7 +152,42 @@ function ServeSession:setUpdateLoadingTextCallback(callback)
 end
 
 function ServeSession:setLoadingText(text: string)
+	self.__phaseStartedAt = os.clock()
+	self.__phase = text
 	self.__updateLoadingText(text)
+end
+
+function ServeSession:getBridgeStatus()
+	return {
+		available = self.__studioBridge ~= nil and not self.__studioBridge.stopped,
+		error = self.__bridgeError,
+	}
+end
+
+function ServeSession:restartStudioBridge()
+	assert(self.__status == Status.Connected, "Connect normal sync before starting the Studio bridge")
+	assert(self.__bridgePairing, "Start rojo serve with --studio-token-file to enable the Studio bridge")
+	if self.__studioBridge then
+		self.__studioBridge:stop()
+	end
+	self.__bridgeError = nil
+	local bridge
+	bridge = StudioBridge.new(self.__apiContext, self.__bridgePairing, function(err, intentional)
+		if self.__studioBridge ~= bridge then
+			return
+		end
+		-- Agent tooling is optional. Its HTTP connection must not tear down healthy sync.
+		self.__bridgeError = tostring(err)
+		if intentional then
+			-- The user turned the bridge off, so every connect would otherwise
+			-- warn about a choice they made.
+			Log.debug("{}", err)
+			return
+		end
+		Log.warn("{} Normal syncing remains connected. Retry the bridge through agent control.", err)
+	end)
+	self.__studioBridge = bridge
+	bridge:start()
 end
 
 --[=[
@@ -220,6 +256,7 @@ function ServeSession:start()
 				return
 			end
 
+			self.__serverVersion = serverInfo.serverVersion
 			self:setLoadingText("Loading initial data from server...")
 			return self:__initialSync(serverInfo):andThen(function()
 				if self.__status == Status.Disconnected then
@@ -254,6 +291,14 @@ function ServeSession:start()
 				}, function()
 					if self.__status ~= Status.Disconnected then
 						self:__setStatus(Status.Connected, serverInfo.projectName)
+						if serverInfo.studioBridge and self.__status ~= Status.Disconnected then
+							self.__bridgePairing = serverInfo.studioBridge
+							local ok, err = pcall(self.restartStudioBridge, self)
+							if not ok then
+								self.__bridgeError = tostring(err)
+								Log.warn("Studio bridge unavailable: {}. Normal syncing remains connected.", err)
+							end
+						end
 					end
 				end)
 			end)
@@ -685,6 +730,10 @@ function ServeSession:__stopInternal(err)
 	end
 
 	self.__status = Status.Disconnected
+	if self.__studioBridge then
+		self.__studioBridge:stop()
+		self.__studioBridge = nil
+	end
 	self.__apiContext:disconnect()
 	self.__instanceMap:stop()
 	self.__changeBatcher:stop()

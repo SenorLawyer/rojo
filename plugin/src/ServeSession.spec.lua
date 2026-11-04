@@ -2,6 +2,8 @@ return function()
 	local Promise = require(script.Parent.Parent.Packages.Promise)
 	local ServeSession = require(script.Parent.ServeSession)
 	local PatchSet = require(script.Parent.PatchSet)
+	local StudioBridge = require(script.Parent.StudioBridge)
+	local nativeRequest = StudioBridge.__requestAsync
 
 	local session
 	local api
@@ -36,6 +38,93 @@ return function()
 
 	afterEach(function()
 		session:stop()
+		StudioBridge.__requestAsync = nativeRequest
+		StudioBridge.manualStart = false
+	end)
+
+	it("keeps normal syncing connected when the optional bridge request fails", function()
+		api.__baseUrl = "http://127.0.0.1:34872"
+		api.connectWebSocket = function(_, _, opened)
+			opened()
+			return Promise.resolve()
+		end
+		session.__initialSync = function()
+			return Promise.resolve()
+		end
+		StudioBridge.__requestAsync = function()
+			error("simulated Studio bridge request timed out")
+		end
+		-- A timed-out request is retried before the bridge gives up.
+		local previousDelay = StudioBridge.retryDelay
+		StudioBridge.retryDelay = 0
+		session:start()
+		connectResolve({
+			projectName = "test",
+			studioBridge = { protocolVersion = 1, pluginToken = "test", identity = {} },
+		})
+		local deadline = os.clock() + 2
+		while session:getBridgeStatus().available ~= false and os.clock() < deadline do
+			task.wait()
+		end
+		StudioBridge.retryDelay = previousDelay
+		expect(session:getStatus()).to.equal(ServeSession.Status.Connected)
+		expect(session:getBridgeStatus().available).to.equal(false)
+		expect(session:getBridgeStatus().error:find("timed out") ~= nil).to.equal(true)
+	end)
+
+	it("stops the bridge and its poll as soon as the sync connection closes", function()
+		api.__baseUrl = "http://127.0.0.1:34872"
+		local closeSocket
+		local events = {}
+		api.connectWebSocket = function(_, _, opened)
+			opened()
+			return Promise.new(function(_, reject)
+				closeSocket = reject
+			end)
+		end
+		api.disconnect = function()
+			table.insert(events, "sync disconnected")
+		end
+		session.__initialSync = function()
+			return Promise.resolve()
+		end
+		local poll = Promise.new(function() end)
+		local polls = 0
+		StudioBridge.__requestAsync = function(_, options, token)
+			local route = string.match(options.Url, "/api/studio/(%w+)$")
+			table.insert(events, route)
+			if route == "poll" then
+				polls += 1
+				token.transport = poll
+				return poll:expect()
+			end
+			return { Success = true, StatusCode = 200, Body = "{}" }
+		end
+		StudioBridge.manualStart = true
+		session:start()
+		connectResolve({
+			projectName = "test",
+			studioBridge = { protocolVersion = 1, pluginToken = "test", identity = {} },
+		})
+		task.wait()
+		StudioBridge.manualStart = false
+		local bridge = session.__studioBridge
+		expect(bridge).to.be.ok()
+		expect(polls).to.equal(1)
+
+		-- The server closes the socket when the checkout changes.
+		closeSocket("Connection to the Rojo server closed. Reconnect to resync.")
+		task.wait()
+		expect(session:getStatus()).to.equal(ServeSession.Status.Disconnected)
+		expect(bridge.stopped).to.equal(true)
+		expect(session.__studioBridge).to.equal(nil)
+		expect(poll:getStatus()).to.equal(Promise.Status.Cancelled)
+		-- The bridge is stopped before sync is torn down and never polls again.
+		local stoppedAt = table.find(events, "disconnect")
+		local syncAt = table.find(events, "sync disconnected")
+		expect(stoppedAt ~= nil and syncAt ~= nil and stoppedAt < syncAt).to.equal(true)
+		task.wait()
+		expect(polls).to.equal(1)
 	end)
 
 	it("ignores a late connection result after stopping", function()

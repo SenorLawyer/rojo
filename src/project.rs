@@ -28,7 +28,7 @@ pub struct ProjectError(#[from] Error);
 enum Error {
     #[error(
         "Rojo requires a project file, but no project file was found in path {}\n\
-        See https://rojo.space/docs/ for guides and documentation.",
+        See https://github.com/SenorLawyer/rojo/tree/master/docs for guides and documentation.",
         .path.display()
     )]
     NoProjectFound { path: PathBuf },
