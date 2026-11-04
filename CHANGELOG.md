@@ -31,6 +31,7 @@ Making a new release? Simply add the new header with the version and date undern
 
 ## Unreleased
 
+* Agent Can Skip Confirmation is now on by default for new plugin settings. Existing saved preferences, including an off setting, are preserved. ([fork#3])
 * The Studio plugin now cancels abandoned connections and prevents overlapping sessions. When the server asks it to resync, the session ends with a readable error; reconnect to resync. ([fork#1])
 * The Studio plugin now disconnects when the place ID changes, including when a local file is published or the initial sync is waiting for confirmation. Reconnect to sync the new place. ([fork#1])
 * Update checks now look for releases of SenorLawyer/rojo instead of upstream Rojo. ([fork#1])
@@ -142,6 +143,7 @@ Making a new release? Simply add the new header with the version and date undern
 [#1351]: https://github.com/rojo-rbx/rojo/pull/1351
 [fork#1]: https://github.com/SenorLawyer/rojo/pull/1
 [fork#2]: https://github.com/SenorLawyer/rojo/pull/2
+[fork#3]: https://github.com/SenorLawyer/rojo/pull/3
 
 ## [7.7.1] (October 1st, 2026)
 
