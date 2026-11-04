@@ -540,29 +540,27 @@ async fn handle_websocket_subscription(
                         if !messages.is_empty() {
                             let msgpack_message = {
                                 let tree = tree_handle.lock().unwrap();
-                                let api_messages = messages
-                                    .into_iter()
-                                    .map(|patch| SubscribeMessage::from_patch_update(&tree, patch))
-                                    .collect::<anyhow::Result<Vec<_>>>();
+                                let messages = SubscribeMessage::from_patch_updates(&tree, messages);
 
-                                api_messages.and_then(|messages| {
-                                    serialize_msgpack(SocketPacket {
-                                        session_id,
-                                        packet_type: SocketPacketType::Messages,
-                                        body: SocketPacketBody::Messages(MessagesPacket {
-                                            message_cursor: new_cursor,
-                                            messages,
-                                        }),
-                                    })
+                                serialize_msgpack(SocketPacket {
+                                    session_id,
+                                    packet_type: SocketPacketType::Messages,
+                                    body: SocketPacketBody::Messages(MessagesPacket {
+                                        message_cursor: new_cursor,
+                                        messages,
+                                    }),
                                 })
                             };
 
                             let msgpack_message = match msgpack_message {
                                 Ok(message) => message,
                                 Err(error) => {
+                                    // Last resort: the batch could not be encoded, so the
+                                    // plugin would silently fall out of sync. Ask it to
+                                    // reconnect, which resyncs from a fresh snapshot.
                                     let _ = websocket.send(Message::Close(Some(CloseFrame {
                                         code: CloseCode::Restart,
-                                        reason: "Subscription history is stale; reconnect to resync".into(),
+                                        reason: "Failed to encode subscription messages; reconnect to resync".into(),
                                     }))).await;
                                     return Err(error);
                                 }

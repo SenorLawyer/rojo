@@ -26,6 +26,10 @@ pub fn apply_patch_set(tree: &mut RojoTree, patch_set: PatchSet) -> AppliedPatch
     {
         profiling::scope!("removals");
         for removed_id in patch_set.removed_instances {
+            context.removed_specified_id |= tree.get_instance(removed_id).is_some()
+                && tree
+                    .descendants(removed_id)
+                    .any(|instance| instance.metadata().specified_id.is_some());
             apply_remove_instance(&mut context, tree, removed_id);
         }
     }
@@ -81,6 +85,11 @@ struct PatchApplyContext {
     /// properties.
     attribute_refs_to_rewrite: MultiMap<Ref, (Ustr, String)>,
 
+    /// Whether any removed instance had a user-specified ID, which means
+    /// instances outside of this patch may hold Ref properties (resolved from
+    /// `Rojo_Target_*` attributes) that now point at nothing.
+    removed_specified_id: bool,
+
     /// The current applied patch result, describing changes made to the tree.
     applied_patch_set: AppliedPatchSet,
 }
@@ -129,7 +138,82 @@ fn finalize_patch_application(context: PatchApplyContext, tree: &mut RojoTree) -
         instance.properties_mut().extend(real_rewrites.drain(..));
     }
 
-    context.applied_patch_set
+    let mut applied_patch_set = context.applied_patch_set;
+    if context.removed_specified_id {
+        repair_refs_to_removed_instances(tree, &mut applied_patch_set);
+    }
+
+    applied_patch_set
+}
+
+/// Fixes up Ref properties that point at instances that are no longer in the
+/// tree after a removal.
+///
+/// Attribute refs are only resolved when the instance holding them is
+/// snapshotted, so removing a target (for example deleting its file) would
+/// otherwise leave the pointer referencing a destroyed instance until the
+/// pointer itself happens to be re-snapshotted, which depends on whether the
+/// file watcher also reports a change to the containing directory. Each such
+/// property is re-resolved through its `Rojo_Target_*` attribute in case the
+/// target was replaced within the same patch, and removed otherwise, which
+/// matches what re-snapshotting the pointer would produce.
+fn repair_refs_to_removed_instances(tree: &mut RojoTree, applied_patch_set: &mut AppliedPatchSet) {
+    let mut repairs = Vec::new();
+
+    for instance in tree.descendants(tree.get_root_id()) {
+        let attributes = match instance.properties().get(&ustr("Attributes")) {
+            Some(Variant::Attributes(attributes)) => Some(attributes),
+            _ => None,
+        };
+
+        for (&name, value) in instance.properties() {
+            let Variant::Ref(referent) = value else {
+                continue;
+            };
+            if referent.is_none() || tree.get_instance(*referent).is_some() {
+                continue;
+            }
+
+            let replacement = attributes
+                .and_then(|attributes| {
+                    attributes.get(format!("{REF_POINTER_ATTRIBUTE_PREFIX}{name}"))
+                })
+                .and_then(|target| match target {
+                    Variant::String(target) => Some(target.clone()),
+                    Variant::BinaryString(target) => {
+                        std::str::from_utf8(target.as_ref()).ok().map(str::to_owned)
+                    }
+                    _ => None,
+                })
+                .and_then(|target| tree.get_specified_id(&RojoRef::new(target)))
+                .map(Variant::Ref);
+
+            repairs.push((instance.id(), name, replacement));
+        }
+    }
+
+    for (id, name, replacement) in repairs {
+        let mut instance = tree
+            .get_instance_mut(id)
+            .expect("instance with a dangling ref should still exist");
+        match &replacement {
+            Some(value) => instance.properties_mut().insert(name, value.clone()),
+            None => instance.properties_mut().remove(&name),
+        };
+
+        let update = match applied_patch_set
+            .updated
+            .iter_mut()
+            .position(|update| update.id == id)
+        {
+            Some(index) => &mut applied_patch_set.updated[index],
+            None => {
+                applied_patch_set.updated.push(AppliedPatchUpdate::new(id));
+                applied_patch_set.updated.last_mut().unwrap()
+            }
+        };
+        update.changed_properties.insert(name, replacement);
+    }
 }
 
 fn apply_remove_instance(context: &mut PatchApplyContext, tree: &mut RojoTree, removed_id: Ref) {

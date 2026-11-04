@@ -1,0 +1,53 @@
+---
+source: src/cli/sourcemap.rs
+expression: sourcemap_contents
+---
+{
+  "name": "run_contexts",
+  "className": "DataModel",
+  "filePaths": [
+    "default.project.json"
+  ],
+  "children": [
+    {
+      "name": "ServerScriptService",
+      "className": "ServerScriptService",
+      "children": [
+        {
+          "name": "Legacy",
+          "className": "Script",
+          "runContext": "Legacy"
+        },
+        {
+          "name": "Scripts",
+          "className": "Folder",
+          "children": [
+            {
+              "name": "client",
+              "className": "Script",
+              "runContext": "Client",
+              "filePaths": [
+                "src/client.client.luau"
+              ]
+            },
+            {
+              "name": "module",
+              "className": "ModuleScript",
+              "filePaths": [
+                "src/module.luau"
+              ]
+            },
+            {
+              "name": "server",
+              "className": "Script",
+              "runContext": "Server",
+              "filePaths": [
+                "src/server.server.luau"
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

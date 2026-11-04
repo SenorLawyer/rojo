@@ -573,16 +573,15 @@ fn ref_properties_remove() {
             .get_api_socket_packet(SocketPacketType::Messages, read_response.message_cursor)
             .unwrap();
         let librojo::web_api::SocketPacketBody::Messages(packet) = socket_packet.body;
-        assert!(packet
-            .messages
-            .iter()
-            .any(|message| message.removed.contains(&target_id)));
+        assert!(packet.messages.iter().any(|message| {
+            message.removed.contains(&target_id)
+                && message.updated.iter().any(|update| update.id == pointer_id)
+        }));
         for message in packet.messages {
             assert!(message.added.is_empty());
             assert!(message.removed.iter().all(|id| *id == target_id));
-            // Some backends also report a directory Write and clear the
-            // dangling reference in a second patch. Its batching is not part
-            // of the protocol contract.
+            // Some backends also report a directory Write. Re-snapshotting
+            // the directory must not produce anything beyond the cleared ref.
             for update in message.updated {
                 assert_eq!(update.id, pointer_id);
                 assert!(update.changed_name.is_none());
@@ -600,9 +599,16 @@ fn ref_properties_remove() {
         assert_eq!(after_removal.instances.len(), 2);
         assert!(!after_removal.instances.contains_key(&target_id));
         assert!(after_removal.instances.contains_key(&pointer_id));
+        // Removing the target clears the pointer's resolved ref in the same
+        // patch, so it never dangles regardless of which events the platform's
+        // file watcher reports.
+        assert_yaml_snapshot!(
+            "ref_properties_remove_pointer_after_removal",
+            redactions.redacted_yaml(&after_removal.instances[&pointer_id])
+        );
 
-        // A subsequent edit proves processing is still alive and reconciles
-        // the reference even on backends without a directory Write event.
+        // A subsequent edit proves processing is still alive and that
+        // re-snapshotting the pointer agrees with the cleared ref.
         fs::write(
             session.path().join("src/pointer.model.json"),
             r#"{

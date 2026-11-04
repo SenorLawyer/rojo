@@ -123,7 +123,6 @@ fs-err = "2.11.0"
 maplit = "1.0.2"
 semver = "1.0.22"
 
-
 [dev-dependencies]
 rojo-insta-ext = { path = "crates/rojo-insta-ext" }
 

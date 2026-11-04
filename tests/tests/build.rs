@@ -1,4 +1,12 @@
-use std::{fs, path::Path, process::Command};
+use std::{
+    fs,
+    io::Read,
+    path::Path,
+    process::{Command, Stdio},
+    sync::{Arc, Mutex},
+    thread,
+    time::{Duration, Instant},
+};
 
 use insta::assert_snapshot;
 use tempfile::tempdir;
@@ -157,4 +165,86 @@ fn binary_compression_modes_round_trip() {
                 .any(|bytes| bytes == [0x28, 0xb5, 0x2f, 0xfd]));
         }
     }
+}
+
+/// A failing rebuild in watch mode (here: the root temporarily stops being a
+/// DataModel while building a place) must be reported without stopping the
+/// watcher, so that fixing the project produces a new build.
+#[test]
+fn watch_keeps_running_after_failed_rebuild() {
+    fn project(root_class: &str, child: &str) -> String {
+        format!(
+            r#"{{"name": "watch", "tree": {{"$className": "{root_class}", "{child}": {{"$className": "Folder"}}}}}}"#
+        )
+    }
+
+    fn wait_until(what: &str, mut condition: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !condition() {
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    let temp = tempdir().unwrap();
+    let project_path = temp.path().join("default.project.json");
+    let output = temp.path().join("watch.rbxlx");
+    fs::write(&project_path, project("DataModel", "FirstBuild")).unwrap();
+
+    let mut child = Command::new(ROJO_PATH)
+        .arg("build")
+        .arg(&project_path)
+        .arg("-o")
+        .arg(&output)
+        .arg("--watch")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    let stderr = Arc::new(Mutex::new(String::new()));
+    let reader = {
+        let stderr = Arc::clone(&stderr);
+        let mut pipe = child.stderr.take().unwrap();
+        thread::spawn(move || {
+            let mut buffer = [0; 1024];
+            while let Ok(read) = pipe.read(&mut buffer) {
+                if read == 0 {
+                    break;
+                }
+                stderr
+                    .lock()
+                    .unwrap()
+                    .push_str(&String::from_utf8_lossy(&buffer[..read]));
+            }
+        })
+    };
+
+    let output_contains = |needle: &str| {
+        fs::read_to_string(&output)
+            .map(|contents| contents.contains(needle))
+            .unwrap_or(false)
+    };
+
+    wait_until("initial build", || output_contains("FirstBuild"));
+
+    fs::write(&project_path, project("Folder", "Broken")).unwrap();
+    wait_until("rebuild error", || {
+        stderr.lock().unwrap().contains("Failed to rebuild project")
+    });
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "watch mode exited after a failed rebuild"
+    );
+    assert!(
+        output_contains("FirstBuild"),
+        "failed rebuild replaced the last good output"
+    );
+
+    fs::write(&project_path, project("DataModel", "SecondBuild")).unwrap();
+    wait_until("rebuild after fix", || output_contains("SecondBuild"));
+
+    child.kill().unwrap();
+    child.wait().unwrap();
+    reader.join().unwrap();
 }

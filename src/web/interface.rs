@@ -37,32 +37,67 @@ pub struct SubscribeMessage<'a> {
 }
 
 impl<'a> SubscribeMessage<'a> {
-    pub(crate) fn from_patch_update(
+    /// Converts a single applied patch into a message using the current tree.
+    #[cfg(test)]
+    pub(crate) fn from_patch_update(tree: &'a RojoTree, patch: AppliedPatchSet) -> Self {
+        Self::from_patch_updates(tree, std::iter::once(patch))
+            .pop()
+            .unwrap()
+    }
+
+    /// Converts a batch of applied patches into messages using the current
+    /// tree.
+    ///
+    /// The tree is only read once every patch in the batch has already been
+    /// applied, so it can be ahead of any individual patch. Instances added by
+    /// one patch may have been removed by a later one (a save followed by a
+    /// delete, or a branch checkout), and those removals are always delivered
+    /// later in the same or a subsequent batch. Updates carry their own values
+    /// and never need the tree, so they are forwarded as-is even if the
+    /// instance is gone; the plugin ignores updates and removals for instances
+    /// it does not know about.
+    pub(crate) fn from_patch_updates(
+        tree: &'a RojoTree,
+        patches: impl IntoIterator<Item = AppliedPatchSet>,
+    ) -> Vec<Self> {
+        // Additions are serialized from the current tree including all of
+        // their current descendants, so a descendant that was itself added by a
+        // later patch in this batch has already been sent and can be skipped.
+        let mut sent = HashSet::new();
+
+        patches
+            .into_iter()
+            .map(|patch| Self::from_patch_update_inner(tree, patch, &mut sent))
+            .collect()
+    }
+
+    fn from_patch_update_inner(
         tree: &'a RojoTree,
         patch: AppliedPatchSet,
-    ) -> anyhow::Result<Self> {
+        sent: &mut HashSet<Ref>,
+    ) -> Self {
         let removed = patch.removed;
 
         let mut added = HashMap::new();
         for id in patch.added {
-            let instance = tree.get_instance(id).ok_or_else(|| {
-                anyhow::anyhow!("Added instance {id} no longer exists in subscription history")
-            })?;
+            if sent.contains(&id) {
+                continue;
+            }
+
+            let Some(instance) = tree.get_instance(id) else {
+                log::debug!(
+                    "Skipping addition of instance {id} because it was removed by a later patch"
+                );
+                continue;
+            };
+
+            sent.insert(id);
             added.insert(id, Instance::from_rojo_instance(instance));
 
             for instance in tree.descendants(id) {
-                added.insert(instance.id(), Instance::from_rojo_instance(instance));
-            }
-        }
-
-        // Patches are retained while the tree keeps changing. Replaying an update
-        // for a removed instance cannot be reconstructed from the current tree.
-        for update in &patch.updated {
-            if tree.get_instance(update.id).is_none() {
-                anyhow::bail!(
-                    "Updated instance {} no longer exists in subscription history",
-                    update.id
-                );
+                if sent.insert(instance.id()) {
+                    added.insert(instance.id(), Instance::from_rojo_instance(instance));
+                }
             }
         }
 
@@ -99,11 +134,11 @@ impl<'a> SubscribeMessage<'a> {
             })
             .collect();
 
-        Ok(Self {
+        Self {
             removed,
             added,
             updated,
-        })
+        }
     }
 }
 
@@ -358,35 +393,109 @@ mod tests {
             updated: vec![update],
         };
 
-        SubscribeMessage::from_patch_update(&tree, patch)
-            .unwrap()
-            .updated
+        SubscribeMessage::from_patch_update(&tree, patch).updated
     }
 
-    #[test]
-    fn removed_historical_addition_requires_resync() {
-        let patch = AppliedPatchSet {
-            removed: Vec::new(),
-            added: vec![Ref::new()],
-            updated: Vec::new(),
-        };
-
-        let tree = empty_tree();
-        let error = SubscribeMessage::from_patch_update(&tree, patch).unwrap_err();
-        assert!(error.to_string().contains("Added instance"));
+    fn folder(name: &str) -> InstanceSnapshot {
+        InstanceSnapshot::new().name(name).class_name("Folder")
     }
 
+    /// A save followed by a delete produces two patches that the websocket
+    /// task can receive in one batch, after both have been applied to the
+    /// tree. The update must still be forwarded instead of failing the batch
+    /// and dropping the plugin's connection.
     #[test]
-    fn removed_historical_update_requires_resync() {
-        let patch = AppliedPatchSet {
-            removed: Vec::new(),
-            added: Vec::new(),
-            updated: vec![AppliedPatchUpdate::new(Ref::new())],
-        };
+    fn update_then_remove_in_one_batch_is_forwarded() {
+        let mut tree = empty_tree();
+        let child = tree.insert_instance(tree.get_root_id(), folder("Child"));
+        tree.remove(child);
 
-        let tree = empty_tree();
-        let error = SubscribeMessage::from_patch_update(&tree, patch).unwrap_err();
-        assert!(error.to_string().contains("Updated instance"));
+        let mut update = AppliedPatchUpdate::new(child);
+        update.changed_name = Some("Renamed".to_owned());
+
+        let messages = SubscribeMessage::from_patch_updates(
+            &tree,
+            [
+                AppliedPatchSet {
+                    removed: Vec::new(),
+                    added: Vec::new(),
+                    updated: vec![update],
+                },
+                AppliedPatchSet {
+                    removed: vec![child],
+                    added: Vec::new(),
+                    updated: Vec::new(),
+                },
+            ],
+        );
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].updated.len(), 1);
+        assert_eq!(messages[0].updated[0].id, child);
+        assert_eq!(messages[1].removed, vec![child]);
+    }
+
+    /// An instance created and then deleted before the websocket task reads
+    /// the tree cannot be serialized; it is skipped because its removal is
+    /// delivered by a later message.
+    #[test]
+    fn add_then_remove_in_one_batch_skips_addition() {
+        let mut tree = empty_tree();
+        let kept = tree.insert_instance(tree.get_root_id(), folder("Kept"));
+        let gone = tree.insert_instance(tree.get_root_id(), folder("Gone"));
+        tree.remove(gone);
+
+        let messages = SubscribeMessage::from_patch_updates(
+            &tree,
+            [
+                AppliedPatchSet {
+                    removed: Vec::new(),
+                    added: vec![gone, kept],
+                    updated: Vec::new(),
+                },
+                AppliedPatchSet {
+                    removed: vec![gone],
+                    added: Vec::new(),
+                    updated: Vec::new(),
+                },
+            ],
+        );
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].added.len(), 1);
+        assert!(messages[0].added.contains_key(&kept));
+        assert_eq!(messages[1].removed, vec![gone]);
+    }
+
+    /// Additions are serialized with their current descendants, so a
+    /// descendant added by a later patch in the same batch is only sent once.
+    #[test]
+    fn descendant_added_later_in_batch_is_sent_once() {
+        let mut tree = empty_tree();
+        let parent = tree.insert_instance(tree.get_root_id(), folder("Parent"));
+        let child = tree.insert_instance(parent, folder("Child"));
+
+        let messages = SubscribeMessage::from_patch_updates(
+            &tree,
+            [
+                AppliedPatchSet {
+                    removed: Vec::new(),
+                    added: vec![parent],
+                    updated: Vec::new(),
+                },
+                AppliedPatchSet {
+                    removed: Vec::new(),
+                    added: vec![child],
+                    updated: Vec::new(),
+                },
+            ],
+        );
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].added.len(), 2);
+        assert!(messages[0].added.contains_key(&parent));
+        assert!(messages[0].added.contains_key(&child));
+        assert!(messages[1].added.is_empty());
     }
 
     #[test]
