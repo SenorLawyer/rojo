@@ -552,22 +552,101 @@ fn ref_properties_remove() {
             "ref_properties_remove_all",
             read_response.intern_and_redact(&mut redactions, root_id)
         );
+        let target_id = read_response
+            .instances
+            .values()
+            .find(|instance| instance.name == "target")
+            .unwrap()
+            .id;
+        let pointer_id = read_response
+            .instances
+            .values()
+            .find(|instance| instance.name == "pointer")
+            .unwrap()
+            .id;
+        let initial_pointer = &read_response.instances[&pointer_id];
+        let initial_root = &read_response.instances[&root_id];
 
         fs::remove_file(session.path().join("src/target.model.json")).unwrap();
 
         let socket_packet = session
-            .get_api_socket_packet(SocketPacketType::Messages, 0)
+            .get_api_socket_packet(SocketPacketType::Messages, read_response.message_cursor)
             .unwrap();
-        assert_yaml_snapshot!(
-            "ref_properties_remove_subscribe",
-            socket_packet.intern_and_redact(&mut redactions, ())
-        );
+        let librojo::web_api::SocketPacketBody::Messages(packet) = socket_packet.body;
+        assert!(packet
+            .messages
+            .iter()
+            .any(|message| message.removed.contains(&target_id)));
+        for message in packet.messages {
+            assert!(message.added.is_empty());
+            assert!(message.removed.iter().all(|id| *id == target_id));
+            // Some backends also report a directory Write and clear the
+            // dangling reference in a second patch. Its batching is not part
+            // of the protocol contract.
+            for update in message.updated {
+                assert_eq!(update.id, pointer_id);
+                assert!(update.changed_name.is_none());
+                assert!(update.changed_class_name.is_none());
+                assert!(update.changed_metadata.is_none());
+                assert_eq!(update.changed_properties.len(), 1);
+                assert_eq!(
+                    update.changed_properties.get(&rbx_dom_weak::ustr("Value")),
+                    Some(&None)
+                );
+            }
+        }
 
-        let read_response = session.get_api_read(root_id).unwrap();
-        assert_yaml_snapshot!(
-            "ref_properties_remove_all-2",
-            read_response.intern_and_redact(&mut redactions, root_id)
-        );
+        let after_removal = session.get_api_read(root_id).unwrap();
+        assert_eq!(after_removal.instances.len(), 2);
+        assert!(!after_removal.instances.contains_key(&target_id));
+        assert!(after_removal.instances.contains_key(&pointer_id));
+
+        // A subsequent edit proves processing is still alive and reconciles
+        // the reference even on backends without a directory Write event.
+        fs::write(
+            session.path().join("src/pointer.model.json"),
+            r#"{
+            "className": "ObjectValue",
+            "attributes": { "Rojo_Target_Value": "test pointer", "AfterRemoval": true }
+        }"#,
+        )
+        .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let final_read = loop {
+            let read = session.get_api_read(root_id).unwrap();
+            let pointer = &read.instances[&pointer_id];
+            let updated = match pointer.properties.get(&rbx_dom_weak::ustr("Attributes")) {
+                Some(value) => {
+                    matches!(value.as_ref(), rbx_dom_weak::types::Variant::Attributes(attributes)
+                    if attributes.get("AfterRemoval") == Some(&rbx_dom_weak::types::Variant::Bool(true)))
+                }
+                None => false,
+            };
+            if updated {
+                break read;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "valid edit after target removal did not sync"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        assert_eq!(final_read.instances.len(), 2);
+        let root = &final_read.instances[&root_id];
+        assert_eq!(root.name, initial_root.name);
+        assert_eq!(root.class_name, initial_root.class_name);
+        assert_eq!(root.parent, initial_root.parent);
+        assert_eq!(root.properties, initial_root.properties);
+        assert_eq!(root.children.as_ref(), &[pointer_id]);
+        let pointer = &final_read.instances[&pointer_id];
+        assert_eq!(pointer.name, initial_pointer.name);
+        assert_eq!(pointer.class_name, initial_pointer.class_name);
+        assert_eq!(pointer.parent, initial_pointer.parent);
+        assert!(pointer.children.is_empty());
+        assert!(!pointer
+            .properties
+            .contains_key(&rbx_dom_weak::ustr("Value")));
+        assert_eq!(pointer.properties.len(), 1);
     });
 }
 

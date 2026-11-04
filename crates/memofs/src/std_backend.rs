@@ -190,7 +190,9 @@ impl VfsBackend for StdBackend {
             self.parent_watches.remove(&watched);
             if let Some(watcher) = &mut self.watcher {
                 if let Err(err) = watcher.unwatch(&watched) {
-                    result = Err(notify_io_error(err));
+                    if !is_removed_watch_error(&watched, &err) {
+                        result = Err(notify_io_error(err));
+                    }
                 }
             }
         }
@@ -198,6 +200,15 @@ impl VfsBackend for StdBackend {
         // event stream on macOS and lose unrelated events during the restart.
         result
     }
+}
+
+fn is_removed_watch_error(path: &Path, err: &notify::Error) -> bool {
+    // Linux removes inotify watches automatically when the watched inode is
+    // deleted. Removing that already-gone watch returns EINVAL.
+    let already_removed = matches!(err, notify::Error::WatchNotFound)
+        || matches!(err, notify::Error::Io(err) if err.kind() == io::ErrorKind::InvalidInput);
+    already_removed
+        && matches!(fs_err::symlink_metadata(path), Err(err) if err.kind() == io::ErrorKind::NotFound)
 }
 
 fn notify_io_error(err: notify::Error) -> io::Error {
@@ -299,5 +310,18 @@ mod test {
     fn notify_io_errors_preserve_the_os_error() {
         let err = notify_io_error(notify::Error::Io(io::Error::from_raw_os_error(5)));
         assert_eq!(err.raw_os_error(), Some(5));
+    }
+
+    #[test]
+    fn automatic_watch_removal_is_ignored_only_for_missing_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("removed");
+        let already_removed = notify::Error::Io(io::Error::from(io::ErrorKind::InvalidInput));
+        assert!(is_removed_watch_error(&path, &already_removed));
+        fs_err::create_dir(&path).unwrap();
+        assert!(!is_removed_watch_error(&path, &already_removed));
+        fs_err::remove_dir(&path).unwrap();
+        let denied = notify::Error::Io(io::Error::from(io::ErrorKind::PermissionDenied));
+        assert!(!is_removed_watch_error(&path, &denied));
     }
 }

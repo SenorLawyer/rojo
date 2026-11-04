@@ -8,7 +8,7 @@ use rbx_dom_weak::{
     ustr, HashMapExt as _, UstrMap, UstrSet,
 };
 
-use crate::{variant_eq::variant_eq, RojoRef, REF_POINTER_ATTRIBUTE_PREFIX};
+use crate::{variant_eq::variant_eq, RojoRef, REF_ID_ATTRIBUTE_NAME, REF_POINTER_ATTRIBUTE_PREFIX};
 
 use super::{
     patch::{PatchAdd, PatchSet, PatchUpdate},
@@ -101,6 +101,22 @@ fn compute_property_patches(
 ) {
     let mut visited_properties = UstrSet::default();
     let mut changed_properties = UstrMap::new();
+
+    // Patch application resolves Rojo_Id attributes into metadata. Compare
+    // the same effective ID here so rereading an unchanged directory does
+    // not clear and reapply that metadata or publish a phantom update.
+    if let Some(Variant::Attributes(attributes)) = snapshot.properties.get(&ustr("Attributes")) {
+        let attribute_id = match attributes.get(REF_ID_ATTRIBUTE_NAME) {
+            Some(Variant::String(value)) => Some(value.clone()),
+            Some(Variant::BinaryString(value)) => {
+                std::str::from_utf8(value.as_ref()).ok().map(str::to_owned)
+            }
+            _ => None,
+        };
+        if let Some(id) = attribute_id {
+            snapshot.metadata.specified_id = Some(RojoRef::new(id));
+        }
+    }
 
     let attribute_ref_properties = compute_ref_properties(snapshot, tree);
 

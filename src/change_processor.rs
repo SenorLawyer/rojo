@@ -167,13 +167,6 @@ impl JobThreadContext {
     fn handle_vfs_event(&self, event: VfsEvent) {
         log::trace!("Vfs event: {:?}", event);
 
-        // Parent anchor watches can report directory timestamp changes even
-        // when the contents are unchanged. Child Create/Remove/Write events
-        // carry the actual changes. Avoid resnapshotting on those timestamps.
-        if matches!(&event, VfsEvent::Write(path) if path.is_dir()) {
-            return;
-        }
-
         // Update the VFS immediately with the event.
         if let Err(err) = self.vfs.commit_event(&event) {
             log::error!("Error applying VFS change: {:?}", err);
@@ -456,7 +449,7 @@ fn compute_and_apply_changes(tree: &mut RojoTree, vfs: &Vfs, id: Ref) -> Option<
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::snapshot::{InstanceContext, PatchUpdate};
+    use crate::snapshot::{InstanceContext, InstanceSnapshot, PatchUpdate};
     use rbx_dom_weak::{ustr, UstrMap};
 
     fn context(path: &Path) -> JobThreadContext {
@@ -464,11 +457,53 @@ mod test {
         let snapshot = snapshot_from_vfs(&InstanceContext::default(), &vfs, path)
             .unwrap()
             .unwrap();
+        let mut tree = RojoTree::new(InstanceSnapshot::new());
+        let patch = compute_patch_set(Some(snapshot), &tree, tree.get_root_id());
+        apply_patch_set(&mut tree, patch);
         JobThreadContext {
-            tree: Arc::new(Mutex::new(RojoTree::new(snapshot))),
+            tree: Arc::new(Mutex::new(tree)),
             vfs: Arc::new(vfs),
             message_queue: Arc::new(MessageQueue::new()),
         }
+    }
+
+    #[test]
+    fn directory_write_reconciles_children_without_a_child_event() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dunce::canonicalize(dir.path()).unwrap();
+        let task = context(&root);
+        let added = root.join("package.luau");
+        fs::write(&added, "return 'new'").unwrap();
+        task.handle_vfs_event(VfsEvent::Write(root));
+        assert!(!task.tree.lock().unwrap().get_ids_at_path(&added).is_empty());
+    }
+
+    #[test]
+    fn unchanged_project_directory_write_does_not_publish_a_patch() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dunce::canonicalize(dir.path()).unwrap();
+        let packages = root.join("Packages");
+        fs::create_dir(&packages).unwrap();
+        fs::write(packages.join("module.luau"), "return 1").unwrap();
+        let project = root.join("default.project.json");
+        fs::write(
+            &project,
+            r#"{"name":"test","tree":{"$className":"Folder","Packages":{"$path":"Packages"}}}"#,
+        )
+        .unwrap();
+        let task = context(&project);
+        task.handle_vfs_event(VfsEvent::Write(packages));
+        assert_eq!(task.message_queue.cursor(), 0);
+    }
+
+    #[test]
+    fn unchanged_reference_directory_write_does_not_publish_a_patch() {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("rojo-test/serve-tests/ref_properties_remove");
+        let task = context(&fixture.join("default.project.json"));
+        task.handle_vfs_event(VfsEvent::Write(fixture.join("src")));
+        let mut pending = task.message_queue.subscribe(0);
+        assert_eq!(task.message_queue.cursor(), 0, "{:?}", pending.try_recv());
     }
 
     #[test]

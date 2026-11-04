@@ -4,9 +4,9 @@ Tested on Windows on November 4, 2026. The fork starts at upstream commit 84e098
 
 ## CLI and server
 
-The workspace suite passed 264 tests: 14 memofs, 154 library and 96 end-to-end tests. Two pre-existing tests are ignored. Regression coverage includes missing event paths, delayed mapped-directory recreation, explicit init-file paths, interrupted request bodies, historical subscription IDs, metadata changes, binary compression round trips and embedded plugin replacement.
+The Windows release-profile workspace suite passed 268 tests: 15 memofs, 157 library and 96 end-to-end tests. Two pre-existing tests are ignored. Regression coverage includes missing event paths, delayed mapped-directory recreation, explicit init-file paths, interrupted request bodies, historical subscription IDs, metadata changes, binary compression round trips and embedded plugin replacement.
 
-The live watcher test compares every name and Source across 322 scripts after ten real Git branch checkouts, twelve complete package-tree replacements, a deletion/recreation with a 500 ms gap, two-way init-source writing and a server restart. The final run passed every comparison. Checkout convergence after Git returned ranged from about 3 to 289 ms. The twelve replacements settled in 2.29 seconds after mutations stopped. Initial read after restarted server readiness took 4.32 ms; server startup itself took 504 ms. Filesystem errors while a tree is temporarily absent are logged and recovered; no panic occurred.
+The live watcher test compares every name and Source across 322 scripts after ten real Git branch checkouts, twelve complete package-tree replacements, a deletion/recreation with a 500 ms gap, two-way init-source writing and a server restart. The optimized build passed every comparison. Tests cover both rapid replacement and recreation after the deletion has settled. Timing depends on filesystem event batching and is not a production-project latency guarantee. Filesystem errors while a tree is temporarily absent are logged and recovered; no panic occurred.
 
 To repeat on Windows, install Python's msgpack package and run:
 ```powershell
@@ -33,7 +33,7 @@ A cold-font measurement was initially suspected. The suspended coroutine showed 
 
 ## Review and remaining scope
 
-GPT-6.1 Sol High reviewed the combined diff independently through sol-loop. Round one found no blocker or should-level defect and one artifact-location nit, which was fixed. The final review and GitHub CI verdict are recorded in the PR.
+GPT-6.1 Sol High reviewed the combined diff independently through sol-loop. The artifact-location nit was fixed. An optimized stress run later exposed a directory-event race that unit tests had missed. The invalid event filter was removed, effective reference metadata was normalized, and regression tests now cover the coalesced event. The release suite and repeated optimized stress tests were rerun. The final review and GitHub CI verdict are recorded in the PR. Windows CI runs the release-profile suite and Git/package stress script; other platform failures cannot cancel that job.
 
 The [issue inventory](upstream-issues.md) includes all 196 open upstream issues, and the [PR review](upstream-pull-requests.md) includes all 27 open PRs with authors and reviewed heads. Deferred entries are not solved. Cloud upload migration, multiple paths, child patterns, custom metadata names and a third-party plugin API require more design and testing.
 

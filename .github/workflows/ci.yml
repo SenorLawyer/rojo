@@ -20,8 +20,11 @@ jobs:
   build:
     name: Build and Test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    env:
+      BUILD_PROFILE: ${{ matrix.os == 'windows-latest' && 'release' || 'debug' }}
 
     strategy:
+      fail-fast: false
       matrix:
         os: [ubuntu-22.04, windows-latest, macos-latest, ubuntu-22.04-arm]
 
@@ -42,22 +45,29 @@ jobs:
           target
         key: ${{ matrix.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
-    - name: Build
-      run: cargo build --locked --verbose
+    - name: Build and test
+      run: cargo test --workspace --locked --verbose ${{ matrix.os == 'windows-latest' && '--release' || '' }}
 
     - name: Export embedded Studio plugin
       shell: bash
-      run: target/debug/rojo plugin install --plugins-dir artifacts
+      run: target/${{ env.BUILD_PROFILE }}/rojo plugin install --plugins-dir artifacts
 
-    - name: Upload Studio plugin
+    - name: Test Windows release during Git and package churn
+      if: matrix.os == 'windows-latest'
+      run: |
+        python -m pip install msgpack==1.2.4
+        python scripts/watcher-smoke.py target/release/rojo.exe
+
+    - name: Upload Windows CLI and Studio plugin
       if: matrix.os == 'windows-latest'
       uses: actions/upload-artifact@v4
       with:
-        name: Rojo-Studio-plugin
-        path: artifacts/RojoManagedPlugin.rbxm
-
-    - name: Test
-      run: cargo test --workspace --locked --verbose
+        name: Rojo-Windows-x64
+        path: |
+          target/release/rojo.exe
+          artifacts/RojoManagedPlugin.rbxm
+          LICENSE.txt
+          FORK.md
 
     - name: Save Rust Cache
       uses: actions/cache/save@v4
