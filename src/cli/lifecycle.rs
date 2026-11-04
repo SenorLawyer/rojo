@@ -205,9 +205,16 @@ struct PublishOptions {
 #[derive(Debug, Parser)]
 struct StageOptions {
     name: String,
-    /// The test place as UNIVERSE_ID:PLACE_ID. Must not be the release's own place.
+    /// The test place as UNIVERSE_ID:PLACE_ID. Must not be the release's own
+    /// place, and must be in another universe unless --allow-live-universe is set.
     #[clap(long)]
     staging: String,
+    /// Allow a staging place in the release's own universe. Places in one
+    /// universe share its DataStores and other universe-wide data, so the
+    /// smoke script then runs against the live game's data, and players can
+    /// reach the staging place by teleport.
+    #[clap(long)]
+    allow_live_universe: bool,
     /// A Luau script run with Luau Execution against the staged version. It
     /// passes by returning `true` or a table with `ok = true`.
     #[clap(long)]
@@ -1282,7 +1289,12 @@ enum PublishKind {
         promote: Option<PromoteGate>,
     },
     /// A test place other than the release's target. Writes no `live` record.
-    Staging { universe_id: u64, place_id: u64 },
+    Staging {
+        universe_id: u64,
+        place_id: u64,
+        /// Accept a place in the release's own universe.
+        allow_live_universe: bool,
+    },
 }
 
 /// What `release promote` accepts as evidence that staging went well.
@@ -1323,8 +1335,10 @@ fn publish_release(
                     release.place_id
                 );
             }
+            // Checked here so that a refusal comes before decoding the
+            // place, and again once the lock is held.
             if let Some(gate) = promote {
-                promoted_from = Some(passing_staging_record(&repo, &release, gate)?);
+                passing_staging_record(&repo, &release, gate)?;
             }
             let purpose = match (promote, rollback) {
                 (Some(_), _) => "promote",
@@ -1336,19 +1350,28 @@ fn publish_release(
         PublishKind::Staging {
             universe_id,
             place_id,
+            allow_live_universe,
         } => {
             ensure!(
                 *universe_id != 0 && *place_id != 0,
                 "Staging universe and place IDs must be nonzero"
             );
-            // Place IDs are unique across universes, so the place alone decides
-            // whether staging would change what players join.
+            // Place IDs are unique across universes, so this refuses the
+            // release's own place whatever universe ID was given with it.
             ensure!(
                 *place_id != release.place_id,
                 "The staging place must differ from release {}'s target {}:{}",
                 release.name,
                 release.universe_id,
                 release.place_id
+            );
+            // Another place in the live universe is not isolated from players:
+            // they can teleport into it, and the smoke script would read and
+            // write the live game's DataStores, which are shared universe-wide.
+            ensure!(
+                *universe_id != release.universe_id || *allow_live_universe,
+                "Staging place {universe_id}:{place_id} is in universe {universe_id}, the universe release {} goes live in. Places in one universe share its DataStores, so a smoke check there runs against live player data, and players can teleport into the staging place. Stage to a place in a separate test universe, or pass --allow-live-universe to accept this.",
+                release.name
             );
             // Nor may staging overwrite a place players join through another
             // release, whether it is already live or only prepared.
@@ -1390,7 +1413,35 @@ fn publish_release(
     let lock_path = repo.state.join("publication.lock");
     let attempt = uuid::Uuid::new_v4().to_string();
     let attempts = repo.state.join("publication-attempts");
+    #[cfg(test)]
+    tests::run_before_lock_hook();
     let lock = acquire_publication_lock(&lock_path, &attempts, &attempt)?;
+    // A `release stage` of this release could have uploaded between the check
+    // above and taking the lock. Its journal entry exists by now, and while
+    // this process holds the lock no other upload can start, so checking
+    // again decides on what staging really runs.
+    if let PublishKind::Live {
+        promote: Some(gate),
+        ..
+    } = &kind
+    {
+        match passing_staging_record(&repo, &release, gate) {
+            Ok(record) => promoted_from = Some(record),
+            Err(error) => {
+                drop(lock);
+                let removed = fs::remove_file(&lock_path);
+                let error = error
+                    .context("Staging changed while promote was starting; nothing was uploaded");
+                return Err(match removed {
+                    Ok(()) => error,
+                    Err(removal) => error.context(format!(
+                        "Rojo could not remove {}: {removal}. Nothing was journaled for this attempt, so remove it.",
+                        lock_path.display()
+                    )),
+                });
+            }
+        }
+    }
     let receipt_path = attempts.join(format!("{attempt}.json"));
     let mut receipt = serde_json::json!({"attempt": attempt, "release": release.name,
         "universe_id": universe_id, "place_id": place_id, "checkpoint": checkpoint.name,
@@ -1517,8 +1568,11 @@ fn publish_release(
     }
 }
 
-/// Luau Execution accepts scripts up to 4 MB.
-const MAX_SMOKE_SCRIPT_BYTES: u64 = 4 * 1024 * 1024;
+/// Luau Execution accepts scripts up to 4 MB. Whether Roblox counts the
+/// script or the request it is sent in, and in decimal or binary megabytes,
+/// is not documented, so Rojo holds the script as it is sent, JSON-encoded,
+/// to the smaller decimal figure.
+const MAX_SMOKE_SCRIPT_BYTES: u64 = 4_000_000;
 const DEFAULT_SMOKE_TIMEOUT_SECONDS: u64 = 60;
 /// Luau Execution's own maximum task timeout.
 const MAX_SMOKE_TIMEOUT_SECONDS: u64 = 300;
@@ -1583,6 +1637,7 @@ fn stage_with(
         PublishKind::Staging {
             universe_id,
             place_id,
+            allow_live_universe: options.allow_live_universe,
         },
         upload,
     )?;
@@ -1648,7 +1703,7 @@ fn read_smoke_script(path: &Path) -> anyhow::Result<String> {
         .len();
     ensure!(
         size <= MAX_SMOKE_SCRIPT_BYTES,
-        "Smoke script {} is larger than the 4 MiB Luau Execution allows",
+        "Smoke script {} is {size} bytes, more than the 4,000,000 that Luau Execution allows",
         path.display()
     );
     let script = fs::read_to_string(path)
@@ -1656,6 +1711,15 @@ fn read_smoke_script(path: &Path) -> anyhow::Result<String> {
     ensure!(
         !script.trim().is_empty(),
         "Smoke script {} is empty",
+        path.display()
+    );
+    // Quotes, backslashes and control characters grow when the script is
+    // escaped into the request, so a script under the limit on disk can
+    // still be refused. Checking here fails before the staging upload.
+    let encoded = serde_json::to_string(&script)?.len();
+    ensure!(
+        encoded as u64 <= MAX_SMOKE_SCRIPT_BYTES,
+        "Smoke script {} is {encoded} bytes once escaped for Luau Execution, more than the 4,000,000 it allows",
         path.display()
     );
     Ok(script)
@@ -1735,7 +1799,7 @@ fn smoke_outcome(result: Result<LuauTaskResult, OpenCloudError>) -> serde_json::
         .map(|log| {
             serde_json::json!({
                 "message": log.message.chars().take(500).collect::<String>(),
-                "kind": log.kind,
+                "kind": bounded(&log.kind, SMOKE_LABEL_CHARS),
             })
         })
         .collect();
@@ -1753,12 +1817,25 @@ fn smoke_outcome(result: Result<LuauTaskResult, OpenCloudError>) -> serde_json::
         )
     };
     serde_json::json!({
-        "status": status, "reason": short_reason(&reason), "task": task.path,
+        "status": status, "reason": short_reason(&reason),
+        "task": bounded(&task.path, 1000),
         "results": results, "results_truncated": results_truncated,
-        "error_code": task.error_code, "logs": logs,
+        "error_code": task.error_code.as_deref().map(|code| bounded(code, SMOKE_LABEL_CHARS)),
+        "logs": logs,
         "logs_omitted": skip > 0 || task.logs_truncated,
-        "logs_error": task.logs_error,
+        "logs_error": task.logs_error.as_deref().map(short_reason),
     })
+}
+
+/// The most characters kept of a short label from Roblox, such as an error
+/// code or a log message's kind.
+const SMOKE_LABEL_CHARS: usize = 100;
+
+/// The first `chars` characters of `text`. Every field a smoke record copies
+/// from Roblox is bounded, so a staging record stays far below the size
+/// `read_json` accepts.
+fn bounded(text: &str, chars: usize) -> String {
+    text.chars().take(chars).collect()
 }
 
 /// The reason comes partly from Roblox and the script (an error message or a
@@ -1923,8 +2000,10 @@ fn ensure_latest_staging_attempt(
     let attempt = record["attempt"].as_str().unwrap_or_default();
     let attempts = repo.state.join("publication-attempts");
     // A rejected or `--not-published` attempt created no version, so it
-    // cannot have replaced what the record's stage uploaded.
-    let uploads: Vec<_> = list_manifest_entries(&attempts, false)
+    // cannot have replaced what the record's stage uploaded. Unlike `release
+    // list`, this does not skip unreadable entries: one could be a newer
+    // staging upload.
+    let uploads: Vec<_> = read_journal_strictly(&attempts)?
         .into_iter()
         .filter(|(_, receipt)| {
             receipt["purpose"] == "staging"
@@ -1962,6 +2041,37 @@ fn ensure_latest_staging_attempt(
         );
     }
     Ok(())
+}
+
+/// Reads every journal entry in `directory`, failing on the first one that
+/// cannot be read or parsed. A missing directory has no entries.
+fn read_journal_strictly(directory: &Path) -> anyhow::Result<Vec<(PathBuf, serde_json::Value)>> {
+    let entries = match fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(error).with_context(|| format!("Cannot read {}", directory.display()))
+        }
+    };
+    let mut journal = Vec::new();
+    for entry in entries {
+        let entry = entry.with_context(|| format!("Cannot read {}", directory.display()))?;
+        let path = entry.path();
+        // Leftovers of interrupted writes start with `.`.
+        if entry.file_name().to_string_lossy().starts_with('.')
+            || path.extension() != Some(OsStr::new("json"))
+        {
+            continue;
+        }
+        let receipt = read_json(&path).with_context(|| {
+            format!(
+                "Cannot check the publication journal: {} cannot be read, and it could record a newer staging upload. Repair it, or check Roblox version history and move it out of publication-attempts",
+                path.display()
+            )
+        })?;
+        journal.push((path, receipt));
+    }
+    Ok(journal)
 }
 
 /// Creates the publication lock and records which attempt holds it, so a lock
@@ -2233,15 +2343,18 @@ fn upload_bytes(
         .build()
         .map_err(|error| UploadFailure::Rejected(format!("Cannot create HTTP client: {error}")))?;
     // Sensitive values are left out of reqwest's debug output and logs.
-    let mut key = reqwest::header::HeaderValue::from_str(key).map_err(|_| {
+    let mut header = reqwest::header::HeaderValue::from_str(key).map_err(|_| {
         UploadFailure::Rejected(
             "Request was not sent: the API key is not a valid HTTP header value".to_owned(),
         )
     })?;
-    key.set_sensitive(true);
+    header.set_sensitive(true);
+    // Error messages end up in the terminal and in journal entries, so a
+    // server that echoes the key back must not get it written there.
+    let excerpt = |text: &str| excerpt(&redact_key(text, key));
     let response = client
         .post(url)
-        .header("x-api-key", key)
+        .header("x-api-key", header)
         .header("Content-Type", content_type)
         .body(bytes)
         .send()
@@ -2249,10 +2362,11 @@ fn upload_bytes(
             // Builder errors (such as an invalid header) and connection failures
             // (DNS, refused connections, TLS handshakes, connect timeouts) happen
             // before any request reaches Roblox. Anything later may have been applied.
+            let text = redact_key(&error.to_string(), key);
             if error.is_builder() || error.is_connect() {
-                UploadFailure::Rejected(format!("Request was not sent: {error}"))
+                UploadFailure::Rejected(format!("Request was not sent: {text}"))
             } else {
-                UploadFailure::Unconfirmed(format!("Request failed after sending: {error}"))
+                UploadFailure::Unconfirmed(format!("Request failed after sending: {text}"))
             }
         })?;
     let status = response.status();
@@ -2272,7 +2386,10 @@ fn upload_bytes(
         });
     }
     let body = body.map_err(|error| {
-        UploadFailure::Unconfirmed(format!("Open Cloud response could not be read: {error}"))
+        UploadFailure::Unconfirmed(format!(
+            "Open Cloud response could not be read: {}",
+            redact_key(&error.to_string(), key)
+        ))
     })?;
     let result: serde_json::Value = serde_json::from_str(&body).map_err(|_| {
         UploadFailure::Unconfirmed(format!(
@@ -2289,6 +2406,17 @@ fn upload_bytes(
                 excerpt(&body)
             ))
         })
+}
+
+/// Replaces the API key in server-provided text with `[redacted]`, as
+/// `OpenCloud` does for its own errors. This runs before the text is
+/// shortened, so a key cut off at the end of an excerpt cannot leak in part.
+fn redact_key(text: &str, key: &str) -> String {
+    if key.is_empty() {
+        text.to_owned()
+    } else {
+        text.replace(key, "[redacted]")
+    }
 }
 
 /// A short, single-line copy of a response body for error messages and receipts.
@@ -2851,11 +2979,20 @@ fn print_json(value: &impl Serialize) -> anyhow::Result<()> {
     println!("{}", serde_json::to_string_pretty(value)?);
     Ok(())
 }
+/// Reads one of Rojo's own state records. They are all far smaller than
+/// `MAX_MANIFEST_BYTES`, so a larger file is damaged and is refused rather
+/// than read into memory whole.
 fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> anyhow::Result<T> {
-    serde_json::from_slice(
-        &fs::read(path).with_context(|| format!("Cannot read {}", path.display()))?,
-    )
-    .with_context(|| format!("Invalid JSON in {}", path.display()))
+    let mut bytes = Vec::new();
+    fs::File::open(path)
+        .and_then(|file| file.take(MAX_MANIFEST_BYTES + 1).read_to_end(&mut bytes))
+        .with_context(|| format!("Cannot read {}", path.display()))?;
+    ensure!(
+        bytes.len() as u64 <= MAX_MANIFEST_BYTES,
+        "{} is larger than 1 MiB, more than any Rojo state record",
+        path.display()
+    );
+    serde_json::from_slice(&bytes).with_context(|| format!("Invalid JSON in {}", path.display()))
 }
 fn write_new(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     let parent = path
@@ -2944,7 +3081,26 @@ fn list_manifest_entries(directory: &Path, nested: bool) -> Vec<(PathBuf, serde_
 mod tests {
     use super::*;
     use rbx_dom_weak::InstanceBuilder;
+    use std::cell::RefCell;
     use std::io::Read;
+
+    thread_local! {
+        static BEFORE_LOCK: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
+    }
+
+    /// Runs `hook` once, the next time this thread's `publish_release` is
+    /// about to take the publication lock, to stand in for another process.
+    fn set_before_lock_hook(hook: impl FnOnce() + 'static) {
+        BEFORE_LOCK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+    }
+
+    pub(super) fn run_before_lock_hook() {
+        // Taken before running, so a publication inside the hook does not
+        // run it again.
+        if let Some(hook) = BEFORE_LOCK.with(|slot| slot.borrow_mut().take()) {
+            hook();
+        }
+    }
 
     struct Fixture {
         _temp: tempfile::TempDir,
@@ -4362,6 +4518,32 @@ mod tests {
     }
 
     #[test]
+    fn publisher_redacts_an_api_key_that_the_server_echoes() {
+        let tail: &'static str =
+            Box::leak(format!("{}fixture-key", "x".repeat(995)).into_boxed_str());
+        for (status, body) in [
+            (
+                "401 Unauthorized",
+                r#"{"message":"Invalid API Key fixture-key"}"#,
+            ),
+            ("500 Internal Server Error", "echo: fixture-key"),
+            ("200 OK", "not json fixture-key"),
+            // Cut off by the excerpt's length limit, the key must not leak in part.
+            ("400 Bad Request", tail),
+        ] {
+            let (url, handle) = serve_once(status, body);
+            let message = match upload_fixture(&url) {
+                Err(UploadFailure::Rejected(message) | UploadFailure::Unconfirmed(message)) => {
+                    message
+                }
+                Ok(version) => panic!("expected a failure, got version {version}"),
+            };
+            assert!(!message.contains("fixture-"), "{message}");
+            handle.join().unwrap();
+        }
+    }
+
+    #[test]
     fn publisher_reports_unsent_requests_as_rejected() {
         // Nothing listens on a port that was just released.
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -4990,6 +5172,7 @@ mod tests {
             StageOptions {
                 name: "v1".into(),
                 staging: staging.into(),
+                allow_live_universe: false,
                 smoke: smoke.then(|| self.script.clone()),
                 smoke_timeout: Some(30),
                 api_key_env: "FIXTURE_UNUSED".into(),
@@ -5371,6 +5554,7 @@ mod tests {
             PublishKind::Staging {
                 universe_id: 9,
                 place_id: 99,
+                allow_live_universe: false,
             },
             |_, _, _| Ok(8),
         )
@@ -5469,6 +5653,194 @@ mod tests {
             assert!(error.contains(expected), "{error}");
         }
         assert!(!repo.state.join("publication-attempts").exists());
+    }
+
+    #[test]
+    fn promote_checks_staging_again_once_it_holds_the_lock() {
+        let staging = Staging::new();
+        staging
+            .stage(finished_task("COMPLETE", "[true]", ""))
+            .0
+            .unwrap();
+        let repo = staging.fixture.repo();
+        age_attempts(&repo, 20);
+        staging.edit_latest(|record| record["staged_unix"] = (now() - 20).into());
+        // A concurrent stage that uploads after promote's first check but
+        // before promote takes the lock, and has not recorded its smoke
+        // check yet.
+        let root = staging.fixture.root.clone();
+        set_before_lock_hook(move || {
+            publish_release(
+                &root,
+                "v1",
+                PublishKind::Staging {
+                    universe_id: 9,
+                    place_id: 99,
+                    allow_live_universe: false,
+                },
+                |_, _, _| Ok(8),
+            )
+            .unwrap();
+        });
+        let error = format!(
+            "{:#}",
+            promote_with(
+                PromoteOptions {
+                    publish: staging.fixture.options("v1"),
+                    max_age_hours: 24,
+                    allow_unsmoked: false,
+                },
+                |_, _, _| panic!("must not publish live"),
+            )
+            .unwrap_err()
+        );
+        assert!(error.contains("nothing was uploaded"), "{error}");
+        assert!(error.contains("was staged again"), "{error}");
+        assert!(!repo.state.join("live").exists());
+        assert!(!repo.state.join("publication.lock").exists());
+        // Only the two staging uploads are journaled, not the promote.
+        let receipts = list_manifests(&repo.state.join("publication-attempts"), false);
+        assert_eq!(receipts.len(), 2);
+        assert!(receipts
+            .iter()
+            .all(|receipt| receipt["purpose"] == "staging"));
+    }
+
+    #[test]
+    fn promote_refuses_an_unreadable_journal_entry() {
+        let staging = Staging::new();
+        staging
+            .stage(finished_task("COMPLETE", "[true]", ""))
+            .0
+            .unwrap();
+        let repo = staging.fixture.repo();
+        // A damaged entry could be a newer staging upload, so it is not skipped.
+        let damaged = repo.state.join("publication-attempts").join("damaged.json");
+        fs::write(&damaged, b"{\"purpose\": \"staging\", ").unwrap();
+        let error = format!("{:#}", staging.promote(false).unwrap_err());
+        assert!(
+            error.contains("Cannot check the publication journal"),
+            "{error}"
+        );
+        assert!(error.contains("damaged.json"), "{error}");
+        assert!(!repo.state.join("live").exists());
+        fs::remove_file(&damaged).unwrap();
+        staging.promote(false).unwrap();
+    }
+
+    #[test]
+    fn stage_refuses_the_live_universe_unless_allowed() {
+        let staging = Staging::new();
+        let error = stage_with(
+            staging.options("123:789", true),
+            |_, _, _| panic!("must not upload"),
+            Box::new(|_, _, _, _, _| panic!("must not run a smoke check")),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("--allow-live-universe"), "{error}");
+        assert!(error.contains("DataStores"), "{error}");
+        let repo = staging.fixture.repo();
+        assert!(!repo.state.join("publication-attempts").exists());
+
+        let mut options = staging.options("123:789", false);
+        options.allow_live_universe = true;
+        let mut uploaded = None;
+        let record = stage_with(
+            options,
+            |url, _, _| {
+                uploaded = Some(url.to_owned());
+                Ok(7)
+            },
+            Box::new(|_, _, _, _, _| panic!("no smoke script was given")),
+        )
+        .unwrap();
+        assert_eq!(record["universe_id"], 123);
+        assert!(uploaded
+            .unwrap()
+            .ends_with("/universes/v1/123/places/789/versions?versionType=Published"));
+        // The flag never allows the release's own place.
+        let mut options = staging.options("123:456", false);
+        options.allow_live_universe = true;
+        let error = stage_with(
+            options,
+            |_, _, _| panic!("must not upload"),
+            Box::new(|_, _, _, _, _| panic!("no smoke script was given")),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("must differ"), "{error}");
+    }
+
+    #[test]
+    fn stage_refuses_a_script_too_large_once_escaped_before_uploading() {
+        let staging = Staging::new();
+        // 700,000 bytes on disk, but each control character is escaped as
+        // six bytes in the request.
+        fs::write(&staging.script, "\u{1}".repeat(700_000)).unwrap();
+        let error = stage_with(
+            staging.options("9:99", true),
+            |_, _, _| panic!("must not upload"),
+            Box::new(|_, _, _, _, _| panic!("must not run a smoke check")),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("once escaped"), "{error}");
+        assert!(!staging
+            .fixture
+            .repo()
+            .state
+            .join("publication-attempts")
+            .exists());
+        fs::write(&staging.script, vec![b'-'; 4_000_001]).unwrap();
+        let error = stage_with(
+            staging.options("9:99", true),
+            |_, _, _| panic!("must not upload"),
+            Box::new(|_, _, _, _, _| panic!("must not run a smoke check")),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("4,000,000"), "{error}");
+    }
+
+    #[test]
+    fn smoke_records_bound_every_field_from_roblox() {
+        let long = "x".repeat(100_000);
+        let outcome = smoke_outcome(Ok(LuauTaskResult {
+            path: long.clone(),
+            state: TaskState::Failed,
+            results: Vec::new(),
+            error_code: Some(long.clone()),
+            error_message: None,
+            logs: vec![crate::open_cloud::LogMessage {
+                message: long.clone(),
+                kind: long.clone(),
+            }],
+            logs_truncated: true,
+            logs_error: Some(long),
+        }));
+        assert!(outcome["task"].as_str().unwrap().len() <= 1000);
+        assert!(outcome["error_code"].as_str().unwrap().len() <= SMOKE_LABEL_CHARS);
+        assert!(outcome["logs"][0]["kind"].as_str().unwrap().len() <= SMOKE_LABEL_CHARS);
+        assert!(outcome["logs_error"].as_str().unwrap().len() <= 1000);
+        assert!(outcome["reason"].as_str().unwrap().len() <= 1000);
+    }
+
+    #[test]
+    fn oversized_state_records_are_refused() {
+        let staging = Staging::new();
+        staging
+            .stage(finished_task("COMPLETE", "[true]", ""))
+            .0
+            .unwrap();
+        let (path, _) = staging.staging_records().pop().unwrap();
+        let mut bytes = b"{\"padding\": \"".to_vec();
+        bytes.resize(MAX_MANIFEST_BYTES as usize + 10, b'x');
+        bytes.extend_from_slice(b"\"}");
+        fs::write(&path, bytes).unwrap();
+        let error = format!("{:#}", read_json::<serde_json::Value>(&path).unwrap_err());
+        assert!(error.contains("larger than 1 MiB"), "{error}");
+        let error = format!("{:#}", staging.promote(false).unwrap_err());
+        assert!(error.contains("Cannot check staging records"), "{error}");
     }
 
     #[test]
