@@ -1560,6 +1560,45 @@ mod test {
     }
 
     #[test]
+    fn two_way_sync_does_not_write_luau_over_data_csv_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dunce::canonicalize(dir.path()).unwrap();
+        let items = root.join("Items.data.csv");
+        fs::write(&items, "id,cost\nsword,100\n").unwrap();
+        let levels = root.join("Levels");
+        fs::create_dir(&levels).unwrap();
+        let levels_init = levels.join("init.data.csv");
+        fs::write(&levels_init, "id,music\n1,calm\n").unwrap();
+        fs::write(levels.join("Helper.luau"), "return 1").unwrap();
+        let task = context(&root);
+
+        for (path, file) in [(&items, &items), (&levels, &levels_init)] {
+            let before = fs::read(file).unwrap();
+            let id = task.tree.lock().unwrap().get_ids_at_path(path)[0];
+            let mut properties = UstrMap::default();
+            properties.insert(
+                ustr("Source"),
+                Some(Variant::String("return 'edited in Studio'".into())),
+            );
+            task.handle_tree_event(PatchSet {
+                updated_instances: vec![PatchUpdate {
+                    id,
+                    changed_name: None,
+                    changed_class_name: None,
+                    changed_properties: properties,
+                    changed_metadata: None,
+                }],
+                ..PatchSet::new()
+            });
+            assert_eq!(fs::read(file).unwrap(), before, "{}", file.display());
+        }
+
+        // Nothing else was written next to them, such as an init.luau.
+        assert!(!levels.join("init.luau").exists());
+        assert_eq!(fs::read_dir(&levels).unwrap().count(), 2);
+    }
+
+    #[test]
     fn init_source_resolution_matches_snapshot_priority() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
