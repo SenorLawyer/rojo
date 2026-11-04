@@ -32,6 +32,11 @@ Making a new release? Simply add the new header with the version and date undern
 ## Unreleased
 
 * The Studio plugin now cancels abandoned connections, prevents overlapping sessions, and retries subscriptions that the server asks it to resync. ([fork#1])
+* Connecting no longer times out while Studio's "allow HTTP access" prompt is open. The plugin says it is waiting and Cancel still works. Update checks remember a Deny even when it comes late. ([fork#1])
+* Initial project loads and sync fallback requests time out after 60 seconds instead of stalling the sync queue. Undo history recordings now close when applying a patch fails. ([fork#1])
+* A server message that fails to apply now ends the session with a logged error and traceback instead of syncing on top of a partial change. Reconnect to resync. ([fork#1])
+* Update checks treat `-fork.N` versions as releases rather than prereleases. Changing the prerelease setting during a check runs it again. ([fork#1])
+* The patch visualizer shows vector, UDim2, CFrame and NumberRange components at float32 precision, so 0.0001 no longer appears as 9.999999747378752e-05. ([fork#1])
 * Fixed the server closing the Studio plugin's connection when an instance was changed and then removed (for example a save followed by a delete, or a `git checkout`) before the change was sent. ([fork#1])
 * Fixed file events for removed or replaced paths crashing the server. Mapped directories are now watched again after being deleted and recreated. ([fork#1])
 * Edits keep syncing after a mapped folder is replaced faster than the watcher can report it, after the folder containing mapped folders is replaced, and after the watcher drops events. A project `$path` that is missing now syncs once it is created. ([fork#1])

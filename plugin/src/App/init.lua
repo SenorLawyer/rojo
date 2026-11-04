@@ -247,11 +247,25 @@ function App:closeNotification(id: number)
 end
 
 function App:checkForUpdates()
-	if self.__unmounted or (self.updateCheckThread and coroutine.status(self.updateCheckThread) ~= "dead") then
+	if self.__unmounted then
 		return
 	end
+	if self.updateCheckThread and coroutine.status(self.updateCheckThread) ~= "dead" then
+		-- The running check read the settings before they changed, so check
+		-- again once it finishes rather than dropping this request.
+		self.updateCheckQueued = true
+		return
+	end
+	self.updateCheckQueued = false
 	self.updateCheckThread = task.defer(function()
 		local updateMessage = Version.getUpdateMessage()
+		if self.updateCheckQueued then
+			-- This result may reflect stale settings, so let the queued check
+			-- decide what to show.
+			self.updateCheckThread = nil
+			self:checkForUpdates()
+			return
+		end
 		if updateMessage and not self.__unmounted then
 			self:addNotification({
 				text = updateMessage,
@@ -457,6 +471,12 @@ end
 function App:checkSyncReminder()
 	local syncReminderMode = Settings:get("syncReminderMode")
 	if syncReminderMode == "None" then
+		return
+	end
+
+	if next(self.activeProbes) ~= nil then
+		-- A probe can wait indefinitely on Studio's HTTP permission prompt, so
+		-- polling must not pile up more requests behind it.
 		return
 	end
 

@@ -111,6 +111,10 @@ function ApiContext.new(baseUrl)
 		__connected = true,
 		__activeRequests = {},
 		__handshakeTimeout = 15,
+		-- Initial reads and fallback serialization can be large, so they get
+		-- far more time than the handshake. They still need a bound because
+		-- they block the in-order message queue while outstanding.
+		__transferTimeout = 60,
 	}
 
 	return setmetatable(self, ApiContext)
@@ -140,19 +144,24 @@ function ApiContext:disconnect()
 
 	if self.__wsClient then
 		Log.trace("Closing WebSocket client")
-		self.__wsClient:Close()
+		pcall(self.__wsClient.Close, self.__wsClient)
 	end
 	self.__wsClient = nil
 end
 
-function ApiContext:__request(method, url, body, timeoutMessage)
+function ApiContext:__request(
+	method,
+	url,
+	body,
+	options: { timeout: number, timeoutMessage: string, onWaitingForPermission: (() -> ())? }?
+)
 	if not self.__connected then
 		return Promise.reject("Cannot send a request after disconnecting")
 	end
 
 	local request = Http[method](url, body)
-	if timeoutMessage then
-		request = request:timeout(self.__handshakeTimeout, timeoutMessage)
+	if options then
+		request = Http.timeout(request, url, options.timeout, options.timeoutMessage, options.onWaitingForPermission)
 	end
 	self.__activeRequests[request] = true
 	return request:finally(function()
@@ -164,10 +173,18 @@ function ApiContext:setMessageCursor(index)
 	self.__messageCursor = index
 end
 
-function ApiContext:connect()
+--[[
+	onWaitingForPermission is called if the handshake is slow while Studio may
+	still be asking the user whether Rojo can access the server's host.
+]]
+function ApiContext:connect(onWaitingForPermission: (() -> ())?)
 	local url = ("%s/api/rojo"):format(self.__baseUrl)
 
-	return self:__request("get", url, nil, "Timed out connecting to the Rojo server. Check `rojo serve` and retry.")
+	return self:__request("get", url, nil, {
+		timeout = self.__handshakeTimeout,
+		timeoutMessage = "Timed out connecting to the Rojo server. Check `rojo serve` and retry.",
+		onWaitingForPermission = onWaitingForPermission,
+	})
 		:andThen(rejectFailedRequests)
 		:andThen(Http.Response.msgpack)
 		:andThen(rejectWrongProtocolVersion)
@@ -187,7 +204,10 @@ end
 function ApiContext:read(ids)
 	local url = ("%s/api/read/%s"):format(self.__baseUrl, table.concat(ids, ","))
 
-	return self:__request("get", url)
+	return self:__request("get", url, nil, {
+		timeout = self.__transferTimeout,
+		timeoutMessage = "Timed out loading the project from the Rojo server. Check `rojo serve` and reconnect.",
+	})
 		:andThen(rejectFailedRequests)
 		:andThen(Http.Response.msgpack)
 		:andThen(function(body)
@@ -284,7 +304,12 @@ function ApiContext:connectWebSocket(packetHandlers, onOpened)
 			if self.__wsClient == wsClient then
 				self.__wsClient = nil
 			end
-			wsClient:Close()
+			-- Closing an already-failed socket can throw, and callers reject
+			-- after cleanup, so this must not prevent the promise from settling.
+			local closed, closeError = pcall(wsClient.Close, wsClient)
+			if not closed then
+				Log.debug("Ignoring error while closing the Rojo WebSocket: {}", closeError)
+			end
 		end
 
 		onCancel(cleanup)
@@ -347,8 +372,16 @@ function ApiContext:connectWebSocket(packetHandlers, onOpened)
 				-- rather than applying a later patch while the previous one is suspended.
 				processingMessages = true
 				while not settled and #pendingMessages > 0 do
-					local ok, err = pcall(handleMessage, table.remove(pendingMessages, 1))
+					local trace
+					local ok, err = xpcall(handleMessage, function(message)
+						trace = debug.traceback(tostring(message), 2)
+						return message
+					end, table.remove(pendingMessages, 1))
 					if not ok then
+						-- Applying later messages on top of a partially applied one
+						-- would leave Studio silently out of sync, so the session
+						-- ends and the user reconnects to resync from scratch.
+						Log.warn("Stopped syncing because a Rojo server message could not be applied:\n{}", trace)
 						cleanup()
 						reject("Failed to process a Rojo server message: " .. tostring(err))
 					end
@@ -410,7 +443,10 @@ function ApiContext:serialize(ids: { string })
 	local url = ("%s/api/serialize"):format(self.__baseUrl)
 	local request_body = Http.msgpackEncode({ sessionId = self.__sessionId, ids = ids })
 
-	return self:__request("post", url, request_body)
+	return self:__request("post", url, request_body, {
+		timeout = self.__transferTimeout,
+		timeoutMessage = "Timed out serializing instances on the Rojo server.",
+	})
 		:andThen(rejectFailedRequests)
 		:andThen(Http.Response.msgpack)
 		:andThen(function(response_body)
@@ -428,7 +464,10 @@ function ApiContext:refPatch(ids: { string })
 	local url = ("%s/api/ref-patch"):format(self.__baseUrl)
 	local request_body = Http.msgpackEncode({ sessionId = self.__sessionId, ids = ids })
 
-	return self:__request("post", url, request_body)
+	return self:__request("post", url, request_body, {
+		timeout = self.__transferTimeout,
+		timeoutMessage = "Timed out fetching references from the Rojo server.",
+	})
 		:andThen(rejectFailedRequests)
 		:andThen(Http.Response.msgpack)
 		:andThen(function(response_body)
