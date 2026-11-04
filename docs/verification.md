@@ -4,7 +4,7 @@ Tested on Windows on November 4, 2026. The fork starts at upstream commit 84e098
 
 ## CLI and server
 
-The Windows release-profile workspace suite passed 268 tests: 15 memofs, 157 library and 96 end-to-end tests. Two pre-existing tests are ignored. Regression coverage includes missing event paths, delayed mapped-directory recreation, explicit init-file paths, interrupted request bodies, historical subscription IDs, metadata changes, binary compression round trips and embedded plugin replacement.
+At commit d295daa, `cargo test --workspace --locked` on Windows passed 322 tests: 36 memofs, 185 library and 101 end-to-end tests. Two tests are ignored. Regression coverage includes missing event paths, delayed mapped-directory recreation, explicit init-file paths, interrupted request bodies, historical subscription IDs, metadata changes, binary compression round trips and embedded plugin replacement.
 
 The live watcher test compares every name and Source across 322 scripts after ten real Git branch checkouts, twelve complete package-tree replacements, a deletion/recreation with a 500 ms gap, two-way init-source writing and a server restart. The optimized build passed every comparison. Tests cover both rapid replacement and recreation after the deletion has settled. Timing depends on filesystem event batching and is not a production-project latency guarantee. Filesystem errors while a tree is temporarily absent are logged and recovered; no panic occurred.
 
@@ -18,10 +18,10 @@ Standalone checks also covered all three init templates with lz4/zstd/uncompress
 
 ## Studio
 
-The full plugin/package suite passed 98 tests, with no failures and one pre-existing skipped test in an isolated Studio test place.
+At commit d295daa, the full plugin/package suite passed 131 tests, with no failures and one skipped test, in an isolated Studio test place on Windows.
 
 The actual App and local server were exercised together:
-- With HTTP access to the host already allowed, a stalled handshake failed with a retry message after 15.07 seconds.
+- After a request to the host had completed in the Studio session, a stalled handshake failed with a retry message after 15.07 seconds. Until a request to the host completes in a session, a stalled handshake waits up to two more minutes, even when access was allowed in an earlier session, because the plugin cannot tell it apart from an unanswered permission prompt.
 - Cancel released the tracked request immediately.
 - A duplicate Connect attempt kept the existing session.
 - Killing the server cleared the session and displayed a readable error.
@@ -33,7 +33,7 @@ The header reads cached update information during render, and background checks 
 
 ## Remaining scope
 
-An optimized stress run exposed a directory-event race that unit tests had missed. The invalid event filter was removed, effective reference metadata was normalized, and regression tests now cover the coalesced event. The release suite and repeated optimized stress tests were rerun afterwards. Windows CI runs the release-profile suite and Git/package stress script; other platform failures cannot cancel that job.
+Regression tests cover coalesced directory events, a race that only showed up in optimized stress runs. Windows CI runs the release-profile suite and Git/package stress script; other platform failures cannot cancel that job.
 
 The [issue inventory](upstream-issues.md) includes all 196 open upstream issues, and the [PR review](upstream-pull-requests.md) includes all 27 open PRs with authors and reviewed heads. Deferred entries are not solved. Cloud upload migration, multiple paths, child patterns, custom metadata names and a third-party plugin API require more design and testing.
 

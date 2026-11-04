@@ -93,9 +93,16 @@ impl BuildCommand {
         let session = ServeSession::new(vfs, project_path)?;
         let mut cursor = session.message_queue().cursor();
 
-        write_model(&session, &output_path, output_kind, self.compress)?;
+        let initial_build = write_model(&session, &output_path, output_kind, self.compress);
 
         if self.watch {
+            // The first build can fail for the same transient reasons as a
+            // rebuild, so watch mode reports it and waits for the next change
+            // instead of exiting.
+            if let Err(error) = &initial_build {
+                log::error!("Failed to build project: {error:?}");
+            }
+
             let rt = Runtime::new().context("Failed to start the async runtime for watch mode")?;
 
             loop {
@@ -124,7 +131,11 @@ impl BuildCommand {
         // and we're about to exit anyways.
         forget(session);
 
-        Ok(())
+        if self.watch {
+            Ok(())
+        } else {
+            initial_build
+        }
     }
 }
 
