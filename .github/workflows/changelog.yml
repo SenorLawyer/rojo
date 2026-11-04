@@ -6,6 +6,12 @@ on:
     branches:
       - master
 
+# With checkNotification set to Simple, the action only lists the pull
+# request's files and fails the job. It does not comment or create checks.
+permissions:
+  contents: read
+  pull-requests: read
+
 jobs:
   build:
     name: Check Actions

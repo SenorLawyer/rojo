@@ -284,7 +284,13 @@ function ApiContext:write(patch)
 
 	body = Http.msgpackEncode(body)
 
-	return self:__request("post", url, body)
+	-- Without a bound, a stalled server keeps this request tracked until the
+	-- session disconnects. Writes can carry whole scripts, so they get the
+	-- transfer timeout rather than the handshake's.
+	return self:__request("post", url, body, {
+		timeout = self.__transferTimeout,
+		timeoutMessage = "Timed out sending changes to the Rojo server. Check `rojo serve` and reconnect.",
+	})
 		:andThen(rejectFailedRequests)
 		:andThen(Http.Response.msgpack)
 		:andThen(function(responseBody)
@@ -463,7 +469,12 @@ end
 function ApiContext:open(id)
 	local url = ("%s/api/open/%s"):format(self.__baseUrl, id)
 
-	return self:__request("post", url, "")
+	-- Opening a file only asks the server to launch an editor, so it should
+	-- answer as quickly as the handshake does.
+	return self:__request("post", url, "", {
+		timeout = self.__handshakeTimeout,
+		timeoutMessage = "Timed out asking the Rojo server to open the script. Check `rojo serve` and retry.",
+	})
 		:andThen(rejectFailedRequests)
 		:andThen(Http.Response.msgpack)
 		:andThen(function(body)

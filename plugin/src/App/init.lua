@@ -881,10 +881,27 @@ function App:startSession()
 			timeout = 7,
 		})
 
-		return self.confirmationEvent:Wait()
+		return self:onConfirmationAnswered(serveSession, self.confirmationEvent:Wait())
 	end)
 
 	serveSession:start()
+end
+
+function App:onConfirmationAnswered(serveSession, decision)
+	-- The session keeps working after an answer: applying the patch, writing
+	-- the rejected changes back and opening the sync socket. The Confirming
+	-- page's buttons do nothing by then, so show the connecting page, whose
+	-- Cancel ends the session.
+	if self.serveSession == serveSession and decision ~= "Abort" then
+		self:setState({
+			appStatus = AppStatus.Connecting,
+			connectingText = if decision == "Reject"
+				then "Sending Studio's changes to the server..."
+				else "Applying changes...",
+		})
+	end
+
+	return decision
 end
 
 function App:endSession()
