@@ -26,7 +26,9 @@ local function compare(a, b)
 	return 0
 end
 
-local RELEASES_URL = "https://api.github.com/repos/SenorLawyer/rojo/releases?per_page=10"
+-- 100 is the most GitHub returns at once. The 8.x line publishes to the same
+-- repository, so a smaller page could leave newer 7.7 releases off it.
+local RELEASES_URL = "https://api.github.com/repos/SenorLawyer/rojo/releases?per_page=100"
 
 local Version = {}
 
