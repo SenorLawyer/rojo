@@ -22,35 +22,13 @@ pub fn filter_properties_preallocated<'inst>(
     inst: &'inst Instance,
     allocation: &mut Vec<(Ustr, &'inst Variant)>,
 ) {
-    let sync_unscriptable = project
-        .syncback_rules
-        .as_ref()
-        .and_then(|s| s.sync_unscriptable)
-        .unwrap_or(true);
-
     let class_data = rbx_reflection_database::get()
         .unwrap()
         .classes
         .get(inst.class.as_str());
 
     let predicate = |prop_name: &Ustr, prop_value: &Variant| {
-        // We don't want to serialize Ref or UniqueId properties in JSON files
-        if matches!(prop_value, Variant::Ref(_) | Variant::UniqueId(_)) {
-            return true;
-        }
-        if !should_property_serialize(&inst.class, prop_name) {
-            return true;
-        }
-        if !sync_unscriptable {
-            if let Some(data) = class_data {
-                if let Some(prop_data) = data.properties.get(prop_name.as_str()) {
-                    if matches!(prop_data.scriptability, Scriptability::None) {
-                        return true;
-                    }
-                }
-            }
-        }
-        false
+        is_excluded_by_rules(project, &inst.class, prop_name, prop_value)
     };
 
     if let Some(class_data) = class_data {
@@ -75,6 +53,42 @@ pub fn filter_properties_preallocated<'inst>(
             allocation.push((*name, value));
         }
     }
+}
+
+/// Returns whether `filter_properties` leaves this property out for a reason
+/// other than its value being the default: it is a Ref or UniqueId, does not
+/// serialize, or is unscriptable while `syncUnscriptable` is off. Syncback has
+/// no value for such a property, so an entry for it in a file must be kept
+/// rather than taken for a property reset to its default.
+pub fn is_excluded_by_rules(
+    project: &Project,
+    class_name: &str,
+    prop_name: &str,
+    prop_value: &Variant,
+) -> bool {
+    // We don't want to serialize Ref or UniqueId properties in JSON files
+    if matches!(prop_value, Variant::Ref(_) | Variant::UniqueId(_)) {
+        return true;
+    }
+    if !should_property_serialize(class_name, prop_name) {
+        return true;
+    }
+    let sync_unscriptable = project
+        .syncback_rules
+        .as_ref()
+        .and_then(|s| s.sync_unscriptable)
+        .unwrap_or(true);
+    if !sync_unscriptable {
+        let class_data = rbx_reflection_database::get()
+            .ok()
+            .and_then(|db| db.classes.get(class_name));
+        if let Some(prop_data) = class_data.and_then(|data| data.properties.get(prop_name)) {
+            if matches!(prop_data.scriptability, Scriptability::None) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn should_property_serialize(class_name: &str, prop_name: &str) -> bool {

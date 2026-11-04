@@ -20,7 +20,9 @@ use crate::{
         InstanceWithMeta, InstigatingSource, PathIgnoreRule, SyncRule,
     },
     snapshot_middleware::Middleware,
-    syncback::{filter_properties, FsSnapshot, SyncbackReturn, SyncbackSnapshot},
+    syncback::{
+        filter_properties, is_excluded_by_rules, FsSnapshot, SyncbackReturn, SyncbackSnapshot,
+    },
     variant_eq::variant_eq,
     RojoRef,
 };
@@ -585,11 +587,21 @@ pub fn syncback_project<'sync>(
 /// Entries named in `untouched` (see
 /// [`SyncbackSnapshot::untouched_properties`]) are left as they are.
 fn project_node_property_syncback(
+    project: &Project,
     filtered_properties: UstrMap<&Variant>,
     new_inst: &Instance,
     node: &mut ProjectNode,
     untouched: &UstrSet,
 ) -> bool {
+    // A property the syncback rules leave out, such as an unscriptable one
+    // while `syncUnscriptable` is off, has no value to sync, so its entry is
+    // kept instead of being taken for a property reset to its default.
+    let excluded = |name: &Ustr| {
+        new_inst
+            .properties
+            .get(name)
+            .is_some_and(|value| is_excluded_by_rules(project, &new_inst.class, name, value))
+    };
     let class_data = rbx_reflection_database::get()
         .ok()
         .and_then(|db| db.classes.get(new_inst.class.as_str()));
@@ -616,7 +628,10 @@ fn project_node_property_syncback(
     for (legacy_name, content_name, migrated) in legacy_entries {
         // The new DOM holds no value for an ignored or unreadable property,
         // which must not be mistaken for a value reset to its default.
-        if untouched.contains(&legacy_name) || untouched.contains(&content_name) {
+        if untouched.contains(&legacy_name)
+            || untouched.contains(&content_name)
+            || excluded(&content_name)
+        {
             kept_legacy.insert(legacy_name);
             continue;
         }
@@ -673,6 +688,7 @@ fn project_node_property_syncback(
         if filtered_properties.contains_key(prop_name)
             || kept_legacy.contains(prop_name)
             || untouched.contains(prop_name)
+            || excluded(prop_name)
         {
             return true;
         }
@@ -708,7 +724,13 @@ fn project_node_property_syncback_path(
     let filtered_properties = snapshot
         .get_path_filtered_properties(new_inst.referent())
         .unwrap();
-    project_node_property_syncback(filtered_properties, new_inst, node, untouched)
+    project_node_property_syncback(
+        snapshot.project(),
+        filtered_properties,
+        new_inst,
+        node,
+        untouched,
+    )
 }
 
 fn project_node_property_syncback_no_path(
@@ -718,7 +740,13 @@ fn project_node_property_syncback_no_path(
     untouched: &UstrSet,
 ) -> bool {
     let filtered_properties = filter_properties(snapshot.project(), new_inst);
-    project_node_property_syncback(filtered_properties, new_inst, node, untouched)
+    project_node_property_syncback(
+        snapshot.project(),
+        filtered_properties,
+        new_inst,
+        node,
+        untouched,
+    )
 }
 
 fn project_node_should_reserialize(

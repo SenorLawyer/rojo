@@ -45,6 +45,8 @@ Project files work the same way. A `$properties` entry with a legacy name stays 
 
 In `syncbackRules.ignoreProperties`, a legacy name and its `Content` name are the same property, so listing either one, such as `"Sound": ["SoundId"]` or `"Sound": ["AudioContent"]`, ignores both. Syncback leaves entries for an ignored property in project files as they are. A `.model.json` or `.meta.json` file is written from the place, so one that Syncback rewrites because something else in it changed loses them.
 
+With `syncbackRules.syncUnscriptable` set to `false`, Syncback has no value for an unscriptable `Content` property, such as `SurfaceAppearance.TexturePackContent`, so an entry for it, or for its legacy name, is kept as written.
+
 ## Limits
 
 - A `Content` value that refers to an object, such as an `EditableImage`, only exists in a running game. Rojo leaves such a property out of its tree and logs a warning. Syncback also logs a warning and handles the property as if `ignoreProperties` listed it for that instance, so it does not write the value and leaves the entry your files already have.

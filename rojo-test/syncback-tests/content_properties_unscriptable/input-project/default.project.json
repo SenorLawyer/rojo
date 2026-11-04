@@ -1,0 +1,29 @@
+{
+  "name": "content_properties_unscriptable",
+  "tree": {
+    "$className": "DataModel",
+    "ServerStorage": {
+      "Kept": {
+        "$className": "SurfaceAppearance",
+        "$properties": {
+          "TexturePack": "rbxassetid://5"
+        }
+      },
+      "KeptNew": {
+        "$className": "SurfaceAppearance",
+        "$properties": {
+          "TexturePackContent": "rbxassetid://5"
+        }
+      },
+      "Changed": {
+        "$className": "Sound",
+        "$properties": {
+          "Volume": 0.75
+        }
+      }
+    }
+  },
+  "syncbackRules": {
+    "syncUnscriptable": false
+  }
+}
