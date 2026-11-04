@@ -206,9 +206,11 @@ pub fn syncback_loop(
         );
 
         // Modules generated from data files keep their source file as it is.
+        // A directory with an `init.data.csv` file is not skipped here, so
+        // its children are still synced back.
         if matches!(
             middleware,
-            Middleware::Json | Middleware::Toml | Middleware::DataCsv | Middleware::DataCsvDir
+            Middleware::Json | Middleware::Toml | Middleware::DataCsv
         ) {
             log::warn!("Cannot syncback {middleware:?} at {inst_path}, skipping");
             continue;

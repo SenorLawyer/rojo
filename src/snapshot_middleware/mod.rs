@@ -41,7 +41,7 @@ use crate::{
 
 use self::{
     csv::{snapshot_csv, snapshot_csv_init, syncback_csv, syncback_csv_init},
-    data_csv::{snapshot_data_csv, snapshot_data_csv_init},
+    data_csv::{snapshot_data_csv, snapshot_data_csv_init, syncback_data_csv_init},
     dir::{snapshot_dir, syncback_dir},
     json::snapshot_json,
     json_model::{snapshot_json_model, syncback_json_model},
@@ -314,9 +314,8 @@ impl Middleware {
             // The module is generated from the spreadsheet, and turning edited
             // Luau back into CSV would lose formatting and comments people
             // keep in their spreadsheet tools.
-            Middleware::DataCsv | Middleware::DataCsvDir => {
-                anyhow::bail!("cannot syncback {self:?} middleware")
-            }
+            Middleware::DataCsv => anyhow::bail!("cannot syncback {self:?} middleware"),
+            Middleware::DataCsvDir => syncback_data_csv_init(snapshot),
             // Projects are only generated from files that already exist on the
             // file system, so we don't need to pass a file name.
             Middleware::Project => syncback_project(snapshot),

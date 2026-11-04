@@ -18,6 +18,9 @@ The first row holds the column names. Every other row becomes a table with one f
 - `true` and `false` become booleans, in any letter case (`TRUE`, `False`).
 - An empty cell leaves the field out, so it reads as `nil`.
 - Anything else is a string, exactly as written. Spaces around a value are kept, so ` 5` is the string `" 5"`.
+- A whole number of 2^53 (9007199254740992) or more, written with digits only, stays a string, since a Luau number cannot hold every integer that large. Two long codes that differ in their last digit stay two different values.
+- There is no way to force a value to be text. Quoting a cell in the CSV file does not change its type, because spreadsheet tools quote cells for their own reasons. A code with leading zeros, like `007`, becomes the number `7`. Add a letter, such as `A007`, to keep it as text.
+- Values must be separated by commas. A file exported with semicolons, as some spreadsheet tools do in locales that use a decimal comma, is read as one column.
 - A column with an empty name is skipped. Spreadsheet tools often export these after the last column.
 
 If a column is named exactly `id` (lowercase), the module returns a dictionary keyed by each row's `id` value, and each row keeps its `id` field. Without an `id` column, the module returns an array of rows in file order. An `id` column was chosen over keying by the first column so that adding or reordering columns never changes the shape of the table.
@@ -72,7 +75,7 @@ The file fails to load, with an error that names the file and the line, when:
 - a row has more or fewer fields than the header row,
 - two columns have the same name,
 - a row has an empty `id`,
-- two rows have the same `id`. Ids are compared as Luau values, so `1` and `1.0` are the same id.
+- two rows have the same `id`. Ids are compared as Luau values, so `1`, `1.0` and `-0`/`0` are the same id, and the error names both values.
 
 While `rojo serve` is running, the error is logged and the module keeps its last good contents until the file is fixed.
 
@@ -80,7 +83,21 @@ While `rojo serve` is running, the error is logged and the module keeps its last
 
 `rojo serve` regenerates the module whenever the CSV file changes, like any other file.
 
-The CSV file is the source of truth. Two-way sync does not write a script edited in Studio back over the CSV file; the server logs a warning instead. `rojo syncback` leaves `.data.csv` files, and directories with an `init.data.csv`, as they are and logs a warning, the same way it skips `.json` and `.toml` modules. Turning edited Luau back into CSV would lose what spreadsheet tools keep in the file, so it is not attempted.
+The CSV file is the source of truth. Two-way sync does not write a script edited in Studio back over the CSV file; the server logs a warning instead. `rojo syncback` leaves `.data.csv` files as they are, the same way it skips `.json` and `.toml` modules. In a directory with an `init.data.csv`, syncback still writes the module's children, but not its source, and logs a warning when the source was changed. Turning edited Luau back into CSV would lose what spreadsheet tools keep in the file, so it is not attempted.
+
+## Type checking and editors
+
+`rojo typecheck` writes each data module's generated Luau to a temporary file, so scripts that require a data module, or use `Items.Row`, are checked against it. See [Type checking](typecheck.md).
+
+`rojo sourcemap`, which editors running luau-lsp use, still lists the `.data.csv` file for a data module. luau-lsp cannot read it, so in the editor a `require` of a data module is unknown and its `Row` type cannot be used. The sourcemap does not point at generated files, since an editor would keep reading them after they went out of date.
+
+## Upgrading
+
+Before data modules, every `.csv` file became a LocalizationTable. When upgrading:
+
+- A file whose name ends in `.data.csv`, such as `Strings.data.csv`, becomes a ModuleScript instead of a LocalizationTable. Rojo logs a warning when such a file has the `Key` and `Source` columns of a LocalizationTable. Rename it, for example to `Strings.csv`, to keep it a LocalizationTable.
+- A directory with an `init.data.csv` file becomes a ModuleScript. Before, the file was a child LocalizationTable named `init.data`.
+- When a directory has both an `init.luau` (or another init script) and an `init.data.csv`, the init script wins as before, and the `init.data.csv` is now ignored instead of becoming a child LocalizationTable.
 
 ## Sync rules
 

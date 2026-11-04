@@ -34,6 +34,9 @@ syncback_tests! {
     child_but_not => ["OnlyOneCopy/child_of_one.luau", "ReplicatedStorage/child_replicated_storage.luau"],
     // Ensures that syncback works with CSVs
     csv => ["src/csv_init/init.csv", "src/csv.csv"],
+    // Ensures that the children of a directory with an `init.data.csv` are
+    // synced back, while the data CSV files themselves are left as they are
+    data_csv_init => ["src/Items.data.csv", "src/Levels/init.data.csv", "src/Levels/Helper.luau", "src/Levels/Added.luau"],
     // Ensures that if a RojoId is duplicated somewhere in the project, it's
     // rewritten rather than synced back as a conflict
     duplicate_rojo_id => ["container.model.json"],

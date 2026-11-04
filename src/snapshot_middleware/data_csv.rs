@@ -12,10 +12,13 @@ use anyhow::{bail, Context};
 use memofs::Vfs;
 use rbx_dom_weak::ustr;
 
-use crate::snapshot::{InstanceContext, InstanceMetadata, InstanceSnapshot};
+use crate::{
+    snapshot::{InstanceContext, InstanceMetadata, InstanceSnapshot},
+    syncback::{SyncbackReturn, SyncbackSnapshot},
+};
 
 use super::{
-    dir::snapshot_dir_no_meta,
+    dir::{snapshot_dir_no_meta, syncback_dir_no_meta},
     meta_file::{AdjacentMetadata, DirectoryMetadata},
 };
 
@@ -88,6 +91,29 @@ pub fn snapshot_data_csv_init(
     Ok(Some(init_snapshot))
 }
 
+/// Syncs back the children of a directory with an `init.data.csv` file. The
+/// CSV file itself is left as it is: turning edited Luau back into CSV would
+/// lose what spreadsheet tools keep in the file.
+pub fn syncback_data_csv_init<'sync>(
+    snapshot: &SyncbackSnapshot<'sync>,
+) -> anyhow::Result<SyncbackReturn<'sync>> {
+    let source = ustr("Source");
+    let new_source = snapshot.new_inst().properties.get(&source);
+    let old_source = snapshot
+        .old_inst()
+        .and_then(|old| old.properties().get(&source));
+    if new_source != old_source {
+        log::warn!(
+            "Not writing the Source of {} to {}, since it is generated from the CSV file. \
+             Its children are still synced back.",
+            snapshot.get_new_inst_path(snapshot.new),
+            snapshot.path.join("init.data.csv").display()
+        );
+    }
+
+    syncback_dir_no_meta(snapshot)
+}
+
 /// A single parsed cell. Empty cells are `None` and are left out of the row.
 #[derive(Debug, Clone, PartialEq)]
 enum Cell {
@@ -112,12 +138,23 @@ impl Cell {
         // Rust's float parser also accepts `inf` and `NaN`, which have no
         // literal in Luau and are much more likely to be meant as text.
         if let Ok(number) = value.parse::<f64>() {
-            if number.is_finite() {
+            if number.is_finite() && !is_inexact_integer(value, number) {
                 return Some(Self::Number(number));
             }
         }
 
         Some(Self::String(value.to_owned()))
+    }
+
+    /// The key this value has in a Luau table, as text. Luau treats `-0` and
+    /// `0` as the same key, so they are given the same text.
+    fn key_text(&self) -> String {
+        let mut key = String::new();
+        match self {
+            Self::Number(number) if *number == 0.0 => Self::Number(0.0).write_key(&mut key),
+            cell => cell.write_key(&mut key),
+        }
+        key
     }
 
     fn type_name(&self) -> &'static str {
@@ -146,6 +183,19 @@ impl Cell {
             }
         }
     }
+}
+
+/// Whether `value` is written as a whole number too large for a Luau number
+/// to hold every integer around it, such as a 19-digit product code. These
+/// stay strings so that they are not silently rounded to another number.
+fn is_inexact_integer(value: &str, number: f64) -> bool {
+    // 2^53. From here on, not every integer has its own f64.
+    const MAX_EXACT_INTEGER: f64 = 9_007_199_254_740_992.0;
+
+    let digits = value.strip_prefix(['-', '+']).unwrap_or(value);
+    !digits.is_empty()
+        && digits.bytes().all(|byte| byte.is_ascii_digit())
+        && number.abs() >= MAX_EXACT_INTEGER
 }
 
 struct Column {
@@ -198,10 +248,26 @@ fn data_csv_to_luau(contents: &[u8], file_name: &str) -> anyhow::Result<String> 
         });
     }
 
+    // Before data modules, every `.csv` file was a LocalizationTable, so a
+    // file named like `Strings.data.csv` may still be one.
+    if looks_like_localization_table(&columns) {
+        log::warn!(
+            "{} has the Key and Source columns of a LocalizationTable, but files ending \
+             in .data.csv become ModuleScripts. Rename it to end in .csv if it is a \
+             LocalizationTable.",
+            if file_name.is_empty() {
+                "A data CSV file"
+            } else {
+                file_name
+            }
+        );
+    }
+
     let id_column = columns.iter().position(|column| column.name == ID_COLUMN);
 
     let mut rows: Vec<Vec<Option<Cell>>> = Vec::new();
-    let mut ids: HashMap<String, u64> = HashMap::new();
+    // The line and text of the row that has each key.
+    let mut ids: HashMap<String, (u64, String)> = HashMap::new();
 
     for record in reader.records() {
         let record = record.context("could not read a row")?;
@@ -233,13 +299,20 @@ fn data_csv_to_luau(contents: &[u8], file_name: &str) -> anyhow::Result<String> 
 
             // Keys are compared as they will appear in Luau, so `1` and `1.0`
             // count as the same id.
-            let mut key = String::new();
-            id.write_key(&mut key);
-            if let Some(previous_line) = ids.insert(key, line) {
+            let text = &record[columns[id_column].index];
+            if let Some((previous_line, previous_text)) =
+                ids.insert(id.key_text(), (line, text.to_owned()))
+            {
+                if previous_text == text {
+                    bail!(
+                        "row on line {line} has the same {ID_COLUMN:?} as the row on \
+                         line {previous_line}: {text:?}"
+                    );
+                }
                 bail!(
                     "row on line {line} has the same {ID_COLUMN:?} as the row on \
-                     line {previous_line}: {:?}",
-                    &record[columns[id_column].index]
+                     line {previous_line}: {text:?} and {previous_text:?} are the same \
+                     value in Luau"
                 );
             }
         }
@@ -295,6 +368,13 @@ fn data_csv_to_luau(contents: &[u8], file_name: &str) -> anyhow::Result<String> 
     output.push_str("}\n\nreturn data\n");
 
     Ok(output)
+}
+
+/// Whether the columns are those Roblox reads as a LocalizationTable: `Key`
+/// and `Source`, with the optional `Context` and `Example`.
+fn looks_like_localization_table(columns: &[Column]) -> bool {
+    let has = |name: &str| columns.iter().any(|column| column.name == name);
+    has("Key") && has("Source")
 }
 
 fn write_row(output: &mut String, columns: &[Column], row: &[Option<Cell>]) {
@@ -534,8 +614,65 @@ mod test {
         let error = convert_err("id,name\n1,One\n2,Two\n1.0,Also one\n");
         assert_eq!(
             error,
-            "row on line 4 has the same \"id\" as the row on line 2: \"1.0\""
+            "row on line 4 has the same \"id\" as the row on line 2: \"1.0\" and \"1\" are the same value in Luau"
         );
+    }
+
+    #[test]
+    fn negative_zero_and_zero_are_the_same_id() {
+        let error = convert_err("id,name\n0,Zero\n-0,Negative zero\n");
+        assert_eq!(
+            error,
+            "row on line 3 has the same \"id\" as the row on line 2: \"-0\" and \"0\" are the same value in Luau"
+        );
+    }
+
+    #[test]
+    fn integers_too_large_for_a_luau_number_stay_strings() {
+        assert_eq!(
+            Cell::parse("9007199254740993"),
+            Some(Cell::String("9007199254740993".into()))
+        );
+        assert_eq!(
+            Cell::parse("-12345678901234567890"),
+            Some(Cell::String("-12345678901234567890".into()))
+        );
+        assert_eq!(
+            Cell::parse("9007199254740991"),
+            Some(Cell::Number(9007199254740991.0))
+        );
+        // Written with a decimal point or an exponent, it reads as a number.
+        assert_eq!(Cell::parse("1e20"), Some(Cell::Number(1e20)));
+
+        // Two codes that would round to the same number stay distinct ids.
+        let source = convert("id\n9007199254740992\n9007199254740993\n");
+        assert!(
+            source.contains("\t[\"9007199254740993\"] = { id = \"9007199254740993\" },\n"),
+            "{source}"
+        );
+    }
+
+    #[test]
+    fn localization_table_headers_are_recognised() {
+        let columns = |names: &[&str]| -> Vec<Column> {
+            names
+                .iter()
+                .enumerate()
+                .map(|(index, name)| Column {
+                    index,
+                    name: (*name).to_owned(),
+                    types: BTreeSet::new(),
+                    optional: false,
+                })
+                .collect()
+        };
+
+        assert!(looks_like_localization_table(&columns(&[
+            "Key", "Source", "Context", "Example", "es"
+        ])));
+        assert!(looks_like_localization_table(&columns(&["Key", "Source"])));
+        assert!(!looks_like_localization_table(&columns(&["id", "Source"])));
+        assert!(!looks_like_localization_table(&columns(&["key", "source"])));
     }
 
     #[test]
