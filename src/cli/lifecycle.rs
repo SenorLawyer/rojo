@@ -1506,6 +1506,8 @@ const DEFAULT_SMOKE_TIMEOUT_SECONDS: u64 = 60;
 const MAX_SMOKE_TIMEOUT_SECONDS: u64 = 300;
 /// How many of the smoke script's last log messages a staging record keeps.
 const SMOKE_LOG_TAIL: usize = 50;
+/// The largest smoke result kept as JSON in a staging record.
+const SMOKE_RESULTS_BYTES: usize = 4096;
 
 /// Runs a smoke script against a published place version. The arguments are
 /// the universe, place, version, script and timeout.
@@ -1718,10 +1720,22 @@ fn smoke_outcome(result: Result<LuauTaskResult, OpenCloudError>) -> serde_json::
             })
         })
         .collect();
+    // The values the script returned, as JSON, unless they are too large to
+    // keep in the record; then a shortened text form is stored instead.
+    let results = serde_json::Value::from(task.results);
+    let results_text = results.to_string();
+    let (results, results_truncated) = if results_text.len() <= SMOKE_RESULTS_BYTES {
+        (results, false)
+    } else {
+        let shortened = excerpt(&results_text);
+        (
+            serde_json::Value::from(shortened.trim_start_matches(": ")),
+            true,
+        )
+    };
     serde_json::json!({
         "status": status, "reason": reason, "task": task.path,
-        "results": excerpt(&serde_json::Value::from(task.results).to_string())
-            .trim_start_matches(": "),
+        "results": results, "results_truncated": results_truncated,
         "error_code": task.error_code, "logs": logs,
         "logs_omitted": skip > 0 || task.logs_truncated,
     })
@@ -4941,6 +4955,9 @@ mod tests {
         assert_eq!(record["place_id"], 99);
         assert_eq!(record["release_target"], "123:456");
         assert_eq!(record["smoke"]["logs"][0]["message"], "smoke ran");
+        // The returned values are kept as JSON, not as JSON text.
+        assert_eq!(record["smoke"]["results"], serde_json::json!([{"ok": true}]));
+        assert_eq!(record["smoke"]["results_truncated"], false);
         // The smoke check runs against the version that staging just created.
         assert_eq!(requests.len(), 2);
         assert!(requests[0].starts_with(
