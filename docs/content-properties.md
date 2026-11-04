@@ -34,6 +34,7 @@ Rojo moves legacy properties to their `Content` replacements when it loads a pro
 - The plugin sets the `Content` property in Studio. Studio keeps the legacy property in step, so scripts that read `Sound.SoundId` still see the same asset.
 - `CharacterMesh` ids such as `MeshId = 1234` become `rbxassetid://1234`, and `0` becomes no content.
 - If an instance sets both names, the `Content` property is used and Rojo logs a warning when the two values differ.
+- A project node's `$properties` override the asset properties of the file its `$path` points to under either name, so `"SoundId"` on a node whose `.rbxm` model sets `AudioContent` replaces the model's value.
 
 Model files (`.rbxm` and `.rbxmx`) in either format are read as Studio reads them, including XML `Content` values written as `<uri>` or `<null />`.
 

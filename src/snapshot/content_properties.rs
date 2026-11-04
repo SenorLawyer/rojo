@@ -14,7 +14,7 @@
 //! and the plugin's diff all agree on one value.
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     sync::{Mutex, OnceLock},
 };
 
@@ -125,11 +125,37 @@ fn conflict_warning(class_name: &str, name: &str, legacy: &str, new: &str) -> St
     )
 }
 
+/// Alias lists already worked out, per class and property name.
+type AliasCache = HashMap<(Ustr, Ustr), Vec<Ustr>>;
+
 /// Returns the other names of the asset property `property_name` of
 /// `class_name`: the `Content` replacement of a legacy property, or the legacy
 /// properties that a `Content` property replaced. Returns nothing for any
 /// other property.
 pub fn content_property_aliases(class_name: &str, property_name: &str) -> Vec<Ustr> {
+    // Syncback asks for every ignored name on every instance, and project
+    // loading for every `$properties` entry, so answers are kept per class
+    // and property instead of walking the class's properties each time.
+    static CACHE: OnceLock<Mutex<AliasCache>> = OnceLock::new();
+
+    let key = (ustr(class_name), ustr(property_name));
+    let cache = CACHE.get_or_init(Default::default);
+    if let Some(aliases) = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(&key)
+    {
+        return aliases.clone();
+    }
+    let aliases = find_content_property_aliases(class_name, property_name);
+    cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(key, aliases.clone());
+    aliases
+}
+
+fn find_content_property_aliases(class_name: &str, property_name: &str) -> Vec<Ustr> {
     let mut aliases = Vec::new();
     if let Some(migration) = content_migration(class_name, property_name) {
         aliases.extend(migration.new_property_names().iter().map(|name| ustr(name)));

@@ -9,6 +9,8 @@
       "EmptyNew": { "$className": "Sound", "$properties": { "AudioContent": "" } },
       "LegacyChar": { "$className": "CharacterMesh", "$properties": { "MeshId": 123 } },
       "NewChar": { "$className": "CharacterMesh", "$properties": { "MeshContent": "rbxassetid://9" } },
+      "LegacyOverride": { "$path": "models/Override.rbxmx", "$properties": { "SoundId": "rbxassetid://2" } },
+      "NewOverride": { "$path": "models/Override.rbxmx", "$properties": { "AudioContent": "rbxassetid://3" } },
       "Src": { "$path": "src" }
     }
   }

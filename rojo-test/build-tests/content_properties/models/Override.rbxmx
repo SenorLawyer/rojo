@@ -1,0 +1,8 @@
+<roblox version="4">
+  <Item class="Sound" referent="RBX1">
+    <Properties>
+      <string name="Name">Override</string>
+      <Content name="AudioContent"><uri>rbxassetid://1</uri></Content>
+    </Properties>
+  </Item>
+</roblox>

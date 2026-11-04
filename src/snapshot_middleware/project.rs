@@ -16,8 +16,8 @@ use crate::{
     project::{PathNode, Project, ProjectNode},
     resolution::UnresolvedValue,
     snapshot::{
-        migrate_content_property, InstanceContext, InstanceMetadata, InstanceSnapshot,
-        InstanceWithMeta, InstigatingSource, PathIgnoreRule, SyncRule,
+        content_property_aliases, migrate_content_property, InstanceContext, InstanceMetadata,
+        InstanceSnapshot, InstanceWithMeta, InstigatingSource, PathIgnoreRule, SyncRule,
     },
     snapshot_middleware::Middleware,
     syncback::{
@@ -296,6 +296,16 @@ pub fn snapshot_project_node(
             _ => {}
         }
 
+        // A node's `$properties` override what its `$path` file sets. Files
+        // read by rbx-dom only carry the `Content` name of an asset property,
+        // such as `AudioContent`, so a node that overrides it with the legacy
+        // name, such as `SoundId`, removes the file's value; otherwise the
+        // file's `Content` value would win once legacy names are moved.
+        for alias in content_property_aliases(&class_name, key) {
+            if !node.properties.contains_key(&alias) {
+                properties.remove(&alias);
+            }
+        }
         properties.insert(*key, value);
     }
 
