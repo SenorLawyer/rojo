@@ -137,6 +137,9 @@ impl Default for Timing {
 
 /// The format of a place file, which decides the upload's content type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// The full set of values Open Cloud accepts or returns; not every command
+// uses each one yet.
+#[allow(dead_code)]
 pub enum PlaceFormat {
     /// `.rbxl`
     Binary,
@@ -155,6 +158,9 @@ impl PlaceFormat {
 
 /// Whether a new place version only gets saved or also goes live.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// The full set of values Open Cloud accepts or returns; not every command
+// uses each one yet.
+#[allow(dead_code)]
 pub enum VersionType {
     /// Saved as a version without changing what players join.
     Saved,
@@ -173,6 +179,9 @@ impl VersionType {
 
 /// Asset types that the Open Cloud Assets API accepts for new uploads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// The full set of values Open Cloud accepts or returns; not every command
+// uses each one yet.
+#[allow(dead_code)]
 pub enum AssetType {
     /// PNG, JPEG, BMP or TGA. Its id works directly in `rbxassetid://` for
     /// image and texture properties.
@@ -245,6 +254,9 @@ pub struct LuauTaskResult {
 
 /// A finished asset upload.
 #[derive(Debug, Clone)]
+// The full set of values Open Cloud accepts or returns; not every command
+// uses each one yet.
+#[allow(dead_code)]
 pub struct UploadedAsset {
     pub asset_id: u64,
     /// As Roblox reports it, such as `Image`.

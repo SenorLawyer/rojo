@@ -334,7 +334,7 @@ impl TestReport {
         for failure in &self.failures {
             let _ = writeln!(output, "FAIL {}", failure.path.join(" > "));
             for message in &failure.messages {
-                output.push_str(&indent(message));
+                output.push_str(&indent(&without_runner_frames(message)));
             }
         }
         if self.omitted_failures > 0 {
@@ -383,21 +383,55 @@ impl TestReport {
                     self.skipped
                 );
                 if !self.load_errors.is_empty() || self.omitted_load_errors > 0 {
+                    let count = self.load_errors.len() as u64 + self.omitted_load_errors;
                     let _ = write!(
                         output,
-                        ", {} modules failed to load",
-                        self.load_errors.len() as u64 + self.omitted_load_errors
+                        ", {count} {} to load",
+                        if count == 1 {
+                            "module failed"
+                        } else {
+                            "modules failed"
+                        }
                     );
                 }
                 let _ = write!(output, " in {:.2}s", self.duration_seconds);
                 if let Some(framework) = &self.framework {
-                    let _ = write!(output, " ({framework}, {} spec modules)", self.modules);
+                    let _ = write!(
+                        output,
+                        " ({framework}, {} spec {})",
+                        self.modules,
+                        if self.modules == 1 {
+                            "module"
+                        } else {
+                            "modules"
+                        }
+                    );
                 }
                 output.push('\n');
             }
         }
         output
     }
+}
+
+/// Drops stack frames inside the test framework and Rojo's runner from a
+/// failure message, which otherwise outnumber the frames in the spec itself.
+/// JSON reports keep the full message.
+fn without_runner_frames(message: &str) -> String {
+    let is_runner_frame = |line: &str| {
+        let line = line.trim_start();
+        line.contains(".TestEZ.")
+            || line.contains("__RojoBridgeSpec_")
+            || line.starts_with("SpecRunner:")
+            || line.contains(".SpecRunner:")
+    };
+    let mut lines = message.lines();
+    let mut kept: Vec<&str> = lines.next().into_iter().collect();
+    kept.extend(lines.filter(|line| !is_runner_frame(line)));
+    kept.join(
+        "
+",
+    )
 }
 
 /// Picks the session to test: the one requested, or the only one connected.
@@ -636,6 +670,25 @@ impl TestCommand {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rendered_failures_hide_framework_frames() {
+        let message = [
+            "ReplicatedStorage.Packages.TestEZ.TestRunner:86: Expected value 3, got 2",
+            "ReplicatedStorage.Packages.TestEZ.Expectation:47 function equal",
+            "ReplicatedStorage.Shared.Math.spec:11",
+            "ServerScriptService.__RojoBridgeSpec_x.SpecRunner:554 function runTestEZ",
+        ]
+        .join(
+            "
+",
+        );
+        assert_eq!(
+            without_runner_frames(&message),
+            "ReplicatedStorage.Packages.TestEZ.TestRunner:86: Expected value 3, got 2
+ReplicatedStorage.Shared.Math.spec:11"
+        );
+    }
     use crate::web::studio::DEFAULT_SPEC_SECONDS;
 
     fn failing_report() -> Value {
@@ -679,7 +732,7 @@ mod tests {
         assert!(report.failures.is_empty());
         assert_eq!(
             report.render(),
-            "PASSED: 2 passed, 0 failed, 0 skipped in 0.25s (testez, 1 spec modules)\n"
+            "PASSED: 2 passed, 0 failed, 0 skipped in 0.25s (testez, 1 spec module)\n"
         );
     }
 
@@ -695,7 +748,7 @@ mod tests {
             .starts_with("LOAD ERROR game/ReplicatedStorage/Broken.spec\n    syntax error\nFAIL "));
         assert!(rendered.contains("... 7 more failures not shown\n"));
         assert!(rendered.contains("(2 messages were shortened"));
-        assert!(rendered.contains(", 1 modules failed to load in"));
+        assert!(rendered.contains(", 1 module failed to load in"));
     }
 
     #[test]

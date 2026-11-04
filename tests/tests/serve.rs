@@ -244,14 +244,18 @@ fn edit_data_csv() {
             read_response.intern_and_redact(&mut redactions, root_id)
         );
 
+        // Written beside the file and renamed over it, so the watcher never
+        // sees a partly written CSV and the first packet is the final edit.
+        let staged = session.path().join("Items.data.csv.tmp");
         fs::write(
-            session.path().join("src/Items.data.csv"),
+            &staged,
             "id,cost
 sword,150
 shield,50
 ",
         )
         .unwrap();
+        fs::rename(&staged, session.path().join("src/Items.data.csv")).unwrap();
 
         let socket_packet = session
             .get_api_socket_packet(SocketPacketType::Messages, 0)
