@@ -31,6 +31,7 @@ Making a new release? Simply add the new header with the version and date undern
 
 ## Unreleased
 
+* `rojo doc --agent` now bundles detailed guides, printed with `rojo doc --agent <topic>` and listed with `--list`, and its main guide lists what this fork adds over upstream Rojo. `rojo doc --agent --write <dir>` replaces a project's ROJO_AGENT.md with the installed version's guide and creates an AGENTS.md pointing to it if there is none, and `rojo init` now creates that AGENTS.md too, so agents find the guide on their own. ([fork#5])
 * Fixed the Studio bridge stalling after a minute or two of use, with commands returning HTTP 504 and the session expiring while sync stayed connected. Studio slows a plugin's RequestAsync calls more and more once it long-polls with them, so the bridge now polls over its own HTTP stream, sharing a budget of 3 streams with sync so that neither can use up Studio's limit of 4 per plugin. ([fork#4])
 * Added `rojo assets sync`, which uploads new and changed images, audio and models from a folder through Open Cloud and writes a Luau module of their ids, such as `Assets.Icons.Coin`. A committed `assets.lock.json` records each file's content hash and asset id, so unchanged, renamed and copied files are never uploaded again, and an interrupted sync keeps what it already uploaded. An upload Roblox accepted but whose processing could not be followed, for example during a network outage, is recorded as pending under its contents and resumed by the next sync for the same creator instead of being uploaded again, even if the file was renamed and new contents were written under its old name. Contents Roblox rejected in moderation are recorded and not sent again until they change (or with `--retry-rejected`), and only one sync per config runs at a time (a sync stopped with Ctrl+C or killed leaves its `.lock` file behind; docs/assets.md explains how to remove it). Files are checked against Open Cloud's size and format limits before anything is uploaded. `rojo assets status` shows what is new, changed, renamed or missing without network access. See [docs/assets.md](docs/assets.md). ([fork#4])
 * Agent Can Skip Confirmation is now on by default for new plugin settings, so agent control (any plugin, the command bar or a Studio MCP tool) can accept or reject sync confirmations, make confirmation behavior less strict, raise the large-changes threshold and turn on two-way sync without asking. Turn it off in Rojo's settings to require your answer in Studio. Existing saved preferences, including an off setting, are preserved; plugins before 8.0.0-dev.6 saved the old default (off) even when it was never changed, so upgraded installs usually keep it off until it is turned on. ([fork#4])
@@ -153,6 +154,7 @@ Making a new release? Simply add the new header with the version and date undern
 [fork#1]: https://github.com/SenorLawyer/rojo/pull/1
 [fork#2]: https://github.com/SenorLawyer/rojo/pull/2
 [fork#4]: https://github.com/SenorLawyer/rojo/pull/4
+[fork#5]: https://github.com/SenorLawyer/rojo/pull/5
 
 ## [7.7.1] (October 1st, 2026)
 
