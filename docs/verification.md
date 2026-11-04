@@ -21,7 +21,7 @@ Standalone checks also covered all three init templates with lz4/zstd/uncompress
 The full plugin/package suite passed 98 tests, with no failures and one pre-existing skipped test in an isolated Studio test place.
 
 The actual App and local server were exercised together:
-- A stalled handshake failed with a retry message after 15.07 seconds.
+- With HTTP access to the host already allowed, a stalled handshake failed with a retry message after 15.07 seconds.
 - Cancel released the tracked request immediately.
 - A duplicate Connect attempt kept the existing session.
 - Killing the server cleared the session and displayed a readable error.
@@ -29,12 +29,12 @@ The actual App and local server were exercised together:
 - A real place-ID change disconnected the session.
 - With the GitHub updater deliberately stalled, the native toolbar was created in 11.9 ms and the full App mounted in 14.6 ms.
 
-A cold-font measurement was initially suspected. The suspended coroutine showed the actual remaining mount blocker was the header making a synchronous update request during render. The header now reads cached update information; background checks update that cache.
+The header reads cached update information during render, and background checks update that cache, so a stalled update request cannot hold up mounting.
 
-## Review and remaining scope
+## Remaining scope
 
-The combined diff went through an AI-assisted review. The artifact-location nit it found was fixed. An optimized stress run later exposed a directory-event race that unit tests had missed. The invalid event filter was removed, effective reference metadata was normalized, and regression tests now cover the coalesced event. The release suite and repeated optimized stress tests were rerun. The final review and GitHub CI verdict are recorded in the PR. Windows CI runs the release-profile suite and Git/package stress script; other platform failures cannot cancel that job.
+An optimized stress run exposed a directory-event race that unit tests had missed. The invalid event filter was removed, effective reference metadata was normalized, and regression tests now cover the coalesced event. The release suite and repeated optimized stress tests were rerun afterwards. Windows CI runs the release-profile suite and Git/package stress script; other platform failures cannot cancel that job.
 
 The [issue inventory](upstream-issues.md) includes all 196 open upstream issues, and the [PR review](upstream-pull-requests.md) includes all 27 open PRs with authors and reviewed heads. Deferred entries are not solved. Cloud upload migration, multiple paths, child patterns, custom metadata names and a third-party plugin API require more design and testing.
 
-This work does not claim live macOS or Linux Studio verification, a fix for every Roblox serialization issue, or production proof on the user's large games. The test place was isolated from those games.
+This work does not claim live macOS or Linux Studio verification, a fix for every Roblox serialization issue, or production proof on large games. The test place was isolated from production games.

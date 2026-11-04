@@ -84,26 +84,11 @@ jobs:
           toolchain: stable
           targets: ${{ matrix.target }}
 
-      - name: Restore Rust Cache
-        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ matrix.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-
+      # Published binaries are built from scratch. A restored cache could
+      # carry build outputs or registry sources written by other workflows,
+      # including CI runs on pull request branches.
       - name: Build Release
         run: cargo build --release --locked --verbose --target ${{ matrix.target }}
-
-      - name: Save Rust Cache
-        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ matrix.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Generate Artifact Name
         shell: bash

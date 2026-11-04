@@ -9,5 +9,3 @@ The active default-branch ruleset has no bypass actors. It prohibits force pushe
 Required approving reviews is zero because this is a single-maintainer repository: GitHub does not let an author approve their own PR. CODEOWNERS routes contributions to SenorLawyer. CI remains mandatory for the maintainer too.
 
 Issues are enabled. Wiki and project boards are disabled. GitHub Actions tokens default to read access and cannot approve pull requests. Private vulnerability reporting and vulnerability alerts are enabled. Dependabot configuration covers Cargo and GitHub Actions. The release workflow creates draft GitHub releases and does not upload to upstream Roblox assets.
-
-The pull request that adds these files is not merged automatically. Its files and workflow changes take effect on the default branch only after the maintainer merges it.

@@ -237,6 +237,34 @@ return function()
 				expect(request:getStatus()).to.equal(Promise.Status.Cancelled)
 			end
 		end)
+
+		it("bounds stalled write and open requests", function()
+			local originalPost = Http.post
+			local pending = {}
+			Http.post = function()
+				local request = Promise.new(function() end)
+				table.insert(pending, request)
+				return request
+			end
+			local baseUrl = "http://write-open-answered.test:34872"
+			Http._recordPermissionAnswer(baseUrl, false)
+			local context = ApiContext.new(baseUrl)
+			context.__transferTimeout = 0.01
+			context.__handshakeTimeout = 0.01
+			local writeOk, writeErr = context:write({ removed = {}, updated = {}, added = {} }):await()
+			local openOk, openErr = context:open("A"):await()
+			Http.post = originalPost
+			expect(writeOk).to.equal(false)
+			expect(string.find(tostring(writeErr), "Timed out sending changes", 1, true) ~= nil).to.equal(true)
+			expect(openOk).to.equal(false)
+			expect(string.find(tostring(openErr), "Timed out asking the Rojo server to open", 1, true) ~= nil).to.equal(
+				true
+			)
+			for _, request in pending do
+				expect(request:getStatus()).to.equal(Promise.Status.Cancelled)
+			end
+			expect(next(context.__activeRequests)).to.equal(nil)
+		end)
 	end)
 
 	describe("WebSocket lifecycle", function()

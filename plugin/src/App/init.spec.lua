@@ -108,6 +108,45 @@ return function()
 		expect(#created).to.equal(0)
 	end)
 
+	it("shows a cancellable page once the initial sync is answered", function()
+		local app = fakeApp()
+		local states = {}
+		app.setState = function(_, state)
+			table.insert(states, state)
+		end
+		AppComponent.startSession(app)
+		local session = app.serveSession
+		table.clear(states)
+
+		expect(AppComponent.onConfirmationAnswered(app, session, "Accept")).to.equal("Accept")
+		expect(#states).to.equal(1)
+		expect(states[1].appStatus).to.equal("Connecting")
+
+		expect(AppComponent.onConfirmationAnswered(app, session, "Reject")).to.equal("Reject")
+		expect(states[2].appStatus).to.equal("Connecting")
+
+		-- The connecting page's Cancel must end the session that is still working.
+		AppComponent.endSession(app)
+		expect(app.serveSession).to.equal(nil)
+	end)
+
+	it("leaves the page alone when the answer is an abort or the session ended", function()
+		local app = fakeApp()
+		local states = {}
+		app.setState = function(_, state)
+			table.insert(states, state)
+		end
+		AppComponent.startSession(app)
+		local session = app.serveSession
+		table.clear(states)
+
+		expect(AppComponent.onConfirmationAnswered(app, session, "Abort")).to.equal("Abort")
+		AppComponent.endSession(app)
+		table.clear(states)
+		expect(AppComponent.onConfirmationAnswered(app, session, "Accept")).to.equal("Accept")
+		expect(#states).to.equal(0)
+	end)
+
 	it("defers update checks and ignores results after unmounting", function()
 		local app = fakeApp()
 		local gate = Instance.new("BindableEvent")
