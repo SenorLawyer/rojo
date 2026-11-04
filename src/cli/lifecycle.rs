@@ -5481,6 +5481,7 @@ mod tests {
             error_message: Some("x".repeat(100_000)),
             logs: Vec::new(),
             logs_truncated: false,
+            logs_error: None,
         }));
         assert!(outcome["reason"].as_str().unwrap().len() <= 1000);
     }
