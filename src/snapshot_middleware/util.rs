@@ -1,6 +1,10 @@
-use std::path::Path;
+use std::{
+    io,
+    path::{Path, PathBuf},
+};
 
 use anyhow::Context;
+use memofs::Vfs;
 
 /// If the given string ends up with the given suffix, returns the portion of
 /// the string before the suffix.
@@ -52,4 +56,41 @@ where
 // TEMP function until rojo 8.0, when it can be replaced with bool::default (aka false)
 pub fn emit_legacy_scripts_default() -> Option<bool> {
     Some(true)
+}
+
+/// Canonicalizes the deepest existing ancestor of `path` and appends the
+/// components below it, so that paths which do not exist (yet or anymore)
+/// still use the same form as the canonical paths stored in the tree.
+pub fn canonicalize_existing_ancestor(vfs: &Vfs, path: &Path) -> io::Result<PathBuf> {
+    let mut ancestor = path;
+    let mut suffix = Vec::new();
+
+    loop {
+        match vfs.canonicalize(ancestor) {
+            Ok(mut canonical) => {
+                for component in suffix.iter().rev() {
+                    canonical.push(component);
+                }
+                return Ok(canonical);
+            }
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+                ) =>
+            {
+                // A recursive delete can remove every parent before its first
+                // child event is handled. Resolve the deepest surviving parent
+                // so symlinked and Windows verbatim paths still match the tree.
+                match (ancestor.parent(), ancestor.file_name()) {
+                    (Some(parent), Some(name)) => {
+                        suffix.push(name.to_owned());
+                        ancestor = parent;
+                    }
+                    _ => return Err(err),
+                }
+            }
+            Err(err) => return Err(err),
+        }
+    }
 }

@@ -33,6 +33,7 @@ Making a new release? Simply add the new header with the version and date undern
 
 * The Studio plugin cancels abandoned connections, prevents overlapping sessions, and reports stale subscriptions so they can be retried.
 * File events can outlive removed or replaced paths without crashing the server. Mapped directories are watched again after deletion and recreation. One-shot commands no longer start an OS watcher.
+* Edits keep syncing after a mapped folder is replaced faster than the watcher can report it, after the folder containing mapped folders is replaced, and after the watcher drops events. A project `$path` that is missing syncs once it is created.
 * Two-way edits to directory scripts use the init file. Internal metadata changes no longer produce spurious Studio updates.
 * Added binary build compression choices and protection against overwriting a place with a model. Sourcemaps report explicit script run contexts.
 * Accepted UTF-8 BOMs in JSON, numeric enum members, explicit init script paths and byte-array colors. Circular project references now report an error; syncback sorts metadata keys.

@@ -7,6 +7,11 @@
 * Mapped directories can be watched again after deletion and recreation, using a surviving nonrecursive parent watch.
 * Unwatching an unregistered path no longer restarts the macOS event stream and loses unrelated changes.
 * Watcher errors preserve their underlying OS error details.
+* A removal and recreation that `notify` merges into one write is reported as `VfsEvent::Remove` followed by `VfsEvent::Create`, so watches on the deleted directory are replaced.
+* Watch roots lost because an ancestor was removed are registered again when they reappear, and reported with `VfsEvent::Create`.
+* Added `VfsEvent::Rescan`, emitted when the watcher may have dropped events. Watcher errors are logged instead of ignored.
+* `read_dir` registers its watch before listing, so entries created during the listing are reported.
+* Failing to watch a parent directory no longer fails the read that requested the watch.
 
 # 0.4.0 (2026-07-01)
 * Added `Vfs::canonicalize`. [#1201]

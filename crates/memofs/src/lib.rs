@@ -82,6 +82,18 @@ pub trait VfsBackend: sealed::Sealed + Send + 'static {
     fn event_receiver(&self) -> crossbeam_channel::Receiver<VfsEvent>;
     fn watch(&mut self, path: &Path) -> io::Result<()>;
     fn unwatch(&mut self, path: &Path) -> io::Result<()>;
+
+    /// Called when a path is created or written so that watches lost when it
+    /// or one of its ancestors was removed can be registered again.
+    fn recover_watches(&mut self, _path: &Path) -> io::Result<()> {
+        Ok(())
+    }
+
+    /// Called after the backend reported that events may have been dropped,
+    /// so that watches on paths that disappeared unnoticed can be recovered.
+    fn revalidate_watches(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 /// Vfs equivalent to [`std::fs::DirEntry`][std::fs::DirEntry].
@@ -138,6 +150,9 @@ pub enum VfsEvent {
     Create(PathBuf),
     Write(PathBuf),
     Remove(PathBuf),
+    /// Events may have been dropped, so every watched path should be treated
+    /// as potentially changed.
+    Rescan,
 }
 
 /// Contains implementation details of the Vfs, wrapped by `Vfs` and `VfsLock`,
@@ -190,11 +205,19 @@ impl VfsInner {
 
     fn read_dir<P: AsRef<Path>>(&mut self, path: P) -> io::Result<ReadDir> {
         let path = path.as_ref();
-        let dir = self.backend.read_dir(path)?;
 
-        if self.watch_enabled {
-            self.backend.watch(path)?;
-        }
+        // Register the watch before listing so that entries created while the
+        // directory is being listed still produce an event.
+        let watch_result = if self.watch_enabled {
+            self.backend.watch(path)
+        } else {
+            Ok(())
+        };
+
+        // A missing directory fails to be watched too; report the listing's
+        // error so callers can still recognize `NotFound`.
+        let dir = self.backend.read_dir(path)?;
+        watch_result?;
 
         Ok(dir)
     }
@@ -236,8 +259,20 @@ impl VfsInner {
     }
 
     fn commit_event(&mut self, event: &VfsEvent) -> io::Result<()> {
-        if let VfsEvent::Remove(path) = event {
-            let _ = self.backend.unwatch(path);
+        match event {
+            VfsEvent::Remove(path) => {
+                let _ = self.backend.unwatch(path);
+            }
+            VfsEvent::Create(path) | VfsEvent::Write(path) => {
+                if self.watch_enabled {
+                    self.backend.recover_watches(path)?;
+                }
+            }
+            VfsEvent::Rescan => {
+                if self.watch_enabled {
+                    self.backend.revalidate_watches()?;
+                }
+            }
         }
 
         Ok(())
@@ -702,6 +737,14 @@ mod test {
 
         let vfs = Vfs::new(StdBackend::new().unwrap());
         let err = vfs.canonicalize(&file_path).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn read_dir_of_a_missing_directory_reports_not_found_while_watching() {
+        let dir = tempfile::tempdir().unwrap();
+        let vfs = Vfs::new_default().unwrap();
+        let err = vfs.read_dir(dir.path().join("missing")).err().unwrap();
         assert_eq!(err.kind(), io::ErrorKind::NotFound);
     }
 

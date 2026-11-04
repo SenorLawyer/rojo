@@ -167,6 +167,13 @@ try:
     server.converge("package_burst_12_replacements", expected_scripts())
     REPORT["stages"][-1]["replace_and_converge_ms"] = round((time.perf_counter() - start) * 1000, 2)
 
+    # Replacing Packages faster than the watcher debounce leaves no separate
+    # removal event. A watch still bound to the deleted folder would ignore
+    # these edits, so they must converge too.
+    (ROOT / "Packages" / "package00" / "nested" / "Dep000.luau").write_text("return 'edited-after-burst'\n", encoding="utf-8")
+    (ROOT / "Packages" / "package01" / "nested" / "AddedAfterBurst.luau").write_text("return 'added-after-burst'\n", encoding="utf-8")
+    server.converge("edit_inside_packages_after_burst", expected_scripts())
+
     remove_tree(ROOT / "Packages")
     time.sleep(0.5)
     package_files("delayed-recreate")

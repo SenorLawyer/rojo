@@ -53,8 +53,8 @@ use self::{
 };
 
 pub use self::{
-    lua::ScriptType, project::snapshot_project_node, util::emit_legacy_scripts_default,
-    util::PathExt,
+    lua::ScriptType, project::snapshot_project_node, util::canonicalize_existing_ancestor,
+    util::emit_legacy_scripts_default, util::PathExt,
 };
 
 /// Returns an `InstanceSnapshot` for the provided path.

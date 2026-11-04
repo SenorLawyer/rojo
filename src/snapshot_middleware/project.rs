@@ -25,7 +25,7 @@ use crate::{
     RojoRef,
 };
 
-use super::{emit_legacy_scripts_default, snapshot_from_vfs};
+use super::{canonicalize_existing_ancestor, emit_legacy_scripts_default, snapshot_from_vfs};
 
 pub fn snapshot_project(
     context: &InstanceContext,
@@ -159,6 +159,13 @@ pub fn snapshot_project_node(
             // Take the snapshot's metadata as-is, which will be mutated later
             // on.
             metadata = snapshot.metadata;
+        } else {
+            // Keep the missing path mapped to this instance. Otherwise nothing
+            // in the tree refers to it, and recreating it (after a package
+            // reinstall or branch switch, for example) would never resync it.
+            metadata
+                .relevant_paths
+                .push(canonicalize_existing_ancestor(vfs, &full_path)?);
         }
     }
 
@@ -241,7 +248,7 @@ pub fn snapshot_project_node(
     };
 
     for (child_name, child_project_node) in &node.children {
-        if let Some(child) = snapshot_project_node(
+        match snapshot_project_node(
             context,
             project_path,
             child_name,
@@ -249,7 +256,18 @@ pub fn snapshot_project_node(
             vfs,
             Some(&class_name),
         )? {
-            children.push(child);
+            Some(child) => children.push(child),
+            None => {
+                // An optional child whose path is missing has no instance to
+                // map that path to, so map it to this one. Its creation then
+                // resyncs this node, which adds the child back.
+                if let Some(path_node) = &child_project_node.path {
+                    let full_path = project_folder.join(path_node.path());
+                    metadata
+                        .relevant_paths
+                        .push(canonicalize_existing_ancestor(vfs, &full_path)?);
+                }
+            }
         }
     }
 

@@ -14,7 +14,8 @@ use crate::{
         apply_patch_set, compute_patch_set, AppliedPatchSet, InstigatingSource, PatchSet, RojoTree,
     },
     snapshot_middleware::{
-        get_dir_middleware, snapshot_from_vfs, snapshot_project_node, Middleware,
+        canonicalize_existing_ancestor, get_dir_middleware, snapshot_from_vfs,
+        snapshot_project_node, Middleware,
     },
 };
 
@@ -164,6 +165,19 @@ impl JobThreadContext {
         }
     }
 
+    /// Snapshots the whole tree again after the watcher reported that it may
+    /// have dropped events.
+    fn resync_tree(&self) {
+        log::warn!("The filesystem watcher may have missed changes; resyncing the whole project");
+        let mut tree = self.tree.lock().unwrap();
+        let root_id = tree.get_root_id();
+        if let Some(patch) = compute_and_apply_changes(&mut tree, &self.vfs, root_id) {
+            if !patch.is_empty() {
+                self.message_queue.push_messages(&[patch]);
+            }
+        }
+    }
+
     fn handle_vfs_event(&self, event: VfsEvent) {
         log::trace!("Vfs event: {:?}", event);
 
@@ -175,22 +189,15 @@ impl JobThreadContext {
 
         // For a given VFS event, we might have many changes to different parts
         // of the tree. Calculate and apply all of these changes.
-        match event {
-            VfsEvent::Create(path) | VfsEvent::Write(path) | VfsEvent::Remove(path) => {
-                match canonicalize_event_path(&self.vfs, &path) {
-                    Ok(path) => self.apply_patches(path),
-                    Err(err) => {
-                        log::error!(
-                            "Error resolving filesystem event at {}: {:?}",
-                            path.display(),
-                            err
-                        );
-                    }
-                }
+        match canonicalize_event_path(&self.vfs, &event) {
+            Some(Ok(path)) => self.apply_patches(path),
+            Some(Err(err)) => {
+                log::error!("Error resolving filesystem event {:?}: {:?}", event, err);
             }
-            _ => {
-                log::warn!("Unhandled VFS event: {:?}", event);
-            }
+            None => match event {
+                VfsEvent::Rescan => self.resync_tree(),
+                _ => log::warn!("Unhandled VFS event: {:?}", event),
+            },
         }
     }
 
@@ -256,14 +263,24 @@ impl JobThreadContext {
                                 match instigating_source {
                                     InstigatingSource::Path(path) => {
                                         if let Some(Variant::String(value)) = changed_value {
-                                            if let Err(err) = resolve_source_path(&self.vfs, path)
-                                                .and_then(|path| fs::write(path, value))
-                                            {
-                                                log::error!(
-                                                    "Failed to write file {}: {}",
-                                                    path.display(),
-                                                    err
-                                                );
+                                            match resolve_source_path(&self.vfs, path) {
+                                                Ok(source_path) => {
+                                                    if let Err(err) = fs::write(&source_path, value)
+                                                    {
+                                                        log::error!(
+                                                            "Failed to write file {}: {}",
+                                                            source_path.display(),
+                                                            err
+                                                        );
+                                                    }
+                                                }
+                                                Err(err) => {
+                                                    log::error!(
+                                                        "Failed to find the source file of {}: {}",
+                                                        path.display(),
+                                                        err
+                                                    );
+                                                }
                                             }
                                         } else {
                                             log::warn!("Cannot change Source to non-string value.");
@@ -322,37 +339,21 @@ fn resolve_source_path(vfs: &Vfs, path: &Path) -> io::Result<PathBuf> {
 }
 
 /// Preserve canonical tree keys even when queued events outlive their files.
-fn canonicalize_event_path(vfs: &Vfs, path: &Path) -> io::Result<PathBuf> {
-    let mut ancestor = path;
-    let mut suffix = Vec::new();
-
-    loop {
-        match vfs.canonicalize(ancestor) {
-            Ok(mut canonical) => {
-                for component in suffix.iter().rev() {
-                    canonical.push(component);
-                }
-                return Ok(canonical);
-            }
-            Err(err)
-                if matches!(
-                    err.kind(),
-                    io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
-                ) =>
-            {
-                // A recursive delete can remove every parent before its first
-                // child event is handled. Resolve the deepest surviving parent
-                // so symlinked and Windows verbatim paths still match the tree.
-                match (ancestor.parent(), ancestor.file_name()) {
-                    (Some(parent), Some(name)) => {
-                        suffix.push(name.to_owned());
-                        ancestor = parent;
-                    }
-                    _ => return Err(err),
-                }
-            }
-            Err(err) => return Err(err),
+fn canonicalize_event_path(vfs: &Vfs, event: &VfsEvent) -> Option<io::Result<PathBuf>> {
+    match event {
+        VfsEvent::Create(path) | VfsEvent::Write(path) => {
+            Some(canonicalize_existing_ancestor(vfs, path))
         }
+        // Something may already exist at a removed path again, such as a
+        // recreated symlink. Resolving it would map the removal to wherever
+        // that points now, so only resolve the parent.
+        VfsEvent::Remove(path) => Some(match (path.parent(), path.file_name()) {
+            (Some(parent), Some(name)) => {
+                canonicalize_existing_ancestor(vfs, parent).map(|parent| parent.join(name))
+            }
+            _ => canonicalize_existing_ancestor(vfs, path),
+        }),
+        _ => None,
     }
 }
 
@@ -438,6 +439,16 @@ fn compute_and_apply_changes(tree: &mut RojoTree, vfs: &Vfs, id: Ref) -> Option<
                 }
             };
 
+            // An optional node whose path went missing produces no instance.
+            // Its parent maps that path while it is missing, so resync the
+            // parent to remove this instance and to notice the path returning.
+            if snapshot.is_none() {
+                let parent_id = tree.get_instance(id).map(|instance| instance.parent());
+                if let Some(parent_id) = parent_id.filter(|parent_id| parent_id.is_some()) {
+                    return compute_and_apply_changes(tree, vfs, parent_id);
+                }
+            }
+
             let patch_set = compute_patch_set(snapshot, tree, id);
             apply_patch_set(tree, patch_set)
         }
@@ -453,7 +464,10 @@ mod test {
     use rbx_dom_weak::{ustr, UstrMap};
 
     fn context(path: &Path) -> JobThreadContext {
-        let vfs = Vfs::new_default_without_watch();
+        context_with_vfs(Vfs::new_default_without_watch(), path)
+    }
+
+    fn context_with_vfs(vfs: Vfs, path: &Path) -> JobThreadContext {
         let snapshot = snapshot_from_vfs(&InstanceContext::default(), &vfs, path)
             .unwrap()
             .unwrap();
@@ -537,6 +551,125 @@ mod test {
         }
     }
 
+    fn write_project(root: &Path, tree: &str) -> PathBuf {
+        let project = root.join("default.project.json");
+        fs::write(&project, format!(r#"{{"name":"test","tree":{tree}}}"#)).unwrap();
+        project
+    }
+
+    #[test]
+    fn recreating_a_missing_project_path_resyncs_its_node() {
+        for packages_node in [
+            r#"{"$className":"Folder","$path":"Packages"}"#,
+            r#"{"$path":{"optional":"Packages"}}"#,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dunce::canonicalize(dir.path()).unwrap();
+            let packages = root.join("Packages");
+            fs::create_dir(&packages).unwrap();
+            fs::write(packages.join("old.luau"), "return 1").unwrap();
+            let project = write_project(
+                &root,
+                &format!(r#"{{"$className":"Folder","Packages":{packages_node}}}"#),
+            );
+            let task = context(&project);
+
+            // A package manager deletes the folder and only later recreates it.
+            fs::remove_dir_all(&packages).unwrap();
+            task.handle_vfs_event(VfsEvent::Remove(packages.clone()));
+            assert!(task
+                .tree
+                .lock()
+                .unwrap()
+                .get_ids_at_path(&packages.join("old.luau"))
+                .is_empty());
+
+            fs::create_dir(&packages).unwrap();
+            let added = packages.join("new.luau");
+            fs::write(&added, "return 2").unwrap();
+            task.handle_vfs_event(VfsEvent::Create(packages.clone()));
+            assert!(
+                !task.tree.lock().unwrap().get_ids_at_path(&added).is_empty(),
+                "{packages_node}"
+            );
+        }
+    }
+
+    #[test]
+    fn recreating_the_parent_of_mapped_roots_resyncs_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dunce::canonicalize(dir.path()).unwrap();
+        let src = root.join("src");
+        for name in ["server", "client"] {
+            fs::create_dir_all(src.join(name)).unwrap();
+            fs::write(src.join(name).join("old.luau"), "return 1").unwrap();
+        }
+        let project = write_project(
+            &root,
+            r#"{"$className":"Folder","Server":{"$path":"src/server"},"Client":{"$path":"src/client"}}"#,
+        );
+        let task = context_with_vfs(Vfs::new_default().unwrap(), &project);
+
+        let receiver = task.vfs.event_receiver();
+        let settle = || {
+            while let Ok(event) = receiver.recv_timeout(std::time::Duration::from_millis(300)) {
+                task.handle_vfs_event(event);
+            }
+        };
+
+        // A branch switch replaces `src`, which nothing maps directly. Its
+        // removal drops every watch below it, including the one that would
+        // report its children coming back.
+        fs::remove_dir_all(&src).unwrap();
+        settle();
+        task.handle_vfs_event(VfsEvent::Remove(src.clone()));
+        fs::create_dir(&src).unwrap();
+        settle();
+
+        let added = src.join("client").join("new.luau");
+        fs::create_dir(src.join("server")).unwrap();
+        fs::create_dir(src.join("client")).unwrap();
+        fs::write(&added, "return 2").unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while task.tree.lock().unwrap().get_ids_at_path(&added).is_empty() {
+            let event = receiver
+                .recv_deadline(deadline)
+                .expect("recreated roots were never resynced");
+            task.handle_vfs_event(event);
+        }
+    }
+
+    #[test]
+    fn rescan_resyncs_the_whole_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dunce::canonicalize(dir.path()).unwrap();
+        let nested = root.join("nested");
+        fs::create_dir(&nested).unwrap();
+        let task = context(&root);
+        let added = nested.join("missed.luau");
+        fs::write(&added, "return 1").unwrap();
+        task.handle_vfs_event(VfsEvent::Rescan);
+        assert!(!task.tree.lock().unwrap().get_ids_at_path(&added).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn removal_of_a_recreated_symlink_keeps_its_own_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dunce::canonicalize(dir.path()).unwrap();
+        let target = root.join("target.luau");
+        let link = root.join("link.luau");
+        fs::write(&target, "return 1").unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let vfs = Vfs::new_default_without_watch();
+        assert_eq!(
+            canonicalize_event_path(&vfs, &VfsEvent::Remove(link.clone()))
+                .unwrap()
+                .unwrap(),
+            link
+        );
+    }
+
     #[test]
     fn event_path_resolves_missing_descendants_of_a_replaced_directory() {
         let dir = tempfile::tempdir().unwrap();
@@ -545,7 +678,12 @@ mod test {
         fs::write(&replaced, "now a file").unwrap();
         let vfs = Vfs::new_default_without_watch();
         let missing = replaced.join("child.luau");
-        assert_eq!(canonicalize_event_path(&vfs, &missing).unwrap(), missing);
+        assert_eq!(
+            canonicalize_event_path(&vfs, &VfsEvent::Remove(missing.clone()))
+                .unwrap()
+                .unwrap(),
+            missing
+        );
     }
 
     #[cfg(unix)]
