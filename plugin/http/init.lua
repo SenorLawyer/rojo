@@ -42,7 +42,11 @@ end
 local function recordPermissionAnswer(url: string, denied: boolean)
 	local host = hostOf(url)
 	answeredHosts[host] = true
-	answeredAt[host] = os.clock()
+	-- Only the first answer can end a prompt. Later requests finishing must
+	-- not keep pushing back the deadline of a request that is still stalled.
+	if answeredAt[host] == nil then
+		answeredAt[host] = os.clock()
+	end
 	deniedHosts[host] = if denied then true else nil
 
 	local waiters = answerWaiters[host]
@@ -130,25 +134,66 @@ function Http.awaitPermissionAnswer(url: string)
 	end)
 end
 
+export type TimeoutOptions = {
+	-- How long to wait on a possible permission prompt before giving up.
+	-- Defaults to Http.permissionWaitLimit.
+	permissionWaitLimit: number?,
+	-- Rejection used when the permission wait runs out. Defaults to rejectionValue.
+	permissionRejectionValue: any?,
+	-- Total time allowed regardless of permission state, for callers such as
+	-- background probes that must never wait on a prompt.
+	limit: number?,
+}
+
+--[[
+	Studio usually remembers a plugin's HTTP permission between sessions, so a
+	host we haven't heard back from may have no prompt at all, just a stalled
+	server. Waiting on a possible prompt is therefore capped.
+]]
+Http.permissionWaitLimit = 120
+
 --[[
 	Bounds a request without counting time the user spends on Studio's HTTP
 	permission prompt, which only blocks the first request to a host each
 	session. If the prompt may still be open when the deadline passes,
 	onWaitingForPermission is called and the deadline restarts once the prompt
-	is answered. Cancelling the returned promise cancels the request.
+	is answered. If no answer arrives within the permission wait limit, the
+	request is rejected anyway. Cancelling the returned promise cancels the
+	request.
 ]]
-function Http.timeout(request, url: string, seconds: number, rejectionValue, onWaitingForPermission: (() -> ())?)
+function Http.timeout(
+	request,
+	url: string,
+	seconds: number,
+	rejectionValue,
+	onWaitingForPermission: (() -> ())?,
+	options: TimeoutOptions?
+)
 	local host = hostOf(url)
 	local startedAt = os.clock()
-	local notified = false
+	local permissionWaitLimit = (options and options.permissionWaitLimit) or Http.permissionWaitLimit
+	local permissionRejectionValue = if options and options.permissionRejectionValue ~= nil
+		then options.permissionRejectionValue
+		else rejectionValue
+	local waitingSince = nil
 
 	local function checkDeadline()
 		if Http.isPermissionPending(url) then
-			if onWaitingForPermission and not notified then
-				notified = true
-				onWaitingForPermission()
+			if waitingSince == nil then
+				waitingSince = os.clock()
+				if onWaitingForPermission then
+					onWaitingForPermission()
+				end
 			end
-			return Http.awaitPermissionAnswer(url):andThen(checkDeadline)
+
+			local waitRemaining = waitingSince + permissionWaitLimit - os.clock()
+			if waitRemaining <= 0 then
+				return Promise.reject(permissionRejectionValue)
+			end
+			return Promise.race({
+				Http.awaitPermissionAnswer(url),
+				Promise.delay(waitRemaining),
+			}):andThen(checkDeadline)
 		end
 
 		local remaining = math.max(startedAt, answeredAt[host] or startedAt) + seconds - os.clock()
@@ -158,10 +203,19 @@ function Http.timeout(request, url: string, seconds: number, rejectionValue, onW
 		return Promise.reject(rejectionValue)
 	end
 
-	return Promise.race({
+	local racers = {
 		Promise.delay(seconds):andThen(checkDeadline),
 		request,
-	})
+	}
+	if options and options.limit then
+		table.insert(
+			racers,
+			Promise.delay(options.limit):andThen(function()
+				return Promise.reject(rejectionValue)
+			end)
+		)
+	end
+	return Promise.race(racers)
 end
 
 -- Lets tests simulate an answered (or denied) permission prompt.

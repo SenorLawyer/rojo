@@ -39,6 +39,12 @@ function ConnectingPage:render()
 					TextTruncate = Enum.TextTruncate.AtEnd,
 					TextTransparency = self.props.transparency,
 					BackgroundTransparency = 1,
+				}, {
+					-- The scale-based height reaches zero in a short widget,
+					-- which would hide the waiting text entirely.
+					SizeConstraint = e("UISizeConstraint", {
+						MinSize = Vector2.new(0, theme.TextSize.Medium * 3),
+					}),
 				})
 				else nil,
 			Cancel = e(TextButton, {

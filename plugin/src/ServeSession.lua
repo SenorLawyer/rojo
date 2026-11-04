@@ -211,7 +211,7 @@ function ServeSession:start()
 		:connect(function()
 			if self.__status == Status.Connecting then
 				self:setLoadingText(
-					"Still waiting for the Rojo server...\nIf Studio is asking whether Rojo may access this address, choose Allow."
+					"Still waiting for the Rojo server...\nIf Studio is asking whether Rojo may access this address, choose Allow.\nOtherwise the server may be busy."
 				)
 			end
 		end)
@@ -237,8 +237,17 @@ function ServeSession:start()
 
 						Log.debug("Received {} messages from Rojo server", #messagesPacket.messages)
 
+						-- Applying a patch can yield on fallback requests, during
+						-- which the user may cancel or the session may fail, so
+						-- the rest of the packet must not be applied afterwards.
 						for _, message in messagesPacket.messages do
+							if self.__status == Status.Disconnected then
+								return
+							end
 							self:__applyPatch(message)
+						end
+						if self.__status == Status.Disconnected then
+							return
 						end
 						self.__apiContext:setMessageCursor(messagesPacket.messageCursor)
 					end,

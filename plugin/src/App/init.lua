@@ -424,7 +424,7 @@ function App:findActiveServer()
 	local apiContext = ApiContext.new(baseUrl)
 	self.activeProbes[apiContext] = true
 	return apiContext
-		:connect()
+		:probe()
 		:andThen(function(serverInfo)
 			return serverInfo, host, port
 		end)
@@ -475,8 +475,8 @@ function App:checkSyncReminder()
 	end
 
 	if next(self.activeProbes) ~= nil then
-		-- A probe can wait indefinitely on Studio's HTTP permission prompt, so
-		-- polling must not pile up more requests behind it.
+		-- A probe can take up to ApiContext's probe timeout against a stalled
+		-- server, so polling must not pile up more requests behind it.
 		return
 	end
 

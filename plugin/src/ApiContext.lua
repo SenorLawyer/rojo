@@ -111,9 +111,15 @@ function ApiContext.new(baseUrl)
 		__connected = true,
 		__activeRequests = {},
 		__handshakeTimeout = 15,
-		-- Initial reads and fallback serialization can be large, so they get
-		-- far more time than the handshake. They still need a bound because
-		-- they block the in-order message queue while outstanding.
+		-- Background probes run without the user watching, so they get a hard
+		-- bound that ignores Studio's permission prompt entirely.
+		__probeTimeout = 30,
+		-- The initial read returns the whole project and may queue behind a
+		-- full resync on the server, so it gets much longer than other requests.
+		__initialReadTimeout = 300,
+		-- Fallback serialization can be large, so it gets far more time than
+		-- the handshake. It still needs a bound because it blocks the in-order
+		-- message queue while outstanding.
 		__transferTimeout = 60,
 	}
 
@@ -153,7 +159,13 @@ function ApiContext:__request(
 	method,
 	url,
 	body,
-	options: { timeout: number, timeoutMessage: string, onWaitingForPermission: (() -> ())? }?
+	options: {
+		timeout: number,
+		timeoutMessage: string,
+		onWaitingForPermission: (() -> ())?,
+		permissionTimeoutMessage: string?,
+		limit: number?,
+	}?
 )
 	if not self.__connected then
 		return Promise.reject("Cannot send a request after disconnecting")
@@ -161,7 +173,10 @@ function ApiContext:__request(
 
 	local request = Http[method](url, body)
 	if options then
-		request = Http.timeout(request, url, options.timeout, options.timeoutMessage, options.onWaitingForPermission)
+		request = Http.timeout(request, url, options.timeout, options.timeoutMessage, options.onWaitingForPermission, {
+			permissionRejectionValue = options.permissionTimeoutMessage,
+			limit = options.limit,
+		})
 	end
 	self.__activeRequests[request] = true
 	return request:finally(function()
@@ -173,17 +188,17 @@ function ApiContext:setMessageCursor(index)
 	self.__messageCursor = index
 end
 
---[[
-	onWaitingForPermission is called if the handshake is slow while Studio may
-	still be asking the user whether Rojo can access the server's host.
-]]
-function ApiContext:connect(onWaitingForPermission: (() -> ())?)
+function ApiContext:__handshake(onWaitingForPermission: (() -> ())?, limit: number?)
 	local url = ("%s/api/rojo"):format(self.__baseUrl)
 
 	return self:__request("get", url, nil, {
 		timeout = self.__handshakeTimeout,
 		timeoutMessage = "Timed out connecting to the Rojo server. Check `rojo serve` and retry.",
 		onWaitingForPermission = onWaitingForPermission,
+		permissionTimeoutMessage = "Timed out connecting to the Rojo server."
+			.. "\nIf Studio asked whether Rojo may access this address, choose Allow and retry."
+			.. "\nOtherwise the server may be busy or stalled. Check `rojo serve` and retry.",
+		limit = limit,
 	})
 		:andThen(rejectFailedRequests)
 		:andThen(Http.Response.msgpack)
@@ -201,11 +216,25 @@ function ApiContext:connect(onWaitingForPermission: (() -> ())?)
 		end)
 end
 
+--[[
+	onWaitingForPermission is called if the handshake is slow while Studio may
+	still be asking the user whether Rojo can access the server's host.
+]]
+function ApiContext:connect(onWaitingForPermission: (() -> ())?)
+	return self:__handshake(onWaitingForPermission)
+end
+
+-- Checks for a server in the background. Unlike connect, this never waits on
+-- a possible permission prompt past a fixed bound, so callers can't hang.
+function ApiContext:probe()
+	return self:__handshake(nil, self.__probeTimeout)
+end
+
 function ApiContext:read(ids)
 	local url = ("%s/api/read/%s"):format(self.__baseUrl, table.concat(ids, ","))
 
 	return self:__request("get", url, nil, {
-		timeout = self.__transferTimeout,
+		timeout = self.__initialReadTimeout,
 		timeoutMessage = "Timed out loading the project from the Rojo server. Check `rojo serve` and reconnect.",
 	})
 		:andThen(rejectFailedRequests)

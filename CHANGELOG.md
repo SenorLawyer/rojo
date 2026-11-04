@@ -32,8 +32,8 @@ Making a new release? Simply add the new header with the version and date undern
 ## Unreleased
 
 * The Studio plugin now cancels abandoned connections, prevents overlapping sessions, and retries subscriptions that the server asks it to resync. ([fork#1])
-* Connecting no longer times out while Studio's "allow HTTP access" prompt is open. The plugin says it is waiting and Cancel still works. Update checks remember a Deny even when it comes late. ([fork#1])
-* Initial project loads and sync fallback requests time out after 60 seconds instead of stalling the sync queue. Undo history recordings now close when applying a patch fails. ([fork#1])
+* Connecting waits up to two minutes for Studio's "allow HTTP access" prompt before timing out. The plugin says it is waiting and Cancel still works. Background server checks give up after 30 seconds. Update checks remember a Deny even when it comes late. ([fork#1])
+* Initial project loads time out after 5 minutes and sync fallback requests after 60 seconds instead of stalling the sync queue. Cancelling while server changes are being applied now skips the rest of the batch. Undo history recordings now close when applying a patch fails. ([fork#1])
 * A server message that fails to apply now ends the session with a logged error and traceback instead of syncing on top of a partial change. Reconnect to resync. ([fork#1])
 * Update checks treat `-fork.N` versions as releases rather than prereleases. Changing the prerelease setting during a check runs it again. ([fork#1])
 * The patch visualizer shows vector, UDim2, CFrame and NumberRange components at float32 precision, so 0.0001 no longer appears as 9.999999747378752e-05. ([fork#1])

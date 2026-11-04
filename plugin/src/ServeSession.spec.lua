@@ -133,6 +133,40 @@ return function()
 		expect(session:getStatus()).to.equal(ServeSession.Status.Connecting)
 	end)
 
+	it("stops applying a packet's messages once the session disconnects mid-packet", function()
+		local handlers
+		local cursorCalls = 0
+		api.setMessageCursor = function()
+			cursorCalls += 1
+		end
+		api.connectWebSocket = function(_, packetHandlers)
+			handlers = packetHandlers
+			return Promise.new(function() end)
+		end
+		session.__initialSync = function()
+			return Promise.resolve()
+		end
+		local patchCalls = 0
+		session.__applyPatch = function()
+			patchCalls += 1
+			-- Simulates Cancel while the patch yields on a fallback request.
+			session:stop()
+		end
+
+		session:start()
+		connectResolve({ projectName = "test", rootInstanceId = "ROOT" })
+		task.wait()
+		expect(handlers).to.be.ok()
+
+		handlers.messages({
+			messages = { PatchSet.newEmpty(), PatchSet.newEmpty(), PatchSet.newEmpty() },
+			messageCursor = 3,
+		})
+		expect(patchCalls).to.equal(1)
+		expect(cursorCalls).to.equal(0)
+		expect(session:getStatus()).to.equal(ServeSession.Status.Disconnected)
+	end)
+
 	it("finishes the history recording when applying a patch fails", function()
 		local ChangeHistoryService = game:GetService("ChangeHistoryService")
 		local wasRecording = ChangeHistoryService:IsRecordingInProgress()
