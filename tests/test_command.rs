@@ -355,3 +355,21 @@ fn invalid_options_exit_2_without_reaching_studio() {
     }
     assert!(commands.lock().unwrap().is_empty());
 }
+
+#[test]
+fn a_cloud_project_that_does_not_build_exits_1() {
+    // The project fails to build before anything is sent, so the fake key is
+    // never used and nothing reaches Open Cloud.
+    let directory = tempfile::tempdir().unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_rojo"))
+        .args(["test", "--cloud", "--universe-id=1", "--place-id=2"])
+        .arg("--api-key-env=ROJO_TEST_FAKE_CLOUD_KEY")
+        .arg(directory.path().join("missing.project.json"))
+        .env("ROJO_TEST_FAKE_CLOUD_KEY", "not-a-real-key")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    assert!(!stderr.contains("Built project"), "{stderr}");
+}

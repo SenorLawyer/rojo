@@ -997,15 +997,18 @@ impl StudioBridge {
                     .and_then(Value::as_str)
                     .and_then(|id| state.pending.get(id))
                     .is_some_and(|pending| session.as_deref() == Some(pending.session.as_str()));
+                // The plugin cannot poll while Studio is in Run mode, so a long
+                // spec run validates its request periodically instead, which
+                // must keep the session from expiring. This holds even after
+                // the request was cancelled or expired: Studio is still in Run
+                // mode and polls again once it ends, so letting the session
+                // lapse would take its bridge down. The plugin stops these
+                // heartbeats once a run outlasts its watchdog, which is what
+                // keeps a Run mode that never ends from holding a dead session.
+                if let Some(session) = session.and_then(|id| state.sessions.get_mut(&id)) {
+                    session.last_seen = Instant::now();
+                }
                 if active {
-                    // The plugin cannot poll while Studio is in Run mode, so a
-                    // long spec run validates its request periodically instead,
-                    // which must keep the session from expiring. Only while the
-                    // request is still active, so a Run mode that never ends
-                    // does not keep a session that no longer answers listed.
-                    if let Some(session) = session.and_then(|id| state.sessions.get_mut(&id)) {
-                        session.last_seen = Instant::now();
-                    }
                     reply(StatusCode::OK, json!({"active":true}))
                 } else {
                     failure(StatusCode::GONE, "Request expired or was cancelled")
@@ -1804,11 +1807,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn validating_a_settled_request_does_not_keep_its_session_alive() {
+    async fn validating_a_settled_request_still_keeps_its_session_alive() {
         let (_dir, bridge) = fixture();
         let session = register(&bridge).await;
-        // As if Studio were stuck in Run mode for a request that has since
-        // expired, still sending heartbeats for it.
+        // As if Studio were still in Run mode for a request that has since
+        // been cancelled or expired, sending heartbeats until Run mode ends.
         bridge.state().sessions.get_mut(&session).unwrap().last_seen =
             Instant::now().checked_sub(Duration::from_secs(25)).unwrap();
         let (status, _) = plugin(
@@ -1818,7 +1821,97 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::GONE);
+        assert!(bridge.state().sessions[&session].last_seen.elapsed() < Duration::from_secs(5));
+    }
+
+    #[tokio::test]
+    async fn validating_without_the_plugin_token_does_not_refresh_a_session() {
+        let (_dir, bridge) = fixture();
+        let session = register(&bridge).await;
+        bridge.state().sessions.get_mut(&session).unwrap().last_seen =
+            Instant::now().checked_sub(Duration::from_secs(25)).unwrap();
+        // Without the plugin token the heartbeat is refused outright.
+        let (status, _) = cli(
+            &bridge,
+            "/api/studio/validate",
+            json!({"sessionId":session,"requestId":Uuid::new_v4().to_string()}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
         assert!(bridge.state().sessions[&session].last_seen.elapsed() >= Duration::from_secs(25));
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_running_spec_keeps_its_session_registered() {
+        let (_dir, bridge) = fixture();
+        let session = register(&bridge).await;
+        let id = Uuid::new_v4().to_string();
+        let mut pending = command_future(
+            &bridge,
+            json!({"sessionId":session,"action":"spec","requestId":id}),
+        );
+        assert!(poll!(&mut pending).is_pending());
+        let (_, value) = plugin(&bridge, "/api/studio/poll", json!({"sessionId":session})).await;
+        assert_eq!(value["commands"][0]["action"], "spec");
+        let (status, _) = cli(
+            &bridge,
+            "/api/studio/cancel",
+            json!({"sessionId":session,"requestId":id}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _) = into_value(pending.await).await;
+        assert_eq!(status, StatusCode::GONE);
+        // Studio stays in Run mode well past the session TTL, heartbeating
+        // through validate, which answers 410 for the cancelled request.
+        for _ in 0..3 {
+            bridge.state().sessions.get_mut(&session).unwrap().last_seen =
+                Instant::now().checked_sub(Duration::from_secs(25)).unwrap();
+            let (status, _) = plugin(
+                &bridge,
+                "/api/studio/validate",
+                json!({"sessionId":session,"requestId":id}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::GONE);
+        }
+        // Once Run mode ends the late result is refused, but the bridge keeps
+        // polling the same session instead of getting a 404.
+        let (status, _) = plugin(
+            &bridge,
+            "/api/studio/result",
+            json!({"requestId":id,"sessionId":session,"result":{"ok":true,"value":{}}}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::GONE);
+        let (status, value) =
+            plugin(&bridge, "/api/studio/poll", json!({"sessionId":session})).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(value["commands"], json!([]));
+    }
+
+    #[tokio::test]
+    async fn registering_again_after_expiry_restores_the_session() {
+        let (_dir, bridge) = fixture();
+        let session = Uuid::new_v4().to_string();
+        let body = json!({"sessionId":session,"description":{"placeName":"test"}});
+        assert_eq!(
+            plugin(&bridge, "/api/studio/register", body.clone())
+                .await
+                .0,
+            StatusCode::OK
+        );
+        bridge.state().sessions.get_mut(&session).unwrap().last_seen =
+            Instant::now().checked_sub(SESSION_TTL).unwrap();
+        let (status, _) = plugin(&bridge, "/api/studio/poll", json!({"sessionId":session})).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        // The plugin re-registers once with the same ID and description.
+        assert_eq!(
+            plugin(&bridge, "/api/studio/register", body).await.0,
+            StatusCode::OK
+        );
+        let (status, _) = plugin(&bridge, "/api/studio/poll", json!({"sessionId":session})).await;
+        assert_eq!(status, StatusCode::OK);
     }
 
     #[tokio::test]

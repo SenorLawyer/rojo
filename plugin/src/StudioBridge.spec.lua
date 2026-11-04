@@ -481,6 +481,90 @@ return function()
 		expect(string.find(failure, "ConnectFail", 1, true) ~= nil).to.equal(true)
 	end)
 
+	-- Serves one Run-mode command on the first poll, if `action` is given,
+	-- answers the next poll with 404, and holds every later poll open.
+	local function expireAfterPoll(action)
+		local pollGate = Instance.new("BindableEvent")
+		pollGate.Parent = fixture
+		local calls = { register = 0, poll = 0, descriptions = {} }
+		bridge.request = StudioBridge.request
+		bridge.execute = function()
+			return {}
+		end
+		bridge.__requestAsync = function(_, options)
+			local route = options.Url:match("/([^/]+)$")
+			if route == "register" then
+				calls.register += 1
+				table.insert(calls.descriptions, HttpService:JSONDecode(options.Body).description)
+			elseif route == "poll" then
+				calls.poll += 1
+				if calls.poll == 1 and action then
+					return {
+						Success = true,
+						StatusCode = 200,
+						Body = HttpService:JSONEncode({
+							commands = {
+								{
+									action = action,
+									args = {},
+									requestId = "cancelled",
+									expiresAt = DateTime.now().UnixTimestampMillis + 10_000,
+								},
+							},
+						}),
+					}
+				elseif calls.poll == (if action then 2 else 1) then
+					return { Success = false, StatusCode = 404, Body = '{"error":"Studio session expired"}' }
+				end
+				pollGate.Event:Wait()
+			elseif route == "result" then
+				-- The run was cancelled, so its result is discarded.
+				return { Success = false, StatusCode = 410, Body = '{"error":"Request expired or was cancelled"}' }
+			end
+			return { Success = true, StatusCode = 200, Body = '{"commands":[]}' }
+		end
+		return calls
+	end
+
+	it("registers again once when its session expired during Run mode", function()
+		local calls = expireAfterPoll("spec")
+		local failed = false
+		bridge.onFailure = function()
+			failed = true
+		end
+		StudioBridge.manualStart = true
+		bridge:start()
+		StudioBridge.manualStart = false
+		waitUntil(function()
+			return calls.poll >= 3
+		end)
+		expect(failed).to.equal(false)
+		expect(bridge.stopped).to.equal(false)
+		expect(calls.register).to.equal(2)
+		expect(calls.poll).to.equal(3)
+		-- The same description, so the server treats it as the same session.
+		expect(calls.descriptions[2].sessionId).to.equal(calls.descriptions[1].sessionId)
+		expect(calls.descriptions[2].placeName).to.equal(calls.descriptions[1].placeName)
+		expect(calls.descriptions[2].mode).to.equal(calls.descriptions[1].mode)
+	end)
+
+	it("stops when its session expired without a Run-mode command", function()
+		local calls = expireAfterPoll(nil)
+		local failure
+		bridge.onFailure = function(err)
+			failure = err
+		end
+		StudioBridge.manualStart = true
+		bridge:start()
+		StudioBridge.manualStart = false
+		waitUntil(function()
+			return failure ~= nil
+		end)
+		expect(bridge.stopped).to.equal(true)
+		expect(calls.register).to.equal(1)
+		expect(string.find(failure, "404", 1, true) ~= nil).to.equal(true)
+	end)
+
 	it("resends a result whose first attempt was lost", function()
 		local previousDelay = StudioBridge.retryDelay
 		StudioBridge.retryDelay = 0
@@ -1015,7 +1099,7 @@ return function()
 			expect(runner()).to.equal(nil)
 		end)
 
-		it("stops the heartbeats once the server no longer knows the request", function()
+		it("keeps the heartbeats going after the request is cancelled", function()
 			local args = specFixture()
 			local validations = 0
 			bridge.request = function(_, route, _value, failure)
@@ -1038,8 +1122,13 @@ return function()
 				task.wait(0.4)
 				return { status = "passed" }
 			end
-			bridge:execute(specCommand(args))
-			expect(validations).to.equal(2)
+			-- The cancelled run's result is discarded, but Run mode goes on,
+			-- and the heartbeats keep its session from expiring until it ends.
+			pcall(bridge.execute, bridge, specCommand(args))
+			expect(validations >= 4).to.equal(true)
+			local after = validations
+			task.wait(0.2)
+			expect(validations).to.equal(after)
 		end)
 
 		it("stops the heartbeats once a run outlasts its watchdog", function()

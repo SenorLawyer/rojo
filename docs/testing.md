@@ -104,7 +104,7 @@ The bridge's `spec` action runs the specs in Studio's Run mode, the same way the
 
 The plugin checks the options, the roots and the framework in Edit mode first, so a wrong path or a missing TestEZ fails without starting Run mode. TestEZ itself requires every spec before running any, and one that fails to load stops the run, so the runner requires each spec separately and gives the rest to TestEZ's planner and runner.
 
-While the specs run, Studio cannot answer other bridge commands. They wait until Run mode ends and may time out. A second run requested meanwhile waits too; if less than its `--timeout` plus 10 seconds of its deadline is left once Studio gets to it, it fails without entering Run mode and asks you to run the specs again. A spec that yields for longer than `--timeout` ends the run with `timedOut`. A spec that never yields cannot be interrupted, but Roblox stops it once it exhausts the script execution timeout. Cancelling a run that Studio has started discards its result but does not stop Run mode.
+While the specs run, Studio cannot answer other bridge commands. They wait until Run mode ends and may time out. A second run requested meanwhile waits too; if less than its `--timeout` plus 10 seconds of its deadline is left once Studio gets to it, it fails without entering Run mode and asks you to run the specs again. A spec that yields for longer than `--timeout` ends the run with `timedOut`. A spec that never yields cannot be interrupted, but Roblox stops it once it exhausts the script execution timeout. Cancelling a run that Studio has started, with Ctrl-C, `rojo studio cancel` or an MCP cancellation, discards its result but does not stop Run mode. The bridge stays connected: the plugin keeps the session alive until Run mode ends (at most `--timeout` plus 30 seconds), then goes back to polling.
 
 The specs run with the place's other scripts, in a server context. Anything those scripts do during a normal Run session, such as DataStore or HTTP requests when Studio API access is enabled, happens during a test run too.
 
@@ -152,7 +152,7 @@ The API key needs the `universe-places:write` scope (not needed with `--no-uploa
 
 Progress (the build, the saved version, the Luau task's path) goes to stderr, so `--json` output on stdout stays one object. In human mode, messages the task logged as errors are printed before the report. With `--json`, the object also has `universeId`, `placeId`, `placeVersion` (the version the task ran on), `uploaded`, `taskPath`, `logs` (every `{ "message", "kind" }` the task logged, where `kind` is `OUTPUT`, `INFO`, `WARNING` or `ERROR`) and `logsTruncated`.
 
-The exit codes are those of Studio mode. A task that fails (for example a script error), is cancelled, or runs out of time is reported with status `error` or `timedOut` and exits with 1. A missing ID or API key, a refused save or a request that Open Cloud refuses exits with 2.
+The exit codes are those of Studio mode. A task that fails (for example a script error), is cancelled, or runs out of time is reported with status `error` or `timedOut` and exits with 1. A project that does not build also exits with 1, before anything is saved. A missing ID or API key, a refused save or a request that Open Cloud refuses exits with 2.
 
 ### How a cloud run differs from Studio
 

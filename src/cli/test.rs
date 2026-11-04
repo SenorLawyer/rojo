@@ -773,7 +773,13 @@ impl TestCommand {
     }
 
     fn run_cloud(self) -> anyhow::Result<()> {
-        let run = self.execute_cloud().map_err(UsageError)?;
+        let (client, universe_id, place_id) = self.prepare_cloud().map_err(UsageError)?;
+        // A project that does not build is a problem with the project, like a
+        // run that fails in Studio, so it exits with 1 rather than 2.
+        let place = self.build_cloud_place()?;
+        let run = self
+            .execute_cloud(&client, universe_id, place_id, place.as_deref())
+            .map_err(UsageError)?;
         if self.json {
             println!("{}", serde_json::to_string(&run.output())?);
         } else {
@@ -785,29 +791,44 @@ impl TestCommand {
         }
     }
 
-    /// Everything up to the cloud run's report. As for Studio, errors are
-    /// usage or connection problems.
-    fn execute_cloud(&self) -> anyhow::Result<cloud::CloudRun> {
+    /// The checks that come before building, so a usage problem is reported
+    /// without building the project first.
+    fn prepare_cloud(&self) -> anyhow::Result<(OpenCloud, u64, u64)> {
         self.check_timeout()?;
         self.spec_options().validate()?;
         let (universe_id, place_id) = self.cloud_target()?;
         let client =
             OpenCloud::from_env(self.api_key_env.as_deref().unwrap_or(DEFAULT_API_KEY_VAR))?;
-        let place = if self.no_upload {
-            None
-        } else {
-            let project = super::resolve_path(self.project.as_deref().unwrap_or(Path::new("")))?;
-            let (name, bytes) = cloud::build_place(&project)?;
-            eprintln!("Built project '{name}'.");
-            Some(bytes)
-        };
+        Ok((client, universe_id, place_id))
+    }
+
+    /// The place file to save, or `None` with --no-upload.
+    fn build_cloud_place(&self) -> anyhow::Result<Option<Vec<u8>>> {
+        if self.no_upload {
+            return Ok(None);
+        }
+        let project = super::resolve_path(self.project.as_deref().unwrap_or(Path::new("")))?;
+        let (name, bytes) = cloud::build_place(&project)?;
+        eprintln!("Built project '{name}'.");
+        Ok(Some(bytes))
+    }
+
+    /// From the built place to the cloud run's report. As for Studio, errors
+    /// are usage or connection problems.
+    fn execute_cloud(
+        &self,
+        client: &OpenCloud,
+        universe_id: u64,
+        place_id: u64,
+        place: Option<&[u8]>,
+    ) -> anyhow::Result<cloud::CloudRun> {
         let options = self.spec_options();
         cloud::run(
-            &client,
+            client,
             &cloud::CloudRequest {
                 universe_id,
                 place_id,
-                place: place.as_deref(),
+                place,
                 options: &options,
                 task_timeout: cloud::task_timeout(self.timeout),
             },
@@ -1307,7 +1328,7 @@ mod tests {
         ])
         .unwrap();
         command.api_key_env = Some("ROJO_TEST_UNSET_KEY_VARIABLE".into());
-        let error = command.execute_cloud().unwrap_err().to_string();
+        let error = command.prepare_cloud().err().unwrap().to_string();
         assert!(error.contains("--root must be a game/"), "{error}");
     }
 
@@ -1439,10 +1460,10 @@ mod tests {
         // The variable is never set, so reaching it would give a different error.
         let mut command = parse_test(&["--cloud", "--place-id", "2"]).unwrap();
         command.api_key_env = Some("ROJO_TEST_UNSET_KEY_VARIABLE".into());
-        let error = command.execute_cloud().unwrap_err().to_string();
+        let error = command.prepare_cloud().err().unwrap().to_string();
         assert!(error.contains("--universe-id"), "{error}");
         command.universe_id = Some(1);
-        let error = command.execute_cloud().unwrap_err().to_string();
+        let error = command.prepare_cloud().err().unwrap().to_string();
         assert!(error.contains("ROJO_TEST_UNSET_KEY_VARIABLE"), "{error}");
     }
 }

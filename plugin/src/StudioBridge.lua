@@ -35,7 +35,8 @@ local REQUEST_TIMEOUT = 30
 -- again, up to this many attempts in a row, before the bridge stops. A poll
 -- that took the whole timeout usually outlived its session on the server, in
 -- which case the retry gets 404 and the bridge stops; the retries mainly help
--- with transport errors and 5xx responses.
+-- with transport errors and 5xx responses. The one exception is the first
+-- poll after Run mode, which registers the session again instead.
 local MAX_REQUEST_ATTEMPTS = 3
 -- IDs are held strongly so Roblox cannot collect an Instance proxy while the
 -- instance still exists. The oldest IDs are forgotten beyond this bound.
@@ -528,13 +529,19 @@ end
 	twice, a poll delivers each command at most once, so a lost poll response
 	is never answered twice, and a result for a request the server already
 	settled is answered with 410, not applied again.
+
+	`lastFailure`, when passed, receives the `status` of the last attempt, so
+	a caller can tell which refusal it was.
 ]]
-function StudioBridge:__requestWithRetry(route, value)
+function StudioBridge:__requestWithRetry(route, value, lastFailure)
 	local attempt = 0
 	while true do
 		attempt += 1
 		local failure = {}
 		local ok, response = self:request(route, value, failure):await()
+		if lastFailure then
+			lastFailure.status = failure.status
+		end
 		if ok then
 			return response, attempt
 		end
@@ -679,15 +686,12 @@ function StudioBridge:__runInRunMode(command, runner, args, seconds)
 			if not running or self.stopped or os.clock() >= heartbeatsEnd then
 				return
 			end
-			-- Other failures are left to the command's own result. A cancelled
-			-- or expired request answers 410 here, but Run mode cannot be
-			-- stopped from the plugin, so the run continues and its result is
-			-- discarded. Nothing is left to keep alive, so the heartbeats stop.
-			local failure = {}
-			local ok = self:request("validate", { requestId = command.requestId }, failure):await()
-			if not ok and failure.status == 410 then
-				return
-			end
+			-- Failures are left to the command's own result. A cancelled or
+			-- expired request answers 410 here, but Run mode cannot be stopped
+			-- from the plugin, so the run continues and its result is
+			-- discarded. The heartbeats still go on: they keep the session
+			-- registered, so the bridge can poll again once Run mode ends.
+			self:request("validate", { requestId = command.requestId }):await()
 		end
 	end)
 	local parented, parentError = StudioBridge.recordRunnerChange("Rojo: Insert Studio test runner", function()
@@ -1042,13 +1046,38 @@ function StudioBridge:start()
 	end)
 	self.worker = task.spawn(function()
 		local ok, err = pcall(function()
-			self:__requestWithRetry("register", { description = self:status() })
+			local description = self:status()
+			self:__requestWithRetry("register", { description = description })
 			self:__announce()
+			-- Set after a command that ran in Run mode, until the next poll
+			-- succeeds. See below.
+			local afterRunMode = false
 			while not self.stopped do
-				local response = self:__requestWithRetry("poll", {})
+				local failure = {}
+				local polled, response = pcall(self.__requestWithRetry, self, "poll", {}, failure)
+				if not polled then
+					-- Studio cannot poll in Run mode, and if its heartbeats did not
+					-- reach the server for long enough the session expired, which
+					-- the next poll reports as 404. Registering the same session
+					-- again with the same description is safe: the server adds it
+					-- back, or refreshes it if it was still there. Only once, so
+					-- an eviction or a server that keeps refusing still stops the
+					-- bridge.
+					if afterRunMode and failure.status == 404 and not self.stopped then
+						afterRunMode = false
+						Log.warn("Rojo Studio bridge session expired during Run mode; registering it again")
+						self:__requestWithRetry("register", { description = description })
+						continue
+					end
+					error(response, 0)
+				end
+				afterRunMode = false
 				for _, command in response.commands do
 					if self.stopped then
 						break
+					end
+					if command.action == "test" or command.action == "spec" then
+						afterRunMode = true
 					end
 					local success, value = pcall(self.execute, self, command)
 					if self.stopped then
