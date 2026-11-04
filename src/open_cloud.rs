@@ -453,7 +453,7 @@ impl OpenCloud {
             .ok_or_else(|| {
                 self.unconfirmed(format!(
                     "response has no valid versionNumber{}",
-                    excerpt(&body)
+                    self.excerpt(&body)
                 ))
             })
     }
@@ -489,7 +489,8 @@ impl OpenCloud {
             upload_timeout(request.len()),
         )?;
         let mut task: TaskResource = self.parse(&body, "a Luau execution task")?;
-        let task_path = checked_path(&task.path, "universes/")
+        let task_path = self
+            .checked_path(&task.path, "universes/")
             .map_err(|error| self.unconfirmed(error))?
             .to_owned();
 
@@ -658,7 +659,8 @@ impl OpenCloud {
             upload_timeout(body.len()),
         )?;
         let operation: Operation = self.parse(&response, "an asset operation")?;
-        let path = checked_path(&operation.path, "operations/")
+        let path = self
+            .checked_path(&operation.path, "operations/")
             .map_err(|error| self.unconfirmed(error))?
             .to_owned();
         Ok(StartedUpload {
@@ -703,7 +705,7 @@ impl OpenCloud {
         if let Some(error) = operation.error.filter(|error| !error.is_null()) {
             return Err(OpenCloudError::Failed(self.redact(format!(
                 "asset upload {operation_path} failed: {}",
-                excerpt(&error.to_string()).trim_start_matches(": ")
+                self.excerpt(&error.to_string()).trim_start_matches(": ")
             ))));
         }
         let asset = operation.response.unwrap_or(Value::Null);
@@ -716,7 +718,7 @@ impl OpenCloud {
         .ok_or_else(|| {
             self.unconfirmed(format!(
                 "asset upload {operation_path} finished without a valid assetId{}",
-                excerpt(&asset.to_string())
+                self.excerpt(&asset.to_string())
             ))
         })?;
         Ok(UploadedAsset {
@@ -734,7 +736,8 @@ impl OpenCloud {
     /// checked the same way as one Roblox returned, so a damaged or crafted
     /// record cannot send the key anywhere but an asset operation.
     pub fn resume_asset_upload(&self, operation: &str) -> Result<UploadedAsset> {
-        let path = checked_path(operation, "operations/")
+        let path = self
+            .checked_path(operation, "operations/")
             .map_err(|error| {
                 OpenCloudError::NotSent(format!("cannot resume asset upload: {error}"))
             })?
@@ -811,7 +814,7 @@ impl OpenCloud {
                 return Err(OpenCloudError::Status {
                     status,
                     request: request_name,
-                    body: self.redact(text.map(|text| excerpt(&text)).unwrap_or_default()),
+                    body: text.map(|text| self.excerpt(&text)).unwrap_or_default(),
                 });
             }
             return text.map_err(|error| {
@@ -832,7 +835,10 @@ impl OpenCloud {
 
     fn parse<T: for<'de> Deserialize<'de>>(&self, body: &str, what: &str) -> Result<T> {
         serde_json::from_str(body).map_err(|_| {
-            self.unconfirmed(format!("expected {what}, got{}", excerpt_or_empty(body)))
+            self.unconfirmed(format!(
+                "expected {what}, got{}",
+                excerpt_or_empty(&self.redact(body.to_owned()))
+            ))
         })
     }
 
@@ -846,6 +852,40 @@ impl OpenCloud {
         match std::str::from_utf8(self.key.as_bytes()) {
             Ok(key) if text.contains(key) => text.replace(key, "[redacted]"),
             _ => text,
+        }
+    }
+
+    /// [`excerpt`] of server text with the key removed first: shortening
+    /// first could cut an echoed key in two and leave its start behind,
+    /// where [`OpenCloud::redact`] no longer finds it.
+    fn excerpt(&self, text: &str) -> String {
+        excerpt(&self.redact(text.to_owned()))
+    }
+
+    /// Checks that a resource path from a response is a plain relative path
+    /// starting with `prefix`, so it cannot add a query or climb out of the
+    /// API.
+    fn checked_path<'a>(
+        &self,
+        path: &'a str,
+        prefix: &str,
+    ) -> std::result::Result<&'a str, String> {
+        let valid = path.starts_with(prefix)
+            && path.len() > prefix.len()
+            && path.len() <= 512
+            && path
+                .split('/')
+                .all(|segment| !segment.is_empty() && segment != "." && segment != "..")
+            && path
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'/' | b'-' | b'_' | b'.'));
+        if valid {
+            Ok(path)
+        } else {
+            Err(format!(
+                "response has an unexpected resource path{}",
+                self.excerpt(path)
+            ))
         }
     }
 }
@@ -919,28 +959,6 @@ fn retry_after(response: &reqwest::blocking::Response) -> Option<Duration> {
     let value = response.headers().get("retry-after")?.to_str().ok()?;
     let seconds: f64 = value.trim().parse().ok()?;
     (seconds.is_finite() && seconds >= 0.0).then(|| Duration::from_secs_f64(seconds.min(3600.0)))
-}
-
-/// Checks that a resource path from a response is a plain relative path
-/// starting with `prefix`, so it cannot add a query or climb out of the API.
-fn checked_path<'a>(path: &'a str, prefix: &str) -> std::result::Result<&'a str, String> {
-    let valid = path.starts_with(prefix)
-        && path.len() > prefix.len()
-        && path.len() <= 512
-        && path
-            .split('/')
-            .all(|segment| !segment.is_empty() && segment != "." && segment != "..")
-        && path
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'/' | b'-' | b'_' | b'.'));
-    if valid {
-        Ok(path)
-    } else {
-        Err(format!(
-            "response has an unexpected resource path{}",
-            excerpt(path)
-        ))
-    }
 }
 
 /// Percent-encodes everything but unreserved characters.
@@ -1747,6 +1765,52 @@ mod tests {
 
         let error = OpenCloud::with_base_url("bad\nkey-secret", "http://x").unwrap_err();
         assert!(!format!("{error:?}").contains("key-secret"));
+    }
+
+    #[test]
+    fn a_key_echoed_across_the_excerpt_limit_does_not_leak_in_part() {
+        // Places the key 990 characters into the text that is shortened to
+        // 1000, after `before` characters of JSON around it.
+        let echo = |before: usize| format!("{}{KEY}", "x".repeat(990 - before));
+        let (base, _) = serve(vec![
+            reply("401 Unauthorized", echo(0)),
+            reply("200 OK", echo(0)),
+            reply("200 OK", format!(r#"{{"m":"{}"}}"#, echo(6))),
+            reply(
+                "200 OK",
+                format!(
+                    r#"{{"path":"operations/op-1","done":true,"error":{{"m":"{}"}}}}"#,
+                    echo(6)
+                ),
+            ),
+            reply(
+                "200 OK",
+                format!(
+                    r#"{{"path":"operations/op-1","done":true,"response":{{"m":"{}"}}}}"#,
+                    echo(6)
+                ),
+            ),
+            reply(
+                "200 OK",
+                format!(r#"{{"path":"operations/{}","done":true}}"#, echo(11)),
+            ),
+        ]);
+        let client = client(&base);
+        let errors = [
+            // Error status, unparsable body, missing versionNumber.
+            publish(&client).unwrap_err(),
+            publish(&client).unwrap_err(),
+            publish(&client).unwrap_err(),
+            // Failed operation, missing assetId, unexpected path.
+            upload(&client).unwrap_err(),
+            upload(&client).unwrap_err(),
+            upload(&client).unwrap_err(),
+        ];
+        for error in &errors {
+            let text = format!("{error} {error:?}");
+            assert!(text.contains("xxxxx"), "{text}");
+            assert!(!text.contains(&KEY[..10]), "{text}");
+        }
     }
 
     #[test]
