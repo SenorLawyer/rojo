@@ -161,11 +161,57 @@ return function()
 			local baseUrl = "http://read-answered.test:34872"
 			Http._recordPermissionAnswer(baseUrl, false)
 			local context = ApiContext.new(baseUrl)
-			context.__transferTimeout = 0.01
+			context.__initialReadTimeout = 0.01
 			local ok, err = context:read({ "ROOT" }):await()
 			expect(ok).to.equal(false)
 			expect(string.find(tostring(err), "Timed out loading", 1, true) ~= nil).to.equal(true)
 			expect(pending:getStatus()).to.equal(Promise.Status.Cancelled)
+		end)
+
+		it("gives the initial read longer than fallback requests", function()
+			local context = ApiContext.new("http://localhost:34872")
+			expect(context.__initialReadTimeout).to.equal(300)
+			expect(context.__transferTimeout).to.equal(60)
+		end)
+
+		it("gives up on a possible permission prompt that never gets an answer", function()
+			local pending = Promise.new(function() end)
+			Http.get = function()
+				return pending
+			end
+			local originalLimit = Http.permissionWaitLimit
+			Http.permissionWaitLimit = 0.05
+			local context = ApiContext.new("http://handshake-prompt-cap.test:34872")
+			context.__handshakeTimeout = 0.01
+			local waitingCalls = 0
+			local ok, err = context
+				:connect(function()
+					waitingCalls += 1
+				end)
+				:await()
+			Http.permissionWaitLimit = originalLimit
+			expect(ok).to.equal(false)
+			expect(waitingCalls).to.equal(1)
+			-- The host may have no prompt at all, so the message covers both causes.
+			expect(string.find(tostring(err), "choose Allow", 1, true) ~= nil).to.equal(true)
+			expect(string.find(tostring(err), "rojo serve", 1, true) ~= nil).to.equal(true)
+			expect(pending:getStatus()).to.equal(Promise.Status.Cancelled)
+			expect(next(context.__activeRequests)).to.equal(nil)
+		end)
+
+		it("bounds a background probe even while permission may be pending", function()
+			local pending = Promise.new(function() end)
+			Http.get = function()
+				return pending
+			end
+			local context = ApiContext.new("http://probe-cap.test:34872")
+			expect(context.__probeTimeout).to.equal(30)
+			context.__probeTimeout = 0.05
+			local ok, err = context:probe():await()
+			expect(ok).to.equal(false)
+			expect(string.find(tostring(err), "Timed out connecting", 1, true) ~= nil).to.equal(true)
+			expect(pending:getStatus()).to.equal(Promise.Status.Cancelled)
+			expect(next(context.__activeRequests)).to.equal(nil)
 		end)
 
 		it("bounds stalled fallback serialization requests", function()
@@ -203,6 +249,18 @@ return function()
 			expect(string.find(tostring(err), "Timed out opening", 1, true) ~= nil).to.equal(true)
 			expect(socket.closeCount).to.equal(1)
 			expect(socket.Opened.isConnected()).to.equal(false)
+		end)
+
+		it("tells the server which session the socket belongs to", function()
+			local context, socket = socketContext()
+			local socketUrl
+			context.__createWebSocket = function(_, url)
+				socketUrl = url
+				return socket
+			end
+			context:connectWebSocket({})
+			expect(socketUrl).to.equal("ws://localhost:34872/api/socket/-1?sessionId=test-session")
+			context:disconnect()
 		end)
 
 		it("notifies the session only after the socket opens", function()

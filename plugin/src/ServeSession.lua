@@ -211,7 +211,7 @@ function ServeSession:start()
 		:connect(function()
 			if self.__status == Status.Connecting then
 				self:setLoadingText(
-					"Still waiting for the Rojo server...\nIf Studio is asking whether Rojo may access this address, choose Allow."
+					"Still waiting for the Rojo server...\nIf Studio is asking whether Rojo may access this address, choose Allow.\nOtherwise the server may be busy."
 				)
 			end
 		end)
@@ -237,8 +237,17 @@ function ServeSession:start()
 
 						Log.debug("Received {} messages from Rojo server", #messagesPacket.messages)
 
+						-- Applying a patch can yield on fallback requests, during
+						-- which the user may cancel or the session may fail, so
+						-- the rest of the packet must not be applied afterwards.
 						for _, message in messagesPacket.messages do
+							if self.__status == Status.Disconnected then
+								return
+							end
 							self:__applyPatch(message)
+						end
+						if self.__status == Status.Disconnected then
+							return
 						end
 						self.__apiContext:setMessageCursor(messagesPacket.messageCursor)
 					end,
@@ -318,6 +327,11 @@ function ServeSession:__onActiveScriptChanged(activeScript)
 	self.__apiContext:open(scriptId)
 end
 
+-- Separate so specs can supply instances without a real serialized model.
+function ServeSession:__deserializeInstances(modelContents)
+	return SerializationService:DeserializeInstancesAsync(modelContents)
+end
+
 function ServeSession:__replaceInstances(idList)
 	if #idList == 0 then
 		return true, PatchSet.newEmpty()
@@ -330,15 +344,36 @@ function ServeSession:__replaceInstances(idList)
 	end
 
 	-- TODO: Should we do this in multiple requests so we can more granularly mark failures?
+	local presentIds = idList
 	local modelSuccess, replacements = self.__apiContext
 		:serialize(idList)
 		:andThen(function(response)
+			-- The server skips ids removed since the patch was sent. Those
+			-- instances are about to be removed by a later message, so they are
+			-- left alone here rather than counted as failures.
+			if response.missingIds ~= nil and #response.missingIds > 0 then
+				local missing = {}
+				for _, id in response.missingIds do
+					missing[id] = true
+				end
+				presentIds = {}
+				for _, id in idList do
+					if not missing[id] then
+						table.insert(presentIds, id)
+					end
+				end
+				Log.debug("Serialize endpoint skipped {} removed instances", #idList - #presentIds)
+			end
+			if #presentIds == 0 then
+				return {}
+			end
+
 			Log.debug("Deserializing results from serialize endpoint")
-			local objects = SerializationService:DeserializeInstancesAsync(response.modelContents)
+			local objects = self:__deserializeInstances(response.modelContents)
 			if not objects[1] then
 				return Promise.reject("Serialize endpoint did not deserialize into any Instances")
 			end
-			if #objects[1]:GetChildren() ~= #idList then
+			if #objects[1]:GetChildren() ~= #presentIds then
 				return Promise.reject("Serialize endpoint did not return the correct number of Instances")
 			end
 
@@ -353,9 +388,12 @@ function ServeSession:__replaceInstances(idList)
 		Log.warn("Could not replace instances through the sync fallback: {}", replacements)
 		return false
 	end
+	if #presentIds == 0 then
+		return true, PatchSet.newEmpty()
+	end
 
 	local refSuccess, refPatch = self.__apiContext
-		:refPatch(idList)
+		:refPatch(presentIds)
 		:andThen(function(response)
 			return response.patch
 		end)

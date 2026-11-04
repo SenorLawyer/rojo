@@ -216,4 +216,29 @@ return function()
 		assert(newChild ~= nil, "expected child to be present")
 		assert(newChild == child, "expected child to be preserved")
 	end)
+
+	it("should clear a ref property when the server sends the null ref", function()
+		local target = Instance.new("Folder")
+		local value = Instance.new("ObjectValue")
+		value.Value = target
+
+		local instanceMap = InstanceMap.new()
+		instanceMap:insert("VALUE", value)
+
+		local patch = PatchSet.newEmpty()
+		table.insert(patch.updated, {
+			id = "VALUE",
+			changedProperties = {
+				Value = {
+					Ref = "00000000000000000000000000000000",
+				},
+			},
+		})
+
+		local unapplied = applyPatch(instanceMap, patch)
+		assert(PatchSet.isEmpty(unapplied), "expected remaining patch to be empty")
+		expect(value.Value).to.equal(nil)
+		target:Destroy()
+		value:Destroy()
+	end)
 end

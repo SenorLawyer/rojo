@@ -37,6 +37,43 @@ return function()
 			expect(waitingCalls).to.equal(1)
 		end)
 
+		it("caps the wait on a possible permission prompt", function()
+			-- Studio usually remembers the permission, so a first request to a
+			-- host that stalls may be a stalled server rather than a prompt.
+			expect(Http.permissionWaitLimit).to.equal(120)
+			local url = "http://pending-capped.test:34872/api/rojo"
+			local pending = Promise.new(function() end)
+			local waitingCalls = 0
+			local ok, err = Http.timeout(pending, url, 0.01, "timed out", function()
+				waitingCalls += 1
+			end, { permissionWaitLimit = 0.05, permissionRejectionValue = "no answer" }):await()
+			expect(ok).to.equal(false)
+			expect(err).to.equal("no answer")
+			expect(waitingCalls).to.equal(1)
+			expect(pending:getStatus()).to.equal(Promise.Status.Cancelled)
+		end)
+
+		it("enforces a hard limit regardless of permission state", function()
+			local url = "http://pending-hard-limit.test:34872/api/rojo"
+			local pending = Promise.new(function() end)
+			local ok, err = Http.timeout(pending, url, 10, "timed out", nil, { limit = 0.05 }):await()
+			expect(ok).to.equal(false)
+			expect(err).to.equal("timed out")
+			expect(pending:getStatus()).to.equal(Promise.Status.Cancelled)
+		end)
+
+		it("does not extend a stalled request's deadline when other requests finish", function()
+			local url = "http://answered-twice.test:34872/api/rojo"
+			Http._recordPermissionAnswer(url, false)
+			local request = Http.timeout(Promise.new(function() end), url, 0.2, "timed out")
+			request:catch(function() end)
+			task.wait(0.15)
+			-- Another request to the same host finishing is not a new answer.
+			Http._recordPermissionAnswer(url, false)
+			task.wait(0.15)
+			expect(request:getStatus()).to.equal(Promise.Status.Rejected)
+		end)
+
 		it("resolves with the request's result when it finishes in time", function()
 			local url = "http://answered-success.test/api"
 			local ok, value = Http.timeout(Promise.resolve("done"), url, 5, "timed out"):await()
