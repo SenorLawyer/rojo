@@ -34,24 +34,30 @@ local defaultSettings = {
 
 local Settings = {}
 
-Settings._values = table.clone(defaultSettings)
-Settings._updateListeners = {}
-Settings._bindings = {}
-
-if plugin then
-	for name, defaultValue in pairs(Settings._values) do
-		local savedValue = plugin:GetSetting("Rojo_" .. name)
+-- Keep store loading separate so tests can verify upgrades without modifying
+-- the developer's actual plugin preferences.
+function Settings._loadValues(store)
+	local values = table.clone(defaultSettings)
+	if not store then
+		return values
+	end
+	for name, defaultValue in pairs(values) do
+		local savedValue = store:GetSetting("Rojo_" .. name)
 
 		if savedValue == nil then
 			-- plugin:SetSetting hits disc instead of memory, so it can be slow. Spawn so we don't hang.
-			task.spawn(plugin.SetSetting, plugin, "Rojo_" .. name, defaultValue)
-			Settings._values[name] = defaultValue
+			task.spawn(store.SetSetting, store, "Rojo_" .. name, defaultValue)
 		else
-			Settings._values[name] = savedValue
+			values[name] = savedValue
 		end
 	end
 	Log.trace("Loaded settings from plugin store")
+	return values
 end
+
+Settings._values = Settings._loadValues(plugin)
+Settings._updateListeners = {}
+Settings._bindings = {}
 
 function Settings:get(name)
 	if defaultSettings[name] == nil then
