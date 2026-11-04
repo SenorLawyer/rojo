@@ -119,6 +119,25 @@ pub fn missing_relevant_path(vfs: &Vfs, path: &Path) -> PathBuf {
     path
 }
 
+/// Calls [`missing_relevant_path`] for a `$path` that produced no instance, if
+/// that is because it is missing.
+///
+/// A path that exists but produces no instance, such as a file of an unknown
+/// type, would otherwise be watched recursively and reported as created.
+pub fn relevant_path_if_missing(vfs: &Vfs, path: &Path) -> Option<PathBuf> {
+    match vfs.metadata(path) {
+        Err(err)
+            if matches!(
+                err.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+            ) =>
+        {
+            Some(missing_relevant_path(vfs, path))
+        }
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod test {
     use super::*;

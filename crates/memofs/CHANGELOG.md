@@ -16,10 +16,12 @@
 * Watching a missing path reports `io::ErrorKind::NotFound` on every platform.
 * After a rescan, existing watch roots are registered again, so on Linux a root replaced while events were dropped, and directories created meanwhile, are watched again.
 * On Linux, removing a watch root nested inside another watch root no longer removes the outer root's watches below it.
-* Parent watches used to notice recreated roots are only placed inside directories that were watched before, so a missing path cannot put a watch on the home directory or filesystem root.
+* Parent watches used to notice recreated roots are only placed on the parent of a path, or inside directories that were watched before. The filesystem root and a parent reached through `..`, such as the project's parent for `../shared`, are not watched unless they were watched before, so a missing path cannot put a watch on the home directory through `..`.
+* Where no watch can report the creation of a path passed to `Vfs::watch_missing`, the path is checked for every 2 seconds and reported with `VfsEvent::Create` once it exists. This is always the case on macOS, where FSEvents cannot watch a path before it exists, and elsewhere for paths such as `../shared` whose parent may not be watched.
+* A watch root that cannot be registered again after a rescan, for example because the inotify watch limit was reached, is no longer kept as watched while directories created in it go unwatched. It is degraded and logged like any other watch failure, or treated as lost if it disappeared.
 * Paths below a path that could not be watched are read without watches, and without a warning each. Directories that could not be watched for the creation of a path are not retried until a rescan.
 * On Windows, where `notify` never reports a rescan, paths that could not be watched are retried every 30 seconds, reported with `VfsEvent::Write`.
-* A recursive watch that fails because a directory below it disappeared mid-walk is retried, and a symlink whose target is missing reports `io::ErrorKind::NotFound` instead of counting as unwatchable.
+* A recursive watch that fails because a directory below it disappeared mid-walk is retried, at first immediately, and a symlink whose target is missing reports `io::ErrorKind::NotFound` instead of counting as unwatchable.
 * Paths are no longer considered inside a directory through a `..` component, so a missing `../shared` path cannot put a parent watch above the directories watched before.
 * Added `Vfs::watch_missing`, which reports the creation of a path that does not exist yet, even when its parent is missing too.
 * Watch roots recovered during a rescan are no longer also reported with `VfsEvent::Create`, since the rescan resyncs everything.

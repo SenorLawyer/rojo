@@ -5,7 +5,7 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crossbeam_channel::{Receiver, Sender};
+use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 use notify::{watcher, DebouncedEvent, RecommendedWatcher, RecursiveMode, Watcher};
 
 use crate::{DirEntry, Metadata, ReadDir, VfsBackend, VfsEvent};
@@ -41,10 +41,21 @@ const POLL_DEGRADED: bool = cfg!(windows);
 /// rescan. Each poll snapshots every degraded path again.
 const DEGRADED_POLL_INTERVAL: Duration = Duration::from_secs(30);
 
+/// FSEvents cannot watch a path that does not exist, and watching an ancestor
+/// instead would wake the stream for that ancestor's whole subtree and restart
+/// it. Missing paths are polled there instead.
+const POLL_MISSING: bool = PATH_BASED_WATCHES;
+
+/// How often missing paths that no watch would report are checked for. Each
+/// check reads the metadata of those paths only.
+const MISSING_POLL_INTERVAL: Duration = Duration::from_secs(2);
+
 /// How often a recursive watch is retried when part of the tree disappears
-/// while notify walks it, such as during a package reinstall.
+/// while notify walks it, such as during a package reinstall. The first retry
+/// is immediate, since the walk usually only raced a single removal, and the
+/// Vfs lock is held while waiting.
 const TRANSIENT_WATCH_RETRIES: u32 = 3;
-const TRANSIENT_WATCH_RETRY_DELAY: Duration = Duration::from_millis(10);
+const TRANSIENT_WATCH_RETRY_DELAY: Duration = Duration::from_millis(5);
 
 /// `VfsBackend` that uses `std::fs` and the `notify` crate.
 pub struct StdBackend {
@@ -68,8 +79,12 @@ pub struct StdBackend {
     degraded: HashSet<PathBuf>,
     /// Degraded paths that were already logged, so retries do not spam.
     reported_degraded: HashSet<PathBuf>,
-    /// The degraded paths, shared with the thread that polls them.
-    polled_degraded: Arc<Mutex<Vec<PathBuf>>>,
+    /// The paths that are polled, shared with the thread that polls them.
+    polled: Arc<Mutex<Polled>>,
+    /// Whether missing paths are always polled instead of watched for.
+    poll_missing: bool,
+    missing_poll_interval: Duration,
+    poll_thread: Option<PollThread>,
     /// Ancestors that could not be watched for the creation of a path. They
     /// are not retried, or logged again, until the watcher asks for a rescan.
     failed_creation_watches: HashSet<PathBuf>,
@@ -95,7 +110,10 @@ impl StdBackend {
             anchors: HashSet::new(),
             degraded: HashSet::new(),
             reported_degraded: HashSet::new(),
-            polled_degraded: Arc::new(Mutex::new(Vec::new())),
+            polled: Arc::default(),
+            poll_missing: POLL_MISSING,
+            missing_poll_interval: MISSING_POLL_INTERVAL,
+            poll_thread: None,
             failed_creation_watches: HashSet::new(),
         }
     }
@@ -119,28 +137,36 @@ impl StdBackend {
             Result::<(), crossbeam_channel::SendError<VfsEvent>>::Ok(())
         });
 
-        if POLL_DEGRADED {
-            let degraded = Arc::downgrade(&self.polled_degraded);
-            let tx = self.watcher_sender.clone();
-            thread::spawn(move || loop {
-                thread::sleep(DEGRADED_POLL_INTERVAL);
-                // The backend is gone once nothing else holds the list.
-                let Some(degraded) = degraded.upgrade() else {
-                    return;
-                };
-                let paths = degraded.lock().unwrap().clone();
-                for path in paths {
-                    // Handling the write retries the watch, and resyncs the
-                    // path in case it changed while it was not watched.
-                    if tx.send(VfsEvent::Write(path)).is_err() {
-                        return;
-                    }
-                }
-            });
-        }
-
         self.watcher = Some(watcher);
         Ok(())
+    }
+
+    /// Starts the thread that polls `polled`, unless it is running already.
+    fn ensure_poll_thread(&mut self) {
+        if self.poll_thread.is_none() {
+            self.poll_thread = Some(PollThread::spawn(
+                Arc::clone(&self.polled),
+                self.watcher_sender.clone(),
+                self.missing_poll_interval,
+            ));
+        }
+    }
+
+    /// Reports the creation of `path` by polling for it.
+    fn poll_for_creation(&mut self, path: &Path) {
+        self.ensure_poll_thread();
+        let mut polled = self.polled.lock().unwrap();
+        if !polled.missing.iter().any(|missing| missing == path) {
+            polled.missing.push(path.to_owned());
+        }
+    }
+
+    /// Whether a watch would report the creation of `path`: one covering it,
+    /// or a creation watch on its nearest existing ancestor.
+    fn reports_creation(&self, path: &Path) -> bool {
+        self.is_covered(path)
+            || nearest_existing_ancestor(path)
+                .is_some_and(|ancestor| self.parent_watches.contains(ancestor))
     }
 
     fn is_covered(&self, path: &Path) -> bool {
@@ -158,9 +184,12 @@ impl StdBackend {
         containing_ancestors(path).any(|ancestor| self.degraded.contains(ancestor))
     }
 
-    fn publish_degraded(&self) {
+    fn publish_degraded(&mut self) {
         if POLL_DEGRADED {
-            *self.polled_degraded.lock().unwrap() = self.degraded.iter().cloned().collect();
+            if !self.degraded.is_empty() {
+                self.ensure_poll_thread();
+            }
+            self.polled.lock().unwrap().degraded = self.degraded.iter().cloned().collect();
         }
     }
 
@@ -202,7 +231,9 @@ impl StdBackend {
             // Only the parent of a path, or a directory inside something that
             // was watched before, may be watched for its creation. Otherwise a
             // missing absolute or `..` path could climb to the home directory.
-            if path.parent() != Some(ancestor) && !self.is_anchored(ancestor) {
+            // A parent reached through `..`, like the project's parent for
+            // `../shared`, or the filesystem root, is no exception.
+            if !(is_plain_parent(path, ancestor) || self.is_anchored(ancestor)) {
                 log::debug!(
                     "Not watching {} for the creation of {}, since nothing in it was watched before",
                     ancestor.display(),
@@ -298,10 +329,117 @@ impl StdBackend {
             // Other backends would keep the old registration running as well.
             let _ = watcher.unwatch(path);
         }
-        if let Err(err) = watcher.watch(path, mode) {
-            log::debug!("Could not watch {} again: {}", path.display(), err);
+        let Err(err) = watcher.watch(path, mode) else {
+            return;
+        };
+        let err = notify_io_error(err);
+        log::debug!("Could not watch {} again: {}", path.display(), err);
+        match mode {
+            // Kept in `watches`, the root would count as covered, and
+            // directories created below it would silently go unwatched.
+            // Watching it from scratch retries, degrades or loses it the way
+            // any other watch failure does.
+            RecursiveMode::Recursive => {
+                self.watches.remove(path);
+                if self.watch(path).is_err() {
+                    self.lost_watches.insert(path.to_owned());
+                }
+            }
+            RecursiveMode::NonRecursive => {
+                self.parent_watches.remove(path);
+                if !is_missing(path) {
+                    self.failed_creation_watches.insert(path.to_owned());
+                    log::warn!(
+                        "Could not watch {} again, so watch roots in it may not be resynced if they are deleted and recreated: {}",
+                        path.display(),
+                        err
+                    );
+                }
+            }
         }
     }
+}
+
+impl Drop for StdBackend {
+    fn drop(&mut self) {
+        if let Some(poll_thread) = self.poll_thread.take() {
+            poll_thread.stop();
+        }
+    }
+}
+
+/// The paths that the poll thread checks.
+#[derive(Default)]
+struct Polled {
+    /// Degraded paths, reported with `VfsEvent::Write` every
+    /// `DEGRADED_POLL_INTERVAL`, which retries their watch.
+    degraded: Vec<PathBuf>,
+    /// Missing paths that no watch would report, reported with
+    /// `VfsEvent::Create` once they exist and then forgotten.
+    missing: Vec<PathBuf>,
+}
+
+/// A thread that polls paths no watch reports changes to.
+struct PollThread {
+    /// Dropping this stops the thread without waiting for its next poll.
+    stop: Sender<()>,
+    handle: thread::JoinHandle<()>,
+}
+
+impl PollThread {
+    fn spawn(polled: Arc<Mutex<Polled>>, tx: Sender<VfsEvent>, interval: Duration) -> Self {
+        let (stop, stopped) = crossbeam_channel::bounded::<()>(0);
+        let handle = thread::spawn(move || {
+            let mut last_degraded_poll = Instant::now();
+            loop {
+                match stopped.recv_timeout(interval) {
+                    Err(RecvTimeoutError::Timeout) => {}
+                    _ => return,
+                }
+                let mut events = Vec::new();
+                {
+                    let mut polled = polled.lock().unwrap();
+                    if last_degraded_poll.elapsed() >= DEGRADED_POLL_INTERVAL {
+                        last_degraded_poll = Instant::now();
+                        // Handling the write retries the watch, and resyncs the
+                        // path in case it changed while it was not watched.
+                        events.extend(polled.degraded.iter().cloned().map(VfsEvent::Write));
+                    }
+                    events.extend(
+                        take_created(&mut polled.missing)
+                            .into_iter()
+                            .map(VfsEvent::Create),
+                    );
+                }
+                for event in events {
+                    if tx.send(event).is_err() {
+                        return;
+                    }
+                }
+            }
+        });
+        Self { stop, handle }
+    }
+
+    fn stop(self) {
+        drop(self.stop);
+        let _ = self.handle.join();
+    }
+}
+
+/// Removes the paths that exist now from `missing`, and returns them.
+fn take_created(missing: &mut Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut created = Vec::new();
+    missing.retain(|path| {
+        // Follow symlinks, like the watches registered once it is read.
+        if path.exists() {
+            created.push(path.clone());
+            false
+        } else {
+            true
+        }
+    });
+    created
 }
 
 /// Which recovered watch roots `recover_lost_watches` reports as created.
@@ -429,6 +567,17 @@ fn translate_event(
     }
 }
 
+/// Whether `ancestor` is the parent of `path`, and is neither the filesystem
+/// root nor reached through a `..` component.
+fn is_plain_parent(path: &Path, ancestor: &Path) -> bool {
+    path.parent() == Some(ancestor)
+        && ancestor.parent().is_some()
+        && !matches!(
+            ancestor.components().next_back(),
+            Some(Component::ParentDir)
+        )
+}
+
 fn nearest_existing_ancestor(path: &Path) -> Option<&Path> {
     path.ancestors()
         .skip(1)
@@ -537,9 +686,11 @@ impl VfsBackend for StdBackend {
                 // disappears mid-walk. Degrading the root for that would leave
                 // it unwatched during exactly the churn that caused it.
                 WatchFailure::Transient if retries < TRANSIENT_WATCH_RETRIES => {
+                    if retries > 0 {
+                        thread::sleep(TRANSIENT_WATCH_RETRY_DELAY);
+                    }
                     retries += 1;
                     log::debug!("Retrying the watch of {}: {}", path.display(), err);
-                    thread::sleep(TRANSIENT_WATCH_RETRY_DELAY);
                 }
                 WatchFailure::Transient | WatchFailure::Unwatchable => {
                     self.degrade(path, &err);
@@ -650,16 +801,27 @@ impl VfsBackend for StdBackend {
     /// Reports the creation of `path`, which does not exist yet, by treating
     /// it like a watch root that was lost.
     fn watch_missing(&mut self, path: &Path) -> io::Result<()> {
-        if PATH_BASED_WATCHES || self.is_covered(path) || self.is_degraded(path) {
+        if self.is_covered(path) || self.is_degraded(path) {
             return Ok(());
         }
         if self.initialize_watcher().is_err() {
+            return Ok(());
+        }
+        if self.poll_missing {
+            // The poll also reports a path created since the caller found it
+            // missing.
+            self.poll_for_creation(path);
             return Ok(());
         }
         self.lost_watches.insert(path.to_owned());
         // It may have been created after the caller found it missing, without
         // an event from the creation watch registered here.
         self.recover_lost_watches(vec![path.to_owned()], Report::ExceptTrigger(None));
+        // No watch may be allowed, or able, to report it, such as for a
+        // `../shared` path whose parent is outside the watched directories.
+        if self.lost_watches.contains(path) && !self.reports_creation(path) {
+            self.poll_for_creation(path);
+        }
         Ok(())
     }
 
@@ -1248,6 +1410,144 @@ mod test {
         assert!(backend.watches.contains(&packages));
     }
 
+    #[test]
+    fn polls_take_only_the_missing_paths_that_exist_now() {
+        let (_dir, dir) = tempdir();
+        let lib = dir.join("lib");
+        let packages = lib.join("Packages");
+        let other = dir.join("Other");
+        let mut missing = vec![packages.clone(), other.clone()];
+        assert!(take_created(&mut missing).is_empty());
+
+        // Its parent appearing is not its creation.
+        fs_err::create_dir(&lib).unwrap();
+        assert!(take_created(&mut missing).is_empty());
+        fs_err::create_dir(&packages).unwrap();
+        assert_eq!(take_created(&mut missing), [packages]);
+        assert_eq!(missing, [other]);
+    }
+
+    /// Waits for a `VfsEvent::Create` of `path` without committing events.
+    fn wait_for_creation(receiver: &Receiver<VfsEvent>, path: &Path) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let event = receiver
+                .recv_deadline(deadline)
+                .unwrap_or_else(|_| panic!("the creation of {} was not reported", path.display()));
+            if matches!(&event, VfsEvent::Create(created) if created == path) {
+                return;
+            }
+        }
+    }
+
+    #[test]
+    fn polled_missing_paths_are_reported_once_they_exist() {
+        // Like macOS, where nothing can watch a path before it exists.
+        let mut backend = StdBackend::new_without_watch();
+        backend.poll_missing = true;
+        backend.missing_poll_interval = Duration::from_millis(20);
+        let (_dir, dir) = tempdir();
+        let lib = dir.join("lib");
+        let packages = lib.join("Packages");
+        backend.watch_missing(&packages).unwrap();
+        backend.watch_missing(&packages).unwrap();
+        assert_eq!(
+            backend.polled.lock().unwrap().missing,
+            std::slice::from_ref(&packages)
+        );
+        assert!(backend.parent_watches.is_empty());
+        assert!(backend.lost_watches.is_empty());
+
+        let receiver = backend.event_receiver();
+        fs_err::create_dir(&lib).unwrap();
+        assert!(receiver.recv_timeout(Duration::from_millis(200)).is_err());
+        fs_err::create_dir(&packages).unwrap();
+        wait_for_creation(&receiver, &packages);
+        assert!(backend.polled.lock().unwrap().missing.is_empty());
+
+        // Dropping the backend stops the thread.
+        let started = Instant::now();
+        let polled = Arc::downgrade(&backend.polled);
+        drop(backend);
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(polled.upgrade().is_none());
+    }
+
+    #[test]
+    fn parents_reached_through_parent_directory_components_are_not_watched_for_creation() {
+        let project = Path::new("/project");
+        assert!(is_plain_parent(&project.join("Packages"), project));
+        let parent = project.join("..");
+        assert!(!is_plain_parent(&parent.join("shared"), &parent));
+        assert!(is_plain_parent(
+            &parent.join("shared").join("src"),
+            &parent.join("shared")
+        ));
+        let root = Path::new("/");
+        assert!(!is_plain_parent(&root.join("Packages"), root));
+    }
+
+    #[test]
+    fn missing_paths_beside_the_project_are_polled_instead_of_watching_its_parent() {
+        let mut backend = StdBackend::new().unwrap();
+        backend.missing_poll_interval = Duration::from_millis(20);
+        let (_dir, dir) = tempdir();
+        let project = dir.join("project");
+        fs_err::create_dir(&project).unwrap();
+        let project_file = project.join("default.project.json");
+        fs_err::write(&project_file, "{}").unwrap();
+        backend.watch(&project_file).unwrap();
+
+        // Like `$path: {"optional": "../shared"}` while `shared` is missing.
+        // Its parent is the project's parent, such as the home directory.
+        let parent = project.join("..");
+        let shared = parent.join("shared");
+        backend.watch_missing(&shared).unwrap();
+        assert!(!backend.parent_watches.contains(&parent));
+        assert!(!backend.parent_watches.contains(&dir));
+        assert_eq!(
+            backend.polled.lock().unwrap().missing,
+            std::slice::from_ref(&shared)
+        );
+
+        let receiver = backend.event_receiver();
+        fs_err::create_dir(dir.join("shared")).unwrap();
+        wait_for_creation(&receiver, &shared);
+        // What the change processor does with the event.
+        backend.recover_watches(&shared).unwrap();
+        assert!(backend.lost_watches.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn roots_that_cannot_be_watched_again_after_a_rescan_are_degraded() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut backend = StdBackend::new().unwrap();
+        let (_dir, dir) = tempdir();
+        let root = dir.join("root");
+        fs_err::create_dir(&root).unwrap();
+        backend.watch(&root).unwrap();
+        assert!(backend.watches.contains(&root));
+
+        // A directory created while events were dropped can fail to be
+        // watched, like one past the inotify watch limit.
+        let locked = root.join("locked");
+        fs_err::create_dir(&locked).unwrap();
+        fs_err::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let denied = fs_err::read_dir(&locked).is_err();
+        let result = backend.revalidate_watches();
+        let degraded = backend.degraded.contains(&root);
+        let watched = backend.watches.contains(&root);
+        fs_err::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        result.unwrap();
+        if INOTIFY_WATCHES && denied {
+            // Otherwise it would count as covered, with `locked` unwatched.
+            assert!(degraded);
+            assert!(!watched);
+        }
+    }
+
     #[cfg(windows)]
     #[test]
     fn polling_a_degraded_path_retries_its_watch() {
@@ -1256,13 +1556,13 @@ mod test {
         backend.degraded.insert(dir.clone());
         backend.publish_degraded();
         assert_eq!(
-            *backend.polled_degraded.lock().unwrap(),
+            backend.polled.lock().unwrap().degraded,
             std::slice::from_ref(&dir)
         );
         // What the polling thread's write leads to.
         backend.recover_watches(&dir).unwrap();
         assert!(backend.degraded.is_empty());
-        assert!(backend.polled_degraded.lock().unwrap().is_empty());
+        assert!(backend.polled.lock().unwrap().degraded.is_empty());
         assert!(backend.watches.contains(&dir));
     }
 

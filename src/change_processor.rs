@@ -123,9 +123,13 @@ struct JobThreadContext {
     /// When the whole tree was last resynced because of a rescan.
     last_resync: Cell<Option<Instant>>,
 
-    /// Whether a rescan arrived too soon after the last resync and still
-    /// needs one.
+    /// Whether a rescan arrived too soon after the last resync, or the last
+    /// resync failed, and the tree still needs one.
     resync_pending: Cell<bool>,
+
+    /// How many resyncs in a row failed, such as while a required `$path`
+    /// was briefly missing or a project file was half written.
+    resync_failures: Cell<u32>,
 }
 
 /// The shortest time between two resyncs of the whole tree.
@@ -134,6 +138,13 @@ struct JobThreadContext {
 /// keep up with, such as a large `git checkout` or package install, and each
 /// resync snapshots the entire project.
 const RESYNC_INTERVAL: Duration = Duration::from_secs(1);
+
+/// The longest time between retries of a resync that keeps failing.
+const MAX_RESYNC_RETRY_INTERVAL: Duration = Duration::from_secs(30);
+
+/// The tree could not be brought up to date with the filesystem, for example
+/// because a snapshot failed, and still holds what was synced before.
+struct StaleTree;
 
 impl JobThreadContext {
     fn new(
@@ -147,7 +158,16 @@ impl JobThreadContext {
             message_queue,
             last_resync: Cell::new(None),
             resync_pending: Cell::new(false),
+            resync_failures: Cell::new(0),
         }
+    }
+
+    /// The shortest time between the last resync and the next one. It grows
+    /// while resyncs keep failing, so a project that stays broken is not
+    /// snapshotted every second.
+    fn resync_interval(&self) -> Duration {
+        let doublings = self.resync_failures.get().saturating_sub(1).min(16);
+        (RESYNC_INTERVAL * 2u32.pow(doublings)).min(MAX_RESYNC_RETRY_INTERVAL)
     }
 
     /// Computes and applies patches to the DOM for a given file path.
@@ -188,7 +208,7 @@ impl JobThreadContext {
             if tree.get_instance(id).is_none() {
                 continue;
             }
-            if let Some(patch) = compute_and_apply_changes(&mut tree, &self.vfs, id) {
+            if let Ok(Some(patch)) = compute_and_apply_changes(&mut tree, &self.vfs, id) {
                 if !patch.is_empty() {
                     applied_patches.push(patch);
                 }
@@ -210,7 +230,7 @@ impl JobThreadContext {
         let recently_resynced = self
             .last_resync
             .get()
-            .is_some_and(|last| last.elapsed() < RESYNC_INTERVAL);
+            .is_some_and(|last| last.elapsed() < self.resync_interval());
         if recently_resynced {
             self.resync_pending.set(true);
         } else {
@@ -226,27 +246,57 @@ impl JobThreadContext {
         Some(
             self.last_resync
                 .get()
-                .map_or_else(Instant::now, |last| last + RESYNC_INTERVAL),
+                .map_or_else(Instant::now, |last| last + self.resync_interval()),
         )
     }
 
     /// Snapshots the whole tree again after the watcher reported that it may
     /// have dropped events.
+    ///
+    /// A resync that fails is retried, since the events it was meant to make
+    /// up for are gone, and nothing else would bring the tree up to date.
     fn resync_tree(&self) {
         self.resync_pending.set(false);
-        log::warn!("The filesystem watcher may have missed changes; resyncing the whole project");
+        let failures = self.resync_failures.get();
+        if failures == 0 {
+            log::warn!(
+                "The filesystem watcher may have missed changes; resyncing the whole project"
+            );
+        } else {
+            log::debug!("Retrying the resync of the whole project");
+        }
         // Watches can be lost along with the events, so recover them first.
         if let Err(err) = self.vfs.commit_event(&VfsEvent::Rescan) {
             log::error!("Error recovering filesystem watches: {:?}", err);
         }
         let mut tree = self.tree.lock().unwrap();
         let root_id = tree.get_root_id();
-        if let Some(patch) = compute_and_apply_changes(&mut tree, &self.vfs, root_id) {
+        let result = compute_and_apply_changes(&mut tree, &self.vfs, root_id);
+        if let Ok(Some(patch)) = &result {
             if !patch.is_empty() {
-                self.message_queue.push_messages(&[patch]);
+                self.message_queue
+                    .push_messages(std::slice::from_ref(patch));
             }
         }
+        drop(tree);
         self.last_resync.set(Some(Instant::now()));
+        match result {
+            Ok(_) => {
+                if failures > 0 {
+                    log::info!("Resynced the whole project");
+                }
+                self.resync_failures.set(0);
+            }
+            Err(StaleTree) => {
+                self.resync_failures.set(failures + 1);
+                self.resync_pending.set(true);
+                if failures == 0 {
+                    log::warn!(
+                        "Could not resync the whole project, so it may be out of date. Retrying until it succeeds."
+                    );
+                }
+            }
+        }
     }
 
     fn handle_vfs_event(&self, event: VfsEvent) {
@@ -440,12 +490,20 @@ fn canonicalize_event_path(vfs: &Vfs, event: &VfsEvent) -> Option<io::Result<Pat
     }
 }
 
-fn compute_and_apply_changes(tree: &mut RojoTree, vfs: &Vfs, id: Ref) -> Option<AppliedPatchSet> {
+/// Snapshots instance `id` again and applies the changes to the tree.
+///
+/// Fails when the snapshot could not be taken, and the instance was kept as it
+/// was. Returns `None` when there was nothing to update.
+fn compute_and_apply_changes(
+    tree: &mut RojoTree,
+    vfs: &Vfs,
+    id: Ref,
+) -> Result<Option<AppliedPatchSet>, StaleTree> {
     let Some(metadata) = tree.get_metadata(id) else {
         // Panicking here would stop the processor thread, and every later
         // change with it.
         log::warn!("Instance {:?} was removed before it could be updated", id);
-        return None;
+        return Ok(None);
     };
 
     let instigating_source = match &metadata.instigating_source {
@@ -456,7 +514,7 @@ fn compute_and_apply_changes(tree: &mut RojoTree, vfs: &Vfs, id: Ref) -> Option<
                 id
             );
             log::error!("This is a bug. Please file an issue!");
-            return None;
+            return Ok(None);
         }
     };
 
@@ -473,7 +531,7 @@ fn compute_and_apply_changes(tree: &mut RojoTree, vfs: &Vfs, id: Ref) -> Option<
                     Ok(snapshot) => snapshot,
                     Err(err) => {
                         log::error!("Snapshot error: {:?}", err);
-                        return None;
+                        return Err(StaleTree);
                     }
                 };
                 if snapshot.is_none() && id == tree.get_root_id() {
@@ -481,7 +539,7 @@ fn compute_and_apply_changes(tree: &mut RojoTree, vfs: &Vfs, id: Ref) -> Option<
                         "{} no longer produces an instance. Keeping the last synced project.",
                         path.display()
                     );
-                    return None;
+                    return Err(StaleTree);
                 }
 
                 let patch_set = compute_patch_set(snapshot, tree, id);
@@ -494,7 +552,7 @@ fn compute_and_apply_changes(tree: &mut RojoTree, vfs: &Vfs, id: Ref) -> Option<
                     "{} no longer exists. Keeping the last synced project until it is restored.",
                     path.display()
                 );
-                return None;
+                return Err(StaleTree);
             }
             Ok(None) => {
                 // Our instance was previously created from a path, but that
@@ -510,7 +568,7 @@ fn compute_and_apply_changes(tree: &mut RojoTree, vfs: &Vfs, id: Ref) -> Option<
             }
             Err(err) => {
                 log::error!("Error processing filesystem change: {:?}", err);
-                return None;
+                return Err(StaleTree);
             }
         },
 
@@ -537,7 +595,7 @@ fn compute_and_apply_changes(tree: &mut RojoTree, vfs: &Vfs, id: Ref) -> Option<
                 Ok(snapshot) => snapshot,
                 Err(err) => {
                     log::error!("{:?}", err);
-                    return None;
+                    return Err(StaleTree);
                 }
             };
 
@@ -552,7 +610,7 @@ fn compute_and_apply_changes(tree: &mut RojoTree, vfs: &Vfs, id: Ref) -> Option<
                 // The root cannot be removed.
                 if id == tree.get_root_id() {
                     log::warn!("The project root no longer produces an instance");
-                    return None;
+                    return Err(StaleTree);
                 }
             }
 
@@ -561,7 +619,7 @@ fn compute_and_apply_changes(tree: &mut RojoTree, vfs: &Vfs, id: Ref) -> Option<
         }
     };
 
-    Some(applied_patch_set)
+    Ok(Some(applied_patch_set))
 }
 
 #[cfg(test)]
@@ -777,12 +835,14 @@ mod test {
         let root = dunce::canonicalize(dir.path()).unwrap();
         let task = context(&root);
         let mut tree = task.tree.lock().unwrap();
-        assert!(compute_and_apply_changes(&mut tree, &task.vfs, Ref::new()).is_none());
+        assert!(matches!(
+            compute_and_apply_changes(&mut tree, &task.vfs, Ref::new()),
+            Ok(None)
+        ));
     }
 
-    // FSEvents cannot watch a path before it exists, and Rojo does not watch
-    // the project folder recursively there.
-    #[cfg(not(target_os = "macos"))]
+    // On macOS, where FSEvents cannot watch a path before it exists, the
+    // backend polls for it instead.
     #[test]
     fn creating_a_project_path_whose_parent_was_missing_syncs_it() {
         let dir = tempfile::tempdir().unwrap();
@@ -800,7 +860,7 @@ mod test {
         fs::create_dir(root.join("lib")).unwrap();
         fs::create_dir(root.join("lib").join("Packages")).unwrap();
         fs::write(&added, "return 1").unwrap();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while task.tree.lock().unwrap().get_ids_at_path(&added).is_empty() {
             let event = receiver
                 .recv_deadline(deadline)
@@ -842,6 +902,46 @@ mod test {
         task.resync_tree();
         assert!(task.pending_resync_deadline().is_none());
         assert!(!task.tree.lock().unwrap().get_ids_at_path(&added).is_empty());
+    }
+
+    #[test]
+    fn failed_resyncs_are_retried_with_backoff() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dunce::canonicalize(dir.path()).unwrap();
+        let packages = root.join("Packages");
+        fs::create_dir(&packages).unwrap();
+        fs::write(packages.join("old.luau"), "return 1").unwrap();
+        let project = write_project(
+            &root,
+            r#"{"$className":"Folder","Packages":{"$path":"Packages"}}"#,
+        );
+        let task = context(&project);
+
+        // The watcher drops events during a package reinstall, and the resync
+        // runs while the required folder is missing.
+        fs::remove_dir_all(&packages).unwrap();
+        task.handle_vfs_event(VfsEvent::Rescan);
+        let first_retry = task.pending_resync_deadline().unwrap();
+        assert!(first_retry <= Instant::now() + RESYNC_INTERVAL);
+        task.resync_tree();
+        let second_retry = task.pending_resync_deadline().unwrap();
+        assert!(second_retry > Instant::now() + RESYNC_INTERVAL);
+        assert!(second_retry <= Instant::now() + 2 * RESYNC_INTERVAL);
+        for _ in 0..10 {
+            task.resync_tree();
+        }
+        assert_eq!(task.resync_interval(), MAX_RESYNC_RETRY_INTERVAL);
+
+        // Its creation was never reported, so only the retry picks it up.
+        fs::create_dir(&packages).unwrap();
+        let added = packages.join("new.luau");
+        fs::write(&added, "return 2").unwrap();
+        task.resync_tree();
+        assert!(task.pending_resync_deadline().is_none());
+        assert_eq!(task.resync_interval(), RESYNC_INTERVAL);
+        let tree = task.tree.lock().unwrap();
+        assert!(!tree.get_ids_at_path(&added).is_empty());
+        assert!(tree.get_ids_at_path(&packages.join("old.luau")).is_empty());
     }
 
     #[test]

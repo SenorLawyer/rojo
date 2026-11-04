@@ -25,7 +25,7 @@ use crate::{
     RojoRef,
 };
 
-use super::{emit_legacy_scripts_default, snapshot_from_vfs, util::missing_relevant_path};
+use super::{emit_legacy_scripts_default, snapshot_from_vfs, util::relevant_path_if_missing};
 
 pub fn snapshot_project(
     context: &InstanceContext,
@@ -159,13 +159,11 @@ pub fn snapshot_project_node(
             // Take the snapshot's metadata as-is, which will be mutated later
             // on.
             metadata = snapshot.metadata;
-        } else {
+        } else if let Some(missing) = relevant_path_if_missing(vfs, &full_path) {
             // Keep the missing path mapped to this instance. Otherwise nothing
             // in the tree refers to it, and recreating it (after a package
             // reinstall or branch switch, for example) would never resync it.
-            metadata
-                .relevant_paths
-                .push(missing_relevant_path(vfs, &full_path));
+            metadata.relevant_paths.push(missing);
         }
     }
 
@@ -263,9 +261,9 @@ pub fn snapshot_project_node(
                 // resyncs this node, which adds the child back.
                 if let Some(path_node) = &child_project_node.path {
                     let full_path = project_folder.join(path_node.path());
-                    metadata
-                        .relevant_paths
-                        .push(missing_relevant_path(vfs, &full_path));
+                    if let Some(missing) = relevant_path_if_missing(vfs, &full_path) {
+                        metadata.relevant_paths.push(missing);
+                    }
                 }
             }
         }
@@ -750,6 +748,7 @@ mod test {
     use super::*;
 
     use memofs::{InMemoryFs, VfsSnapshot};
+    use std::path::PathBuf;
 
     #[test]
     fn rejects_project_referring_to_its_own_directory() {
@@ -773,6 +772,56 @@ mod test {
             format!("{err:#}").contains("Circular Rojo project reference"),
             "{err:#}"
         );
+    }
+
+    #[test]
+    fn only_missing_paths_without_an_instance_are_relevant() {
+        let mut fs = InMemoryFs::new();
+        fs.load_snapshot(
+            "/foo",
+            VfsSnapshot::dir([
+                (
+                    "default.project.json",
+                    VfsSnapshot::file(
+                        r#"{
+                            "name": "paths",
+                            "tree": {
+                                "$className": "Folder",
+                                "Notes": {"$className": "Folder", "$path": "notes.unknown"},
+                                "Unknown": {"$path": {"optional": "other.unknown"}},
+                                "Packages": {"$path": {"optional": "Packages"}}
+                            }
+                        }"#,
+                    ),
+                ),
+                ("notes.unknown", VfsSnapshot::file("")),
+                ("other.unknown", VfsSnapshot::file("")),
+            ]),
+        )
+        .unwrap();
+        let snapshot = snapshot_project(
+            &InstanceContext::default(),
+            &Vfs::new(fs),
+            Path::new("/foo/default.project.json"),
+            "paths",
+        )
+        .unwrap()
+        .unwrap();
+
+        // Paths that exist but produce no instance are not watched for their
+        // creation, which would watch them recursively.
+        let notes = snapshot
+            .children
+            .iter()
+            .find(|child| child.name == "Notes")
+            .unwrap();
+        assert!(!notes
+            .metadata
+            .relevant_paths
+            .contains(&PathBuf::from("/foo/notes.unknown")));
+        let relevant = &snapshot.metadata.relevant_paths;
+        assert!(!relevant.contains(&PathBuf::from("/foo/other.unknown")));
+        assert!(relevant.contains(&PathBuf::from("/foo/Packages")));
     }
 
     #[ignore = "Functionality moved to root snapshot middleware"]
