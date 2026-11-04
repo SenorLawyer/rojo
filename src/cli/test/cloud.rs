@@ -25,8 +25,10 @@ use crate::{
 const MAX_TASK_SECONDS: u64 = 300;
 
 /// Time the task gets beyond the specs' own timeout, for loading the runner,
-/// finding the specs and requiring the framework. The runner's own timeout
-/// fires first, so a slow spec still produces a report listing what failed.
+/// finding the specs and requiring the framework. Up to a spec timeout of 270
+/// seconds, the runner's own timeout fires first, so a slow spec still
+/// produces a report listing what failed. Above that, [`MAX_TASK_SECONDS`]
+/// caps the task and its limit can end the run before the runner reports.
 const TASK_MARGIN_SECONDS: u64 = 30;
 
 /// How long the Luau task may run for specs allowed `spec_seconds`.

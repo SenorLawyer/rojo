@@ -108,6 +108,16 @@ StudioBridge.specRunnerModule = script.Parent.SpecRunner
 -- tests.
 StudioBridge.heartbeatInterval = 5
 
+-- How long past its expected duration a run is given before the runner is
+-- removed and the heartbeats stop (seconds). Replaced by tests.
+StudioBridge.runModeGrace = REQUEST_TIMEOUT
+
+-- A spec run starts only with at least this many seconds of its request's
+-- deadline left beyond its own timeout, for Studio to start and leave Run
+-- mode. The server allows 30 (SPEC_RUN_MARGIN in src/web/studio.rs), so a
+-- run that waited behind another one may have too little left.
+local SPEC_START_MARGIN = 10
+
 --[[
 	Starts Run mode and waits for the runner to call EndTest. Replaced by tests.
 ]]
@@ -657,18 +667,27 @@ function StudioBridge:__runInRunMode(command, runner, args, seconds)
 	self.testRunners[runner] = true
 	-- If Studio never returns from the run, remove the runner anyway so it is
 	-- not saved or published with the place.
-	local watchdog = task.delay(seconds + REQUEST_TIMEOUT, removeRunner)
+	local grace = seconds + StudioBridge.runModeGrace
+	local watchdog = task.delay(grace, removeRunner)
+	local heartbeatsEnd = os.clock() + grace
 	local running = true
 	task.spawn(function()
 		while true do
 			task.wait(StudioBridge.heartbeatInterval)
-			if not running or self.stopped then
+			-- Past the watchdog's time the run is presumed hung, and its
+			-- heartbeats would only keep a session that cannot answer listed.
+			if not running or self.stopped or os.clock() >= heartbeatsEnd then
 				return
 			end
-			-- Failures are left to the command's own result. A cancelled
-			-- request answers 410 here, but Run mode cannot be stopped from
-			-- the plugin, so the run continues and its result is discarded.
-			self:request("validate", { requestId = command.requestId }):await()
+			-- Other failures are left to the command's own result. A cancelled
+			-- or expired request answers 410 here, but Run mode cannot be
+			-- stopped from the plugin, so the run continues and its result is
+			-- discarded. Nothing is left to keep alive, so the heartbeats stop.
+			local failure = {}
+			local ok = self:request("validate", { requestId = command.requestId }, failure):await()
+			if not ok and failure.status == 410 then
+				return
+			end
 		end
 	end)
 	local parented, parentError = StudioBridge.recordRunnerChange("Rojo: Insert Studio test runner", function()
@@ -881,6 +900,19 @@ function StudioBridge:execute(command)
 		SpecRunner.prepare(options, game)
 		self:request("validate", { requestId = command.requestId }):expect()
 		self:ensureActive(command)
+		-- A spec that waited behind another run may have too little of its
+		-- deadline left. Starting it anyway would run the place's scripts for a
+		-- result the server has already given up on.
+		local remaining = (command.expiresAt - DateTime.now().UnixTimestampMillis) / 1000
+		assert(
+			remaining >= options.timeoutSeconds + SPEC_START_MARGIN,
+			string.format(
+				"Only %d seconds were left of this request's deadline when Studio could start it, "
+					.. "too few for a %d-second spec run. Studio was probably busy with another run; run the specs again.",
+				math.max(0, math.floor(remaining)),
+				options.timeoutSeconds
+			)
+		)
 		local ok, report, elapsed = self:__runSpecs(command, options)
 		self:ensureActive(command)
 		assert(ok, tostring(report))

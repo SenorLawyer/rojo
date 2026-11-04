@@ -991,20 +991,21 @@ impl StudioBridge {
             "/api/studio/validate" => {
                 let mut state = self.state();
                 Self::prune(&mut state);
-                // The plugin cannot poll while Studio is in Run mode, so a
-                // long spec run validates its request periodically instead,
-                // which must keep the session from expiring.
-                if let Some(session) = session_id(&value).and_then(|id| state.sessions.get_mut(&id))
-                {
-                    session.last_seen = Instant::now();
-                }
-                let pending = value
+                let session = session_id(&value);
+                let active = value
                     .get("requestId")
                     .and_then(Value::as_str)
-                    .and_then(|id| state.pending.get(id));
-                if pending
-                    .is_some_and(|pending| session_id(&value) == Some(pending.session.clone()))
-                {
+                    .and_then(|id| state.pending.get(id))
+                    .is_some_and(|pending| session.as_deref() == Some(pending.session.as_str()));
+                if active {
+                    // The plugin cannot poll while Studio is in Run mode, so a
+                    // long spec run validates its request periodically instead,
+                    // which must keep the session from expiring. Only while the
+                    // request is still active, so a Run mode that never ends
+                    // does not keep a session that no longer answers listed.
+                    if let Some(session) = session.and_then(|id| state.sessions.get_mut(&id)) {
+                        session.last_seen = Instant::now();
+                    }
                     reply(StatusCode::OK, json!({"active":true}))
                 } else {
                     failure(StatusCode::GONE, "Request expired or was cancelled")
@@ -1800,6 +1801,24 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK);
         assert!(bridge.state().sessions[&session].last_seen.elapsed() < Duration::from_secs(5));
+    }
+
+    #[tokio::test]
+    async fn validating_a_settled_request_does_not_keep_its_session_alive() {
+        let (_dir, bridge) = fixture();
+        let session = register(&bridge).await;
+        // As if Studio were stuck in Run mode for a request that has since
+        // expired, still sending heartbeats for it.
+        bridge.state().sessions.get_mut(&session).unwrap().last_seen =
+            Instant::now().checked_sub(Duration::from_secs(25)).unwrap();
+        let (status, _) = plugin(
+            &bridge,
+            "/api/studio/validate",
+            json!({"sessionId":session,"requestId":Uuid::new_v4().to_string()}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::GONE);
+        assert!(bridge.state().sessions[&session].last_seen.elapsed() >= Duration::from_secs(25));
     }
 
     #[tokio::test]

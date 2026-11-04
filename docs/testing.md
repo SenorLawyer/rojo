@@ -52,7 +52,7 @@ By default the specs are searched for in ReplicatedFirst, ReplicatedStorage, Ser
 
 | Option | Meaning |
 | --- | --- |
-| `--root <path>` | Search only beneath this instance, such as `game/ReplicatedStorage/Shared`. Repeat for several roots, up to 32. Paths start with `game`, are at most 2048 bytes and use the bridge's syntax: `/` between names and `\` before a `/` or `\` inside a name. |
+| `--root <path>` | Search only beneath this instance, such as `game/ReplicatedStorage/Shared`. Repeat for several roots, up to 32. Paths start with `game`, have no empty names (so no trailing or doubled `/`), are at most 2048 bytes and use the bridge's syntax: `/` between names and `\` before a `/` or `\` inside a name. |
 | `--filter <pattern>` | Run only tests whose full name (the describe phrases and the test's own phrase, joined by spaces) matches this Lua pattern, at most 256 bytes. TestEZ marks the rest as skipped. |
 | `--framework auto\|testez\|jest` | Which framework to run. `auto`, the default, uses TestEZ when the place has it, otherwise Jest. |
 | `--module <path>` | The framework's ModuleScript, as a `game/...` path like `--root`. When omitted, the shallowest ModuleScript named `TestEZ` (or `Jest`) in ReplicatedStorage, ServerStorage or ServerScriptService is used. |
@@ -79,7 +79,7 @@ A spec module that fails to load (a syntax error, or an error while it is requir
 | --- | --- |
 | 0 | Every test passed. |
 | 1 | A test failed, a module failed to load, or the run could not finish: no TestEZ was found, no specs were found, the specs did not finish within `--timeout`, Studio was not in Edit mode, or Studio did not answer in time. |
-| 2 | `rojo test` could not reach Studio or was used incorrectly: the bridge is not running or refused the token, no session or several sessions are connected without `--session`, or an option is invalid, such as a root that does not start with `game/`, more than 32 roots or a filter longer than 256 bytes. A root that does not exist is only found in Studio, so it exits with 1. |
+| 2 | `rojo test` could not reach Studio or was used incorrectly: the bridge is not running or refused the token, no session or several sessions are connected without `--session`, or an option is invalid, such as a root that does not start with `game/` or has an empty name like `game/`, more than 32 roots or a filter longer than 256 bytes. A root that does not exist is only found in Studio, so it exits with 1. |
 
 ### JSON report
 
@@ -104,7 +104,7 @@ The bridge's `spec` action runs the specs in Studio's Run mode, the same way the
 
 The plugin checks the options, the roots and the framework in Edit mode first, so a wrong path or a missing TestEZ fails without starting Run mode. TestEZ itself requires every spec before running any, and one that fails to load stops the run, so the runner requires each spec separately and gives the rest to TestEZ's planner and runner.
 
-While the specs run, Studio cannot answer other bridge commands. They wait until Run mode ends and may time out. A spec that yields for longer than `--timeout` ends the run with `timedOut`. A spec that never yields cannot be interrupted, but Roblox stops it once it exhausts the script execution timeout. Cancelling a run that Studio has started discards its result but does not stop Run mode.
+While the specs run, Studio cannot answer other bridge commands. They wait until Run mode ends and may time out. A second run requested meanwhile waits too; if less than its `--timeout` plus 10 seconds of its deadline is left once Studio gets to it, it fails without entering Run mode and asks you to run the specs again. A spec that yields for longer than `--timeout` ends the run with `timedOut`. A spec that never yields cannot be interrupted, but Roblox stops it once it exhausts the script execution timeout. Cancelling a run that Studio has started discards its result but does not stop Run mode.
 
 The specs run with the place's other scripts, in a server context. Anything those scripts do during a normal Run session, such as DataStore or HTTP requests when Studio API access is enabled, happens during a test run too.
 

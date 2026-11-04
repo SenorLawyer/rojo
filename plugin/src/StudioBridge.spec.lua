@@ -223,6 +223,18 @@ return function()
 			return create, created
 		end
 
+		-- Waits a bounded number of frames for `condition`, so a spec does
+		-- not depend on how many frames the transport takes.
+		local function waitFor(condition)
+			for _ = 1, 100 do
+				if condition() then
+					return true
+				end
+				task.wait()
+			end
+			return condition()
+		end
+
 		beforeEach(function()
 			previousStream = StudioBridge.bridgeStream
 		end)
@@ -266,17 +278,74 @@ return function()
 				pcall(bridge.__requestAsync, bridge, { Url = "poll", Method = "POST", Body = "{}" })
 				finished = true
 			end)
-			task.wait()
-			task.wait()
-			expect(#created).to.equal(1)
+			expect(waitFor(function()
+				return #created == 1
+			end)).to.equal(true)
 			for transport in table.clone(bridge.transports) do
 				transport:cancel()
 			end
-			task.wait()
-			task.wait()
-			expect(created[1].closedByCaller).to.equal(true)
-			expect(finished).to.equal(true)
-			expect(budget:liveCount()).to.equal(0)
+			expect(waitFor(function()
+				return finished and created[1].closedByCaller and budget:liveCount() == 0
+			end)).to.equal(true)
+			expect(#created).to.equal(1)
+		end)
+
+		it("reads a status that the stream reports through Error", function()
+			local previousDelay = StudioBridge.retryDelay
+			StudioBridge.retryDelay = 0
+			bridge.request = StudioBridge.request
+			local function respondWith(...)
+				local responses = { ... }
+				local sent = 0
+				local create, created = fakeClient(function(_, opened, message, closed, errored)
+					sent += 1
+					local response = responses[sent]
+					if response.code == 200 then
+						opened:Fire(200, "content-type: application/json\r\n")
+						message:Fire("{}")
+						closed:Fire()
+						return
+					end
+					if response.body then
+						message:Fire(response.body)
+					end
+					errored:Fire(response.code, "HTTP " .. response.code)
+				end)
+				StudioBridge.bridgeStream = StreamRequest.new(create, StreamBudget.new(), StreamBudget.Priority.Bridge)
+				return created
+			end
+			local ok, err = pcall(function()
+				-- 410 for a result is a discarded result, with the reason read
+				-- only from a body the server sent.
+				respondWith({ code = 410 })
+				local answered, result = bridge:request("result", {}):await()
+				expect(answered).to.equal(true)
+				expect(result.discarded).to.equal(true)
+				expect(result.reason).to.equal("Request expired or was cancelled")
+				respondWith({ code = 410, body = '{"error":"Request expired"}' })
+				answered, result = bridge:request("result", {}):await()
+				expect(answered).to.equal(true)
+				expect(result.reason).to.equal("Request expired")
+
+				-- 503 is transient: its status is recorded and it is sent again.
+				local failure = {}
+				respondWith({ code = 503 })
+				answered = bridge:request("poll", {}, failure):await()
+				expect(answered).to.equal(false)
+				expect(failure.status).to.equal(503)
+				local created = respondWith({ code = 503 }, { code = 200 })
+				local _, attempts = bridge:__requestWithRetry("poll", {})
+				expect(attempts).to.equal(2)
+				expect(#created).to.equal(2)
+
+				-- 409 means the server refused the session, so it is not retried.
+				created = respondWith({ code = 409 }, { code = 200 })
+				local retried = pcall(bridge.__requestWithRetry, bridge, "poll", {})
+				expect(retried).to.equal(false)
+				expect(#created).to.equal(1)
+			end)
+			StudioBridge.retryDelay = previousDelay
+			assert(ok, err)
 		end)
 
 		it("falls back to RequestAsync only when no stream slot is free", function()
@@ -818,6 +887,7 @@ return function()
 	describe("spec", function()
 		local originalExecuteRunMode = StudioBridge.executeRunMode
 		local originalHeartbeatInterval = StudioBridge.heartbeatInterval
+		local originalRunModeGrace = StudioBridge.runModeGrace
 		local fixturePath = "game/ReplicatedStorage/__RojoBridgeSpec"
 
 		local function specFixture()
@@ -834,9 +904,18 @@ return function()
 			return game:GetService("ServerScriptService"):FindFirstChild("__RojoBridgeSpec_" .. bridge.sessionId)
 		end
 
+		-- A spec command with the deadline the server gives it: its timeout
+		-- plus 30 seconds.
+		local function specCommand(args)
+			local request = command("spec", args)
+			request.expiresAt = DateTime.now().UnixTimestampMillis + (args.timeoutSeconds + 30) * 1000
+			return request
+		end
+
 		afterEach(function()
 			StudioBridge.executeRunMode = originalExecuteRunMode
 			StudioBridge.heartbeatInterval = originalHeartbeatInterval
+			StudioBridge.runModeGrace = originalRunModeGrace
 		end)
 
 		it("advertises its bounds", function()
@@ -882,7 +961,7 @@ return function()
 				}
 				return { framework = "testez", status = "passed", passed = 1, failed = 0, skipped = 0 }
 			end
-			local result = bridge:execute(command("spec", args))
+			local result = bridge:execute(specCommand(args))
 			expect(seen.source).to.equal(StudioBridge.SPEC_RUNNER_SOURCE)
 			expect(seen.module).to.be.ok()
 			expect(seen.module:IsA("ModuleScript")).to.equal(true)
@@ -910,7 +989,7 @@ return function()
 				task.wait(0.4)
 				return { status = "passed" }
 			end
-			bridge:execute(command("spec", args))
+			bridge:execute(specCommand(args))
 			-- One validation before Run mode starts, then the heartbeats.
 			expect(validations >= 3).to.equal(true)
 			local after = validations
@@ -918,12 +997,81 @@ return function()
 			expect(validations).to.equal(after)
 		end)
 
+		it("does not start Run mode with too little of the deadline left", function()
+			local args = specFixture()
+			local started = false
+			StudioBridge.executeRunMode = function()
+				started = true
+				return { status = "passed" }
+			end
+			-- As if the request had waited behind another run: 8 seconds are
+			-- left for a 5-second run.
+			local request = specCommand(args)
+			request.expiresAt = DateTime.now().UnixTimestampMillis + 8_000
+			local ok, err = pcall(bridge.execute, bridge, request)
+			expect(ok).to.equal(false)
+			expect(string.find(tostring(err), "run the specs again", 1, true)).to.be.ok()
+			expect(started).to.equal(false)
+			expect(runner()).to.equal(nil)
+		end)
+
+		it("stops the heartbeats once the server no longer knows the request", function()
+			local args = specFixture()
+			local validations = 0
+			bridge.request = function(_, route, _value, failure)
+				if route ~= "validate" then
+					return Promise.resolve({ active = true })
+				end
+				validations += 1
+				-- The validation before Run mode starts succeeds; then the
+				-- request is cancelled.
+				if validations == 1 then
+					return Promise.resolve({ active = true })
+				end
+				if failure then
+					failure.status = 410
+				end
+				return Promise.reject("Studio bridge request failed: 410")
+			end
+			StudioBridge.heartbeatInterval = 0.05
+			StudioBridge.executeRunMode = function()
+				task.wait(0.4)
+				return { status = "passed" }
+			end
+			bridge:execute(specCommand(args))
+			expect(validations).to.equal(2)
+		end)
+
+		it("stops the heartbeats once a run outlasts its watchdog", function()
+			local validations = 0
+			bridge.request = function(_, route)
+				if route == "validate" then
+					validations += 1
+				end
+				return Promise.resolve({ active = true })
+			end
+			StudioBridge.heartbeatInterval = 0.05
+			StudioBridge.runModeGrace = 0.15
+			StudioBridge.executeRunMode = function()
+				-- Far past the watchdog, as when Studio never returns.
+				task.wait(0.6)
+				return {}
+			end
+			local testRunner = Instance.new("Script")
+			bridge:__runInRunMode(command("test", {}), testRunner, {}, 0)
+			-- About three heartbeats fit before the watchdog; a dozen would
+			-- fit in the whole run.
+			expect(validations >= 1).to.equal(true)
+			expect(validations <= 4).to.equal(true)
+			expect(testRunner.Parent).to.equal(nil)
+		end)
+
 		it("fails when Run mode ends without a report", function()
 			local args = specFixture()
 			StudioBridge.executeRunMode = function()
 				return nil
 			end
-			local ok, err = pcall(bridge.execute, bridge, command("spec", args))
+			local ok, err = pcall(bridge.execute, bridge, specCommand(args))
 			expect(ok).to.equal(false)
 			expect(string.find(tostring(err), "without a report", 1, true)).to.be.ok()
 			expect(runner()).to.equal(nil)
@@ -934,7 +1082,7 @@ return function()
 			StudioBridge.executeRunMode = function()
 				error("Studio is already running a test")
 			end
-			local ok, err = pcall(bridge.execute, bridge, command("spec", args))
+			local ok, err = pcall(bridge.execute, bridge, specCommand(args))
 			expect(ok).to.equal(false)
 			expect(string.find(tostring(err), "already running", 1, true)).to.be.ok()
 			expect(runner()).to.equal(nil)

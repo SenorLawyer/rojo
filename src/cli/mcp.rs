@@ -637,6 +637,16 @@ fn catalog() -> Vec<Value> {
     tools
 }
 
+/// A `run_tests` root or module: a `game/...` path the runner can resolve,
+/// within the schema's length. Checked here so a bad path is invalid
+/// arguments rather than a failed run.
+fn is_spec_path(text: &str) -> bool {
+    !text.is_empty()
+        && text.len() <= 1024
+        && !text.chars().any(char::is_control)
+        && super::test::is_instance_path(text)
+}
+
 fn validate_arguments<'a>(name: &str, value: &'a Value) -> Result<&'a Map<String, Value>, String> {
     let tool = catalog()
         .into_iter()
@@ -660,7 +670,7 @@ fn validate_arguments<'a>(name: &str, value: &'a Value) -> Result<&'a Map<String
                 uuid::Uuid::parse_str(value.as_str().ok_or("session must be a UUID string")?)
                     .map_err(|_| "session must be an exact UUID from studio_sessions")?;
             }
-            "instance" | "output" | "module" => {
+            "instance" | "output" => {
                 let text = value.as_str().ok_or("Expected a string")?;
                 if text.is_empty() || text.len() > 1024 || text.chars().any(char::is_control) {
                     return Err("Invalid string argument".into());
@@ -684,9 +694,15 @@ fn validate_arguments<'a>(name: &str, value: &'a Value) -> Result<&'a Map<String
                 }
                 for entry in entries {
                     let text = entry.as_str().ok_or("Roots must be strings")?;
-                    if text.is_empty() || text.len() > 1024 || text.chars().any(char::is_control) {
-                        return Err("Invalid root path".into());
+                    if !is_spec_path(text) {
+                        return Err("Each root must be a game/... instance path".into());
                     }
+                }
+            }
+            "module" => {
+                let text = value.as_str().ok_or("Expected a string")?;
+                if !is_spec_path(text) {
+                    return Err("module must be a game/... instance path".into());
                 }
             }
             "filter" => {
@@ -863,7 +879,12 @@ mod tests {
             json!({"roots": [5]}),
             json!({"framework": "mocha"}),
             json!({"filter": "a".repeat(257)}),
+            json!({"roots": ["ReplicatedStorage/Shared"]}),
+            json!({"roots": ["game/"]}),
+            json!({"roots": ["game//Shared"]}),
             json!({"module": ""}),
+            json!({"module": "Packages/TestEZ"}),
+            json!({"module": "game/ReplicatedStorage/Packages/"}),
             json!({"script": "print(1)"}),
             json!({"session": "--help"}),
         ] {

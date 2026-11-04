@@ -196,11 +196,36 @@ const MAX_ROOTS: usize = 32;
 const MAX_PATH_BYTES: usize = 2048;
 const MAX_FILTER_BYTES: usize = 256;
 
-/// The runner resolves paths whose first name is `game`.
+/// Splits a path the way the runner's `splitPath` does: names are joined by
+/// `/`, and `\` escapes the character after it.
+fn path_names(path: &str) -> Vec<String> {
+    let mut names = vec![String::new()];
+    let mut characters = path.chars().peekable();
+    while let Some(character) = characters.next() {
+        match character {
+            '\\' if characters.peek().is_some() => {
+                names.last_mut().unwrap().extend(characters.next());
+            }
+            '/' => names.push(String::new()),
+            _ => names.last_mut().unwrap().push(character),
+        }
+    }
+    names
+}
+
+/// Whether `path` is one the runner can resolve: its first name is `game`
+/// and no name is empty. An empty name, as in `game/` or `game//Shared`, is
+/// almost always a typo, and the runner would only report it from Studio.
+pub(crate) fn is_instance_path(path: &str) -> bool {
+    let names = path_names(path);
+    names[0] == "game" && names.iter().all(|name| !name.is_empty())
+}
+
 fn check_instance_path(option: &str, path: &str) -> anyhow::Result<()> {
     anyhow::ensure!(
-        path == "game" || path.starts_with("game/"),
-        "{option} must be a game/... instance path, such as game/ReplicatedStorage/Shared, not '{path}'"
+        is_instance_path(path),
+        "{option} must be a game/... instance path without empty names, such as \
+         game/ReplicatedStorage/Shared, not '{path}'"
     );
     anyhow::ensure!(
         path.len() <= MAX_PATH_BYTES,
@@ -596,10 +621,7 @@ fn without_runner_frames(message: &str) -> String {
     let mut lines = message.lines();
     let mut kept: Vec<&str> = lines.next().into_iter().collect();
     kept.extend(lines.filter(|line| !is_runner_frame(line)));
-    kept.join(
-        "
-",
-    )
+    kept.join("\n")
 }
 
 /// Picks the session to test: the one requested, or the only one connected.
@@ -850,6 +872,7 @@ impl TestCommand {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::web::studio::DEFAULT_SPEC_SECONDS;
 
     #[test]
     fn rendered_failures_hide_framework_frames() {
@@ -860,17 +883,13 @@ mod tests {
             "ServerScriptService.__RojoBridgeSpec_x.SpecRunner:554 function runTestEZ",
             "TaskScript:555 function runTestEZ",
         ]
-        .join(
-            "
-",
-        );
+        .join("\n");
         assert_eq!(
             without_runner_frames(&message),
-            "ReplicatedStorage.Packages.TestEZ.TestRunner:86: Expected value 3, got 2
-ReplicatedStorage.Shared.Math.spec:11"
+            "ReplicatedStorage.Packages.TestEZ.TestRunner:86: Expected value 3, got 2\n\
+             ReplicatedStorage.Shared.Math.spec:11"
         );
     }
-    use crate::web::studio::DEFAULT_SPEC_SECONDS;
 
     fn failing_report() -> Value {
         json!({
@@ -1224,6 +1243,18 @@ ReplicatedStorage.Shared.Math.spec:11"
             (
                 options_with(&["game\\/Shared"], None, None),
                 "--root must be a game/",
+            ),
+            (
+                options_with(&["game/"], None, None),
+                "--root must be a game/",
+            ),
+            (
+                options_with(&["game//Shared"], None, None),
+                "--root must be a game/",
+            ),
+            (
+                options_with(&[], Some("game/ReplicatedStorage/"), None),
+                "--module must be a game/",
             ),
             (
                 options_with(&[long_path.as_str()], None, None),

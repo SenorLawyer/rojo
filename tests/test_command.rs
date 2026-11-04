@@ -264,12 +264,7 @@ fn mcp_run_tests(body: Value) -> (Value, Vec<Value>) {
         json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"run_tests","arguments":{"session":SESSION,"roots":["game/ReplicatedStorage/Shared"],"timeout":5}}}),
     ] {
         serde_json::to_writer(&mut input, &message).unwrap();
-        input
-            .write_all(
-                b"
-",
-            )
-            .unwrap();
+        input.write_all(b"\n").unwrap();
     }
     drop(input);
     let output = child.wait_with_output().unwrap();
@@ -306,9 +301,7 @@ fn mcp_run_tests_returns_failed_runs_as_results() {
 fn mcp_run_tests_cuts_a_large_report_instead_of_failing() {
     // 250 failures with long tracebacks: within the runner's own bounds, but
     // larger than the 256 KiB the adapter reads from a command.
-    let traceback = "ReplicatedStorage.Shared.Util:12 function helper
-"
-    .repeat(20);
+    let traceback = "ReplicatedStorage.Shared.Util:12 function helper\n".repeat(20);
     let failures: Vec<Value> = (0..250)
         .map(|index| {
             json!({
@@ -349,6 +342,8 @@ fn invalid_options_exit_2_without_reaching_studio() {
             &["--root", "ReplicatedStorage/Shared"][..],
             "--root must be a game/",
         ),
+        // The runner would reject the empty name only once Studio had it.
+        (&["--root=game/"][..], "--root must be a game/"),
         (&roots[..], "at most 32 times"),
         (&[long_filter.as_str()][..], "--filter must be at most 256"),
         (&["--module="][..], "--module must be a game/"),
