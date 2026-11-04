@@ -31,8 +31,8 @@ Making a new release? Simply add the new header with the version and date undern
 
 ## Unreleased
 
-* Agent Can Skip Confirmation is now on by default for new plugin settings. Existing saved preferences, including an off setting, are preserved. ([fork#3])
-* Added `rojo test`, which runs a place's TestEZ specs (and, untested in Studio so far, Jest-Lua) in Studio's Run mode through the Studio bridge and prints each failure and a summary, or a JSON report with `--json`. It exits with 1 when a test fails or the run cannot finish and with 2 when Studio cannot be reached. The bridge's new `spec` action runs a fixed runner with options passed as data, and its deadline follows the run's own 1-300 second timeout. `rojo mcp` offers the same run as `run_tests`. During `test` and `spec` runs the plugin keeps its bridge session alive while it cannot poll. See [docs/testing.md](docs/testing.md). ([fork#3])
+* Agent Can Skip Confirmation is now on by default for new plugin settings. Existing saved preferences, including an off setting, are preserved. ([fork#4])
+* Added `rojo test`, which runs a place's TestEZ specs (and, untested in Studio so far, Jest-Lua) in Studio's Run mode through the Studio bridge and prints each failure and a summary, or a JSON report with `--json`. It exits with 1 when a test fails or the run cannot finish and with 2 when Studio cannot be reached. The bridge's new `spec` action runs a fixed runner with options passed as data, and its deadline follows the run's own 1-300 second timeout. `rojo mcp` offers the same run as `run_tests`. During `test` and `spec` runs the plugin keeps its bridge session alive while it cannot poll. See [docs/testing.md](docs/testing.md). ([fork#4])
 * The Studio plugin now cancels abandoned connections and prevents overlapping sessions. When the server asks it to resync, the session ends with a readable error; reconnect to resync. ([fork#1])
 * The Studio plugin now disconnects when the place ID changes, including when a local file is published or the initial sync is waiting for confirmation. Reconnect to sync the new place. ([fork#1])
 * Update checks now look for releases of SenorLawyer/rojo instead of upstream Rojo. ([fork#1])
@@ -137,9 +137,9 @@ Making a new release? Simply add the new header with the version and date undern
 * The plugin keeps at most two HTTP streams open at once, staying well under Studio's limit, and saves one for the sync connection. Requests that find no free stream use RequestAsync instead, and the Studio bridge always uses RequestAsync and stops as soon as sync disconnects. ([fork#2])
 * The Studio bridge waits up to 30 seconds per request and tries each poll or result up to three times when it is lost or the server is unavailable, so long Git operations no longer stop it, and Connect waits 30 seconds. Local reads too large for an HTTP stream, or queued behind a stream that never opens, are sent with RequestAsync instead of failing. ([fork#2])
 * Studio now shows the Rojo server's error reason, such as a changed Git checkout, instead of the raw MessagePack bytes of the error response. ([fork#2])
-* Added data modules: a `.data.csv` file, or `init.data.csv` in a directory, becomes a ModuleScript that returns its rows as Luau tables with an exported `Row` type. Numbers, booleans and empty cells are converted, and a column named `id` turns the rows into a dictionary. Ragged rows and duplicate ids fail with the file and line. Two-way sync and syncback leave the CSV file as it is. See `docs/data-modules.md`. ([fork#3])
-* Added `rojo typecheck`, which generates a sourcemap and runs `luau-lsp analyze` on the project's scripts, exiting non-zero when luau-lsp reports a problem. Arguments after `--` are passed to luau-lsp. See `docs/typecheck.md` for a GitHub Actions job. ([fork#3])
-* Added `rojo studio logs --follow`, which prints new Studio log entries every second until interrupted, one JSON object per line with `--json`. The plugin numbers each entry with a `sequence`, and `--after N`, also available as `after` on the `studio_logs` MCP tool, returns only newer entries with the sequence to read next and how many were dropped from the 200-entry buffer. Without these options, `rojo studio logs` returns the same list as before and works with older plugins. ([fork#3])
+* Added data modules: a `.data.csv` file, or `init.data.csv` in a directory, becomes a ModuleScript that returns its rows as Luau tables with an exported `Row` type. Numbers, booleans and empty cells are converted, and a column named `id` turns the rows into a dictionary. Ragged rows and duplicate ids fail with the file and line. Two-way sync and syncback leave the CSV file as it is. See `docs/data-modules.md`. ([fork#4])
+* Added `rojo typecheck`, which generates a sourcemap and runs `luau-lsp analyze` on the project's scripts, exiting non-zero when luau-lsp reports a problem. Arguments after `--` are passed to luau-lsp. See `docs/typecheck.md` for a GitHub Actions job. ([fork#4])
+* Added `rojo studio logs --follow`, which prints new Studio log entries every second until interrupted, one JSON object per line with `--json`. The plugin numbers each entry with a `sequence`, and `--after N`, also available as `after` on the `studio_logs` MCP tool, returns only newer entries with the sequence to read next and how many were dropped from the 200-entry buffer. Without these options, `rojo studio logs` returns the same list as before and works with older plugins. ([fork#4])
 * LocalizationTables no longer report as changed when nothing changes. ([#1333])
 * Sounds now preloaded correctly. The warning "*ContentId: rbxassetid://203785492 failed due to: Asset type does not match requested type*" is fixed. ([#1351])
 
@@ -147,7 +147,7 @@ Making a new release? Simply add the new header with the version and date undern
 [#1351]: https://github.com/rojo-rbx/rojo/pull/1351
 [fork#1]: https://github.com/SenorLawyer/rojo/pull/1
 [fork#2]: https://github.com/SenorLawyer/rojo/pull/2
-[fork#3]: https://github.com/SenorLawyer/rojo/pull/3
+[fork#4]: https://github.com/SenorLawyer/rojo/pull/4
 
 ## [7.7.1] (October 1st, 2026)
 
