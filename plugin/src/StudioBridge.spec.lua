@@ -845,4 +845,103 @@ return function()
 			expect(runner()).to.equal(nil)
 		end)
 	end)
+
+	describe("logs", function()
+		local function record(count)
+			for index = 1, count do
+				bridge:__recordLog("message " .. index, "MessageOutput")
+			end
+		end
+
+		local function sequences(entries)
+			local result = {}
+			for _, entry in entries do
+				table.insert(result, entry.sequence)
+			end
+			return table.concat(result, ",")
+		end
+
+		it("numbers entries and keeps counting when the buffer is trimmed", function()
+			record(205)
+			expect(#bridge.logs).to.equal(200)
+			expect(bridge.logs[1].sequence).to.equal(6)
+			expect(bridge.logs[1].message).to.equal("message 6")
+			expect(bridge.logs[200].sequence).to.equal(205)
+			expect(bridge.logSequence).to.equal(205)
+		end)
+
+		it("returns the newest entries as a list without after", function()
+			record(5)
+			local result = bridge:execute(command("logs", { limit = 2 }))
+			expect(result.entries).to.equal(nil)
+			expect(sequences(result)).to.equal("4,5")
+		end)
+
+		it("returns only entries newer than after", function()
+			record(5)
+			local result = bridge:execute(command("logs", { after = 3 }))
+			expect(sequences(result.entries)).to.equal("4,5")
+			expect(result.latestSequence).to.equal(5)
+			expect(result.nextAfter).to.equal(5)
+			expect(result.dropped).to.equal(0)
+			expect(result.more).to.equal(false)
+			expect(result.restarted).to.equal(false)
+		end)
+
+		it("returns no entries when nothing is new", function()
+			record(2)
+			local result = bridge:execute(command("logs", { after = 2 }))
+			expect(#result.entries).to.equal(0)
+			expect(result.nextAfter).to.equal(2)
+			expect(result.dropped).to.equal(0)
+		end)
+
+		it("reports entries trimmed from the buffer since after", function()
+			record(3)
+			local first = bridge:execute(command("logs", { after = 0 }))
+			expect(first.nextAfter).to.equal(3)
+			record(250)
+			local result = bridge:execute(command("logs", { after = first.nextAfter, limit = 200 }))
+			-- 253 entries were captured and the oldest kept is 54, so 4-53 were lost.
+			expect(result.dropped).to.equal(50)
+			expect(result.entries[1].sequence).to.equal(54)
+			expect(#result.entries).to.equal(200)
+			expect(result.more).to.equal(false)
+			expect(result.nextAfter).to.equal(253)
+		end)
+
+		it("returns the oldest new entries first when more than limit are waiting", function()
+			record(10)
+			local result = bridge:execute(command("logs", { after = 2, limit = 3 }))
+			expect(sequences(result.entries)).to.equal("3,4,5")
+			expect(result.more).to.equal(true)
+			expect(result.nextAfter).to.equal(5)
+			local rest = bridge:execute(command("logs", { after = result.nextAfter, limit = 10 }))
+			expect(sequences(rest.entries)).to.equal("6,7,8,9,10")
+			expect(rest.more).to.equal(false)
+		end)
+
+		it("starts over when after is ahead of the latest sequence", function()
+			record(3)
+			local result = bridge:execute(command("logs", { after = 99 }))
+			expect(result.restarted).to.equal(true)
+			expect(sequences(result.entries)).to.equal("1,2,3")
+			expect(result.dropped).to.equal(0)
+		end)
+
+		it("counts cleared entries as dropped", function()
+			record(3)
+			bridge.logs = {}
+			local result = bridge:execute(command("logs", { after = 1 }))
+			expect(#result.entries).to.equal(0)
+			expect(result.dropped).to.equal(2)
+			expect(result.nextAfter).to.equal(3)
+		end)
+
+		it("advertises follow support", function()
+			local logs = bridge:capabilities().logs
+			expect(logs.follow).to.equal(true)
+			expect(logs.maxEntries).to.equal(200)
+		end)
+	end)
 end

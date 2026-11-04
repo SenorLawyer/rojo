@@ -40,7 +40,7 @@ Use the host's own configuration format when it differs. Rojo writes only JSON-R
 | `run_tests` | `test --json` | optional `session`, `roots`, `filter`, `framework`, `module`, `timeout` |
 | `studio_tree` | `studio tree --json` | `session`, optional `instance`, `depth`, `limit` |
 | `studio_properties` | `studio properties --json` | `session`, `instance`, `properties` |
-| `studio_logs` | `studio logs --json` | `session`, optional `limit` |
+| `studio_logs` | `studio logs --json` | `session`, optional `limit`, `after` |
 | `studio_export` | `studio export --json` | `session`, `instance`, `output` |
 | `checkpoint_list` | `checkpoint list --json` | None |
 | `workspace_list` | `workspace list --json` | None |
@@ -50,11 +50,13 @@ List Studio sessions first and choose the exact UUID for every targeted operatio
 
 `studio_export` creates a native `.rbxm` file at a relative path inside that project. Its parent directory must already exist. Absolute paths, parent traversal and escaping through a parent symlink are rejected. Paths inside a directory mapped by the project's `$path` entries are also rejected, since `rojo serve` would sync the exported model back into Studio. The native export command refuses to overwrite an existing file. This tool exports a model; it does not save or publish the place. Imports remain explicit CLI operations outside this MCP catalog.
 
+`studio_logs` returns the newest entries as a list. To tail the log, pass `after: 0` on the first call and the result's `nextAfter` on each later call. Each result then holds only the entries captured since the previous call, oldest first, with `more: true` when more are waiting than `limit` allowed and a `dropped` count for entries lost from the plugin's 200-entry buffer in between. See [Following logs](studio-bridge.md#following-logs) for every field. The MCP tool reads once per call; it does not run `--follow`.
+
 `studio_test` runs a native simulation for `1..5` seconds, then returns to Edit mode. It executes the existing and synced scripts of the explicitly selected trusted place in game context. With Studio API access enabled, those scripts can write DataStores or make HTTP requests. Its annotations set `readOnlyHint: false`, `destructiveHint: true` and `openWorldHint: true` for that reason. It does not accept new script source.
 
 `run_tests` runs the place's `*.spec` modules in Run mode, as described in [Running specs](testing.md), and returns the report as JSON: `status` (`passed`, `failed`, `error` or `timedOut`), counts, and each failure's test path and messages. A run whose tests fail is a successful tool call with `isError: false` and `status: "failed"`; `isError: true` means the run could not be requested at all, such as when no session is connected. It carries the same annotations as `studio_test`, since it executes the same scripts. Only a call with an explicit `session` can be cancelled at the bridge. Roots and the module are `game/...` paths, the filter is at most 256 characters and the timeout is `1..300` seconds.
 
-Unknown arguments and incorrect types are rejected before starting a child command. Tree depth is limited to `0..6`, tree limits to `1..500`, log limits to `1..200` (the most entries the plugin returns), and property reads to `1..64` ordinary property names. All commands use native argument arrays without a shell. Tool descriptions include JSON Schemas with additional properties disabled.
+Unknown arguments and incorrect types are rejected before starting a child command. Tree depth is limited to `0..6`, tree limits to `1..500`, log limits to `1..200` (the most entries the plugin returns), log `after` values to `0..2^53-1`, and property reads to `1..64` ordinary property names. All commands use native argument arrays without a shell. Tool descriptions include JSON Schemas with additional properties disabled.
 
 ## Protocol and limits
 

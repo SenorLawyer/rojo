@@ -501,7 +501,7 @@ fn command(
             if let Some(session) = &session {
                 command.arg(format!("--session={session}"));
             }
-            for key in ["instance", "depth", "limit", "seconds"] {
+            for key in ["instance", "depth", "limit", "seconds", "after"] {
                 if let Some(value) = arguments.get(key) {
                     command.arg(format!(
                         "--{key}={}",
@@ -604,6 +604,9 @@ fn mapped_paths(project: &Path) -> anyhow::Result<Vec<PathBuf>> {
     Ok(paths)
 }
 
+/// The largest integer JSON clients and Luau numbers both represent exactly.
+const MAX_SAFE_INTEGER: u64 = (1 << 53) - 1;
+
 fn catalog() -> Vec<Value> {
     let session = json!({"type":"string","format":"uuid","maxLength":128});
     let instance = json!({"type":"string","minLength":1,"maxLength":1024});
@@ -614,7 +617,7 @@ fn catalog() -> Vec<Value> {
         ("studio_test", "Run a 1-5 second native simulation, then return to Edit mode. This executes the place's existing and synced scripts in game context, which can have side effects such as DataStore or HTTP requests when Studio API access is enabled.", json!({"session":session,"seconds":{"type":"integer","minimum":1,"maximum":5}}), vec!["session"]),
         ("studio_tree", "Inspect a bounded instance tree in the selected Studio session.", json!({"session":session,"instance":instance,"depth":{"type":"integer","minimum":0,"maximum":6},"limit":{"type":"integer","minimum":1,"maximum":500}}), vec!["session"]),
         ("studio_properties", "Read named properties from one instance.", json!({"session":session,"instance":instance,"properties":{"type":"array","minItems":1,"maxItems":64,"items":{"type":"string","pattern":"^[A-Za-z_][A-Za-z0-9_]*$","maxLength":128}}}), vec!["session","instance","properties"]),
-        ("studio_logs", "Read a bounded number of captured Studio log entries.", json!({"session":session,"limit":{"type":"integer","minimum":1,"maximum":200}}), vec!["session"]),
+        ("studio_logs", "Read a bounded number of captured Studio log entries. Pass `after` (0 to start) to read only entries newer than that sequence number; the result then has `entries`, `nextAfter` to pass on the next call, `more` when entries are still waiting, and `dropped` for entries lost from the 200-entry buffer.", json!({"session":session,"limit":{"type":"integer","minimum":1,"maximum":200},"after":{"type":"integer","minimum":0,"maximum":MAX_SAFE_INTEGER}}), vec!["session"]),
         ("run_tests", "Run the place's *.spec modules (TestEZ, or Jest-Lua) in Studio's Run mode and return a report: status (passed, failed, error or timedOut), counts, and each failure's test path and messages. A failing test is a result, not a tool error. This executes the place's existing and synced scripts in game context, like studio_test. The session may be omitted when exactly one is connected, but only a call with an explicit session can be cancelled.", json!({"session":session,"roots":{"type":"array","minItems":1,"maxItems":32,"items":instance},"filter":{"type":"string","maxLength":256},"framework":{"type":"string","enum":["auto","testez","jest"]},"module":instance,"timeout":{"type":"integer","minimum":1,"maximum":300}}), vec![]),
         ("studio_export", "Export an instance to a new relative .rbxm file inside the fixed project. Does not save or publish the place.", json!({"session":session,"instance":instance,"output":{"type":"string","minLength":1,"maxLength":1024}}), vec!["session","instance","output"]),
         ("checkpoint_list", "List archived checkpoints for the fixed project.", json!({}), vec![]),
@@ -655,7 +658,7 @@ fn validate_arguments<'a>(name: &str, value: &'a Value) -> Result<&'a Map<String
                     return Err("Invalid string argument".into());
                 }
             }
-            "depth" | "limit" | "seconds" | "timeout" => {
+            "depth" | "limit" | "seconds" | "timeout" | "after" => {
                 let number = value.as_u64().ok_or("Expected a non-negative integer")?;
                 // Bounds come from the advertised schema so they cannot drift
                 // apart, such as the log limit that the plugin caps lower than
@@ -875,6 +878,31 @@ mod tests {
     }
 
     #[test]
+    fn logs_after_is_passed_to_the_native_command() {
+        let options = McpCommand {
+            project: std::env::temp_dir(),
+            address: "http://127.0.0.1:34872".into(),
+            token_file: Some(PathBuf::from("token")),
+        };
+        let arguments = json!({
+            "session": "00000000-0000-4000-8000-000000000000",
+            "after": 41,
+            "limit": 5,
+        });
+        let (command, _) =
+            command(&options, "studio_logs", arguments.as_object().unwrap()).unwrap();
+        let args: Vec<_> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+
+        assert!(args.contains(&"logs".to_owned()), "{args:?}");
+        assert!(args.contains(&"--after=41".to_owned()), "{args:?}");
+        assert!(args.contains(&"--limit=5".to_owned()), "{args:?}");
+        assert!(!args.iter().any(|arg| arg == "--follow"), "{args:?}");
+    }
+
+    #[test]
     fn numeric_bounds_follow_the_advertised_schema() {
         let session = "00000000-0000-4000-8000-000000000000";
         let call = |name: &str, limit: u64| {
@@ -884,6 +912,14 @@ mod tests {
         assert!(call("studio_logs", 200));
         assert!(!call("studio_logs", 201));
         assert!(call("studio_tree", 500));
+        let after = |after: Value| {
+            validate_arguments("studio_logs", &json!({"session":session,"after":after})).is_ok()
+        };
+        assert!(after(json!(0)));
+        assert!(after(json!(MAX_SAFE_INTEGER)));
+        assert!(!after(json!(MAX_SAFE_INTEGER + 1)));
+        assert!(!after(json!(-1)));
+        assert!(!after(json!("5")));
         assert!(!call("studio_tree", 501));
         assert!(!call("studio_tree", 0));
     }

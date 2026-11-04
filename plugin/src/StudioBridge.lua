@@ -36,6 +36,7 @@ local MAX_REQUEST_ATTEMPTS = 3
 -- instance still exists. The oldest IDs are forgotten beyond this bound.
 local MAX_TRACKED_INSTANCES = 20_000
 local MAX_LOG_BYTES = 4096
+local MAX_LOG_ENTRIES = 200
 local MAX_SANITIZE_DEPTH = 64
 local REPLACEMENT_CHARACTER = utf8.char(0xFFFD)
 
@@ -236,6 +237,10 @@ function StudioBridge.new(apiContext, pairing, onFailure)
 		transports = {},
 		testRunners = {},
 		logs = {},
+		-- Numbers every captured message so `rojo studio logs --follow` can ask
+		-- for what is new since its last read. It keeps counting when the
+		-- buffer is trimmed or cleared, so a follower can tell what it missed.
+		logSequence = 0,
 	}, StudioBridge)
 	self:__resetInstances()
 	return self
@@ -350,7 +355,12 @@ function StudioBridge:capabilities()
 		tree = { available = true, maxInstances = 2000, maxDepth = 10 },
 		properties = { available = true, maxProperties = 64 },
 		selection = { available = true },
-		logs = { available = true, maxEntries = 200, scope = "Messages since this bridge session connected" },
+		logs = {
+			available = true,
+			maxEntries = MAX_LOG_ENTRIES,
+			follow = true,
+			scope = "Messages since this bridge session connected",
+		},
 		export = { available = true, format = "Native SerializationService model bytes", maxBytes = MAX_MODEL_BYTES },
 		import = {
 			available = RunService:IsEdit(),
@@ -673,6 +683,74 @@ function StudioBridge:__runSpecs(command, options)
 	return ok, report, elapsed
 end
 
+function StudioBridge:__recordLog(message, kind)
+	self.logSequence += 1
+	table.insert(self.logs, {
+		sequence = self.logSequence,
+		message = StudioBridge.truncateUtf8(message, MAX_LOG_BYTES),
+		kind = kind,
+		timestamp = DateTime.now().UnixTimestampMillis,
+	})
+	if #self.logs > MAX_LOG_ENTRIES then
+		table.remove(self.logs, 1)
+	end
+end
+
+--[[
+	Chooses the entries a `logs` command returns.
+
+	Without `after`, returns the newest `limit` entries as a list, which is
+	what CLIs from before follow mode expect. With `after`, returns the oldest
+	`limit` entries whose sequence is greater, along with:
+
+	- `latestSequence`: the sequence of the newest message captured so far.
+	- `nextAfter`: the `after` to send next. It is `latestSequence` unless
+	  `more` is true, in which case more entries are waiting.
+	- `dropped`: how many entries after `after` were trimmed from the buffer,
+	  or cleared when the bridge stopped, before they could be read.
+	- `restarted`: true when `after` was ahead of `latestSequence`, so the
+	  entries start over from the oldest one still kept.
+]]
+function StudioBridge.selectLogs(logs, latestSequence, args)
+	local limit = math.clamp(tonumber(args.limit) or 100, 1, MAX_LOG_ENTRIES)
+	local after = tonumber(args.after)
+	if after == nil then
+		local result = {}
+		for index = math.max(1, #logs - limit + 1), #logs do
+			table.insert(result, logs[index])
+		end
+		return result
+	end
+
+	after = math.max(0, math.floor(after))
+	local restarted = after > latestSequence
+	if restarted then
+		after = 0
+	end
+
+	local oldest = if logs[1] then logs[1].sequence else latestSequence + 1
+	local entries = {}
+	local more = false
+	for _, entry in logs do
+		if entry.sequence > after then
+			if #entries >= limit then
+				more = true
+				break
+			end
+			table.insert(entries, entry)
+		end
+	end
+
+	return {
+		entries = entries,
+		latestSequence = latestSequence,
+		nextAfter = if more then entries[#entries].sequence else latestSequence,
+		dropped = math.max(0, oldest - after - 1),
+		more = more,
+		restarted = restarted,
+	}
+end
+
 function StudioBridge:execute(command)
 	self:ensureActive(command)
 	local args = command.args or {}
@@ -688,12 +766,7 @@ function StudioBridge:execute(command)
 		end
 		return result
 	elseif command.action == "logs" then
-		local limit = math.clamp(tonumber(args.limit) or 100, 1, 200)
-		local result = {}
-		for index = math.max(1, #self.logs - limit + 1), #self.logs do
-			table.insert(result, self.logs[index])
-		end
-		return result
+		return StudioBridge.selectLogs(self.logs, self.logSequence, args)
 	elseif command.action == "tree" then
 		local limit = math.clamp(tonumber(args.limit) or 500, 1, 2000)
 		local maxDepth = math.clamp(tonumber(args.depth) or 3, 0, 10)
@@ -895,14 +968,7 @@ function StudioBridge:start()
 		if self.stopped then
 			return
 		end
-		table.insert(self.logs, {
-			message = StudioBridge.truncateUtf8(message, MAX_LOG_BYTES),
-			kind = kind.Name,
-			timestamp = DateTime.now().UnixTimestampMillis,
-		})
-		if #self.logs > 200 then
-			table.remove(self.logs, 1)
-		end
+		self:__recordLog(message, kind.Name)
 	end)
 	self.worker = task.spawn(function()
 		local ok, err = pcall(function()
