@@ -1250,12 +1250,16 @@ ReplicatedStorage.Shared.Math.spec:11"
 
     #[test]
     fn option_bounds_match_the_runner() {
+        // Compared line by line, since Git may check the file out with CRLF.
         for line in [
-            format!("SpecRunner.MAX_ROOTS = {MAX_ROOTS}\n"),
-            format!("SpecRunner.MAX_PATH_BYTES = {MAX_PATH_BYTES}\n"),
-            format!("SpecRunner.MAX_FILTER_BYTES = {MAX_FILTER_BYTES}\n"),
+            format!("SpecRunner.MAX_ROOTS = {MAX_ROOTS}"),
+            format!("SpecRunner.MAX_PATH_BYTES = {MAX_PATH_BYTES}"),
+            format!("SpecRunner.MAX_FILTER_BYTES = {MAX_FILTER_BYTES}"),
         ] {
-            assert!(SPEC_RUNNER.contains(&line), "SpecRunner.lua lacks {line:?}");
+            assert!(
+                SPEC_RUNNER.lines().any(|source| source.trim_end() == line),
+                "SpecRunner.lua lacks {line:?}"
+            );
         }
     }
 
