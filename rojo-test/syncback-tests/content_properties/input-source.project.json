@@ -9,6 +9,18 @@
       "AlreadyNew": { "$className": "Sound", "$properties": { "AudioContent": "rbxassetid://5" } },
       "Added": { "$className": "Sky", "$properties": { "SkyboxBackContent": "rbxassetid://6" } },
       "AddedEmpty": { "$className": "Sky", "$properties": { "MoonTextureContent": "" } }
+    },
+    "ServerStorage": {
+      "ProjectUnchanged": { "$className": "Sound", "$properties": { "AudioContent": "rbxassetid://1" } },
+      "ProjectChanged": { "$className": "Sound", "$properties": { "AudioContent": "rbxassetid://3" } },
+      "ProjectCleared": { "$className": "Decal", "$properties": { "TextureContent": "" } },
+      "MeshUnchanged": { "$className": "CharacterMesh", "$properties": { "MeshContent": "rbxassetid://123" } },
+      "MeshChanged": { "$className": "CharacterMesh", "$properties": { "MeshContent": "rbxassetid://11" } }
+    },
+    "Lighting": {
+      "$className": "Lighting",
+      "Sound": { "$className": "Sound", "$properties": { "AudioContent": "rbxassetid://1" } },
+      "Mesh": { "$className": "CharacterMesh", "$properties": { "MeshContent": "rbxassetid://123" } }
     }
   }
 }

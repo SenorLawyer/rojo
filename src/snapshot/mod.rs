@@ -56,7 +56,7 @@ mod patch_apply;
 mod patch_compute;
 mod tree;
 
-pub use content_properties::normalize_content_properties;
+pub use content_properties::{migrate_content_property, normalize_content_properties};
 pub use instance_snapshot::InstanceSnapshot;
 pub use metadata::*;
 pub use patch::*;

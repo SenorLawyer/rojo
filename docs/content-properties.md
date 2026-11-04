@@ -41,7 +41,10 @@ Model files (`.rbxm` and `.rbxmx`) in either format are read as Studio reads the
 
 `rojo syncback` compares a place saved by Studio with the project as Rojo loads it, so legacy names in your files count as equal to the `Content` properties in the place. A file is left as it is while its value matches. When a value changes, or Syncback creates a file for a new instance, it writes the `Content` property name.
 
+Project files work the same way. A `$properties` entry with a legacy name stays as written while its value matches the place, and a project file whose entries all match is not rewritten. When Syncback rewrites a project file because something else in it changed, unchanged legacy entries keep their names. An entry whose value changed is replaced by the `Content` name, and an entry reset to its default is removed. Syncback does not add the `Content` name next to a legacy entry. If a node sets both names, the `Content` entry is updated and the legacy entry is removed unless it matches the place.
+
 ## Limits
 
 - A `Content` value that refers to an object, such as an `EditableImage`, only exists in a running game. Rojo leaves such a property out of its tree and logs a warning.
 - `VideoPlayer.Asset` is not in Rojo's reflection database. Use `VideoPlayer.VideoContent`.
+- `PluginToolbarButton.Icon` and `PluginToolbarButton.IconContent` belong to buttons that plugins create while Studio runs. Neither is saved in place or model files, and Rojo does not move one to the other.

@@ -1,0 +1,22 @@
+---
+source: tests/tests/syncback.rs
+expression: unchanged.project.json
+---
+{
+  "name": "unchanged",
+  "tree": {
+    "$className": "Lighting",
+    "Sound": {
+      "$className": "Sound",
+      "$properties": {
+        "SoundId": "rbxassetid://1"
+      }
+    },
+    "Mesh": {
+      "$className": "CharacterMesh",
+      "$properties": {
+        "MeshId": 123
+      }
+    }
+  }
+}

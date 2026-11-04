@@ -38,60 +38,49 @@ pub fn normalize_content_properties(snapshot: &mut InstanceSnapshot) {
 }
 
 fn normalize_instance(snapshot: &mut InstanceSnapshot) {
-    // Only ContentId, Int64 and Content values can be involved, so most
-    // properties are skipped before the reflection database is consulted.
-    let candidates: Vec<Ustr> = snapshot
+    // Object references are removed before any legacy property is moved, so
+    // that a legacy value is never discarded in favour of a `Content` value
+    // that is about to be dropped. Doing both in one pass would make the
+    // result depend on the property map's iteration order.
+    let object_contents: Vec<Ustr> = snapshot
         .properties
         .iter()
         .filter(|(_, value)| {
-            matches!(
-                value,
-                Variant::ContentId(_) | Variant::Int64(_) | Variant::Content(_)
-            )
+            matches!(value, Variant::Content(content) if matches!(content.value(), ContentType::Object(_)))
         })
         .map(|(name, _)| *name)
         .collect();
 
-    for name in candidates {
-        if let Some(Variant::Content(content)) = snapshot.properties.get(&name) {
-            if let ContentType::Object(_) = content.value() {
-                // An object reference only means something inside the place
-                // that holds the object. Rojo's tree, the XML format and the
-                // plugin cannot carry it, so it is dropped rather than left
-                // pointing at nothing.
-                warn_once(format!(
-                    "{} '{}' has a {} that refers to an object, which Rojo cannot sync. \
-                     The property was left out.",
-                    snapshot.class_name, snapshot.name, name
-                ));
-                snapshot.properties.remove(&name);
-            }
-            continue;
-        }
+    for name in object_contents {
+        // An object reference only means something inside the place that
+        // holds the object. Rojo's tree, the XML format and the plugin cannot
+        // carry it, so it is dropped rather than left pointing at nothing.
+        warn_once(format!(
+            "{} '{}': {} refers to an object, which Rojo cannot sync.              The property was left out.",
+            snapshot.class_name, snapshot.name, name
+        ));
+        snapshot.properties.remove(&name);
+    }
 
-        let Some(migration) = content_migration(&snapshot.class_name, &name) else {
+    // Only ContentId and Int64 values can be legacy asset properties, so most
+    // properties are skipped before the reflection database is consulted.
+    let candidates: Vec<Ustr> = snapshot
+        .properties
+        .iter()
+        .filter(|(_, value)| matches!(value, Variant::ContentId(_) | Variant::Int64(_)))
+        .map(|(name, _)| *name)
+        .collect();
+
+    for name in candidates {
+        let Some(legacy_value) = snapshot.properties.get(&name) else {
             continue;
         };
-        let Some(new_name) = migration.new_property_names().first().map(|s| ustr(s)) else {
+        let Some((new_name, migrated)) =
+            migrate_content_property(&snapshot.class_name, &name, legacy_value)
+        else {
             continue;
         };
-        let legacy_value = snapshot.properties.remove(&name).unwrap();
-        let migrated = match migration.perform(&legacy_value) {
-            Ok(value) => value,
-            Err(err) => {
-                // A value of the wrong type is reported where the property is
-                // used, as it was before; keep it as written.
-                log::debug!(
-                    "Could not move {}.{} to {}: {}",
-                    snapshot.class_name,
-                    name,
-                    new_name,
-                    err
-                );
-                snapshot.properties.insert(name, legacy_value);
-                continue;
-            }
-        };
+        snapshot.properties.remove(&name);
 
         match snapshot.properties.get(&new_name) {
             // Studio ignores a legacy property when its replacement is present
@@ -99,8 +88,7 @@ fn normalize_instance(snapshot: &mut InstanceSnapshot) {
             Some(existing) => {
                 if existing != &migrated {
                     warn_once(format!(
-                        "{} '{}' sets both {} and {} to different values. Using {}; \
-                         remove {} to silence this warning.",
+                        "{} '{}' sets both {} and {} to different values. Using {};                          remove {} to silence this warning.",
                         snapshot.class_name, snapshot.name, name, new_name, new_name, name
                     ));
                 }
@@ -108,6 +96,28 @@ fn normalize_instance(snapshot: &mut InstanceSnapshot) {
             None => {
                 snapshot.properties.insert(new_name, migrated);
             }
+        }
+    }
+}
+
+/// If `property_name` is a legacy asset property of `class_name` that Roblox
+/// replaced with a `Content` property, returns the replacement's name and
+/// `value` converted to it. Returns `None` for any other property, and for a
+/// value of the wrong type, which is then reported where the property is used
+/// as it was before.
+pub fn migrate_content_property(
+    class_name: &str,
+    property_name: &str,
+    value: &Variant,
+) -> Option<(Ustr, Variant)> {
+    let migration = content_migration(class_name, property_name)?;
+    let new_name = ustr(migration.new_property_names().first()?);
+
+    match migration.perform(value) {
+        Ok(migrated) => Some((new_name, migrated)),
+        Err(err) => {
+            log::debug!("Could not move {class_name}.{property_name} to {new_name}: {err}");
+            None
         }
     }
 }
@@ -316,6 +326,51 @@ mod test {
         normalize_content_properties(&mut label);
 
         assert!(label.properties.is_empty());
+    }
+
+    #[test]
+    fn a_legacy_value_outlives_an_object_content() {
+        // The Object-sourced value is dropped first, so the legacy URI always
+        // ends up in the Content property whatever order the map yields.
+        for _ in 0..16 {
+            let mut label = snapshot(
+                "ImageLabel",
+                vec![
+                    ("Image", ContentId::from("rbxassetid://7").into()),
+                    (
+                        "ImageContent",
+                        Content::from_referent(rbx_dom_weak::types::Ref::new()).into(),
+                    ),
+                ],
+            );
+            normalize_content_properties(&mut label);
+
+            assert_eq!(label.properties.len(), 1);
+            assert_eq!(
+                label.properties.get(&ustr("ImageContent")),
+                Some(&uri("rbxassetid://7"))
+            );
+        }
+    }
+
+    #[test]
+    fn migrates_single_legacy_values() {
+        assert_eq!(
+            migrate_content_property(
+                "Sound",
+                "SoundId",
+                &ContentId::from("rbxassetid://1").into()
+            ),
+            Some((ustr("AudioContent"), uri("rbxassetid://1")))
+        );
+        assert_eq!(
+            migrate_content_property("CharacterMesh", "MeshId", &Variant::Int64(9)),
+            Some((ustr("MeshContent"), uri("rbxassetid://9")))
+        );
+        assert_eq!(
+            migrate_content_property("Sound", "Volume", &Variant::Float32(1.0)),
+            None
+        );
     }
 
     #[test]
