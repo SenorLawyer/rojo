@@ -119,6 +119,16 @@ impl ApiService {
             }
         };
 
+        // Clients may name the session they read from so that a socket opened
+        // against a restarted server is rejected even when the cursor happens
+        // to be valid there.
+        let expected_session_id = request.uri().query().and_then(|query| {
+            query.split('&').find_map(|pair| {
+                pair.strip_prefix("sessionId=")
+                    .map(|session_id| session_id.to_owned())
+            })
+        });
+
         // Upgrade the connection to WebSocket
         let (response, websocket) = match upgrade(request, None) {
             Ok(result) => result,
@@ -134,8 +144,13 @@ impl ApiService {
 
         // Spawn a task to handle the WebSocket connection
         tokio::spawn(async move {
-            if let Err(e) =
-                handle_websocket_subscription(serve_session, websocket, input_cursor).await
+            if let Err(e) = handle_websocket_subscription(
+                serve_session,
+                websocket,
+                input_cursor,
+                expected_session_id,
+            )
+            .await
             {
                 log::error!("Error in websocket subscription: {}", e);
             }
@@ -236,7 +251,9 @@ impl ApiService {
     ///
     /// The returned model is a folder that contains ObjectValues with names
     /// that correspond to the requested Instances. These values have their
-    /// `Value` property set to point to the requested Instance.
+    /// `Value` property set to point to the requested Instance. Requested IDs
+    /// that are no longer in the tree are left out of the model and listed in
+    /// `missingIds` instead.
     async fn handle_api_serialize(&self, request: Request<Body>) -> Response<Body> {
         let session_id = self.serve_session.session_id();
         let body = match read_request_body(request.into_body()).await {
@@ -262,37 +279,37 @@ impl ApiService {
         }
 
         let mut response_dom = WeakDom::new(InstanceBuilder::new("Folder"));
+        let mut missing_ids = Vec::new();
 
         let tree = self.serve_session.tree();
         for id in &request.ids {
-            if let Some(instance) = tree.get_instance(*id) {
-                let clone = response_dom.insert(
-                    Ref::none(),
-                    InstanceBuilder::new(instance.class_name())
-                        .with_name(instance.name())
-                        .with_properties(instance.properties().clone()),
-                );
-                let object_value = response_dom.insert(
-                    response_dom.root_ref(),
-                    InstanceBuilder::new("ObjectValue")
-                        .with_name(id.to_string())
-                        .with_property("Value", clone),
-                );
+            // The fallback batches every instance a patch failed to apply, and
+            // a later patch may already have removed some of them. Skipping
+            // those keeps the rest of the batch usable.
+            let Some(instance) = tree.get_instance(*id) else {
+                missing_ids.push(*id);
+                continue;
+            };
+            let clone = response_dom.insert(
+                Ref::none(),
+                InstanceBuilder::new(instance.class_name())
+                    .with_name(instance.name())
+                    .with_properties(instance.properties().clone()),
+            );
+            let object_value = response_dom.insert(
+                response_dom.root_ref(),
+                InstanceBuilder::new("ObjectValue")
+                    .with_name(id.to_string())
+                    .with_property("Value", clone),
+            );
 
-                let mut child_ref = clone;
-                if let Some(parent_class) = parent_requirements(&instance.class_name()) {
-                    child_ref =
-                        response_dom.insert(object_value, InstanceBuilder::new(parent_class));
-                    response_dom.transfer_within(clone, child_ref);
-                }
-
-                response_dom.transfer_within(child_ref, object_value);
-            } else {
-                return msgpack(
-                    ErrorResponse::bad_request(format!("provided id {id} is not in the tree")),
-                    StatusCode::BAD_REQUEST,
-                );
+            let mut child_ref = clone;
+            if let Some(parent_class) = parent_requirements(&instance.class_name()) {
+                child_ref = response_dom.insert(object_value, InstanceBuilder::new(parent_class));
+                response_dom.transfer_within(clone, child_ref);
             }
+
+            response_dom.transfer_within(child_ref, object_value);
         }
         drop(tree);
 
@@ -302,6 +319,7 @@ impl ApiService {
         msgpack_ok(SerializeResponse {
             session_id: self.serve_session.session_id(),
             model_contents: source,
+            missing_ids,
         })
     }
 
@@ -514,12 +532,33 @@ async fn handle_websocket_subscription(
     serve_session: Arc<ServeSession>,
     websocket: HyperWebsocket,
     input_cursor: u32,
+    expected_session_id: Option<String>,
 ) -> anyhow::Result<()> {
     let mut websocket = websocket.await?;
 
     let session_id = serve_session.session_id();
     let tree_handle = serve_session.tree_handle();
     let message_queue = serve_session.message_queue();
+
+    // A cursor past the end of the queue was issued by a different server run,
+    // for example when the server restarted between the client's read and this
+    // subscription. Waiting for the queue to catch up would silently skip the
+    // first changes made on this server, so the client is told to resync. The
+    // queue only grows, so checking once here is enough.
+    let session_changed = expected_session_id
+        .is_some_and(|expected| !expected.eq_ignore_ascii_case(&session_id.to_string()));
+    if session_changed || input_cursor > message_queue.cursor() {
+        log::debug!(
+            "Rejecting WebSocket subscription from a previous server session (cursor {input_cursor})"
+        );
+        let _ = websocket
+            .send(Message::Close(Some(CloseFrame {
+                code: CloseCode::Restart,
+                reason: SESSION_CHANGED_CLOSE_REASON.into(),
+            })))
+            .await;
+        return Ok(());
+    }
 
     log::debug!(
         "WebSocket subscription established for session {}",
@@ -540,7 +579,15 @@ async fn handle_websocket_subscription(
                         if !messages.is_empty() {
                             let msgpack_message = {
                                 let tree = tree_handle.lock().unwrap();
-                                let messages = SubscribeMessage::from_patch_updates(&tree, messages);
+                                // Patches that only touched data the plugin never
+                                // sees (such as relevant paths) would make it open
+                                // an undo recording and run callbacks for nothing.
+                                // The packet is still sent so its cursor advances.
+                                let messages: Vec<_> =
+                                    SubscribeMessage::from_patch_updates(&tree, messages)
+                                        .into_iter()
+                                        .filter(|message| !message.is_empty())
+                                        .collect();
 
                                 serialize_msgpack(SocketPacket {
                                     session_id,
@@ -624,6 +671,11 @@ async fn handle_websocket_subscription(
 
     Ok(())
 }
+
+/// Close reason sent when a subscription belongs to a previous server run. The
+/// plugin shows it after explaining that the connection closed and needs a
+/// reconnect, so it only has to say why.
+const SESSION_CHANGED_CLOSE_REASON: &str = "The Rojo server restarted since this session started.";
 
 /// Certain Instances MUST be a child of specific classes. This function
 /// tracks that information for the Serialize endpoint.

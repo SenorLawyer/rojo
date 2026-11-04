@@ -11,7 +11,7 @@ use std::{
 use insta::assert_snapshot;
 use tempfile::tempdir;
 
-use crate::rojo_test::io_util::{get_working_dir_path, BUILD_TESTS_PATH, ROJO_PATH};
+use crate::rojo_test::io_util::{get_working_dir_path, KillOnDrop, BUILD_TESTS_PATH, ROJO_PATH};
 
 macro_rules! gen_build_tests {
     ( $($test_name: ident,)* ) => {
@@ -191,34 +191,38 @@ fn watch_keeps_running_after_failed_rebuild() {
     let output = temp.path().join("watch.rbxlx");
     fs::write(&project_path, project("DataModel", "FirstBuild")).unwrap();
 
-    let mut child = Command::new(ROJO_PATH)
-        .arg("build")
-        .arg(&project_path)
-        .arg("-o")
-        .arg(&output)
-        .arg("--watch")
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
+    // Killed on drop so a failed assertion doesn't leave the watcher running.
+    let mut child = KillOnDrop(
+        Command::new(ROJO_PATH)
+            .arg("build")
+            .arg(&project_path)
+            .arg("-o")
+            .arg(&output)
+            .arg("--watch")
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
 
-    let stderr = Arc::new(Mutex::new(String::new()));
+    // Raw bytes are kept and decoded when searched, since a chunk boundary can
+    // split a multi-byte character.
+    let stderr = Arc::new(Mutex::new(Vec::new()));
     let reader = {
         let stderr = Arc::clone(&stderr);
-        let mut pipe = child.stderr.take().unwrap();
+        let mut pipe = child.0.stderr.take().unwrap();
         thread::spawn(move || {
             let mut buffer = [0; 1024];
             while let Ok(read) = pipe.read(&mut buffer) {
                 if read == 0 {
                     break;
                 }
-                stderr
-                    .lock()
-                    .unwrap()
-                    .push_str(&String::from_utf8_lossy(&buffer[..read]));
+                stderr.lock().unwrap().extend_from_slice(&buffer[..read]);
             }
         })
     };
+    let stderr_contains =
+        |needle: &str| String::from_utf8_lossy(&stderr.lock().unwrap()).contains(needle);
 
     let output_contains = |needle: &str| {
         fs::read_to_string(&output)
@@ -230,10 +234,10 @@ fn watch_keeps_running_after_failed_rebuild() {
 
     fs::write(&project_path, project("Folder", "Broken")).unwrap();
     wait_until("rebuild error", || {
-        stderr.lock().unwrap().contains("Failed to rebuild project")
+        stderr_contains("Failed to rebuild project")
     });
     assert!(
-        child.try_wait().unwrap().is_none(),
+        child.0.try_wait().unwrap().is_none(),
         "watch mode exited after a failed rebuild"
     );
     assert!(
@@ -244,7 +248,7 @@ fn watch_keeps_running_after_failed_rebuild() {
     fs::write(&project_path, project("DataModel", "SecondBuild")).unwrap();
     wait_until("rebuild after fix", || output_contains("SecondBuild"));
 
-    child.kill().unwrap();
-    child.wait().unwrap();
+    child.0.kill().unwrap();
+    child.0.wait().unwrap();
     reader.join().unwrap();
 }

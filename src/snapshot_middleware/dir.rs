@@ -4,7 +4,7 @@ use std::{
 };
 
 use anyhow::Context;
-use memofs::{DirEntry, Vfs};
+use memofs::{DirEntry, IoResultExt, Vfs};
 
 use crate::{
     snapshot::{
@@ -33,6 +33,28 @@ pub fn snapshot_dir(
     Ok(Some(snapshot))
 }
 
+/// Whether `path` is an init file, which is snapshotted as part of its
+/// containing directory rather than as a child of it.
+///
+/// A file that vanished after the directory was listed (a branch switch or a
+/// package reinstall) is reported as not being an init file instead of failing
+/// the whole directory snapshot, since `snapshot_from_vfs` already skips
+/// children that no longer exist.
+fn is_init_file(vfs: &Vfs, path: &Path) -> anyhow::Result<bool> {
+    let has_init_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(is_init_file_name);
+    if !has_init_name {
+        return Ok(false);
+    }
+
+    Ok(vfs
+        .metadata(path)
+        .with_not_found()?
+        .is_some_and(|metadata| metadata.is_file()))
+}
+
 /// Snapshot a directory without applying meta files; useful for if the
 /// directory's ClassName will change before metadata should be applied. For
 /// example, this can happen if the directory contains an `init.client.lua`
@@ -57,13 +79,7 @@ pub fn snapshot_dir_no_meta(
 
         // Init files represent their containing directory. Explicit $path values
         // still need to be able to snapshot these files on their own.
-        if entry
-            .path()
-            .file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(is_init_file_name)
-            && vfs.metadata(entry.path())?.is_file()
-        {
+        if is_init_file(vfs, entry.path())? {
             continue;
         }
 
@@ -272,5 +288,24 @@ mod test {
                 .unwrap();
 
         insta::assert_yaml_snapshot!(instance_snapshot);
+    }
+
+    #[test]
+    fn vanished_init_file_is_not_an_init_file() {
+        let mut imfs = InMemoryFs::new();
+        imfs.load_snapshot(
+            "/foo",
+            VfsSnapshot::dir([("init.luau", VfsSnapshot::file("return nil"))]),
+        )
+        .unwrap();
+        let vfs = Vfs::new(imfs);
+
+        assert!(is_init_file(&vfs, Path::new("/foo/init.luau")).unwrap());
+
+        // Listing a directory and then checking each entry is not atomic, so an
+        // init file removed in between must not fail the directory snapshot.
+        assert!(!is_init_file(&vfs, Path::new("/foo/init.server.luau")).unwrap());
+        vfs.remove_file(Path::new("/foo/init.luau")).unwrap();
+        assert!(!is_init_file(&vfs, Path::new("/foo/init.luau")).unwrap());
     }
 }

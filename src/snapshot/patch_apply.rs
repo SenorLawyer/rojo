@@ -157,36 +157,43 @@ fn finalize_patch_application(context: PatchApplyContext, tree: &mut RojoTree) -
 /// property is re-resolved through its `Rojo_Target_*` attribute in case the
 /// target was replaced within the same patch, and removed otherwise, which
 /// matches what re-snapshotting the pointer would produce.
+///
+/// Only properties named by a `Rojo_Target_*` attribute are considered: those
+/// are the only refs that can cross into another snapshot and so outlive their
+/// target, while refs inside a single model file are re-snapshotted together
+/// with their target. That keeps this pass to one `Attributes` lookup per
+/// instance plus one lookup per pointer attribute, instead of visiting every
+/// property in the tree while the tree lock is held.
 fn repair_refs_to_removed_instances(tree: &mut RojoTree, applied_patch_set: &mut AppliedPatchSet) {
+    let attributes_key = ustr("Attributes");
     let mut repairs = Vec::new();
 
     for instance in tree.descendants(tree.get_root_id()) {
-        let attributes = match instance.properties().get(&ustr("Attributes")) {
-            Some(Variant::Attributes(attributes)) => Some(attributes),
-            _ => None,
+        let Some(Variant::Attributes(attributes)) = instance.properties().get(&attributes_key)
+        else {
+            continue;
         };
 
-        for (&name, value) in instance.properties() {
-            let Variant::Ref(referent) = value else {
+        for (attribute_name, target) in attributes.iter() {
+            let Some(name) = attribute_name.strip_prefix(REF_POINTER_ATTRIBUTE_PREFIX) else {
+                continue;
+            };
+            let name = ustr(name);
+            let Some(Variant::Ref(referent)) = instance.properties().get(&name) else {
                 continue;
             };
             if referent.is_none() || tree.get_instance(*referent).is_some() {
                 continue;
             }
 
-            let replacement = attributes
-                .and_then(|attributes| {
-                    attributes.get(format!("{REF_POINTER_ATTRIBUTE_PREFIX}{name}"))
-                })
-                .and_then(|target| match target {
-                    Variant::String(target) => Some(target.clone()),
-                    Variant::BinaryString(target) => {
-                        std::str::from_utf8(target.as_ref()).ok().map(str::to_owned)
-                    }
-                    _ => None,
-                })
-                .and_then(|target| tree.get_specified_id(&RojoRef::new(target)))
-                .map(Variant::Ref);
+            let replacement = match target {
+                Variant::String(target) => Some(target.clone()),
+                Variant::BinaryString(target) => {
+                    std::str::from_utf8(target.as_ref()).ok().map(str::to_owned)
+                }
+                _ => None,
+            }
+            .and_then(|target| tree.get_specified_id(&RojoRef::new(target)));
 
             repairs.push((instance.id(), name, replacement));
         }
@@ -196,8 +203,8 @@ fn repair_refs_to_removed_instances(tree: &mut RojoTree, applied_patch_set: &mut
         let mut instance = tree
             .get_instance_mut(id)
             .expect("instance with a dangling ref should still exist");
-        match &replacement {
-            Some(value) => instance.properties_mut().insert(name, value.clone()),
+        match replacement {
+            Some(target) => instance.properties_mut().insert(name, Variant::Ref(target)),
             None => instance.properties_mut().remove(&name),
         };
 
@@ -212,7 +219,13 @@ fn repair_refs_to_removed_instances(tree: &mut RojoTree, applied_patch_set: &mut
                 applied_patch_set.updated.last_mut().unwrap()
             }
         };
-        update.changed_properties.insert(name, replacement);
+        // A cleared ref is sent as an explicit null Ref rather than a removed
+        // property: msgpack nil cannot be stored in a Luau table, so the plugin
+        // would never see a removal and Studio would keep the stale pointer.
+        update.changed_properties.insert(
+            name,
+            Some(Variant::Ref(replacement.unwrap_or_else(Ref::none))),
+        );
     }
 }
 

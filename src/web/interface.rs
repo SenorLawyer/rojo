@@ -37,6 +37,11 @@ pub struct SubscribeMessage<'a> {
 }
 
 impl<'a> SubscribeMessage<'a> {
+    /// Whether this message has no changes for the plugin to apply.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.removed.is_empty() && self.added.is_empty() && self.updated.is_empty()
+    }
+
     /// Converts a single applied patch into a message using the current tree.
     #[cfg(test)]
     pub(crate) fn from_patch_update(tree: &'a RojoTree, patch: AppliedPatchSet) -> Self {
@@ -54,8 +59,10 @@ impl<'a> SubscribeMessage<'a> {
     /// delete, or a branch checkout), and those removals are always delivered
     /// later in the same or a subsequent batch. Updates carry their own values
     /// and never need the tree, so they are forwarded as-is even if the
-    /// instance is gone; the plugin ignores updates and removals for instances
-    /// it does not know about.
+    /// instance is gone. The plugin skips removals of instances it does not
+    /// know about, but reports updates to them as unapplied, which can trigger
+    /// its sync fallback for those IDs; `/api/serialize` then leaves out the
+    /// IDs that no longer exist.
     pub(crate) fn from_patch_updates(
         tree: &'a RojoTree,
         patches: impl IntoIterator<Item = AppliedPatchSet>,
@@ -310,6 +317,10 @@ pub struct SerializeResponse {
     pub session_id: SessionId,
     #[serde(with = "serde_bytes")]
     pub model_contents: Vec<u8>,
+    /// Requested IDs that are no longer in the tree and so are not part of
+    /// `model_contents`.
+    #[serde(default)]
+    pub missing_ids: Vec<Ref>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

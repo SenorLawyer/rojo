@@ -4,9 +4,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use anyhow::{bail, Context};
+use anyhow::{anyhow, bail, Context};
 use clap::{CommandFactory, Parser, ValueEnum};
-use fs_err::File;
 use memofs::Vfs;
 use roblox_install::RobloxStudio;
 use tokio::runtime::Runtime;
@@ -206,43 +205,42 @@ fn write_model(
     if matches!(output_kind, OutputKind::Rbxl | OutputKind::Rbxlx) && class != "DataModel" {
         bail!("Cannot build a {} root as a place. Use .rbxm or .rbxmx, or set the root class to DataModel.", class);
     }
-    log::trace!("Opening output file for write");
-    let mut file = BufWriter::new(File::create(output)?);
+    log::trace!("Serializing to a staged output file");
+    write_file_atomically(output, |file| {
+        match output_kind {
+            OutputKind::Rbxm => {
+                compression
+                    .unwrap_or(Compression::Lz4)
+                    .serializer()
+                    .serialize(file, tree.inner(), &[root_id])?;
+            }
+            OutputKind::Rbxl => {
+                let root_instance = tree.get_instance(root_id).unwrap();
+                let top_level_ids = root_instance.children();
 
-    match output_kind {
-        OutputKind::Rbxm => {
-            compression
-                .unwrap_or(Compression::Lz4)
-                .serializer()
-                .serialize(&mut file, tree.inner(), &[root_id])?;
+                compression
+                    .unwrap_or(Compression::Lz4)
+                    .serializer()
+                    .serialize(file, tree.inner(), top_level_ids)?;
+            }
+            OutputKind::Rbxmx => {
+                // Model files include the root instance of the tree and all its
+                // descendants.
+
+                rbx_xml::to_writer(file, tree.inner(), &[root_id], xml_encode_config())?;
+            }
+            OutputKind::Rbxlx => {
+                // Place files don't contain an entry for the DataModel, but our
+                // WeakDom representation does.
+
+                let root_instance = tree.get_instance(root_id).unwrap();
+                let top_level_ids = root_instance.children();
+
+                rbx_xml::to_writer(file, tree.inner(), top_level_ids, xml_encode_config())?;
+            }
         }
-        OutputKind::Rbxl => {
-            let root_instance = tree.get_instance(root_id).unwrap();
-            let top_level_ids = root_instance.children();
-
-            compression
-                .unwrap_or(Compression::Lz4)
-                .serializer()
-                .serialize(&mut file, tree.inner(), top_level_ids)?;
-        }
-        OutputKind::Rbxmx => {
-            // Model files include the root instance of the tree and all its
-            // descendants.
-
-            rbx_xml::to_writer(&mut file, tree.inner(), &[root_id], xml_encode_config())?;
-        }
-        OutputKind::Rbxlx => {
-            // Place files don't contain an entry for the DataModel, but our
-            // WeakDom representation does.
-
-            let root_instance = tree.get_instance(root_id).unwrap();
-            let top_level_ids = root_instance.children();
-
-            rbx_xml::to_writer(&mut file, tree.inner(), top_level_ids, xml_encode_config())?;
-        }
-    }
-
-    file.flush()?;
+        Ok(())
+    })?;
 
     let filename = output
         .file_name()
@@ -251,4 +249,116 @@ fn write_model(
     println!("Built project to {}", filename);
 
     Ok(())
+}
+
+/// Replaces `destination` with the bytes produced by `write`, leaving the
+/// previous file untouched if writing fails.
+///
+/// The output is staged in a temporary file next to `destination` and renamed
+/// over it once complete. Truncating the destination first would leave a
+/// corrupt file behind whenever serialization fails, and Studio may load a
+/// plugin or place file while it is half written.
+pub(super) fn write_file_atomically(
+    destination: &Path,
+    write: impl FnOnce(&mut dyn Write) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    // The staged file must be on the same filesystem for the rename to be
+    // atomic, so it goes in the destination's directory.
+    let parent = match destination.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    let mut staged = tempfile::NamedTempFile::new_in(parent).with_context(|| {
+        format!(
+            "Could not create a temporary file in {} to write {}",
+            parent.display(),
+            destination.display()
+        )
+    })?;
+
+    {
+        let mut writer = BufWriter::new(staged.as_file_mut());
+        write(&mut writer)?;
+        writer.flush()?;
+    }
+
+    // Temporary files are created owner-only (0600) on Unix. Keep the
+    // permissions of the file being replaced so a rebuild doesn't change who
+    // can read it; a new file gets 0644, the usual mode for a file created
+    // under the default umask.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let permissions = match std::fs::metadata(destination) {
+            Ok(metadata) => metadata.permissions(),
+            Err(_) => std::fs::Permissions::from_mode(0o644),
+        };
+        staged.as_file().set_permissions(permissions)?;
+    }
+
+    // Dropping the staged file on error deletes it, so a failed rename leaves
+    // only the previous output behind.
+    staged.persist(destination).map_err(|error| {
+        anyhow!(
+            "Could not replace {}: {}. The previous file was left unchanged; \
+             if another program such as Roblox Studio has it open, close it and try again.",
+            destination.display(),
+            error.error
+        )
+    })?;
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn failed_write_keeps_previous_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let destination = dir.path().join("place.rbxl");
+        std::fs::write(&destination, b"previous build").unwrap();
+
+        let result = write_file_atomically(&destination, |file| {
+            file.write_all(b"partial")?;
+            bail!("serialization failed")
+        });
+
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(&destination).unwrap(), b"previous build");
+        // The staged file is cleaned up rather than left next to the output.
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn successful_write_replaces_previous_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let destination = dir.path().join("place.rbxl");
+        std::fs::write(&destination, b"previous build").unwrap();
+
+        write_file_atomically(&destination, |file| Ok(file.write_all(b"new build")?)).unwrap();
+
+        assert_eq!(std::fs::read(&destination).unwrap(), b"new build");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rebuild_keeps_permissions_of_previous_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let destination = dir.path().join("place.rbxl");
+        std::fs::write(&destination, b"previous build").unwrap();
+        std::fs::set_permissions(&destination, std::fs::Permissions::from_mode(0o640)).unwrap();
+
+        write_file_atomically(&destination, |file| Ok(file.write_all(b"new build")?)).unwrap();
+
+        let mode = std::fs::metadata(&destination)
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o640);
+    }
 }
