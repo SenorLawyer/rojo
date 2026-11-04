@@ -560,6 +560,66 @@ Hi,Hello
         assert_eq!(strings.class_name, "LocalizationTable");
     }
 
+    /// The upgrade advice in docs/data-modules.md relies on this sync rule
+    /// keeping the name a `.data.csv` LocalizationTable had before.
+    #[test]
+    fn csv_sync_rule_restores_data_csv_localization_tables() {
+        let mut fs = InMemoryFs::new();
+        fs.load_snapshot(
+            "/foo",
+            VfsSnapshot::dir([
+                (
+                    "default.project.json",
+                    VfsSnapshot::file(
+                        r#"{
+                            "name": "foo",
+                            "syncRules": [{ "pattern": "*.data.csv", "use": "csv" }],
+                            "tree": { "$path": "src" }
+                        }"#,
+                    ),
+                ),
+                (
+                    "src",
+                    VfsSnapshot::dir([
+                        (
+                            "Strings.data.csv",
+                            VfsSnapshot::file("Key,Source\nHi,Hello\n"),
+                        ),
+                        (
+                            "Levels",
+                            VfsSnapshot::dir([(
+                                "init.data.csv",
+                                VfsSnapshot::file("Key,Source\nHi,Hello\n"),
+                            )]),
+                        ),
+                    ]),
+                ),
+            ]),
+        )
+        .unwrap();
+
+        let snapshot = snapshot_from_vfs(
+            &InstanceContext::default(),
+            &Vfs::new(fs),
+            Path::new("/foo"),
+        )
+        .unwrap()
+        .unwrap();
+        let child = |name: &str| {
+            snapshot
+                .children
+                .iter()
+                .find(|child| child.name == name)
+                .unwrap_or_else(|| panic!("no child named {name}"))
+        };
+
+        assert_eq!(child("Strings.data").class_name, "LocalizationTable");
+        // Directories are not matched by sync rules, so an init.data.csv
+        // still makes its directory a data module.
+        assert_eq!(child("Levels").class_name, "ModuleScript");
+        assert!(child("Levels").children.is_empty());
+    }
+
     #[test]
     fn directory_init_does_not_duplicate_init_files() {
         let mut fs = InMemoryFs::new();

@@ -14,7 +14,7 @@ Like other files, a data module can have an adjacent `Items.meta.json`, or `init
 
 The first row holds the column names. Every other row becomes a table with one field per column.
 
-- A value that reads as a finite number, such as `100`, `-4`, `12.5` or `1e3`, becomes a number. `inf` and `NaN` stay text.
+- A value that reads as a finite number, such as `100`, `-4`, `12.5` or `1e3`, becomes a number. `inf` and `NaN` stay text, and so does a number too large for a Luau number, like `1e400`. A number too close to zero for a Luau number, like `1e-400`, becomes `0`.
 - `true` and `false` become booleans, in any letter case (`TRUE`, `False`).
 - An empty cell leaves the field out, so it reads as `nil`.
 - Anything else is a string, exactly as written. Spaces around a value are kept, so ` 5` is the string `" 5"`.
@@ -97,8 +97,16 @@ Deleting is different: like any other file, the CSV file is deleted when its mod
 
 Before data modules, every `.csv` file became a LocalizationTable. When upgrading:
 
-- A file whose name ends in `.data.csv`, such as `Strings.data.csv`, becomes a ModuleScript instead of a LocalizationTable. Rojo logs a warning when such a file has the `Key` and `Source` columns of a LocalizationTable. Rename it, for example to `Strings.csv`, to keep it a LocalizationTable.
-- A directory with an `init.data.csv` file becomes a ModuleScript. Before, the file was a child LocalizationTable named `init.data`.
+- A file whose name ends in `.data.csv`, such as `Strings.data.csv`, becomes a ModuleScript instead of a LocalizationTable. Rojo logs a warning when such a file has the `Key` and `Source` columns of a LocalizationTable. To keep these files LocalizationTables with the names they had before, such as `Strings.data`, add this sync rule to the project:
+
+  ```json
+  {
+    "syncRules": [{ "pattern": "*.data.csv", "use": "csv" }]
+  }
+  ```
+
+  Renaming the file to `Strings.csv` also keeps it a LocalizationTable, but renames the instance to `Strings`.
+- A directory with an `init.data.csv` file becomes a ModuleScript. Before, the file was a child LocalizationTable named `init.data`. Sync rules do not apply to directories, so the sync rule above does not change this. To keep the LocalizationTable, rename the file, for example to `Strings.csv`, and update scripts that refer to `init.data`.
 - When a directory has both an `init.luau` (or another init script) and an `init.data.csv`, the init script wins as before, and the `init.data.csv` is now ignored instead of becoming a child LocalizationTable.
 
 ## Sync rules

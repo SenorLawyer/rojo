@@ -482,32 +482,72 @@ fn follow_lines(page: &LogPage, json: bool) -> anyhow::Result<Vec<FollowLine>> {
     }
     for entry in &page.entries {
         lines.push(FollowLine::Out(if json {
-            serde_json::to_string(entry)?
+            json_escape_controls(serde_json::to_string(entry)?)
         } else {
             let kind = entry["kind"].as_str().unwrap_or("Message");
             format!(
                 "[{}] {}: {}",
                 entry["sequence"],
-                kind.strip_prefix("Message")
-                    .filter(|kind| !kind.is_empty())
-                    .unwrap_or(kind),
-                entry["message"].as_str().unwrap_or_default()
+                escape_controls(
+                    kind.strip_prefix("Message")
+                        .filter(|kind| !kind.is_empty())
+                        .unwrap_or(kind)
+                ),
+                escape_controls(entry["message"].as_str().unwrap_or_default())
             )
         }));
     }
     Ok(lines)
 }
 
+/// Escapes control characters other than line breaks and tabs, as in
+/// `\u{1b}`. Scripts in the place choose what they log, and printed raw, an
+/// escape sequence could rewrite the terminal's title, clipboard or earlier
+/// output.
+fn escape_controls(text: &str) -> String {
+    let mut escaped = String::with_capacity(text.len());
+    for character in text.chars() {
+        if character.is_control() && !matches!(character, '\n' | '\t') {
+            escaped.extend(character.escape_unicode());
+        } else {
+            escaped.push(character);
+        }
+    }
+    escaped
+}
+
 fn print_json(value: &Value, compact: bool) -> anyhow::Result<()> {
     println!(
         "{}",
-        if compact {
+        json_escape_controls(if compact {
             serde_json::to_string(value)?
         } else {
             serde_json::to_string_pretty(value)?
-        }
+        })
     );
     Ok(())
+}
+
+/// serde_json escapes the control characters JSON requires it to, but leaves
+/// DEL and the C1 controls, which some terminals read as the start of an
+/// escape sequence. Outside strings JSON has no control characters, so each
+/// one left can be written as a `\u` escape in place.
+fn json_escape_controls(json: String) -> String {
+    if !json
+        .chars()
+        .any(|character| character.is_control() && character != '\n')
+    {
+        return json;
+    }
+    let mut escaped = String::with_capacity(json.len());
+    for character in json.chars() {
+        if character.is_control() && character != '\n' {
+            escaped.push_str(&format!("\\u{:04x}", u32::from(character)));
+        } else {
+            escaped.push(character);
+        }
+    }
+    escaped
 }
 
 pub(super) fn local_address(address: &str) -> anyhow::Result<Url> {
@@ -800,6 +840,50 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<Value>(line).unwrap(),
             page.entries[1]
+        );
+    }
+
+    #[test]
+    fn followed_entries_escape_terminal_control_characters() {
+        let page = LogPage {
+            entries: vec![json!({
+                "sequence": 1,
+                "kind": "MessageOutput\u{9b}",
+                "message": "\u{1b}]52;c;aGk=\u{7}\u{1b}[2Jcarriage\rreturn\ttab\nnext \u{7f}é",
+            })],
+            latest_sequence: 1,
+            next_after: None,
+            dropped: 0,
+            more: false,
+            restarted: false,
+        };
+
+        assert_eq!(
+            follow_lines(&page, false).unwrap(),
+            vec![FollowLine::Out(
+                r"[1] Output\u{9b}: \u{1b}]52;c;aGk=\u{7}\u{1b}[2Jcarriage\u{d}return".to_owned()
+                    + "\ttab\nnext "
+                    + r"\u{7f}é"
+            )]
+        );
+        // JSON output escapes them too, including DEL and C1 controls that
+        // serde_json leaves as they are, and still reads back the same.
+        let FollowLine::Out(line) = &follow_lines(&page, true).unwrap()[0] else {
+            panic!("expected an entry line");
+        };
+        assert!(!line.chars().any(char::is_control), "{line}");
+        assert_eq!(
+            serde_json::from_str::<Value>(line).unwrap(),
+            page.entries[0]
+        );
+        let pretty = json_escape_controls(serde_json::to_string_pretty(&page.entries[0]).unwrap());
+        assert!(
+            !pretty.chars().any(|c| c.is_control() && c != '\n'),
+            "{pretty}"
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(&pretty).unwrap(),
+            page.entries[0]
         );
     }
 

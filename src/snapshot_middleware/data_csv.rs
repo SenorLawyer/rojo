@@ -251,16 +251,7 @@ fn data_csv_to_luau(contents: &[u8], file_name: &str) -> anyhow::Result<String> 
     // Before data modules, every `.csv` file was a LocalizationTable, so a
     // file named like `Strings.data.csv` may still be one.
     if looks_like_localization_table(&columns) {
-        log::warn!(
-            "{} has the Key and Source columns of a LocalizationTable, but files ending \
-             in .data.csv become ModuleScripts. Rename it to end in .csv if it is a \
-             LocalizationTable.",
-            if file_name.is_empty() {
-                "A data CSV file"
-            } else {
-                file_name
-            }
-        );
+        log::warn!("{}", localization_table_warning(file_name));
     }
 
     let id_column = columns.iter().position(|column| column.name == ID_COLUMN);
@@ -381,6 +372,34 @@ fn data_csv_to_luau(contents: &[u8], file_name: &str) -> anyhow::Result<String> 
 fn looks_like_localization_table(columns: &[Column]) -> bool {
     let has = |name: &str| columns.iter().any(|column| column.name == name);
     has("Key") && has("Source")
+}
+
+/// Advice for a data CSV file that looks like it was meant to stay a
+/// LocalizationTable.
+fn localization_table_warning(file_name: &str) -> String {
+    let shown = if file_name.is_empty() {
+        "A data CSV file"
+    } else {
+        file_name
+    };
+    if file_name == "init.data.csv" {
+        // Directories are never matched by sync rules, so only a rename can
+        // turn this back into a child LocalizationTable.
+        format!(
+            "{shown} has the Key and Source columns of a LocalizationTable, but an \
+             init.data.csv file makes its directory a ModuleScript. Rename it, for \
+             example to Strings.csv, if it is a LocalizationTable."
+        )
+    } else {
+        // A sync rule without a suffix names the instance after the file stem,
+        // as `.csv` files were named before data modules.
+        format!(
+            "{shown} has the Key and Source columns of a LocalizationTable, but files \
+             ending in .data.csv become ModuleScripts. If it is a LocalizationTable, add \
+             the sync rule {{\"pattern\": \"*.data.csv\", \"use\": \"csv\"}} to the \
+             project to keep it one with the same name."
+        )
+    }
 }
 
 fn write_row(output: &mut String, columns: &[Column], row: &[Option<Cell>]) {
@@ -691,6 +710,20 @@ mod test {
     }
 
     #[test]
+    fn localization_table_warning_suggests_what_keeps_the_old_instance() {
+        let file = localization_table_warning("Strings.data.csv");
+        assert!(file.starts_with("Strings.data.csv "), "{file}");
+        assert!(
+            file.contains(r#"{"pattern": "*.data.csv", "use": "csv"}"#),
+            "{file}"
+        );
+
+        let init = localization_table_warning("init.data.csv");
+        assert!(init.contains("Rename it"), "{init}");
+        assert!(!init.contains("sync rule"), "{init}");
+    }
+
+    #[test]
     fn empty_ids_are_rejected() {
         let error = convert_err("id,name\nsword,Sword\n,Nameless\n");
         assert_eq!(error, "row on line 3 has an empty \"id\" value");
@@ -735,6 +768,13 @@ mod test {
             assert_eq!(output, expected, "{number:?}");
             assert_eq!(output.parse::<f64>().unwrap().to_bits(), number.to_bits());
         }
+    }
+
+    /// Documented in docs/data-modules.md.
+    #[test]
+    fn numbers_out_of_range_underflow_to_zero_or_stay_text() {
+        assert!(matches!(Cell::parse("1e-400"), Some(Cell::Number(n)) if n == 0.0));
+        assert!(matches!(Cell::parse("1e400"), Some(Cell::String(_))));
     }
 
     #[test]

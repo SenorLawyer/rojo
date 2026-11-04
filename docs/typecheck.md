@@ -50,7 +50,7 @@ rojo typecheck --definitions globalTypes.d.luau
 Everything after `--` is passed to `luau-lsp analyze` before the file list. These paths are relative to the project's folder. Common options:
 
 | Option | Use |
-   | --- | --- |
+| --- | --- |
 | `--ignore=**/Packages/**` | Hide problems in files matching the glob, such as Wally packages. The files are still analyzed. |
 | `--settings=.vscode/settings.json` | Read `luau-lsp.*` settings, such as require aliases, from an editor settings file. |
 | `--base-luaurc=.luaurc` | Use this `.luaurc` as the default configuration. |
