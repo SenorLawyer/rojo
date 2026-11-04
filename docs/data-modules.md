@@ -97,16 +97,19 @@ Deleting is different: like any other file, the CSV file is deleted when its mod
 
 Before data modules, every `.csv` file became a LocalizationTable. When upgrading:
 
-- A file whose name ends in `.data.csv`, such as `Strings.data.csv`, becomes a ModuleScript instead of a LocalizationTable. Rojo logs a warning when such a file has the `Key` and `Source` columns of a LocalizationTable. To keep these files LocalizationTables with the names they had before, such as `Strings.data`, add this sync rule to the project:
+- A file whose name ends in `.data.csv`, such as `Strings.data.csv`, becomes a ModuleScript instead of a LocalizationTable. Rojo logs a warning when such a file has the `Key` and `Source` columns of a LocalizationTable. To keep these files LocalizationTables with the names they had before, such as `Strings.data`, add a sync rule naming each of them to the project:
 
   ```json
   {
-    "syncRules": [{ "pattern": "*.data.csv", "use": "csv" }]
+    "syncRules": [{ "pattern": "**/Strings.data.csv", "use": "csv" }]
   }
   ```
 
+  A pattern such as `*.data.csv` also works, but it turns every data module in the project back into a LocalizationTable.
+
   Renaming the file to `Strings.csv` also keeps it a LocalizationTable, but renames the instance to `Strings`.
-- A directory with an `init.data.csv` file becomes a ModuleScript. Before, the file was a child LocalizationTable named `init.data`. Sync rules do not apply to directories, so the sync rule above does not change this. To keep the LocalizationTable, rename the file, for example to `Strings.csv`, and update scripts that refer to `init.data`.
+- A directory with an `init.data.csv` file becomes a ModuleScript. Before, the file was a child LocalizationTable named `init.data`. Sync rules do not apply to directories, so a sync rule does not change this. To keep the LocalizationTable, rename the file, for example to `Strings.csv`, and update scripts that refer to `init.data`.
+- Data CSV files must be UTF-8. A spreadsheet exported in another encoding, such as Windows-1252, fails with an invalid UTF-8 error; export it as "CSV UTF-8" instead.
 - When a directory has both an `init.luau` (or another init script) and an `init.data.csv`, the init script wins as before, and the `init.data.csv` is now ignored instead of becoming a child LocalizationTable.
 
 ## Sync rules

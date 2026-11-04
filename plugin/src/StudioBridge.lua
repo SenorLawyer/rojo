@@ -1060,9 +1060,10 @@ function StudioBridge:start()
 					-- reach the server for long enough the session expired, which
 					-- the next poll reports as 404. Registering the same session
 					-- again with the same description is safe: the server adds it
-					-- back, or refreshes it if it was still there. Only once, so
-					-- an eviction or a server that keeps refusing still stops the
-					-- bridge.
+					-- back, or refreshes it if it was still there. Only once, so a
+					-- server that keeps refusing still stops the bridge. A session
+					-- evicted by newer registrations during Run mode also comes
+					-- back this way, evicting the oldest one in turn.
 					if afterRunMode and failure.status == 404 and not self.stopped then
 						afterRunMode = false
 						Log.warn("Rojo Studio bridge session expired during Run mode; registering it again")

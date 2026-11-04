@@ -153,7 +153,7 @@ Each stage writes `rojo-state/staging/<attempt>.json` with the release, place ha
 - the latest record ran no smoke check, unless you pass `--allow-unsmoked`;
 - the record is older than `--max-age-hours` (24 by default);
 - a staging record cannot be read, since it could be the latest failure. Fix or remove that file;
-- an entry in `publication-attempts` cannot be read, since it could be a newer staging upload. Repair it, or check Roblox version history and move it out of `publication-attempts`.
+- an entry in `publication-attempts` cannot be read, since it could be a newer staging upload. Repair it, or move it out of `publication-attempts`; if Roblox version history shows a version from it, stage the release again before promoting, since that upload's smoke check is unknown.
 
 Promote runs these checks once before it takes `publication.lock` and again once it holds it, so a `release stage` that uploads in between is not missed. When the second check refuses, promote releases the lock and uploads nothing.
 

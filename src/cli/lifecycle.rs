@@ -1294,7 +1294,8 @@ enum PublishKind {
     Staging {
         universe_id: u64,
         place_id: u64,
-        /// Accept a place in the release's own universe.
+        /// Accept a place in the release's own universe, another release's
+        /// universe or a universe Rojo has published live to.
         allow_live_universe: bool,
     },
 }
@@ -2157,7 +2158,7 @@ fn abandon_lock(lock: fs::File, lock_path: &Path, error: anyhow::Error) -> anyho
 fn read_journal_strictly(directory: &Path) -> anyhow::Result<Vec<(PathBuf, serde_json::Value)>> {
     read_json_dir_strictly(directory, |path| {
         format!(
-            "Cannot check the publication journal: {} cannot be read, and it could record a newer staging upload. Repair it, or check Roblox version history and move it out of publication-attempts",
+            "Cannot check the publication journal: {} cannot be read, and it could record a newer staging upload. Repair it, or move it out of publication-attempts; if Roblox version history shows a version from it, stage the release again before promoting",
             path.display()
         )
     })

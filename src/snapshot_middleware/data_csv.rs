@@ -392,11 +392,13 @@ fn localization_table_warning(file_name: &str) -> String {
         )
     } else {
         // A sync rule without a suffix names the instance after the file stem,
-        // as `.csv` files were named before data modules.
+        // as `.csv` files were named before data modules. The rule names this
+        // file only, so the project's real data modules stay data modules.
+        let pattern = serde_json::to_string(&format!("**/{file_name}")).unwrap_or_default();
         format!(
             "{shown} has the Key and Source columns of a LocalizationTable, but files \
              ending in .data.csv become ModuleScripts. If it is a LocalizationTable, add \
-             the sync rule {{\"pattern\": \"*.data.csv\", \"use\": \"csv\"}} to the \
+             the sync rule {{\"pattern\": {pattern}, \"use\": \"csv\"}} to the \
              project to keep it one with the same name."
         )
     }
@@ -714,7 +716,7 @@ mod test {
         let file = localization_table_warning("Strings.data.csv");
         assert!(file.starts_with("Strings.data.csv "), "{file}");
         assert!(
-            file.contains(r#"{"pattern": "*.data.csv", "use": "csv"}"#),
+            file.contains(r#"{"pattern": "**/Strings.data.csv", "use": "csv"}"#),
             "{file}"
         );
 

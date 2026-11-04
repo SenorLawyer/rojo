@@ -573,7 +573,7 @@ Hi,Hello
                     VfsSnapshot::file(
                         r#"{
                             "name": "foo",
-                            "syncRules": [{ "pattern": "*.data.csv", "use": "csv" }],
+                            "syncRules": [{ "pattern": "**/Strings.data.csv", "use": "csv" }],
                             "tree": { "$path": "src" }
                         }"#,
                     ),
@@ -585,6 +585,7 @@ Hi,Hello
                             "Strings.data.csv",
                             VfsSnapshot::file("Key,Source\nHi,Hello\n"),
                         ),
+                        ("Items.data.csv", VfsSnapshot::file("id,cost\nsword,5\n")),
                         (
                             "Levels",
                             VfsSnapshot::dir([(
@@ -613,7 +614,10 @@ Hi,Hello
                 .unwrap_or_else(|| panic!("no child named {name}"))
         };
 
+        // The rule the warning suggests names the file, matches it inside
+        // `src`, and leaves the project's other data modules alone.
         assert_eq!(child("Strings.data").class_name, "LocalizationTable");
+        assert_eq!(child("Items").class_name, "ModuleScript");
         // Directories are not matched by sync rules, so an init.data.csv
         // still makes its directory a data module.
         assert_eq!(child("Levels").class_name, "ModuleScript");
