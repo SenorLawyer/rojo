@@ -39,6 +39,10 @@ pub struct ServeCommand {
     /// validation for binds where it is otherwise off (such as `0.0.0.0`).
     #[clap(long, value_delimiter = ',')]
     pub allowed_hosts: Vec<String>,
+
+    /// Enable the local Studio control bridge with a token created by `rojo studio token`.
+    #[clap(long)]
+    pub studio_token_file: Option<PathBuf>,
 }
 
 impl ServeCommand {
@@ -67,7 +71,10 @@ impl ServeCommand {
             self.allowed_hosts
         };
 
-        let server = LiveServer::new(session);
+        let mut server = LiveServer::new(session);
+        if let Some(path) = self.studio_token_file {
+            server = server.with_studio_token_file(&path)?;
+        }
 
         server.start((ip, port).into(), allowed_hosts, || {
             let _ = show_start_message(ip, port, global.color.into());

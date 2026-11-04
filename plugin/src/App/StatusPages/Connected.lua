@@ -351,7 +351,7 @@ function ConnectedPage:render()
 
 			Heading = e("Frame", {
 				BackgroundTransparency = 1,
-				Size = UDim2.new(1, 0, 0, 32),
+				Size = UDim2.new(1, 0, 0, 62),
 			}, {
 				Header = e(Header, {
 					transparency = self.props.transparency,
@@ -359,13 +359,13 @@ function ConnectedPage:render()
 
 				ChangeInfo = e("TextButton", {
 					Text = "",
-					Size = UDim2.new(0, 0, 1, 0),
+					Size = UDim2.new(0, 0, 0, 26),
 					AutomaticSize = Enum.AutomaticSize.X,
 					BackgroundColor3 = theme.BorderedContainer.BorderedColor,
 					BackgroundTransparency = if self.state.hoveringChangeInfo then 0.7 else 1,
 					BorderSizePixel = 0,
-					Position = UDim2.new(1, -5, 0.5, 0),
-					AnchorPoint = Vector2.new(1, 0.5),
+					Position = UDim2.new(1, -5, 1, 0),
+					AnchorPoint = Vector2.new(1, 1),
 					[Roact.Event.MouseEnter] = function()
 						self:setState({
 							hoveringChangeInfo = true,

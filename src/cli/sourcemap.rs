@@ -109,16 +109,27 @@ impl SourcemapCommand {
             let rt = Runtime::new().context("Failed to start the async runtime for watch mode")?;
 
             loop {
-                let receiver = session.message_queue().subscribe(cursor);
-                let (new_cursor, patch_set) = match rt.block_on(receiver) {
-                    Ok(message) => message,
-                    // The message queue was dropped, so there is nothing left
-                    // to watch. Stop watching gracefully.
-                    Err(_) => break,
+                let affected = match session.message_queue().subscribe(cursor) {
+                    Ok(receiver) => match rt.block_on(receiver) {
+                        Ok((new_cursor, patch_set)) => {
+                            cursor = new_cursor;
+                            let patches: Vec<_> =
+                                patch_set.into_iter().map(|message| message.patch).collect();
+                            patch_set_affects_sourcemap(&session, &patches, filter)
+                        }
+                        // The message queue was dropped, so there is nothing
+                        // left to watch. Stop watching gracefully.
+                        Err(_) => break,
+                    },
+                    // Changes were trimmed from history before we saw them,
+                    // so rewrite from the current tree.
+                    Err(_) => {
+                        cursor = session.message_queue().cursor();
+                        true
+                    }
                 };
-                cursor = new_cursor;
 
-                if patch_set_affects_sourcemap(&session, &patch_set, filter) {
+                if affected {
                     write_sourcemap(&session, self.output.as_deref(), filter, self.absolute)?;
                 }
             }

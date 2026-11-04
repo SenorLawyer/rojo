@@ -26,6 +26,9 @@ local defaultSettings = {
 	typecheckingEnabled = false,
 	logLevel = "Info",
 	timingLogsEnabled = false,
+	agentControlEnabled = true,
+	agentControlCanChangeConfirmation = false,
+	studioBridgeAutoEnable = true,
 	priorEndpoints = {},
 }
 

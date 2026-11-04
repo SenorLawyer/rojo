@@ -4,9 +4,14 @@ mod build;
 mod doc;
 mod fmt_project;
 mod init;
+mod lifecycle;
+mod mcp;
+mod merge;
+mod packages;
 mod plugin;
 mod serve;
 mod sourcemap;
+mod studio;
 mod syncback;
 mod upload;
 
@@ -20,9 +25,14 @@ pub use self::build::BuildCommand;
 pub use self::doc::DocCommand;
 pub use self::fmt_project::FmtProjectCommand;
 pub use self::init::{InitCommand, InitKind};
+pub use self::lifecycle::{CheckpointCommand, ReleaseCommand, WorkspaceCommand};
+pub use self::mcp::McpCommand;
+pub use self::merge::MergeCommand;
+pub use self::packages::PackagesCommand;
 pub use self::plugin::{PluginCommand, PluginSubcommand};
 pub use self::serve::ServeCommand;
 pub use self::sourcemap::SourcemapCommand;
+pub use self::studio::{CheckUntrustedModelCommand, StudioCommand};
 pub use self::syncback::SyncbackCommand;
 pub use self::upload::UploadCommand;
 
@@ -50,6 +60,14 @@ impl Options {
             Subcommand::Doc(subcommand) => subcommand.run(),
             Subcommand::Plugin(subcommand) => subcommand.run(),
             Subcommand::Syncback(subcommand) => subcommand.run(self.global),
+            Subcommand::Checkpoint(subcommand) => subcommand.run(),
+            Subcommand::Workspace(subcommand) => subcommand.run(),
+            Subcommand::Release(subcommand) => subcommand.run(),
+            Subcommand::Merge(subcommand) => subcommand.run(),
+            Subcommand::Packages(subcommand) => subcommand.run(),
+            Subcommand::Studio(subcommand) => subcommand.run(),
+            Subcommand::Mcp(subcommand) => subcommand.run(),
+            Subcommand::CheckUntrustedModel(subcommand) => subcommand.run(),
         }
     }
 }
@@ -124,6 +142,18 @@ pub enum Subcommand {
     Doc(DocCommand),
     Plugin(PluginCommand),
     Syncback(SyncbackCommand),
+    Checkpoint(CheckpointCommand),
+    Workspace(WorkspaceCommand),
+    Release(ReleaseCommand),
+    Merge(MergeCommand),
+    Packages(PackagesCommand),
+    Studio(StudioCommand),
+    Mcp(McpCommand),
+    /// Internal: checks one untrusted model read from stdin. `rojo serve` and
+    /// `rojo studio import` run it as a child process.
+    // Must match `model_check::SUBCOMMAND`; a test checks that it does.
+    #[clap(name = "check-untrusted-model", hide = true)]
+    CheckUntrustedModel(CheckUntrustedModelCommand),
 }
 
 pub(super) fn resolve_path(path: &Path) -> anyhow::Result<Cow<'_, Path>> {
