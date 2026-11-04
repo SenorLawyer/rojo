@@ -106,14 +106,17 @@ impl BuildCommand {
             let rt = Runtime::new().context("Failed to start the async runtime for watch mode")?;
 
             loop {
-                let receiver = session.message_queue().subscribe(cursor);
-                let (new_cursor, _patch_set) = match rt.block_on(receiver) {
-                    Ok(message) => message,
-                    // The message queue was dropped, so there is nothing left
-                    // to watch. Stop watching gracefully.
-                    Err(_) => break,
-                };
-                cursor = new_cursor;
+                // A rebuild always reads the whole tree, so missing trimmed
+                // history only means rebuilding from the current state now.
+                match session.message_queue().subscribe(cursor) {
+                    Ok(receiver) => match rt.block_on(receiver) {
+                        Ok((new_cursor, _patch_set)) => cursor = new_cursor,
+                        // The message queue was dropped, so there is nothing
+                        // left to watch. Stop watching gracefully.
+                        Err(_) => break,
+                    },
+                    Err(_) => cursor = session.message_queue().cursor(),
+                }
 
                 // A rebuild can fail because of an in-progress edit (for
                 // example, the root's class temporarily isn't a DataModel).

@@ -5,7 +5,7 @@ use std::{collections::HashMap, fs, net::SocketAddr, path::PathBuf, str::FromStr
 
 use futures::{sink::SinkExt, stream::StreamExt};
 use hyper::{
-    body::{Bytes, HttpBody},
+    body::{self, Bytes, HttpBody},
     Body, Method, Request, Response, StatusCode,
 };
 use hyper_tungstenite::{
@@ -20,6 +20,8 @@ use rbx_dom_weak::{
 };
 
 use crate::{
+    change_processor::PublishedPatch,
+    message_queue::MessageQueue,
     serve_session::ServeSession,
     snapshot::{InstanceWithMeta, PatchSet, PatchUpdate},
     web::{
@@ -36,7 +38,103 @@ use crate::{
     },
 };
 
+/// How long `/api/read` keeps the history after its cursor, so a client that
+/// waits for the user to confirm the initial sync can still subscribe.
+const READ_CURSOR_GRACE: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
 pub async fn call(
+    serve_session: Arc<ServeSession>,
+    remote_addr: SocketAddr,
+    request: Request<Body>,
+) -> Response<Body> {
+    with_base64_transfer(request, |request| {
+        call_inner(serve_session, remote_addr, request)
+    })
+    .await
+}
+
+/// Whether a request opted into base64 bodies with `x-rojo-content-transfer`.
+fn wants_base64(request: &Request<Body>) -> bool {
+    request
+        .headers()
+        .get("x-rojo-content-transfer")
+        .is_some_and(|value| value == "base64")
+}
+
+/// The largest encoded request body. Base64 takes four bytes for every three,
+/// so this keeps the decoded limit at [`MAX_REQUEST_BODY`], the same as for
+/// unencoded requests.
+const MAX_ENCODED_REQUEST_BODY: usize = MAX_REQUEST_BODY.div_ceil(3) * 4;
+
+/// Decodes an opted-in request body, runs `handler`, and encodes its response.
+/// Requests without the header are passed through unchanged.
+async fn with_base64_transfer<F, Fut>(request: Request<Body>, handler: F) -> Response<Body>
+where
+    F: FnOnce(Request<Body>) -> Fut,
+    Fut: std::future::Future<Output = Response<Body>>,
+{
+    if !wants_base64(&request) {
+        return handler(request).await;
+    }
+    // Studio RawStream truncates binary bodies at NUL. Opt in per request so
+    // existing clients retain the original MessagePack wire format. Every
+    // response to an opted-in request is encoded, errors included, because the
+    // client decodes the body before inspecting its status.
+    if is_upgrade_request(&request) {
+        return encode_base64(msgpack(
+            ErrorResponse::bad_request("Base64 transfer is only for finite HTTP requests"),
+            StatusCode::BAD_REQUEST,
+        ))
+        .await;
+    }
+    let (parts, body) = request.into_parts();
+    let bytes = match read_body_within(body, MAX_ENCODED_REQUEST_BODY).await {
+        Ok(bytes) => bytes,
+        Err(response) => return encode_base64(*response).await,
+    };
+    let decoded = match data_encoding::BASE64.decode(&bytes) {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            return encode_base64(msgpack(
+                ErrorResponse::bad_request("Invalid base64 request body"),
+                StatusCode::BAD_REQUEST,
+            ))
+            .await
+        }
+    };
+    let response = handler(Request::from_parts(parts, Body::from(decoded))).await;
+    encode_base64(response).await
+}
+
+fn base64_response(mut parts: hyper::http::response::Parts, bytes: &[u8]) -> Response<Body> {
+    parts.headers.remove(hyper::header::CONTENT_LENGTH);
+    parts.headers.insert(
+        hyper::header::CONTENT_TYPE,
+        hyper::header::HeaderValue::from_static("text/plain"),
+    );
+    parts.headers.insert(
+        "x-rojo-content-transfer",
+        hyper::header::HeaderValue::from_static("base64"),
+    );
+    Response::from_parts(parts, Body::from(data_encoding::BASE64.encode(bytes)))
+}
+
+async fn encode_base64(response: Response<Body>) -> Response<Body> {
+    let (parts, body) = response.into_parts();
+    match body::to_bytes(body).await {
+        Ok(bytes) => base64_response(parts, &bytes),
+        Err(_) => {
+            let (parts, _) = msgpack((), StatusCode::INTERNAL_SERVER_ERROR).into_parts();
+            let error = serialize_msgpack(ErrorResponse::internal_error(
+                "Could not encode response body",
+            ))
+            .unwrap_or_default();
+            base64_response(parts, &error)
+        }
+    }
+}
+
+async fn call_inner(
     serve_session: Arc<ServeSession>,
     remote_addr: SocketAddr,
     mut request: Request<Body>,
@@ -223,7 +321,7 @@ impl ApiService {
 
         let message_queue = self.serve_session.message_queue();
         let tree = self.serve_session.tree();
-        let message_cursor = message_queue.cursor();
+        let message_cursor = message_queue.cursor_held_for(READ_CURSOR_GRACE);
 
         let mut instances = HashMap::new();
 
@@ -491,7 +589,11 @@ impl ApiService {
 /// Requests larger than this are rejected rather than buffered in memory.
 const MAX_REQUEST_BODY: usize = 64 * 1024 * 1024;
 
-async fn read_request_body(mut body: Body) -> Result<Bytes, Box<Response<Body>>> {
+async fn read_request_body(body: Body) -> Result<Bytes, Box<Response<Body>>> {
+    read_body_within(body, MAX_REQUEST_BODY).await
+}
+
+async fn read_body_within(mut body: Body, max: usize) -> Result<Bytes, Box<Response<Body>>> {
     let mut bytes = Vec::new();
     while let Some(chunk) = body.data().await {
         let chunk = chunk.map_err(|err| {
@@ -500,9 +602,12 @@ async fn read_request_body(mut body: Body) -> Result<Bytes, Box<Response<Body>>>
                 StatusCode::BAD_REQUEST,
             ))
         })?;
-        if bytes.len() + chunk.len() > MAX_REQUEST_BODY {
+        if bytes.len() + chunk.len() > max {
             return Err(Box::new(msgpack(
-                ErrorResponse::bad_request("Request body exceeds 64 MiB"),
+                ErrorResponse::bad_request(format!(
+                    "Request body exceeds {} MiB",
+                    max.div_ceil(1024 * 1024)
+                )),
                 StatusCode::PAYLOAD_TOO_LARGE,
             )));
         }
@@ -540,6 +645,48 @@ fn pick_script_path(instance: InstanceWithMeta<'_>) -> Option<PathBuf> {
         .map(|path| path.to_owned())
 }
 
+/// Subscribes to messages after `cursor`, or returns the close frame asking
+/// the client to resync when those messages were trimmed from history.
+fn subscribe_or_resync(
+    message_queue: &MessageQueue<PublishedPatch>,
+    cursor: u32,
+) -> Result<futures::channel::oneshot::Receiver<(u32, Vec<PublishedPatch>)>, CloseFrame<'static>> {
+    message_queue.subscribe(cursor).map_err(|stale| {
+        // The changes this client missed cannot be replayed. The plugin ends
+        // the session with this reason, and reconnecting reads the current
+        // tree, which resyncs it.
+        log::warn!("Closing a subscription that fell behind: {stale}");
+        CloseFrame {
+            code: CloseCode::Restart,
+            reason: "Subscription history is stale; reconnect to resync".into(),
+        }
+    })
+}
+
+/// How long one WebSocket message may take to send. A client that stops
+/// reading fills the connection's buffers, and its subscription must not wait
+/// on it forever while holding the history it has not received.
+const SOCKET_SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Sends a message, giving up after [`SOCKET_SEND_TIMEOUT`]. Returns whether
+/// it was sent.
+async fn send_bounded<S>(socket: &mut S, message: Message) -> bool
+where
+    S: futures::Sink<Message> + Unpin,
+{
+    send_within(socket, message, SOCKET_SEND_TIMEOUT).await
+}
+
+async fn send_within<S>(socket: &mut S, message: Message, limit: std::time::Duration) -> bool
+where
+    S: futures::Sink<Message> + Unpin,
+{
+    matches!(
+        tokio::time::timeout(limit, socket.send(message)).await,
+        Ok(Ok(()))
+    )
+}
+
 /// Handle WebSocket connection for streaming subscription messages
 async fn handle_websocket_subscription(
     serve_session: Arc<ServeSession>,
@@ -550,7 +697,6 @@ async fn handle_websocket_subscription(
     let mut websocket = websocket.await?;
 
     let session_id = serve_session.session_id();
-    let tree_handle = serve_session.tree_handle();
     let message_queue = serve_session.message_queue();
 
     // A cursor past the end of the queue was issued by a different server run,
@@ -564,12 +710,14 @@ async fn handle_websocket_subscription(
         log::debug!(
             "Rejecting WebSocket subscription from a previous server session (cursor {input_cursor})"
         );
-        let _ = websocket
-            .send(Message::Close(Some(CloseFrame {
+        send_bounded(
+            &mut websocket,
+            Message::Close(Some(CloseFrame {
                 code: CloseCode::Restart,
                 reason: SESSION_CHANGED_CLOSE_REASON.into(),
-            })))
-            .await;
+            })),
+        )
+        .await;
         return Ok(());
     }
 
@@ -581,8 +729,18 @@ async fn handle_websocket_subscription(
     // Now continuously listen for new messages using select to handle both incoming messages
     // and WebSocket control messages concurrently
     let mut cursor = input_cursor;
+    // The subscription is not registered while a batch is being sent, which
+    // can take up to SOCKET_SEND_TIMEOUT when Studio reads slowly. Holding the
+    // cursor keeps the queue from trimming the history this socket still needs.
+    let hold = message_queue.hold(cursor);
     loop {
-        let receiver = message_queue.subscribe(cursor);
+        let receiver = match subscribe_or_resync(message_queue, cursor) {
+            Ok(receiver) => receiver,
+            Err(close) => {
+                send_bounded(&mut websocket, Message::Close(Some(close))).await;
+                break;
+            }
+        };
 
         tokio::select! {
             // Handle new messages from the message queue
@@ -590,27 +748,23 @@ async fn handle_websocket_subscription(
                 match result {
                     Ok((new_cursor, messages)) => {
                         if !messages.is_empty() {
-                            let msgpack_message = {
-                                let tree = tree_handle.lock().unwrap();
-                                // Patches that only touched data the plugin never
-                                // sees (such as relevant paths) would make it open
-                                // an undo recording and run callbacks for nothing.
-                                // The packet is still sent so its cursor advances.
-                                let messages: Vec<_> =
-                                    SubscribeMessage::from_patch_updates(&tree, messages)
-                                        .into_iter()
-                                        .filter(|message| !message.is_empty())
-                                        .collect();
-
-                                serialize_msgpack(SocketPacket {
-                                    session_id,
-                                    packet_type: SocketPacketType::Messages,
-                                    body: SocketPacketBody::Messages(MessagesPacket {
-                                        message_cursor: new_cursor,
-                                        messages,
-                                    }),
-                                })
-                            };
+                            // Patches that only touched data the plugin never
+                            // sees (such as relevant paths) would make it open an
+                            // undo recording and run callbacks for nothing. The
+                            // packet is still sent so its cursor advances.
+                            let messages: Vec<_> = messages
+                                .into_iter()
+                                .map(|patch| patch.message)
+                                .filter(|message| !message.is_empty())
+                                .collect();
+                            let msgpack_message = serialize_msgpack(SocketPacket {
+                                session_id,
+                                packet_type: SocketPacketType::Messages,
+                                body: SocketPacketBody::Messages(MessagesPacket {
+                                    message_cursor: new_cursor,
+                                    messages,
+                                }),
+                            });
 
                             let msgpack_message = match msgpack_message {
                                 Ok(message) => message,
@@ -618,7 +772,7 @@ async fn handle_websocket_subscription(
                                     // Last resort: the batch could not be encoded, so the
                                     // plugin would silently fall out of sync. Ask it to
                                     // reconnect, which resyncs from a fresh snapshot.
-                                    let _ = websocket.send(Message::Close(Some(CloseFrame {
+                                    send_bounded(&mut websocket, Message::Close(Some(CloseFrame {
                                         code: CloseCode::Restart,
                                         reason: "Failed to encode subscription messages; reconnect to resync".into(),
                                     }))).await;
@@ -628,18 +782,22 @@ async fn handle_websocket_subscription(
 
                             log::debug!("Sending batch of messages over WebSocket subscription");
 
-                            if websocket.send(Message::Binary(msgpack_message)).await.is_err() {
-                                // Client disconnected
-                                log::debug!("WebSocket subscription closed by client");
+                            if !send_bounded(&mut websocket, Message::Binary(msgpack_message)).await {
+                                // The client disconnected or stopped reading.
+                                // Dropping the socket also releases its
+                                // history hold, which would otherwise keep
+                                // the queue from trimming for every client.
+                                log::debug!("WebSocket subscription closed or stopped reading");
                                 break;
                             }
                             cursor = new_cursor;
+                            hold.advance(cursor);
                         }
                     }
                     Err(_) => {
                         // Message queue disconnected
                         log::debug!("Message queue disconnected; closing WebSocket subscription");
-                        let _ = websocket.send(Message::Close(None)).await;
+                        send_bounded(&mut websocket, Message::Close(None)).await;
                         break;
                     }
                 }
@@ -734,13 +892,55 @@ fn percent_decode(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hyper::body;
 
     #[test]
     fn percent_decode_handles_encoded_session_ids() {
         assert_eq!(percent_decode("1d4b%2Dee43%2d9c"), "1d4b-ee43-9c");
         assert_eq!(percent_decode("plain-id"), "plain-id");
         assert_eq!(percent_decode("bad%zzend%2"), "bad%zzend%2");
+    }
+
+    /// A socket whose peer stopped reading: sends never complete.
+    struct Stalled;
+
+    impl futures::Sink<Message> for Stalled {
+        type Error = std::convert::Infallible;
+
+        fn poll_ready(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Pending
+        }
+
+        fn start_send(self: std::pin::Pin<&mut Self>, _: Message) -> Result<(), Self::Error> {
+            Ok(())
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Pending
+        }
+
+        fn poll_close(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Pending
+        }
+    }
+
+    #[tokio::test]
+    async fn sends_to_a_client_that_stopped_reading_give_up() {
+        let limit = std::time::Duration::from_millis(50);
+        let started = std::time::Instant::now();
+        assert!(!send_within(&mut Stalled, Message::Binary(vec![0; 16]), limit).await);
+        assert!(started.elapsed() >= limit);
+        let mut sent = Vec::new();
+        assert!(send_within(&mut sent, Message::Binary(vec![1]), limit).await);
+        assert_eq!(sent, vec![Message::Binary(vec![1])]);
     }
     use serde::Deserialize;
 
@@ -756,6 +956,32 @@ mod tests {
         details: String,
     }
 
+    #[test]
+    fn subscriptions_older_than_the_retained_history_must_resync() {
+        use crate::snapshot::{AppliedPatchSet, InstanceSnapshot, RojoTree};
+
+        let tree = RojoTree::new(InstanceSnapshot::new().name("ROOT").class_name("ROOT"));
+        let queue = MessageQueue::with_limits(1, usize::MAX);
+        let patch = || {
+            let mut patch = AppliedPatchSet::new();
+            patch.removed.push(Ref::new());
+            PublishedPatch::new(&tree, patch)
+        };
+        queue.push_messages(&[patch(), patch()]);
+
+        let close = subscribe_or_resync(&queue, 0).unwrap_err();
+        assert_eq!(close.code, CloseCode::Restart);
+        assert!(close.reason.contains("resync"));
+
+        let (cursor, messages) = subscribe_or_resync(&queue, 1)
+            .unwrap()
+            .try_recv()
+            .unwrap()
+            .unwrap();
+        assert_eq!(cursor, 2);
+        assert_eq!(messages.len(), 1);
+    }
+
     #[tokio::test]
     async fn read_request_body_returns_body_bytes() {
         let body = read_request_body(Body::from("hello")).await.unwrap();
@@ -769,6 +995,21 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn base64_errors_keep_the_transfer_encoding() {
+        let response = encode_base64(msgpack(
+            ErrorResponse::bad_request("Invalid base64 request body"),
+            StatusCode::BAD_REQUEST,
+        ))
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(response.headers()["x-rojo-content-transfer"], "base64");
+        let body = body::to_bytes(response.into_body()).await.unwrap();
+        let decoded = data_encoding::BASE64.decode(&body).unwrap();
+        let error: ApiError = deserialize_msgpack(&decoded).unwrap();
+        assert_eq!(error.kind, ApiErrorKind::BadRequest);
     }
 
     #[tokio::test]

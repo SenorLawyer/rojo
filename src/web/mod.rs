@@ -65,6 +65,12 @@ impl LiveServer {
                         if let Some(response) =
                             origin::check_request_origin(&req, allowed_hosts.as_ref())
                         {
+                            // Deliberately not base64 encoded even when asked:
+                            // the transfer header would identify a Rojo server
+                            // to the prober this generic 404 is hiding from.
+                            // The plugin treats an unencoded response that has
+                            // headers as a server without base64 support and
+                            // sends plain requests to that origin from then on.
                             return Ok::<_, Infallible>(response);
                         }
 

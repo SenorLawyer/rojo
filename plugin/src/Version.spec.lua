@@ -87,6 +87,28 @@ return function()
 			Version.retrieveLatestCompatible({ version = { 7, 7, 2, "-fork.1" }, includePrereleases = true })
 			expect(calls).to.equal(2)
 		end)
+
+		it("does not offer releases of a newer major version", function()
+			-- The fork publishes the 8.0 line from the same repository.
+			Http.get = function()
+				return Promise.resolve({
+					code = 200,
+					body = Http.jsonEncode({
+						{ tag_name = "v8.0.0-dev.6", prerelease = true, published_at = "2026-11-05T00:00:00Z" },
+						{ tag_name = "v8.0.0", prerelease = false, published_at = "2026-11-04T00:00:00Z" },
+						{ tag_name = "v7.7.2-fork.3", prerelease = false, published_at = "2026-11-03T00:00:00Z" },
+					}),
+				})
+			end
+			for _, includePrereleases in { false, true } do
+				Version._cachedLatestCompatible = nil
+				local latest = Version.retrieveLatestCompatible({
+					version = { 7, 7, 2, "-fork.2" },
+					includePrereleases = includePrereleases,
+				})
+				expect(Version.display(latest.version)).to.equal("7.7.2-fork.3")
+			end
+		end)
 	end)
 
 	it("should compare equal versions", function()

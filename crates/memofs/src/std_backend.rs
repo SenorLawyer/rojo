@@ -14,10 +14,15 @@ const DEBOUNCE_DELAY: Duration = Duration::from_millis(50);
 
 /// How long a removal notice waits for the debounced event of its path.
 ///
-/// notify restarts a path's debounce timer on every event for it, so this is
-/// generous. A rename can deliver its debounced event under a different path,
-/// which would otherwise leave the notice behind forever.
-const REMOVAL_NOTICE_LIFETIME: Duration = Duration::from_secs(2);
+/// notify restarts a path's debounce timer on every event for it, so during a
+/// long package reinstall that keeps touching a root's direct children the
+/// debounced event can arrive many seconds after its notice. Expiring the
+/// notice first would hide that the root was replaced, while a notice that
+/// outlives its event only turns a later write or creation of that path into
+/// a harmless removal and recreation, so this is generous. Notices still
+/// expire because a rename can deliver its debounced event under a different
+/// path, which would otherwise leave the notice behind forever.
+const REMOVAL_NOTICE_LIFETIME: Duration = Duration::from_secs(60);
 
 /// FSEvents watches paths, not inodes, so a macOS watch keeps reporting a path
 /// after it is deleted and recreated. Parent watches and dropping the watches
@@ -324,6 +329,28 @@ impl StdBackend {
         );
     }
 
+    /// Registers the parent watch on `path` again after promoting it to a
+    /// recursive watch failed.
+    fn restore_parent_watch(&mut self, path: &Path) {
+        if INOTIFY_WATCHES {
+            // The failed recursive watch added to the existing inotify watch
+            // on `path`, which therefore still exists.
+            return;
+        }
+        let Some(watcher) = self.watcher.as_mut() else {
+            return;
+        };
+        if let Err(err) = watcher.watch(path, RecursiveMode::NonRecursive) {
+            self.parent_watches.remove(path);
+            self.failed_creation_watches.insert(path.to_owned());
+            log::warn!(
+                "Could not watch {} again, so watch roots in it may not be resynced if they are deleted and recreated: {}",
+                path.display(),
+                notify_io_error(err)
+            );
+        }
+    }
+
     /// Registers an existing watch again after events may have been dropped.
     ///
     /// inotify watches inodes, so a root replaced while events were dropped
@@ -534,10 +561,12 @@ fn translate_event(
             removal_notices.insert(path, now);
             Vec::new()
         }
-        DebouncedEvent::Create(path) => {
-            removal_notices.remove(&path);
-            vec![VfsEvent::Create(path)]
+        // notify drops the events of a directory renamed aside within the
+        // debounce window, so its replacement can arrive as a plain creation.
+        DebouncedEvent::Create(path) if removal_notices.remove(&path).is_some() => {
+            vec![VfsEvent::Remove(path.clone()), VfsEvent::Create(path)]
         }
+        DebouncedEvent::Create(path) => vec![VfsEvent::Create(path)],
         DebouncedEvent::Write(path) => {
             if removal_notices.remove(&path).is_some() {
                 vec![VfsEvent::Remove(path.clone()), VfsEvent::Create(path)]
@@ -678,8 +707,11 @@ impl VfsBackend for StdBackend {
         }
         self.ensure_creation_watch(path);
         let watcher = self.watcher.as_mut().unwrap();
-        if self.parent_watches.remove(path) {
-            // The recursive watch below replaces it, so a failure is harmless.
+        let promoted = self.parent_watches.contains(path);
+        if promoted && !INOTIFY_WATCHES {
+            // notify's Windows backend would replace the registration without
+            // stopping it, leaving both running. inotify adds the recursive
+            // watch to the existing one instead, and unwatching would drop it.
             let _ = watcher.unwatch(path);
         }
         let mut retries = 0;
@@ -689,6 +721,13 @@ impl VfsBackend for StdBackend {
                 // Failed registrations of missing paths stay retryable after
                 // a transient deletion.
                 WatchFailure::Missing => {
+                    if promoted {
+                        // The parent watch died with the directory.
+                        self.parent_watches.remove(path);
+                        if INOTIFY_WATCHES {
+                            let _ = watcher.unwatch(path);
+                        }
+                    }
                     return Err(io::Error::new(io::ErrorKind::NotFound, err));
                 }
                 // inotify gives up on the whole tree when one directory in it
@@ -702,11 +741,17 @@ impl VfsBackend for StdBackend {
                     log::debug!("Retrying the watch of {}: {}", path.display(), err);
                 }
                 WatchFailure::Transient | WatchFailure::Unwatchable => {
+                    // The parent watch still reports lost roots in this
+                    // directory coming back, which nothing else would.
+                    if promoted {
+                        self.restore_parent_watch(path);
+                    }
                     self.degrade(path, &err);
                     return Ok(());
                 }
             }
         }
+        self.parent_watches.remove(path);
         self.watches.insert(path.to_path_buf());
         self.anchors.insert(path.to_path_buf());
         // Lost roots below this path are covered by its recursive watch now.
@@ -1637,6 +1682,46 @@ mod test {
     }
 
     #[test]
+    fn creations_merged_with_a_removal_are_reported_as_a_replacement() {
+        let mut notices = HashMap::new();
+        let now = Instant::now();
+        let path = PathBuf::from("Packages");
+        let mut translate = |event| translate_event(event, &mut notices, now);
+        // `mv Packages Packages.old; mkdir Packages` within one debounce
+        // window: notify drops the rename and reports only the creation.
+        assert!(translate(DebouncedEvent::NoticeRemove(path.clone())).is_empty());
+        assert!(matches!(
+            translate(DebouncedEvent::Create(path.clone())).as_slice(),
+            [VfsEvent::Remove(removed), VfsEvent::Create(created)]
+                if *removed == path && *created == path
+        ));
+        assert!(matches!(
+            translate(DebouncedEvent::Create(path.clone())).as_slice(),
+            [VfsEvent::Create(created)] if *created == path
+        ));
+        assert!(notices.is_empty());
+    }
+
+    #[test]
+    fn removal_notices_outlive_a_long_debounce() {
+        let mut notices = HashMap::new();
+        let start = Instant::now();
+        let path = PathBuf::from("Packages");
+        translate_event(
+            DebouncedEvent::NoticeRemove(path.clone()),
+            &mut notices,
+            start,
+        );
+        // A reinstall that keeps touching the path restarts its debounce
+        // timer, delaying the merged event well past the debounce delay.
+        let later = start + Duration::from_secs(30);
+        assert!(matches!(
+            translate_event(DebouncedEvent::Write(path.clone()), &mut notices, later).as_slice(),
+            [VfsEvent::Remove(_), VfsEvent::Create(_)]
+        ));
+    }
+
+    #[test]
     fn removal_notices_expire() {
         let mut notices = HashMap::new();
         let start = Instant::now();
@@ -1688,6 +1773,45 @@ mod test {
         backend.watch(&dir).unwrap();
         assert!(!backend.parent_watches.contains(&dir));
         assert!(backend.watches.contains(&dir));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_promotion_keeps_the_parent_watch() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut backend = StdBackend::new().unwrap();
+        let (_dir, dir) = tempdir();
+        let parent = dir.join("parent");
+        let root = parent.join("root");
+        let locked = parent.join("locked");
+        fs_err::create_dir_all(&root).unwrap();
+        fs_err::create_dir(&locked).unwrap();
+        backend.watch(&root).unwrap();
+        if PATH_BASED_WATCHES {
+            return;
+        }
+        assert!(backend.parent_watches.contains(&parent));
+
+        // inotify needs read access to every directory below the parent.
+        fs_err::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let denied = fs_err::read_dir(&locked).is_err();
+        let result = backend.watch(&parent);
+        fs_err::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        result.unwrap();
+        if !(INOTIFY_WATCHES && denied) {
+            return;
+        }
+        assert!(backend.degraded.contains(&parent));
+        assert!(!backend.watches.contains(&parent));
+        assert!(backend.parent_watches.contains(&parent));
+
+        // The parent watch still reports the root being replaced.
+        settle(&mut backend, Duration::from_millis(200));
+        fs_err::remove_dir(&root).unwrap();
+        wait_for_event(&mut backend, &root);
+        fs_err::create_dir(&root).unwrap();
+        wait_for_event(&mut backend, &root);
     }
 
     #[test]

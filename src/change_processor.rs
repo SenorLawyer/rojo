@@ -11,7 +11,7 @@ use std::{
 };
 
 use crate::{
-    message_queue::MessageQueue,
+    message_queue::{MessageQueue, MessageWeight},
     snapshot::{
         apply_patch_set, compute_patch_set, AppliedPatchSet, InstigatingSource, PatchSet, RojoTree,
     },
@@ -20,6 +20,71 @@ use crate::{
         snapshot_project_node, Middleware,
     },
 };
+
+/// An applied patch together with the subscription message describing it.
+///
+/// The message is built while the tree lock that applied the patch is still
+/// held, because later patches can remove or replace the instances it adds.
+#[derive(Debug, Clone)]
+pub struct PublishedPatch {
+    pub patch: AppliedPatchSet,
+    pub message: crate::web::interface::SubscribeMessage<'static>,
+    /// Estimated memory kept alive by this entry, used to bound the history
+    /// of the message queue.
+    weight: usize,
+}
+
+impl PublishedPatch {
+    pub(crate) fn new(tree: &RojoTree, patch: AppliedPatchSet) -> Self {
+        let message =
+            crate::web::interface::SubscribeMessage::from_patch_update(tree, patch.clone())
+                .into_owned();
+        let weight = message.approximate_size() + approximate_patch_size(&patch);
+        Self {
+            patch,
+            message,
+            weight,
+        }
+    }
+}
+
+impl MessageWeight for PublishedPatch {
+    fn weight(&self) -> usize {
+        self.weight
+    }
+}
+
+/// Estimates the memory an [`AppliedPatchSet`] keeps alive. Only the parts
+/// that can grow large, such as script sources, are measured precisely.
+fn approximate_patch_size(patch: &AppliedPatchSet) -> usize {
+    let ids = (patch.removed.len() + patch.added.len()) * std::mem::size_of::<Ref>();
+    let updates: usize = patch
+        .updated
+        .iter()
+        .map(|update| {
+            std::mem::size_of_val(update)
+                + update.changed_name.as_ref().map_or(0, String::len)
+                + update
+                    .changed_properties
+                    .values()
+                    .map(|value| {
+                        value
+                            .as_ref()
+                            .map_or(0, crate::web::interface::approximate_variant_size)
+                    })
+                    .sum::<usize>()
+        })
+        .sum();
+    std::mem::size_of_val(patch) + ids + updates
+}
+
+/// How long the filesystem must be quiet before paths that may have been
+/// snapshotted half-finished are reconciled again.
+const SETTLE_DELAY: Duration = Duration::from_millis(250);
+
+/// The longest that reconciling those paths again can be postponed by
+/// continuing filesystem activity.
+const MAX_SETTLE_DELAY: Duration = Duration::from_secs(2);
 
 /// Processes file change events, updates the DOM, and sends those updates
 /// through a channel for other stuff to consume.
@@ -54,7 +119,7 @@ impl ChangeProcessor {
     pub fn start(
         tree: Arc<Mutex<RojoTree>>,
         vfs: Arc<Vfs>,
-        message_queue: Arc<MessageQueue<AppliedPatchSet>>,
+        message_queue: Arc<MessageQueue<PublishedPatch>>,
         tree_mutation_receiver: Receiver<PatchSet>,
     ) -> Self {
         let (shutdown_sender, shutdown_receiver) = crossbeam_channel::bounded(1);
@@ -65,6 +130,9 @@ impl ChangeProcessor {
             .name("ChangeProcessor thread".to_owned())
             .spawn(move || {
                 log::trace!("ChangeProcessor thread started");
+                let mut unsettled_paths = std::collections::BTreeSet::new();
+                let mut unsettled_since = None;
+                let mut settle = crossbeam_channel::never();
 
                 loop {
                     let resync_timer = match task.pending_resync_deadline() {
@@ -73,9 +141,29 @@ impl ChangeProcessor {
                     };
                     select! {
                         recv(vfs_receiver) -> event => {
-                            task.handle_vfs_event(event?);
+                            let mut events = vec![event?];
+                            events.extend(vfs_receiver.try_iter().take(4095));
+                            unsettled_paths.extend(task.handle_vfs_events(events));
+                            if !unsettled_paths.is_empty() {
+                                // Wait for activity to settle, but not forever: steady
+                                // unrelated events would otherwise postpone recovery
+                                // indefinitely while `unsettled_paths` keeps growing.
+                                let now = Instant::now();
+                                let first = *unsettled_since.get_or_insert(now);
+                                let deadline = (now + SETTLE_DELAY).min(first + MAX_SETTLE_DELAY);
+                                settle = crossbeam_channel::at(deadline);
+                            }
+                        },
+                        recv(settle) -> _ => {
+                            // Directory extraction can finish between the final OS event
+                            // and our failed snapshot. Reconcile the settled paths once
+                            // more so a partial package does not require a manual edit.
+                            task.apply_patches(std::mem::take(&mut unsettled_paths).into_iter().collect());
+                            unsettled_since = None;
+                            settle = crossbeam_channel::never();
                         },
                         recv(resync_timer) -> _ => {
+                            // A failed resync schedules its own retry.
                             task.resync_tree();
                         },
                         recv(tree_mutation_receiver) -> patch_set => {
@@ -118,7 +206,7 @@ struct JobThreadContext {
 
     /// Whenever changes are applied to the DOM, we should push those changes
     /// into this message queue to inform any connected clients.
-    message_queue: Arc<MessageQueue<AppliedPatchSet>>,
+    message_queue: Arc<MessageQueue<PublishedPatch>>,
 
     /// When the whole tree was last resynced because of a rescan.
     last_resync: Cell<Option<Instant>>,
@@ -150,7 +238,7 @@ impl JobThreadContext {
     fn new(
         tree: Arc<Mutex<RojoTree>>,
         vfs: Arc<Vfs>,
-        message_queue: Arc<MessageQueue<AppliedPatchSet>>,
+        message_queue: Arc<MessageQueue<PublishedPatch>>,
     ) -> Self {
         Self {
             tree,
@@ -170,49 +258,93 @@ impl JobThreadContext {
         (RESYNC_INTERVAL * 2u32.pow(doublings)).min(MAX_RESYNC_RETRY_INTERVAL)
     }
 
-    /// Computes and applies patches to the DOM for a given file path.
+    /// Computes and applies patches to the DOM for a batch of file paths.
     ///
-    /// This function finds the nearest ancestor to the given path that has associated instances
-    /// in the tree.
-    /// It then computes and applies changes for each affected instance ID and
-    /// publishes them before releasing the tree.
-    fn apply_patches(&self, path: PathBuf) {
+    /// For each path, this finds the nearest ancestor that has associated
+    /// instances in the tree. Overlapping instances are coalesced so each DOM
+    /// subtree is reconciled once. It then computes and applies changes for
+    /// each remaining instance ID and publishes them before releasing the tree.
+    fn apply_patches(&self, paths: Vec<PathBuf>) {
         let mut tree = self.tree.lock().unwrap();
         let mut applied_patches = Vec::new();
 
-        // Find the nearest ancestor to this path that has
+        // Find the nearest ancestor to each path that has
         // associated instances in the tree. This helps make sure
         // that we handle additions correctly, especially if we
         // receive events for descendants of a large tree being
         // created all at once.
-        let mut current_path = path.as_path();
-        let affected_ids = loop {
-            let ids = tree.get_ids_at_path(current_path);
-
-            log::trace!("Path {} affects IDs {:?}", current_path.display(), ids);
-
-            if !ids.is_empty() {
-                break ids.to_vec();
-            }
-
-            log::trace!("Trying parent path...");
-            match current_path.parent() {
-                Some(parent) => current_path = parent,
-                None => break Vec::new(),
-            }
-        };
-
-        for id in affected_ids {
-            // Resyncing an earlier node can resync its parent instead, which
-            // may remove later nodes mapped to the same path.
-            if tree.get_instance(id).is_none() {
-                continue;
-            }
-            if let Ok(Some(patch)) = compute_and_apply_changes(&mut tree, &self.vfs, id) {
-                if !patch.is_empty() {
-                    applied_patches.push(patch);
+        let mut affected_ids = std::collections::HashSet::new();
+        for path in &paths {
+            for ancestor in path.ancestors() {
+                let ids = tree.get_ids_at_path(ancestor);
+                if !ids.is_empty() {
+                    affected_ids.extend(ids.iter().copied());
+                    break;
                 }
             }
+        }
+        // Coalesce DOM subtrees, not filesystem paths: two project nodes can
+        // map the same file independently, and both must be reconciled.
+        //
+        // When a root cannot be reconciled, for example because a sibling file
+        // in the same batch is half written, the tree keeps its old subtree.
+        // The affected instances below it are then reconciled on their own in
+        // the next round, so a valid change next to a broken file is not lost.
+        let mut pending = affected_ids;
+        while !pending.is_empty() {
+            let roots: Vec<_> = pending
+                .iter()
+                .copied()
+                .filter(|id| {
+                    let Some(instance) = tree.get_instance(*id) else {
+                        return true;
+                    };
+                    let mut parent = instance.parent();
+                    while let Some(instance) = tree.get_instance(parent) {
+                        if pending.contains(&parent) {
+                            return false;
+                        }
+                        parent = instance.parent();
+                    }
+                    true
+                })
+                .collect();
+
+            let mut reconciled = std::collections::HashSet::new();
+            for id in roots {
+                pending.remove(&id);
+                // Reconciling an earlier root can remove a later one, for
+                // example when a missing optional project path re-snapshots
+                // its parent.
+                if tree.get_instance(id).is_none() {
+                    continue;
+                }
+                if let Ok(patch) = compute_and_apply_changes(&mut tree, &self.vfs, id) {
+                    reconciled.insert(id);
+                    if let Some(patch) = patch.filter(|patch| !patch.is_empty()) {
+                        // Freeze additions before another filesystem event
+                        // can delete or replace them. Subscription history
+                        // must not read the future tree.
+                        applied_patches.push(PublishedPatch::new(&tree, patch));
+                    }
+                }
+            }
+
+            // Everything below a reconciled root was reconciled along with
+            // it. Instances it removed are gone from the tree.
+            pending.retain(|id| {
+                let Some(instance) = tree.get_instance(*id) else {
+                    return false;
+                };
+                let mut parent = instance.parent();
+                while let Some(instance) = tree.get_instance(parent) {
+                    if reconciled.contains(&parent) {
+                        return false;
+                    }
+                    parent = instance.parent();
+                }
+                true
+            });
         }
 
         // Initial reads take the tree lock before sampling the queue cursor.
@@ -226,15 +358,19 @@ impl JobThreadContext {
     /// Resyncs the whole tree after the watcher reported that it may have
     /// dropped events, unless it was resynced very recently. Then the resync
     /// is deferred, so a burst of rescans costs at most one more.
-    fn request_resync(&self) {
+    ///
+    /// Returns whether the tree was resynced now. It was not when the resync
+    /// was deferred or failed, and then a retry is scheduled.
+    fn request_resync(&self) -> bool {
         let recently_resynced = self
             .last_resync
             .get()
             .is_some_and(|last| last.elapsed() < self.resync_interval());
         if recently_resynced {
             self.resync_pending.set(true);
+            false
         } else {
-            self.resync_tree();
+            self.resync_tree()
         }
     }
 
@@ -255,7 +391,9 @@ impl JobThreadContext {
     ///
     /// A resync that fails is retried, since the events it was meant to make
     /// up for are gone, and nothing else would bring the tree up to date.
-    fn resync_tree(&self) {
+    ///
+    /// Returns whether the tree was resynced.
+    fn resync_tree(&self) -> bool {
         self.resync_pending.set(false);
         let failures = self.resync_failures.get();
         if failures == 0 {
@@ -272,57 +410,100 @@ impl JobThreadContext {
         let mut tree = self.tree.lock().unwrap();
         let root_id = tree.get_root_id();
         let result = compute_and_apply_changes(&mut tree, &self.vfs, root_id);
-        if let Ok(Some(patch)) = &result {
-            if !patch.is_empty() {
-                self.message_queue
-                    .push_messages(std::slice::from_ref(patch));
+        let resynced = match result {
+            Ok(patch) => {
+                if let Some(patch) = patch.filter(|patch| !patch.is_empty()) {
+                    // Publish under the tree lock, like `apply_patches`, so the
+                    // message is built from the tree this patch produced.
+                    let message = PublishedPatch::new(&tree, patch);
+                    self.message_queue.push_messages(&[message]);
+                }
+                true
             }
-        }
+            Err(StaleTree) => false,
+        };
         drop(tree);
         self.last_resync.set(Some(Instant::now()));
-        match result {
-            Ok(_) => {
-                if failures > 0 {
-                    log::info!("Resynced the whole project");
-                }
-                self.resync_failures.set(0);
+        if resynced {
+            if failures > 0 {
+                log::info!("Resynced the whole project");
             }
-            Err(StaleTree) => {
-                self.resync_failures.set(failures + 1);
-                self.resync_pending.set(true);
-                if failures == 0 {
-                    log::warn!(
-                        "Could not resync the whole project, so it may be out of date. Retrying until it succeeds."
-                    );
-                }
+            self.resync_failures.set(0);
+        } else {
+            self.resync_failures.set(failures + 1);
+            self.resync_pending.set(true);
+            if failures == 0 {
+                log::warn!(
+                    "Could not resync the whole project, so it may be out of date. Retrying until it succeeds."
+                );
             }
         }
+        resynced
     }
 
+    #[cfg(test)]
     fn handle_vfs_event(&self, event: VfsEvent) {
-        log::trace!("Vfs event: {:?}", event);
+        self.handle_vfs_events(vec![event]);
+    }
 
-        // Recovering every watch is deferred along with the resync.
-        if let VfsEvent::Rescan = event {
-            self.request_resync();
-            return;
-        }
+    /// Commits a batch of VFS events and reconciles every path they touch.
+    ///
+    /// Returns the canonical paths that may have been observed half-finished,
+    /// so the caller can reconcile them once more after the filesystem
+    /// settles.
+    fn handle_vfs_events(&self, events: Vec<VfsEvent>) -> Vec<PathBuf> {
+        let mut paths = Vec::new();
+        let mut settle_paths = Vec::new();
+        let mut rescan = false;
+        for event in events {
+            log::trace!("Vfs event: {:?}", event);
 
-        // Update the VFS immediately with the event.
-        if let Err(err) = self.vfs.commit_event(&event) {
-            log::error!("Error applying VFS change: {:?}", err);
-            return;
-        }
-
-        // For a given VFS event, we might have many changes to different parts
-        // of the tree. Calculate and apply all of these changes.
-        match canonicalize_event_path(&self.vfs, &event) {
-            Some(Ok(path)) => self.apply_patches(path),
-            Some(Err(err)) => {
-                log::error!("Error resolving filesystem event {:?}: {:?}", event, err);
+            // Recovering every watch is deferred along with the resync.
+            if let VfsEvent::Rescan = event {
+                rescan = true;
+                continue;
             }
-            None => log::warn!("Unhandled VFS event: {:?}", event),
+
+            // Update the VFS immediately with the event.
+            if let Err(err) = self.vfs.commit_event(&event) {
+                log::error!("Error applying VFS change: {:?}", err);
+                continue;
+            }
+
+            match canonicalize_event_path(&self.vfs, &event) {
+                Some(Ok(path)) => {
+                    // Only creations, removals and directory changes can be
+                    // observed half-finished, as when a package manager extracts
+                    // a folder. A later write to a file raises its own event, so
+                    // reconciling plain file writes again would be redundant.
+                    let may_be_partial = !matches!(event, VfsEvent::Write(_))
+                        || self
+                            .vfs
+                            .metadata(&path)
+                            .map(|metadata| metadata.is_dir())
+                            .unwrap_or(false);
+                    if may_be_partial {
+                        settle_paths.push(path.clone());
+                    }
+                    paths.push(path);
+                }
+                Some(Err(err)) => {
+                    log::error!("Error resolving filesystem event {:?}: {:?}", event, err);
+                }
+                None => log::warn!("Unhandled VFS event: {:?}", event),
+            }
         }
+        paths.sort();
+        paths.dedup();
+        // A whole-tree resync already covers every path in this batch, but a
+        // deferred one does not run until later, and a failed one kept the
+        // tree as it was, so those paths still need reconciling now.
+        if !(rescan && self.request_resync()) {
+            self.apply_patches(paths);
+        }
+        settle_paths.sort();
+        settle_paths.dedup();
+        settle_paths
     }
 
     fn handle_tree_event(&self, patch_set: PatchSet) {
@@ -442,7 +623,8 @@ impl JobThreadContext {
 
             let applied_patch = apply_patch_set(&mut tree, patch_set);
             if !applied_patch.is_empty() {
-                self.message_queue.push_messages(&[applied_patch]);
+                let message = PublishedPatch::new(&tree, applied_patch);
+                self.message_queue.push_messages(&[message]);
             }
         }
     }
@@ -646,6 +828,212 @@ mod test {
         )
     }
 
+    /// Steady filesystem activity must not postpone reconciling a folder that
+    /// was snapshotted while it was still being written.
+    #[test]
+    fn settle_pass_runs_despite_continuous_events() {
+        use memofs::{InMemoryFs, VfsSnapshot};
+
+        let mut fs = InMemoryFs::new();
+        fs.load_snapshot(
+            "/root",
+            VfsSnapshot::dir([("other.luau", VfsSnapshot::file("return 0"))]),
+        )
+        .unwrap();
+        let vfs = Vfs::new(fs.clone());
+        let snapshot = snapshot_from_vfs(&InstanceContext::default(), &vfs, Path::new("/root"))
+            .unwrap()
+            .unwrap();
+        let mut tree = RojoTree::new(InstanceSnapshot::new());
+        let patch = compute_patch_set(Some(snapshot), &tree, tree.get_root_id());
+        apply_patch_set(&mut tree, patch);
+        let tree = Arc::new(Mutex::new(tree));
+        let queue = Arc::new(MessageQueue::new());
+        let (_mutation_sender, mutation_receiver) = crossbeam_channel::unbounded();
+        let _processor = ChangeProcessor::start(
+            Arc::clone(&tree),
+            Arc::new(vfs),
+            Arc::clone(&queue),
+            mutation_receiver,
+        );
+
+        // The package folder is reported while only its first file exists.
+        fs.load_snapshot(
+            "/root/pkg",
+            VfsSnapshot::dir([("a.luau", VfsSnapshot::file("return 1"))]),
+        )
+        .unwrap();
+        fs.raise_event(VfsEvent::Create(PathBuf::from("/root/pkg")));
+        let started = Instant::now();
+        while queue.cursor() == 0 {
+            assert!(started.elapsed() < Duration::from_secs(5));
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        // The rest of the package lands without an event of its own.
+        fs.load_snapshot("/root/pkg/b.luau", VfsSnapshot::file("return 2"))
+            .unwrap();
+        let late = Path::new("/root/pkg/b.luau");
+        while tree.lock().unwrap().get_ids_at_path(late).is_empty() {
+            assert!(
+                started.elapsed() < MAX_SETTLE_DELAY + Duration::from_secs(3),
+                "continuous events postponed the settle pass"
+            );
+            fs.raise_event(VfsEvent::Write(PathBuf::from("/root/other.luau")));
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    #[test]
+    fn plain_file_writes_are_not_reconciled_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dunce::canonicalize(dir.path()).unwrap();
+        let file = root.join("file.luau");
+        fs::write(&file, "return 1").unwrap();
+        let task = context(&root);
+        fs::write(&file, "return 2").unwrap();
+        assert!(task
+            .handle_vfs_events(vec![VfsEvent::Write(file.clone())])
+            .is_empty());
+        assert_eq!(
+            task.handle_vfs_events(vec![VfsEvent::Write(root.clone())]),
+            vec![root]
+        );
+    }
+
+    #[test]
+    fn published_patch_weight_counts_script_sources() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dunce::canonicalize(dir.path()).unwrap();
+        let task = context(&root);
+        let source = "x".repeat(100_000);
+        fs::write(root.join("big.luau"), &source).unwrap();
+        task.handle_vfs_event(VfsEvent::Create(root.join("big.luau")));
+
+        let (_, messages) = task
+            .message_queue
+            .subscribe(0)
+            .unwrap()
+            .try_recv()
+            .unwrap()
+            .unwrap();
+        assert_eq!(messages.len(), 1);
+        // Both the message and the applied patch may hold a copy, so the
+        // estimate must cover at least one full source.
+        assert!(messages[0].weight() >= source.len());
+    }
+
+    #[test]
+    fn settled_package_paths_recover_children_missing_during_extraction() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dunce::canonicalize(dir.path()).unwrap();
+        let package = root.join("_Index");
+        fs::create_dir(&package).unwrap();
+        let task = context(&root);
+        fs::remove_dir(&package).unwrap();
+        let paths = task.handle_vfs_events(vec![VfsEvent::Remove(package.clone())]);
+        fs::create_dir(&package).unwrap();
+        let module = package.join("dependency.luau");
+        fs::write(&module, "return 'complete'").unwrap();
+        task.apply_patches(paths);
+        assert!(!task
+            .tree
+            .lock()
+            .unwrap()
+            .get_ids_at_path(&module)
+            .is_empty());
+    }
+
+    #[test]
+    fn batched_parent_and_child_events_update_independent_project_mappings() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dunce::canonicalize(dir.path()).unwrap();
+        let src = root.join("src");
+        fs::create_dir(&src).unwrap();
+        let shared = src.join("shared.luau");
+        fs::write(&shared, "return 'before'").unwrap();
+        let project = root.join("default.project.json");
+        fs::write(&project, r#"{"name":"overlap","tree":{"$className":"Folder","A":{"$path":"src"},"B":{"$path":"src/shared.luau"}}}"#).unwrap();
+        let task = context(&project);
+        fs::write(&shared, "return 'after'").unwrap();
+        task.handle_vfs_events(vec![VfsEvent::Write(src), VfsEvent::Write(shared.clone())]);
+        let tree = task.tree.lock().unwrap();
+        let ids = tree.get_ids_at_path(&shared);
+        assert_eq!(ids.len(), 2);
+        for id in ids {
+            assert_eq!(
+                tree.get_instance(*id).unwrap().properties()[&ustr("Source")],
+                Variant::String("return 'after'".into())
+            );
+        }
+    }
+
+    #[test]
+    fn package_event_batch_reconciles_the_parent_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dunce::canonicalize(dir.path()).unwrap();
+        let task = context(&root);
+        let package = root.join("package.luau");
+        fs::write(&package, "return 'installed'").unwrap();
+        task.handle_vfs_events(vec![
+            VfsEvent::Write(root),
+            VfsEvent::Create(package.clone()),
+            VfsEvent::Write(package.clone()),
+        ]);
+        assert_eq!(task.message_queue.cursor(), 1);
+        assert!(!task
+            .tree
+            .lock()
+            .unwrap()
+            .get_ids_at_path(&package)
+            .is_empty());
+    }
+
+    #[test]
+    fn queued_package_addition_keeps_its_contents_after_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dunce::canonicalize(dir.path()).unwrap();
+        let task = context(&root);
+        let package = root.join("package.luau");
+        fs::write(&package, "return 'original'").unwrap();
+        task.handle_vfs_event(VfsEvent::Write(root.clone()));
+        fs::remove_file(&package).unwrap();
+        task.handle_vfs_event(VfsEvent::Write(root.clone()));
+        fs::write(&package, "return 'replacement'").unwrap();
+        task.handle_vfs_event(VfsEvent::Write(root));
+
+        let (_, messages) = task
+            .message_queue
+            .subscribe(0)
+            .unwrap()
+            .try_recv()
+            .unwrap()
+            .unwrap();
+        assert_eq!(messages.len(), 3);
+        let original = messages[0]
+            .message
+            .added
+            .values()
+            .find(|instance| instance.name == "package")
+            .unwrap();
+        assert_eq!(
+            original.properties[&ustr("Source")].as_ref(),
+            &Variant::String("return 'original'".into())
+        );
+        assert!(messages[1].message.removed.contains(&original.id));
+        let replacement = messages[2]
+            .message
+            .added
+            .values()
+            .find(|instance| instance.name == "package")
+            .unwrap();
+        assert_ne!(original.id, replacement.id);
+        assert_eq!(
+            replacement.properties[&ustr("Source")].as_ref(),
+            &Variant::String("return 'replacement'".into())
+        );
+    }
+
     #[test]
     fn directory_write_reconciles_children_without_a_child_event() {
         let dir = tempfile::tempdir().unwrap();
@@ -655,6 +1043,33 @@ mod test {
         fs::write(&added, "return 'new'").unwrap();
         task.handle_vfs_event(VfsEvent::Write(root));
         assert!(!task.tree.lock().unwrap().get_ids_at_path(&added).is_empty());
+    }
+
+    #[test]
+    fn broken_sibling_in_a_batch_does_not_drop_a_valid_child_edit() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dunce::canonicalize(dir.path()).unwrap();
+        let child = root.join("a.luau");
+        fs::write(&child, "return 'before'").unwrap();
+        let task = context(&root);
+
+        fs::write(&child, "return 'after'").unwrap();
+        // A new, half-written sibling makes the parent fail to snapshot.
+        let broken = root.join("broken.model.json");
+        fs::write(&broken, "{").unwrap();
+        task.handle_vfs_events(vec![
+            VfsEvent::Write(child.clone()),
+            VfsEvent::Create(broken.clone()),
+        ]);
+
+        let tree = task.tree.lock().unwrap();
+        let ids = tree.get_ids_at_path(&child);
+        assert_eq!(ids.len(), 1);
+        assert_eq!(
+            tree.get_instance(ids[0]).unwrap().properties()[&ustr("Source")],
+            Variant::String("return 'after'".into())
+        );
+        assert!(tree.get_ids_at_path(&broken).is_empty());
     }
 
     #[test]
@@ -681,7 +1096,7 @@ mod test {
             .join("rojo-test/serve-tests/ref_properties_remove");
         let task = context(&fixture.join("default.project.json"));
         task.handle_vfs_event(VfsEvent::Write(fixture.join("src")));
-        let mut pending = task.message_queue.subscribe(0);
+        let mut pending = task.message_queue.subscribe(0).unwrap();
         assert_eq!(task.message_queue.cursor(), 0, "{:?}", pending.try_recv());
     }
 
@@ -901,6 +1316,47 @@ mod test {
         // The processor thread resyncs once the deadline passes.
         task.resync_tree();
         assert!(task.pending_resync_deadline().is_none());
+        assert!(!task.tree.lock().unwrap().get_ids_at_path(&added).is_empty());
+    }
+
+    #[test]
+    fn paths_batched_with_a_deferred_rescan_are_still_applied() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dunce::canonicalize(dir.path()).unwrap();
+        let task = context(&root);
+        task.handle_vfs_event(VfsEvent::Rescan);
+
+        // The deferred resync only runs later, so the other events in the
+        // batch must not wait for it.
+        let added = root.join("added.luau");
+        fs::write(&added, "return 1").unwrap();
+        task.handle_vfs_events(vec![VfsEvent::Rescan, VfsEvent::Create(added.clone())]);
+        assert!(task.pending_resync_deadline().is_some());
+        assert!(!task.tree.lock().unwrap().get_ids_at_path(&added).is_empty());
+    }
+
+    #[test]
+    fn paths_batched_with_a_failed_rescan_are_still_applied() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dunce::canonicalize(dir.path()).unwrap();
+        let packages = root.join("Packages");
+        let src = root.join("src");
+        fs::create_dir(&packages).unwrap();
+        fs::create_dir(&src).unwrap();
+        let project = write_project(
+            &root,
+            r#"{"$className":"Folder","Packages":{"$path":"Packages"},"src":{"$path":"src"}}"#,
+        );
+        let task = context(&project);
+
+        // The resync fails while the required folder is missing, which leaves
+        // the tree as it was, so the other events in the batch must still be
+        // applied.
+        fs::remove_dir_all(&packages).unwrap();
+        let added = src.join("added.luau");
+        fs::write(&added, "return 1").unwrap();
+        task.handle_vfs_events(vec![VfsEvent::Rescan, VfsEvent::Create(added.clone())]);
+        assert!(task.pending_resync_deadline().is_some());
         assert!(!task.tree.lock().unwrap().get_ids_at_path(&added).is_empty());
     }
 

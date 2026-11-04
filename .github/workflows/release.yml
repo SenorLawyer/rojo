@@ -10,30 +10,46 @@ permissions:
 # Build jobs run third-party build scripts, so they only get read access. A
 # single final job with write access publishes everything they produced.
 jobs:
-  build-plugin:
-    name: Build Roblox Studio Plugin
+  ci-gate:
+    name: Require passing CI
     runs-on: ubuntu-latest
     permissions:
+      actions: read
       contents: read
+    env:
+      # 7.7 releases are tagged on this branch rather than on master, which
+      # holds the 8.0 line. A tag workflow runs the workflow file of the
+      # tagged commit, so this copy is the one that 7.7 tags use.
+      RELEASE_BRANCH: release/7.7
     steps:
+      # Full history is needed to check ancestry against the release branch.
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
-          submodules: true
+          ref: ${{ env.RELEASE_BRANCH }}
+          fetch-depth: 0
           persist-credentials: false
 
-      - name: Setup Rokit
-        uses: CompeyDev/setup-rokit@d49be92bd9502180218c3f43e7988faa945217b0 # v0.1.2
-        with:
-          version: 'v1.1.0'
+      # Pull request CI runs test a merge ref but are recorded under the PR
+      # head SHA, so they do not prove this commit passed CI on its own.
+      # Releases must come from the release branch, and only push runs on it
+      # count.
+      - name: Require the tagged commit to be on the release branch
+        run: |
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" "origin/$RELEASE_BRANCH"; then
+            echo "::error::$GITHUB_SHA is not on $RELEASE_BRANCH. Tag a commit that has been merged to $RELEASE_BRANCH."
+            exit 1
+          fi
 
-      - name: Build Plugin
-        run: rojo build plugin.project.json --output Rojo.rbxm
-
-      - name: Upload Plugin to Artifacts
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: Rojo.rbxm
-          path: Rojo.rbxm
+      - name: Check CI for the tagged commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          passed=$(gh run list --commit "$GITHUB_SHA" --workflow ci.yml --event push --branch "$RELEASE_BRANCH" --status success --json databaseId --jq 'length')
+          if [ "$passed" -eq 0 ]; then
+            echo "::error::The CI workflow has not succeeded on a push to $RELEASE_BRANCH for $GITHUB_SHA. Wait for it to pass on this commit, then re-run this workflow."
+            exit 1
+          fi
 
   build:
     strategy:
@@ -45,6 +61,9 @@ jobs:
             os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             label: linux-x86_64
+            # The released plugin is built by this release's own CLI, not the
+            # upstream Rojo pinned in rokit.toml.
+            plugin: true
 
           - host: linux
             os: ubuntu-22.04-arm
@@ -81,7 +100,8 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
-          toolchain: stable
+          # Keep in sync with ci.yml.
+          toolchain: 1.99.1
           targets: ${{ matrix.target }}
 
       # Published binaries are built from scratch. A restored cache could
@@ -118,9 +138,20 @@ jobs:
           path: ${{ env.ARTIFACT_NAME }}
           name: ${{ env.ARTIFACT_NAME }}
 
+      - name: Build Plugin
+        if: matrix.plugin
+        run: target/${{ matrix.target }}/release/$BIN build plugin.project.json --output Rojo.rbxm
+
+      - name: Upload Plugin to Artifacts
+        if: matrix.plugin
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: Rojo.rbxm
+          path: Rojo.rbxm
+
   release:
     name: Create Release
-    needs: [build-plugin, build]
+    needs: [ci-gate, build]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -138,4 +169,6 @@ jobs:
           RELEASE_TAG: ${{ github.ref_name }}
         run: |
           ls -l dist
-          gh release create "$RELEASE_TAG" --draft --verify-tag --title "$RELEASE_TAG" dist/*
+          (cd dist && sha256sum -- *) > SHA256SUMS
+          cat SHA256SUMS
+          gh release create "$RELEASE_TAG" --draft --verify-tag --title "$RELEASE_TAG" dist/* SHA256SUMS
