@@ -104,16 +104,129 @@ Only one `sync` can run for a config at a time. While it runs, `sync` holds `ass
 `assets.lock.json` maps each file's path to the BLAKE3 hash of its contents, its asset id, asset type, creator, moderation state and upload time.
 
 - A file is uploaded when no entry has the same contents, asset type and creator. Renaming, moving or copying a file reuses its id without uploading.
-- Changing the creator uploads every file again under the new creator.
+- Changing the creator uploads every file again under the new creator. Each old id that a new upload replaces is recorded under `replaced`, keyed by the old id, with the new id, the path, asset type, both creators and the time. See [Moving to a group](#moving-to-a-group).
 - A file that is gone is dropped from the lockfile and the module, and reported. The asset is never deleted on Roblox, since the Assets API cannot delete assets and published places may still use it.
 - The lockfile is rewritten after every successful upload, through a temporary file and a rename. If a sync is interrupted or an upload fails, what was uploaded so far is kept and the next sync continues from there. The module is only written once every upload has succeeded.
 - As soon as Roblox accepts a file, the lockfile records the upload's operation under `pending`, keyed by the asset type, creator and hash of the contents that were sent, together with the path they were sent from. If checking on it then fails (a network outage, a key without `asset:read`, or processing taking longer than five minutes), the next sync checks on that operation again instead of sending the file a second time, and prints `resume` for it. The pending upload is found by contents, so it is resumed for whichever file has those contents now, even if the file was renamed and new contents were written under the old name. A pending upload whose contents no file has any more is dropped from the lockfile after the next successful sync with the same creator; any asset Roblox made for it stays unused. Pending uploads for another creator are kept until a sync with that creator.
 - If a pending upload keeps failing, for example because Roblox no longer knows the operation, check the creator's assets on Roblox, then delete its entry under `pending` in the lockfile (the error names the entry, and its `path` names the file) to upload it again.
 - A file can only be uploaded twice if the sync stops after sending it and before Roblox's reply is recorded, such as a dropped connection during the upload request. The error says when that may have happened.
 - Contents that Roblox rejected in moderation are recorded under `rejected`, keyed by their hash, with the path, asset id, asset type, creator and time. See below.
-- The lockfile has a `version`. A Rojo that finds a version it does not know refuses the lockfile instead of rewriting it, so an older Rojo never drops what a newer one recorded.
+- The lockfile has a `version`. A Rojo that finds a version it does not know refuses the lockfile instead of rewriting it, so an older Rojo never drops what a newer one recorded. A lockfile with `replaced` entries has version 2, which Rojo 8.0.0 refuses, since it would drop them; every other lockfile keeps version 1.
 
 If two branches both add assets, keep both sides' entries when resolving the conflict and run `rojo assets status` to check.
+
+## Moving to a group
+
+Asset ids belong to their creator, so moving a game from your account to a group means uploading every asset again under the group and replacing every use of an old id. `sync` does the uploads and remembers which old id became which new one; `rojo assets remap` finds and rewrites the old ids.
+
+1. Change the creator in `assets.toml`:
+
+   ```toml
+   [creator]
+   group_id = 987654
+   ```
+
+2. Create an API key that belongs to the group, with the `asset:read` and `asset:write` scopes, and put it in `ROBLOX_API_KEY`.
+3. Run `rojo assets sync`. It uploads every file again under the group and rewrites the module, so code that uses the module needs no change. Each old id is recorded under `replaced` in the lockfile, found by path and by contents, so a file moved during the switch keeps its mapping. An interrupted sync keeps what it recorded, and the next sync continues. `rojo assets status` says how many ids were replaced.
+4. Run `rojo assets remap` to list the files that still use an old id, then `rojo assets remap --write` to rewrite them:
+
+   ```
+     src/shared/Shop.luau:12  1111111111 -> 4444444444
+     src/client/Hud.model.json:30  2222222222 -> 5555555555
+   Scanned 214 file(s) for 312 replaced id(s): 2 reference(s) in 2 file(s).
+   Nothing was written; run again with --write to rewrite them.
+   ```
+
+5. Place content outside your files, such as a `Decal.Texture` or `Sound.SoundId` set in Studio, still has the old ids. Write the mapping with `rojo assets remap --map-out asset-ids.json` and run the script below in Studio, for example through the command bar or a Studio MCP tool, then save the place.
+
+Commit the lockfile with its `replaced` section, so teammates can run `remap` on their branches too. If you switch creators again, the earlier records point to the newest ids. Delete the `replaced` section once nothing uses the old ids.
+
+`remap` reads `rbxassetid://<id>`, Roblox asset URLs such as `https://www.roblox.com/asset/?id=<id>` and `https://assetdelivery.roblox.com/v1/asset/?id=<id>`, and `rbxthumb://...&id=<id>`. A number only matches as a whole, so the id `123456789` is never found inside `1234567890`. Options:
+
+- `[paths]...`: files or folders to read. Defaults to the folder holding `assets.toml`. Folders are walked for `.lua`, `.luau`, `.json`, `.toml`, `.csv`, `.tsv`, `.txt`, `.md`, `.yaml`, `.yml`, `.xml`, `.rbxmx`, `.rbxlx` and `.html` files, skipping hidden folders such as `.git`, `node_modules`, `Packages`, `ServerPackages`, `DevPackages` and `target`. Files given by name are read whatever their extension, and folders given by name are walked even if they would be skipped. Every `*.lock.json`, the config, the generated module and the `--map-out` file are always skipped.
+- `--write`: rewrite the references. Files are rewritten through a temporary file and a rename, and everything except the ids stays byte for byte, including line endings. Without it, nothing is written.
+- `--bare`: also match numbers on their own equal to an old id, as in `local COIN = 1111111111`, but not parts of words, decimals or versions. Any number can happen to equal an id, so check the list before adding `--write`. Without it, `remap` says how many such numbers it left alone.
+- `--map-out <file>`: write every old id and its newest id as JSON, such as `{ "1111111111": 4444444444 }`. Written with or without `--write`.
+- `--json`: print a report with each reference's `path`, `line`, `kind` (`assetId`, `url` or `bare`), `oldId` and `newId`, and the counts.
+- `--config <path>`: use another config file.
+
+`remap` exits with 0 whether or not it finds references, and with an error only when it cannot read the config, the lockfile or a file, or cannot write one.
+
+Only assets uploaded with `rojo assets sync` are tracked. Assets uploaded in Studio, through the Toolbox or by another tool are not in the lockfile, so they cannot be moved or remapped this way: add their files to the asset folder and sync them, then replace their ids by hand. Packages, the Toolbox and other places are not read either.
+
+This script rewrites asset properties in the open place. Paste the `--map-out` file between the brackets:
+
+```lua
+local ChangeHistoryService = game:GetService("ChangeHistoryService")
+local HttpService = game:GetService("HttpService")
+
+local map = HttpService:JSONDecode([[
+{ "1111111111": 4444444444 }
+]])
+
+-- Properties that hold asset ids. Add any others the place uses.
+local PROPERTIES = {
+	"Texture", "Image", "HoverImage", "PressedImage", "SoundId", "MeshId", "TextureID",
+	"TextureId", "AnimationId", "ShirtTemplate", "PantsTemplate", "Graphic", "Video",
+	"SkyboxBk", "SkyboxDn", "SkyboxFt", "SkyboxLf", "SkyboxRt", "SkyboxUp",
+	"SunTextureId", "MoonTextureId", "TopImage", "MidImage", "BottomImage",
+	"BaseTextureId", "OverlayTextureId",
+	"TextureContent", "ImageContent", "AudioContent", "MeshContent", "VideoContent",
+}
+
+local function swap(prefix: string, id: string): string
+	local new = map[id]
+	-- %.0f, since tostring could print a large id in exponent form.
+	return prefix .. (if new then string.format("%.0f", new) else id)
+end
+
+local function remapUri(uri: string): string
+	local result = uri:gsub("([rR][bB][xX][aA][sS][sS][eE][tT][iI][dD]://)(%d+)", swap)
+	result = result:gsub("([?&][iI][dD]=)(%d+)", swap)
+	return result
+end
+
+-- The new value for a property, or nil to leave it alone.
+local function remapValue(value: any): any
+	if typeof(value) == "string" then
+		local new = remapUri(value)
+		return if new ~= value then new else nil
+	elseif typeof(value) == "Content" then
+		if value.SourceType == Enum.ContentSourceType.Uri and value.Uri then
+			local new = remapUri(value.Uri)
+			return if new ~= value.Uri then Content.fromUri(new) else nil
+		end
+	elseif typeof(value) == "number" then
+		-- CharacterMesh ids are numbers.
+		return map[string.format("%.0f", value)]
+	end
+	return nil
+end
+
+local recording = ChangeHistoryService:TryBeginRecording("Remap asset ids")
+local changed = 0
+for _, instance in game:GetDescendants() do
+	for _, property in PROPERTIES do
+		-- Most classes lack most of these properties, and some cannot be set
+		-- from scripts, so both the read and the write may fail.
+		local ok, value = pcall(function()
+			return (instance :: any)[property]
+		end)
+		local new = if ok then remapValue(value) else nil
+		if new ~= nil and pcall(function()
+			(instance :: any)[property] = new
+		end) then
+			changed += 1
+		end
+	end
+end
+if recording then
+	ChangeHistoryService:FinishRecording(recording, Enum.FinishRecordingOperation.Commit)
+end
+print(`Remapped {changed} asset propert{if changed == 1 then "y" else "ies"}`)
+```
+
+Setting a legacy property such as `Decal.Texture` also updates its `Content` property, as described in [Asset properties and Content](content-properties.md). Properties that scripts cannot set, such as `SurfaceAppearance.ColorMap`, are skipped; change those by hand.
 
 ## Supported files
 

@@ -32,9 +32,16 @@
 //!   succeeded.
 //! - A run that has nothing to upload never reads the API key, so it works
 //!   on machines and CI jobs without one.
+//! - Ids are never reused across creators, so changing the creator (such as
+//!   moving a game to a group) uploads everything again. Each old id is
+//!   recorded under `replaced` with its new id, since the path-keyed entries
+//!   are overwritten, and `remap` uses those records to rewrite old ids in
+//!   the project's text files. Only creator changes are recorded: a changed
+//!   file for the same creator is a different asset, and code using its old
+//!   id may mean the old contents.
 
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fmt::Write as _,
     fs,
     io::{self, Write},
@@ -59,6 +66,13 @@ const DEFAULT_CONFIG: &str = "assets.toml";
 /// with any other version instead of rewriting them, so bump this when adding
 /// a field that an older build must not silently drop.
 const LOCK_VERSION: u32 = 1;
+
+/// The version of lockfiles that record `replaced` ids. Rojo 8.0.0 reads
+/// version 1 and ignores fields it does not know, so it would drop the
+/// section on its next write, losing the only record of the old ids. Only
+/// lockfiles with replacements get this version, so that every other
+/// lockfile stays readable by 8.0.0.
+const LOCK_VERSION_REPLACED: u32 = 2;
 
 /// Open Cloud's per-request limit for asset files.
 const MAX_FILE_BYTES: u64 = 20 * 1024 * 1024;
@@ -106,6 +120,29 @@ enum AssetsSubcommand {
         #[clap(long, default_value = DEFAULT_CONFIG)]
         config: PathBuf,
     },
+    /// Find references to asset ids that sync replaced when the creator
+    /// changed, and rewrite them to the new ids with --write.
+    Remap {
+        /// Path to the assets config.
+        #[clap(long, default_value = DEFAULT_CONFIG)]
+        config: PathBuf,
+        /// Files or folders to scan. Defaults to the folder holding the config.
+        paths: Vec<PathBuf>,
+        /// Rewrite the references. Without it, only list them.
+        #[clap(long)]
+        write: bool,
+        /// Also match bare numbers equal to an old id, such as `id = 123`.
+        /// Any number can happen to equal an id, so check the list first.
+        #[clap(long)]
+        bare: bool,
+        /// Write every old id and its new id to this JSON file, for updating
+        /// place content in Studio.
+        #[clap(long, value_name = "FILE")]
+        map_out: Option<PathBuf>,
+        /// Print a JSON report.
+        #[clap(long)]
+        json: bool,
+    },
 }
 
 impl AssetsCommand {
@@ -133,6 +170,35 @@ impl AssetsCommand {
             AssetsSubcommand::Status { config } => {
                 let config = resolve_path(&config)?;
                 status(&config, &mut out)?;
+            }
+            AssetsSubcommand::Remap {
+                config,
+                paths,
+                write,
+                bare,
+                map_out,
+                json,
+            } => {
+                let config = resolve_path(&config)?;
+                let options = RemapOptions {
+                    paths: paths
+                        .iter()
+                        .map(|path| resolve_path(path).map(|path| normalize(&path)))
+                        .collect::<anyhow::Result<_>>()?,
+                    write,
+                    bare,
+                    map_out: map_out
+                        .as_deref()
+                        .map(|path| resolve_path(path).map(|path| normalize(&path)))
+                        .transpose()?,
+                };
+                let report = remap(&config, &options)?;
+                if json {
+                    serde_json::to_writer_pretty(&mut out, &report)?;
+                    writeln!(out)?;
+                } else {
+                    describe_remap(&report, &mut out)?;
+                }
             }
         }
         Ok(())
@@ -299,6 +365,31 @@ struct LockFile {
     /// each upload creates another rejected asset on the creator's account.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     rejected: BTreeMap<String, RejectedUpload>,
+    /// Asset ids that a sync replaced with a new upload because the config's
+    /// creator changed, keyed by the old id. Lock entries are keyed by path
+    /// and overwritten, so without this the old ids would be lost, and with
+    /// them any way to find the code and place content still using them.
+    /// Left out when empty, so lockfiles without any stay as they were.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    replaced: BTreeMap<String, ReplacedAsset>,
+}
+
+/// An asset id replaced by an upload for another creator.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ReplacedAsset {
+    /// The latest id. When the creator changes again, earlier records are
+    /// pointed at the newest id, so an old id resolves in one step.
+    new_asset_id: u64,
+    /// The path the replacement was uploaded from.
+    path: String,
+    asset_type: String,
+    /// The creator the old id belongs to.
+    from_creator: String,
+    /// The creator `new_asset_id` belongs to.
+    to_creator: String,
+    /// RFC 3339 time the old id was replaced.
+    replaced: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -374,17 +465,18 @@ fn load_lock(path: &Path) -> anyhow::Result<LockFile> {
             path.display()
         )
     })?;
-    if lock.version > LOCK_VERSION {
+    if lock.version > LOCK_VERSION_REPLACED {
         bail!(
-            "{} has version {}, which a newer Rojo wrote; this Rojo only reads version \
-             {LOCK_VERSION}. Upgrade Rojo to sync with it.",
+            "{} has version {}, which a newer Rojo wrote; this Rojo only reads versions \
+             {LOCK_VERSION} to {LOCK_VERSION_REPLACED}. Upgrade Rojo to sync with it.",
             path.display(),
             lock.version
         );
     }
-    if lock.version != LOCK_VERSION {
+    if lock.version < LOCK_VERSION {
         bail!(
-            "{} has version {}, but this Rojo only reads version {LOCK_VERSION}",
+            "{} has version {}, but this Rojo only reads versions {LOCK_VERSION} to \
+             {LOCK_VERSION_REPLACED}",
             path.display(),
             lock.version
         );
@@ -415,19 +507,39 @@ fn rekey_pending(mut lock: LockFile) -> LockFile {
 }
 
 fn render_lock(lock: &LockFile) -> String {
-    let mut text = serde_json::to_string_pretty(lock).expect("lockfiles always serialize");
+    let version = if lock.replaced.is_empty() {
+        LOCK_VERSION
+    } else {
+        LOCK_VERSION_REPLACED
+    };
+    let mut text = if lock.version == version {
+        serde_json::to_string_pretty(lock)
+    } else {
+        serde_json::to_string_pretty(&LockFile {
+            version,
+            ..lock.clone()
+        })
+    }
+    .expect("lockfiles always serialize");
     text.push('\n');
     text
 }
 
 /// Writes the file through a temporary file in the same folder and a rename,
 /// so a crash leaves either the old or the new contents.
-fn write_atomic(path: &Path, contents: &str) -> anyhow::Result<()> {
+fn write_atomic(path: &Path, contents: impl AsRef<[u8]>) -> anyhow::Result<()> {
     let dir = path.parent().unwrap_or(Path::new("."));
     fs::create_dir_all(dir).with_context(|| format!("Cannot create {}", dir.display()))?;
     let mut file = tempfile::NamedTempFile::new_in(dir)
         .with_context(|| format!("Cannot create a temporary file in {}", dir.display()))?;
-    file.write_all(contents.as_bytes())?;
+    file.write_all(contents.as_ref())?;
+    // The temporary file is only readable by its owner, so a file that is
+    // rewritten in place, such as a script `rojo assets remap` updates,
+    // would otherwise lose its mode.
+    #[cfg(unix)]
+    if let Ok(metadata) = fs::metadata(path) {
+        let _ = file.as_file().set_permissions(metadata.permissions());
+    }
     file.as_file().sync_all()?;
     file.persist(path)
         .map_err(|error| error.error)
@@ -1222,6 +1334,14 @@ fn status(config_path: &Path, out: &mut dyn Write) -> anyhow::Result<()> {
         }
         _ => writeln!(out, "Run `rojo assets sync` to update {output}.")?,
     }
+    if !lock.replaced.is_empty() {
+        writeln!(
+            out,
+            "{} asset id(s) were replaced when the creator changed. Run `rojo assets remap` to \
+             list code still using the old ids, then `rojo assets remap --write` to update it.",
+            lock.replaced.len()
+        )?;
+    }
     Ok(())
 }
 
@@ -1362,15 +1482,26 @@ fn sync(
 
     let mut report = SyncReport::default();
     let mut lock = old_lock.clone();
+    let current_hashes: HashSet<&str> = scan
+        .sources
+        .iter()
+        .map(|source| source.hash.as_str())
+        .collect();
+    let record = |lock: &mut LockFile, source: &Source, entry: &LockEntry| {
+        record_replacements(lock, &old_lock, &current_hashes, source, entry)
+    };
     // Recording reused ids first keeps them when an upload below replaces the
     // entry they were copied from and the run is then interrupted.
     for (source, action) in &plan.items {
         if let Action::Reuse { entry, .. } = action {
+            // A sync for a new creator that was interrupted reuses the new
+            // creator's id on its next run, so this is a replacement too.
+            record(&mut lock, source, entry);
             lock.assets.insert(source.rel.clone(), entry.clone());
         }
     }
     if lock != old_lock {
-        write_atomic(&config.lock, &render_lock(&lock))?;
+        write_atomic(&config.lock, render_lock(&lock))?;
     }
 
     if total > 0 {
@@ -1432,14 +1563,18 @@ fn sync(
             report.uploaded.push((source.rel.clone(), entry.asset_id));
             // Contents retried with --retry-rejected that passed this time.
             lock.rejected.remove(&source.hash);
+            // Recorded in the same write as the entry that overwrites the
+            // old id, so an interrupted run never loses the old id.
+            record(&mut lock, source, &entry);
             lock.assets.insert(source.rel.clone(), entry);
-            write_atomic(&config.lock, &render_lock(&lock))?;
+            write_atomic(&config.lock, render_lock(&lock))?;
         }
     }
 
     for (source, action) in &plan.items {
         if let Action::SameAs { from } = action {
             let entry = lock.assets[from].clone();
+            record(&mut lock, source, &entry);
             lock.assets.insert(source.rel.clone(), entry);
         }
     }
@@ -1450,6 +1585,11 @@ fn sync(
         lock.pending.remove(key);
     }
     write_if_changed(&config.lock, &render_lock(&lock))?;
+    let newly_replaced = lock
+        .replaced
+        .keys()
+        .filter(|old| !old_lock.replaced.contains_key(*old))
+        .count();
 
     let module = module_for(&scan.sources, &lock).expect("every file has a lockfile entry");
     report.module_written = write_if_changed(&config.output, &module)?;
@@ -1464,7 +1604,82 @@ fn sync(
             "is up to date"
         }
     )?;
+    if newly_replaced > 0 {
+        writeln!(
+            out,
+            "{newly_replaced} asset id(s) of the previous creator were replaced and recorded in \
+             {}. Run `rojo assets remap` to find code still using the old ids.",
+            display_path(&config, &config.lock)
+        )?;
+    }
     Ok(report)
+}
+
+/// Records which old ids `entry`, the new lockfile entry for `source`,
+/// replaces because the creator changed: the previous entry at the same path,
+/// and any previous entry with the same contents. Entries of the same creator
+/// are never recorded, since a changed file for the same creator is a new
+/// asset, not a move, and code using its old id may mean the old contents.
+fn record_replacements(
+    lock: &mut LockFile,
+    old_lock: &LockFile,
+    current_hashes: &HashSet<&str>,
+    source: &Source,
+    entry: &LockEntry,
+) {
+    let old_ids: BTreeSet<u64> = old_lock
+        .assets
+        .iter()
+        .filter(|(rel, old)| {
+            old.creator != entry.creator
+                && old.asset_type == entry.asset_type
+                && old.asset_id != entry.asset_id
+                && (old.hash == source.hash
+                    // When the old contents still exist at another path,
+                    // their id moves with them rather than to whatever
+                    // now sits at this path.
+                    || (**rel == source.rel && !current_hashes.contains(old.hash.as_str())))
+        })
+        .map(|(_, old)| old.asset_id)
+        .collect();
+    for old_id in old_ids {
+        let key = old_id.to_string();
+        if lock
+            .replaced
+            .get(&key)
+            .is_some_and(|replaced| replaced.new_asset_id == entry.asset_id)
+        {
+            continue;
+        }
+        let from_creator = old_lock
+            .assets
+            .values()
+            .find(|old| old.asset_id == old_id)
+            .map(|old| old.creator.clone())
+            .unwrap_or_default();
+        // Ids that earlier creator changes replaced with `old_id` now resolve
+        // straight to the newest id.
+        for replaced in lock.replaced.values_mut() {
+            if replaced.new_asset_id == old_id {
+                replaced.new_asset_id = entry.asset_id;
+                replaced.to_creator = entry.creator.clone();
+            }
+        }
+        lock.replaced.insert(
+            key,
+            ReplacedAsset {
+                new_asset_id: entry.asset_id,
+                path: source.rel.clone(),
+                asset_type: entry.asset_type.clone(),
+                from_creator,
+                to_creator: entry.creator.clone(),
+                replaced: humantime::format_rfc3339_seconds(SystemTime::now()).to_string(),
+            },
+        );
+        // Switching back to an earlier creator can make an old id current
+        // again; it must not be remapped, or it would point at itself.
+        lock.replaced.remove(&entry.asset_id.to_string());
+    }
 }
 
 /// Uploads one file, or finishes the earlier upload `resume` names, and
@@ -1508,7 +1723,7 @@ fn upload(
                     started: humantime::format_rfc3339_seconds(SystemTime::now()).to_string(),
                 },
             );
-            write_atomic(&config.lock, &render_lock(lock)).with_context(|| {
+            write_atomic(&config.lock, render_lock(lock)).with_context(|| {
                 format!(
                     "Roblox accepted the upload of {} as {operation}, but it could not be \
                      recorded; check the creator's assets before running sync again, since a \
@@ -1528,7 +1743,7 @@ fn upload(
         // run should send the file again.
         Err(error @ OpenCloudError::Failed(_)) => {
             lock.pending.remove(&key);
-            write_atomic(&config.lock, &render_lock(lock))?;
+            write_atomic(&config.lock, render_lock(lock))?;
             bail!("Could not upload {}: {error}.", source.rel);
         }
         Err(error) => bail!(
@@ -1553,7 +1768,7 @@ fn upload(
                 rejected: humantime::format_rfc3339_seconds(SystemTime::now()).to_string(),
             },
         );
-        write_atomic(&config.lock, &render_lock(lock))?;
+        write_atomic(&config.lock, render_lock(lock))?;
         bail!(
             "Roblox rejected {} in moderation (asset {}). The rejection is recorded in {}, so \
              later syncs do not upload these contents again; replace the file and sync again, \
@@ -1638,6 +1853,442 @@ fn start_upload(
             };
             anyhow::anyhow!("Could not upload {}: {error}.{hint}", source.rel)
         })
+}
+
+/// File extensions `remap` reads when it walks a folder: the text formats
+/// that hold asset ids in Rojo projects, including XML models and places.
+/// Files named on the command line are read whatever their extension.
+const REMAP_EXTENSIONS: &[&str] = &[
+    "lua", "luau", "json", "toml", "csv", "tsv", "txt", "md", "yaml", "yml", "xml", "rbxmx",
+    "rbxlx", "html",
+];
+
+/// Folders `remap` does not walk into: installed packages belong to other
+/// projects and are replaced on the next install, and `target` is build
+/// output. Hidden folders such as `.git` are skipped too.
+const REMAP_SKIPPED_DIRS: &[&str] = &[
+    "node_modules",
+    "Packages",
+    "ServerPackages",
+    "DevPackages",
+    "target",
+];
+
+/// How far back from `id=` a URL is looked for, so that a long line without
+/// spaces cannot make every match scan the whole file.
+const MAX_URL_BYTES: usize = 2048;
+
+#[derive(Debug, Default)]
+struct RemapOptions {
+    /// Absolute, normalized files or folders. Empty for the config's folder.
+    paths: Vec<PathBuf>,
+    write: bool,
+    bare: bool,
+    /// Absolute, normalized.
+    map_out: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+enum ReferenceKind {
+    /// `rbxassetid://<id>`.
+    AssetId,
+    /// A Roblox asset URL such as `https://www.roblox.com/asset/?id=<id>`,
+    /// or an `rbxthumb://` URI.
+    Url,
+    /// A number on its own, only matched with `--bare`.
+    Bare,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Reference {
+    path: String,
+    line: usize,
+    kind: ReferenceKind,
+    old_id: u64,
+    new_id: u64,
+}
+
+/// What a remap found and did. Also the `--json` output.
+#[derive(Debug, Default, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RemapReport {
+    write: bool,
+    lockfile: String,
+    /// Old ids recorded in the lockfile.
+    replacements: usize,
+    files_scanned: usize,
+    references: Vec<Reference>,
+    files_with_references: usize,
+    references_rewritten: usize,
+    files_rewritten: usize,
+    /// Bare numbers equal to an old id, left alone because `--bare` was not
+    /// given.
+    bare_skipped: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    map_out: Option<String>,
+}
+
+/// Each old id under `replaced` with the newest id it leads to. Records are
+/// pointed at the newest id when they are written, but following the chain
+/// here also covers a lockfile merged from branches that both moved assets.
+fn resolve_replacements(lock: &LockFile, lock_path: &Path) -> anyhow::Result<BTreeMap<u64, u64>> {
+    let mut map = BTreeMap::new();
+    for (old, replaced) in &lock.replaced {
+        let old_id: u64 = old.parse().map_err(|_| {
+            anyhow::anyhow!(
+                "{}: {old:?} under \"replaced\" is not an asset id",
+                lock_path.display()
+            )
+        })?;
+        let mut new_id = replaced.new_asset_id;
+        // Bounded, so that a hand-edited cycle cannot loop forever.
+        for _ in 0..lock.replaced.len() {
+            match lock.replaced.get(&new_id.to_string()) {
+                Some(next) => new_id = next.new_asset_id,
+                None => break,
+            }
+        }
+        if new_id != old_id {
+            map.insert(old_id, new_id);
+        }
+    }
+    Ok(map)
+}
+
+/// The `--map-out` file: a JSON object from old id to new id, in id order.
+fn render_id_map(map: &BTreeMap<u64, u64>) -> String {
+    if map.is_empty() {
+        return "{}\n".to_owned();
+    }
+    let lines: Vec<String> = map
+        .iter()
+        .map(|(old, new)| format!("  \"{old}\": {new}"))
+        .collect();
+    format!("{{\n{}\n}}\n", lines.join(",\n"))
+}
+
+/// A reference found in a file, as a byte range of the id's digits.
+struct Found {
+    start: usize,
+    end: usize,
+    line: usize,
+    kind: ReferenceKind,
+    old_id: u64,
+    new_id: u64,
+}
+
+/// Finds every id in `map` in `text`. Works on bytes, so files that are not
+/// valid UTF-8 are read too and everything but the ids stays byte for byte.
+fn find_references(text: &[u8], map: &BTreeMap<u64, u64>) -> Vec<Found> {
+    let mut found = Vec::new();
+    let mut line = 1;
+    let mut at = 0;
+    while at < text.len() {
+        let byte = text[at];
+        if byte == b'\n' {
+            line += 1;
+        }
+        if !byte.is_ascii_digit() {
+            at += 1;
+            continue;
+        }
+        // Only the first digit of a run gets here, so the run is the whole
+        // number and 123 never matches inside 1234.
+        let start = at;
+        while at < text.len() && text[at].is_ascii_digit() {
+            at += 1;
+        }
+        let end = at;
+        // Asset ids have no leading zeros.
+        if text[start] == b'0' {
+            continue;
+        }
+        let Some(old_id) = std::str::from_utf8(&text[start..end])
+            .ok()
+            .and_then(|digits| digits.parse::<u64>().ok())
+        else {
+            continue;
+        };
+        let Some(&new_id) = map.get(&old_id) else {
+            continue;
+        };
+        let before = &text[..start];
+        let kind = if ends_with_ignore_case(before, b"rbxassetid://") {
+            ReferenceKind::AssetId
+        } else if is_asset_url(before) {
+            ReferenceKind::Url
+        } else if is_bare_number(text, start, end) {
+            ReferenceKind::Bare
+        } else {
+            continue;
+        };
+        found.push(Found {
+            start,
+            end,
+            line,
+            kind,
+            old_id,
+            new_id,
+        });
+    }
+    found
+}
+
+fn ends_with_ignore_case(text: &[u8], suffix: &[u8]) -> bool {
+    text.len() >= suffix.len() && text[text.len() - suffix.len()..].eq_ignore_ascii_case(suffix)
+}
+
+/// Whether `before` ends with the `?id=` or `&id=` of a Roblox asset URL,
+/// such as `https://www.roblox.com/asset/?id=`,
+/// `https://assetdelivery.roblox.com/v1/asset/?id=` or
+/// `rbxthumb://type=Asset&id=`.
+fn is_asset_url(before: &[u8]) -> bool {
+    if !ends_with_ignore_case(before, b"id=") {
+        return false;
+    }
+    let rest = &before[..before.len() - 3];
+    if !matches!(rest.last(), Some(b'?' | b'&')) {
+        return false;
+    }
+    let window = &rest[rest.len().saturating_sub(MAX_URL_BYTES)..];
+    // The URL starts after the nearest character that cannot be in one.
+    let url_start = window
+        .iter()
+        .rposition(|byte| {
+            byte.is_ascii_whitespace()
+                || matches!(
+                    byte,
+                    b'"' | b'\'' | b'`' | b'(' | b')' | b'<' | b'>' | b'[' | b']'
+                )
+        })
+        .map_or(0, |position| position + 1);
+    let url = window[url_start..].to_ascii_lowercase();
+    let contains = |needle: &[u8]| url.windows(needle.len()).any(|window| window == needle);
+    url.starts_with(b"rbxthumb://") || (contains(b"roblox.com/") && contains(b"/asset"))
+}
+
+/// Whether the digits at `start..end` are a number of their own rather than
+/// part of a word, such as `id123`, or of a decimal or version, such as
+/// `1.5` or `1.2.3`.
+fn is_bare_number(text: &[u8], start: usize, end: usize) -> bool {
+    let is_word = |byte: u8| byte.is_ascii_alphanumeric() || byte == b'_';
+    let is_digit_at = |index: Option<usize>| {
+        index
+            .and_then(|index| text.get(index))
+            .is_some_and(|byte| byte.is_ascii_digit())
+    };
+    let before = start.checked_sub(1).map(|index| text[index]);
+    let after = text.get(end).copied();
+    if before.is_some_and(is_word) || after.is_some_and(is_word) {
+        return false;
+    }
+    if before == Some(b'.') && is_digit_at(start.checked_sub(2)) {
+        return false;
+    }
+    if after == Some(b'.') && is_digit_at(Some(end + 1)) {
+        return false;
+    }
+    true
+}
+
+/// Lists the files `remap` reads under `roots`, in a stable order.
+fn remap_files(roots: &[PathBuf], skipped: &[PathBuf]) -> anyhow::Result<BTreeSet<PathBuf>> {
+    let mut files = BTreeSet::new();
+    for root in roots {
+        let metadata = match fs::metadata(root) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Err(UsageError(anyhow::anyhow!("{} does not exist", root.display())).into())
+            }
+            Err(error) => {
+                return Err(error).with_context(|| format!("Cannot read {}", root.display()))
+            }
+        };
+        if metadata.is_dir() {
+            walk_text(root, &mut files)?;
+        } else {
+            files.insert(root.clone());
+        }
+    }
+    // Lockfiles of every config are skipped, not only this one's: their ids
+    // are records of past uploads, and with --bare they would be rewritten.
+    files.retain(|path| {
+        !skipped.contains(path)
+            && !path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.to_ascii_lowercase().ends_with(".lock.json"))
+    });
+    Ok(files)
+}
+
+fn walk_text(dir: &Path, files: &mut BTreeSet<PathBuf>) -> anyhow::Result<()> {
+    let entries = fs::read_dir(dir).with_context(|| format!("Cannot list {}", dir.display()))?;
+    for entry in entries {
+        let entry = entry.with_context(|| format!("Cannot list {}", dir.display()))?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with('.') {
+            continue;
+        }
+        let path = entry.path();
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
+            if !REMAP_SKIPPED_DIRS.contains(&name.as_ref()) {
+                walk_text(&path, files)?;
+            }
+        } else if (file_type.is_file() || (file_type.is_symlink() && path.is_file()))
+            && path
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| {
+                    REMAP_EXTENSIONS.contains(&extension.to_ascii_lowercase().as_str())
+                })
+        {
+            files.insert(path);
+        }
+    }
+    Ok(())
+}
+
+/// Finds references to the old ids recorded under `replaced`, and rewrites
+/// them with `write`.
+fn remap(config_path: &Path, options: &RemapOptions) -> anyhow::Result<RemapReport> {
+    let config = load_config(config_path)?;
+    let lock_path = normalize(&config.lock);
+    let lock = load_lock(&lock_path)?;
+    let map = resolve_replacements(&lock, &lock_path)?;
+    let mut report = RemapReport {
+        write: options.write,
+        lockfile: display_path(&config, &lock_path),
+        replacements: map.len(),
+        ..RemapReport::default()
+    };
+
+    if !map.is_empty() {
+        let roots = if options.paths.is_empty() {
+            vec![config
+                .config
+                .parent()
+                .map_or_else(|| PathBuf::from("."), Path::to_path_buf)]
+        } else {
+            options.paths.clone()
+        };
+        // Files Rojo writes from the lockfile, which hold new ids already or
+        // must keep the old ones, and the config, which holds no asset ids.
+        let mut skipped = vec![
+            lock_path.clone(),
+            config.output.clone(),
+            config.config.clone(),
+        ];
+        skipped.extend(options.map_out.iter().cloned());
+        for path in remap_files(&roots, &skipped)? {
+            let text =
+                fs::read(&path).with_context(|| format!("Cannot read {}", path.display()))?;
+            report.files_scanned += 1;
+            let (found, bare): (Vec<Found>, Vec<Found>) = find_references(&text, &map)
+                .into_iter()
+                .partition(|found| options.bare || found.kind != ReferenceKind::Bare);
+            report.bare_skipped += bare.len();
+            if found.is_empty() {
+                continue;
+            }
+            report.files_with_references += 1;
+            let rel = display_path(&config, &path);
+            report
+                .references
+                .extend(found.iter().map(|found| Reference {
+                    path: rel.clone(),
+                    line: found.line,
+                    kind: found.kind,
+                    old_id: found.old_id,
+                    new_id: found.new_id,
+                }));
+            if options.write {
+                let mut rewritten = Vec::with_capacity(text.len());
+                let mut at = 0;
+                for found in &found {
+                    rewritten.extend_from_slice(&text[at..found.start]);
+                    rewritten.extend_from_slice(found.new_id.to_string().as_bytes());
+                    at = found.end;
+                }
+                rewritten.extend_from_slice(&text[at..]);
+                write_atomic(&path, &rewritten)?;
+                report.files_rewritten += 1;
+                report.references_rewritten += found.len();
+            }
+        }
+    }
+
+    if let Some(map_out) = &options.map_out {
+        write_atomic(map_out, render_id_map(&map))?;
+        report.map_out = Some(display_path(&config, map_out));
+    }
+    Ok(report)
+}
+
+fn describe_remap(report: &RemapReport, out: &mut dyn Write) -> io::Result<()> {
+    for reference in &report.references {
+        writeln!(
+            out,
+            "  {}:{}  {} -> {}{}",
+            reference.path,
+            reference.line,
+            reference.old_id,
+            reference.new_id,
+            if reference.kind == ReferenceKind::Bare {
+                " (bare number)"
+            } else {
+                ""
+            }
+        )?;
+    }
+    if report.replacements == 0 {
+        writeln!(
+            out,
+            "No replaced asset ids are recorded in {}; there is nothing to remap.",
+            report.lockfile
+        )?;
+    } else {
+        writeln!(
+            out,
+            "Scanned {} file(s) for {} replaced id(s): {} reference(s) in {} file(s).",
+            report.files_scanned,
+            report.replacements,
+            report.references.len(),
+            report.files_with_references
+        )?;
+        if report.write {
+            writeln!(
+                out,
+                "Rewrote {} reference(s) in {} file(s).",
+                report.references_rewritten, report.files_rewritten
+            )?;
+        } else if !report.references.is_empty() {
+            writeln!(
+                out,
+                "Nothing was written; run again with --write to rewrite them."
+            )?;
+        }
+        if report.bare_skipped > 0 {
+            writeln!(
+                out,
+                "{} bare number(s) equal to an old id were left alone; pass --bare to list \
+                 them, and --bare --write to rewrite them too.",
+                report.bare_skipped
+            )?;
+        }
+    }
+    if let Some(map_out) = &report.map_out {
+        writeln!(
+            out,
+            "Wrote {} id mapping(s) to {map_out}.",
+            report.replacements
+        )?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2525,7 +3176,10 @@ mod tests {
         let lock_path = fixture.dir.path().join("assets.lock.json");
         fs::write(
             &lock_path,
-            "{\"version\": 2, \"assets\": {}, \"future\": {}}\n",
+            format!(
+                "{{\"version\": {}, \"assets\": {{}}, \"future\": {{}}}}\n",
+                LOCK_VERSION_REPLACED + 1
+            ),
         )
         .unwrap();
         let cloud = FakeCloud::start(None);
@@ -2653,5 +3307,420 @@ mod tests {
         assert_eq!(report.uploaded, ids(&[("Coin.png", 1001)]));
         assert_eq!(cloud.uploads(), ["test-Coin", "test-Coin"]);
         assert!(fixture.lock().pending.is_empty());
+    }
+
+    impl Fixture {
+        fn set_creator(&self, creator: &str) {
+            fs::write(
+                self.config(),
+                format!(
+                    "source = \"assets\"\noutput = \"src/Assets.luau\"\nname_prefix = \"test-\"\n\n[creator]\n{creator}\n"
+                ),
+            )
+            .unwrap();
+        }
+
+        /// Writes a file relative to the project folder.
+        fn write_project(&self, rel: &str, bytes: &[u8]) {
+            let path = self.dir.path().join(rel);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, bytes).unwrap();
+        }
+
+        fn read_project(&self, rel: &str) -> String {
+            fs::read_to_string(self.dir.path().join(rel)).unwrap()
+        }
+
+        /// Writes a lockfile with no assets that records `pairs` as replaced.
+        fn write_replaced(&self, pairs: &[(u64, u64)]) {
+            let mut lock = LockFile {
+                version: LOCK_VERSION,
+                ..LockFile::default()
+            };
+            for (old, new) in pairs {
+                lock.replaced.insert(
+                    old.to_string(),
+                    ReplacedAsset {
+                        new_asset_id: *new,
+                        path: "Coin.png".to_owned(),
+                        asset_type: "Image".to_owned(),
+                        from_creator: "user:42".to_owned(),
+                        to_creator: "group:7".to_owned(),
+                        replaced: "2026-01-01T00:00:00Z".to_owned(),
+                    },
+                );
+            }
+            fs::write(self.dir.path().join("assets.lock.json"), render_lock(&lock)).unwrap();
+        }
+
+        fn remap(&self, options: RemapOptions) -> (RemapReport, String) {
+            let report = super::remap(&self.config(), &options).unwrap();
+            let mut out = Vec::new();
+            describe_remap(&report, &mut out).unwrap();
+            (report, String::from_utf8(out).unwrap())
+        }
+
+        fn replaced(&self) -> Vec<(String, u64)> {
+            self.lock()
+                .replaced
+                .into_iter()
+                .map(|(old, replaced)| (old, replaced.new_asset_id))
+                .collect()
+        }
+    }
+
+    #[test]
+    fn changing_the_creator_records_the_replaced_ids() {
+        let fixture = Fixture::new();
+        fixture.write("Coin.png", &png(8, 8, "coin"));
+        fixture.write("Gem.png", &png(8, 8, "gem"));
+        let cloud = FakeCloud::start(None);
+        fixture.sync(&cloud).unwrap();
+
+        // Moving a file at the same time as the creator change still maps
+        // its old id, found by contents.
+        fixture.set_creator("group_id = 7");
+        fixture.rename("Gem.png", "Icons/Gem.png");
+        let (report, out) = fixture.sync(&cloud).unwrap();
+
+        assert_eq!(
+            report.uploaded,
+            ids(&[("Coin.png", 1003), ("Icons/Gem.png", 1004)])
+        );
+        assert!(
+            out.contains("2 asset id(s) of the previous creator were replaced"),
+            "{out}"
+        );
+        assert_eq!(fixture.replaced(), ids(&[("1001", 1003), ("1002", 1004)]));
+        let gem = &fixture.lock().replaced["1002"];
+        assert_eq!(gem.path, "Icons/Gem.png");
+        assert_eq!(gem.asset_type, "Image");
+        assert_eq!(gem.from_creator, "user:42");
+        assert_eq!(gem.to_creator, "group:7");
+        // Rojo 8.0.0 would drop the section, so it must refuse the file.
+        let text = fixture.read_project("assets.lock.json");
+        assert!(text.starts_with("{\n  \"version\": 2,"), "{text}");
+
+        let status = fixture.status();
+        assert!(
+            status.contains("2 asset id(s) were replaced when the creator changed"),
+            "{status}"
+        );
+        assert!(status.contains("rojo assets remap"), "{status}");
+
+        // A rerun with nothing to upload records nothing new.
+        let (_, out) = fixture.sync(&cloud).unwrap();
+        assert!(!out.contains("were replaced"), "{out}");
+        assert_eq!(fixture.read_project("assets.lock.json"), text);
+    }
+
+    #[test]
+    fn a_changed_file_for_the_same_creator_is_not_a_replacement() {
+        let fixture = Fixture::new();
+        fixture.write("Coin.png", &png(8, 8, "coin"));
+        let cloud = FakeCloud::start(None);
+        fixture.sync(&cloud).unwrap();
+
+        fixture.write("Coin.png", &png(8, 8, "shinier coin"));
+        let (report, out) = fixture.sync(&cloud).unwrap();
+
+        assert_eq!(report.uploaded, ids(&[("Coin.png", 1002)]));
+        assert!(fixture.lock().replaced.is_empty());
+        assert!(!out.contains("were replaced"), "{out}");
+        let text = fixture.read_project("assets.lock.json");
+        assert!(!text.contains("replaced"), "{text}");
+        assert!(text.starts_with("{\n  \"version\": 1,"), "{text}");
+        assert!(!fixture.status().contains("remap"));
+    }
+
+    #[test]
+    fn chained_creator_changes_resolve_to_the_latest_id() {
+        let fixture = Fixture::new();
+        fixture.write("Coin.png", &png(8, 8, "coin"));
+        let cloud = FakeCloud::start(None);
+        fixture.sync(&cloud).unwrap();
+        fixture.set_creator("group_id = 7");
+        fixture.sync(&cloud).unwrap();
+        fixture.set_creator("group_id = 8");
+        fixture.sync(&cloud).unwrap();
+
+        assert_eq!(fixture.replaced(), ids(&[("1001", 1003), ("1002", 1003)]));
+        let first = &fixture.lock().replaced["1001"];
+        assert_eq!(first.from_creator, "user:42");
+        assert_eq!(first.to_creator, "group:8");
+
+        // Following the chain also covers records that were not updated,
+        // such as ones merged in from another branch.
+        fixture.write_replaced(&[(1001, 1002), (1002, 1003)]);
+        let map_out = fixture.dir.path().join("map.json");
+        fixture.remap(RemapOptions {
+            map_out: Some(map_out.clone()),
+            ..RemapOptions::default()
+        });
+        assert_eq!(
+            fs::read_to_string(map_out).unwrap(),
+            "{\n  \"1001\": 1003,\n  \"1002\": 1003\n}\n"
+        );
+    }
+
+    #[test]
+    fn switching_back_to_an_earlier_creator_does_not_remap_its_current_ids() {
+        let fixture = Fixture::new();
+        fixture.write("A.png", &png(8, 8, "a"));
+        fixture.write("B.png", &png(8, 8, "a"));
+        let cloud = FakeCloud::start(None);
+        fixture.sync(&cloud).unwrap();
+        // B.png is still the user's when the switch back happens, so A.png
+        // gets the user's id 1001 again.
+        fixture.set_creator("group_id = 7");
+        fixture.sync(&cloud).unwrap();
+        let mut lock = fixture.lock();
+        let user_entry = LockEntry {
+            asset_id: 1001,
+            creator: "user:42".to_owned(),
+            ..lock.assets["A.png"].clone()
+        };
+        lock.assets.insert("B.png".to_owned(), user_entry);
+        fs::write(
+            fixture.dir.path().join("assets.lock.json"),
+            render_lock(&lock),
+        )
+        .unwrap();
+        fixture.set_creator("user_id = 42");
+        fixture.sync(&cloud).unwrap();
+
+        assert_eq!(fixture.ids(), ids(&[("A.png", 1001), ("B.png", 1001)]));
+        assert_eq!(fixture.replaced(), ids(&[("1002", 1001)]));
+    }
+
+    #[test]
+    fn an_interrupted_creator_change_keeps_what_it_recorded() {
+        let fixture = Fixture::new();
+        fixture.write("A.png", &png(8, 8, "a"));
+        fixture.write("B.png", &png(8, 8, "b"));
+        let cloud = FakeCloud::start(Some(4));
+        fixture.sync(&cloud).unwrap();
+        fixture.set_creator("group_id = 7");
+
+        fixture.sync(&cloud).unwrap_err();
+        assert_eq!(fixture.replaced(), ids(&[("1001", 1003)]));
+
+        let (report, _) = fixture.sync(&cloud).unwrap();
+        assert_eq!(report.uploaded, ids(&[("B.png", 1005)]));
+        assert_eq!(fixture.replaced(), ids(&[("1001", 1003), ("1002", 1005)]));
+    }
+
+    #[test]
+    fn lockfiles_without_replacements_load_and_render_unchanged() {
+        let fixture = Fixture::new();
+        let text = "{\n  \"version\": 1,\n  \"assets\": {\n    \"Coin.png\": {\n      \"hash\": \"abc\",\n      \"assetId\": 1001,\n      \"assetType\": \"Image\",\n      \"creator\": \"user:42\",\n      \"moderationState\": \"Approved\",\n      \"uploaded\": \"2026-01-01T00:00:00Z\"\n    }\n  }\n}\n";
+        let path = fixture.dir.path().join("assets.lock.json");
+        fs::write(&path, text).unwrap();
+        let lock = load_lock(&path).unwrap();
+        assert!(lock.replaced.is_empty());
+        assert_eq!(render_lock(&lock), text);
+
+        // Removing every replacement by hand returns the file to version 1.
+        fixture.write_replaced(&[(1, 2)]);
+        let mut lock = fixture.lock();
+        assert_eq!(lock.version, LOCK_VERSION_REPLACED);
+        lock.replaced.clear();
+        assert!(render_lock(&lock).starts_with("{\n  \"version\": 1,"));
+
+        fs::write(&path, text.replace("\"version\": 1", "\"version\": 3")).unwrap();
+        let error = format!("{:#}", load_lock(&path).unwrap_err());
+        assert!(error.contains("which a newer Rojo wrote"), "{error}");
+    }
+
+    const SHOP: &str = "local Shop = {\n\
+        \tCoin = \"rbxassetid://123456789\",\n\
+        \tGem = \"http://www.roblox.com/asset/?id=123456789\",\n\
+        \tOther = \"rbxassetid://1234567890\",\n\
+        \tThumb = \"rbxthumb://type=Asset&id=123456789&w=150&h=150\",\n\
+        \tCdn = \"https://assetdelivery.roblox.com/v1/asset/?ID=123456789\",\n\
+        \tPrice = 123456789,\n\
+        }\n";
+
+    #[test]
+    fn remap_without_write_lists_references_and_changes_nothing() {
+        let fixture = Fixture::new();
+        fixture.write_replaced(&[(123456789, 987654321)]);
+        fixture.write_project("src/Shop.luau", SHOP.as_bytes());
+
+        let (report, out) = fixture.remap(RemapOptions::default());
+
+        assert_eq!(fixture.read_project("src/Shop.luau"), SHOP);
+        let found: Vec<(usize, ReferenceKind)> = report
+            .references
+            .iter()
+            .map(|reference| (reference.line, reference.kind))
+            .collect();
+        assert_eq!(
+            found,
+            [
+                (2, ReferenceKind::AssetId),
+                (3, ReferenceKind::Url),
+                (5, ReferenceKind::Url),
+                (6, ReferenceKind::Url)
+            ]
+        );
+        assert_eq!(report.bare_skipped, 1);
+        assert_eq!(report.files_scanned, 1);
+        assert_eq!(report.references_rewritten, 0);
+        assert!(
+            out.contains("  src/Shop.luau:2  123456789 -> 987654321\n"),
+            "{out}"
+        );
+        assert!(
+            out.contains("Scanned 1 file(s) for 1 replaced id(s): 4 reference(s) in 1 file(s)."),
+            "{out}"
+        );
+        assert!(out.contains("run again with --write"), "{out}");
+        assert!(out.contains("1 bare number(s)"), "{out}");
+
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["references"][0]["oldId"], 123456789);
+        assert_eq!(json["references"][0]["kind"], "assetId");
+        assert_eq!(json["bareSkipped"], 1);
+    }
+
+    #[test]
+    fn remap_with_write_rewrites_ids_and_keeps_everything_else() {
+        let fixture = Fixture::new();
+        fixture.write_replaced(&[(123456789, 987654321)]);
+        let crlf = SHOP.replace('\n', "\r\n");
+        // A byte-order mark and bytes that are not UTF-8 are kept too.
+        let mut original = b"\xEF\xBB\xBF".to_vec();
+        original.extend_from_slice(crlf.as_bytes());
+        original.extend_from_slice(b"-- \xFF\r\n");
+        fixture.write_project("src/Shop.luau", &original);
+
+        let (report, out) = fixture.remap(RemapOptions {
+            write: true,
+            ..RemapOptions::default()
+        });
+
+        let mut expected = b"\xEF\xBB\xBF".to_vec();
+        expected.extend_from_slice(
+            crlf.replace("123456789\"", "987654321\"")
+                .replace("123456789&", "987654321&")
+                .as_bytes(),
+        );
+        expected.extend_from_slice(b"-- \xFF\r\n");
+        assert_eq!(
+            String::from_utf8_lossy(&fs::read(fixture.dir.path().join("src/Shop.luau")).unwrap()),
+            String::from_utf8_lossy(&expected)
+        );
+        assert_eq!(report.references_rewritten, 4);
+        assert_eq!(report.files_rewritten, 1);
+        assert!(
+            out.contains("Rewrote 4 reference(s) in 1 file(s)."),
+            "{out}"
+        );
+
+        // Nothing is left to find.
+        let (report, _) = fixture.remap(RemapOptions::default());
+        assert!(report.references.is_empty());
+    }
+
+    #[test]
+    fn remap_with_bare_only_rewrites_whole_numbers() {
+        let fixture = Fixture::new();
+        fixture.write_replaced(&[(123456789, 987654321)]);
+        let text = "a = 123456789\nb = 1234567890\nc = 9123456789\nd = 123456789.5\n\
+                    e = 0.123456789\nf = x123456789\ng = {123456789, \"123456789\"}\nh = v1.123456789.2\n";
+        fixture.write_project("data/ids.txt", text.as_bytes());
+
+        let (report, _) = fixture.remap(RemapOptions {
+            write: true,
+            bare: true,
+            ..RemapOptions::default()
+        });
+
+        assert_eq!(report.references_rewritten, 3);
+        assert_eq!(
+            fixture.read_project("data/ids.txt"),
+            text.replace("a = 123456789", "a = 987654321")
+                .replace("{123456789, \"123456789\"}", "{987654321, \"987654321\"}")
+        );
+    }
+
+    #[test]
+    fn remap_skips_packages_hidden_folders_and_generated_files() {
+        let fixture = Fixture::new();
+        fixture.write_replaced(&[(123456789, 987654321)]);
+        let reference = b"x = \"rbxassetid://123456789\"\n";
+        for rel in [
+            "src/Kept.luau",
+            "Packages/Lib.lua",
+            "ServerPackages/Lib.lua",
+            "DevPackages/Lib.lua",
+            "node_modules/lib/index.json",
+            "target/out.txt",
+            ".git/COMMIT_EDITMSG.txt",
+            ".hidden/notes.md",
+            "src/.Hidden.luau",
+            "src/Assets.luau",
+            "ui.lock.json",
+            "art/Coin.png",
+            "notes.rtf",
+        ] {
+            fixture.write_project(rel, reference);
+        }
+        let map_out = fixture.dir.path().join("ids.json");
+        fs::write(&map_out, b"{\"123456789\": 987654321}").unwrap();
+
+        let (report, out) = fixture.remap(RemapOptions {
+            write: true,
+            bare: true,
+            map_out: Some(map_out.clone()),
+            ..RemapOptions::default()
+        });
+
+        assert_eq!(report.files_scanned, 1, "{out}");
+        assert_eq!(report.references[0].path, "src/Kept.luau");
+        assert_eq!(
+            fs::read_to_string(&map_out).unwrap(),
+            "{\n  \"123456789\": 987654321\n}\n"
+        );
+        assert!(out.contains("Wrote 1 id mapping(s) to ids.json."), "{out}");
+        assert_eq!(
+            fixture.read_project("Packages/Lib.lua").as_bytes(),
+            reference
+        );
+
+        // Paths given explicitly are read whatever their extension, and
+        // folders given explicitly are walked even if they would be skipped.
+        let (report, _) = fixture.remap(RemapOptions {
+            paths: vec![
+                fixture.dir.path().join("notes.rtf"),
+                fixture.dir.path().join("Packages"),
+            ],
+            ..RemapOptions::default()
+        });
+        let paths: Vec<&str> = report
+            .references
+            .iter()
+            .map(|reference| reference.path.as_str())
+            .collect();
+        assert_eq!(paths, ["Packages/Lib.lua", "notes.rtf"]);
+    }
+
+    #[test]
+    fn remap_without_replacements_does_nothing() {
+        let fixture = Fixture::new();
+        fixture.write_project("src/Shop.luau", SHOP.as_bytes());
+
+        let (report, out) = fixture.remap(RemapOptions {
+            write: true,
+            ..RemapOptions::default()
+        });
+
+        assert_eq!(report.files_scanned, 0);
+        assert!(
+            out.contains("No replaced asset ids are recorded in assets.lock.json"),
+            "{out}"
+        );
+        assert_eq!(fixture.read_project("src/Shop.luau"), SHOP);
     }
 }

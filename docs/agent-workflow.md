@@ -24,7 +24,9 @@ this guide, `--help` and the bundled topics over them. Each topic prints with
 * Assets: `rojo assets sync` uploads new and changed images, audio and models
   through Open Cloud and writes a Luau module of their ids; `rojo assets
   status` shows what would change without network access. Refer to assets
-  through the generated module, not hard-coded ids. Read
+  through the generated module, not hard-coded ids. After the creator changes,
+  such as a move to a group, `rojo assets remap` lists and with `--write`
+  rewrites the old ids still in the project. Read
   `rojo doc --agent assets`.
 * Data modules: a `.data.csv` file becomes a ModuleScript returning its rows
   as typed Luau tables. Edit the CSV, not generated code. Read

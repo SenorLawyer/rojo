@@ -47,7 +47,7 @@ pub const AGENT_TOPICS: &[(&str, &str, &str)] = &[
     ),
     (
         "assets",
-        "rojo assets sync: upload images, audio and models, generate an id module",
+        "rojo assets: upload images, audio and models, id module, remap after a creator move",
         include_str!("../../docs/assets.md"),
     ),
     (
