@@ -195,7 +195,11 @@ pub enum BackupCommand {
         note: Option<String>,
     },
     /// List backups, newest first.
-    List,
+    List {
+        /// List at most this many, the newest.
+        #[clap(long)]
+        limit: Option<usize>,
+    },
     /// Insert a backup into Studio under a parent instance.
     Restore {
         #[clap(flatten)]
@@ -227,11 +231,22 @@ impl StudioCommand {
         // without a running server.
         if let StudioSubcommand::Backup { command } = &self.command {
             match command {
-                BackupCommand::List => {
+                BackupCommand::List { limit } => {
                     let store = backup::Store::open()?;
-                    let backups = store.list()?;
+                    let mut backups = store.list()?;
+                    let total = backups.len();
+                    if let Some(limit) = limit {
+                        backups.truncate(*limit);
+                    }
                     if self.json {
-                        return print_json(&json!({ "backups": backups }), true);
+                        return print_json(
+                            &json!({
+                                "backups": backups,
+                                "total": total,
+                                "truncated": backups.len() < total,
+                            }),
+                            true,
+                        );
                     }
                     backup::print_list(&store, &backups);
                     return Ok(());
@@ -392,16 +407,21 @@ impl StudioCommand {
                         token: token.trim(),
                         session: &target.session,
                     };
-                    let imported = bridge.command(
+                    // The import is the step that changes the place, so it gets the
+                    // caller's request ID, which `rojo studio cancel` can then stop.
+                    let imported = bridge.command_as(
                         "import",
                         json!({"parent": parent, "model": BASE64.encode(&bytes), "allowScripts": allow_scripts}),
+                        self.request_id
+                            .clone()
+                            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
                     )?;
                     return print_json(
                         &json!({"restored": record.id, "result": imported}),
                         self.json,
                     );
                 }
-                BackupCommand::List | BackupCommand::Remove { .. } => unreachable!(),
+                BackupCommand::List { .. } | BackupCommand::Remove { .. } => unreachable!(),
             }
         }
         if let StudioSubcommand::Cancel { target, request } = &self.command {
@@ -783,6 +803,12 @@ struct Bridge<'a> {
 impl Bridge<'_> {
     /// Runs one command and returns the value the plugin answered with.
     fn command(&self, action: &str, args: Value) -> anyhow::Result<Value> {
+        self.command_as(action, args, uuid::Uuid::new_v4().to_string())
+    }
+
+    /// Like [`Self::command`], with the request ID a caller chose so that it
+    /// can cancel the command.
+    fn command_as(&self, action: &str, args: Value, request_id: String) -> anyhow::Result<Value> {
         let mut result = request(
             self.client,
             self.address,
@@ -791,7 +817,7 @@ impl Bridge<'_> {
                 "sessionId": self.session,
                 "action": action,
                 "args": args,
-                "requestId": uuid::Uuid::new_v4().to_string(),
+                "requestId": request_id,
             })),
         )?;
         let response = &mut result["result"];

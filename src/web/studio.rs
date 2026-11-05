@@ -1365,13 +1365,6 @@ impl StudioBridge {
             let mut errors = Vec::new();
             let mut remaining: u64 = batches.iter().map(|batch| batch.count as u64).sum();
             for batch in batches {
-                // The caller's request ID only covered `sources`, which has
-                // finished, so a cancel for it lands in `cancelled`. Checking it
-                // before each batch keeps the whole fix cancellable.
-                if self.take_cancelled(&id, session_id) {
-                    errors.push("Cancelled before every script was fixed".to_owned());
-                    break;
-                }
                 // The caller stops waiting after its own timeout, and a fix it
                 // no longer hears about must not keep changing Studio.
                 if started.elapsed() > VERIFY_FIX_BUDGET {
@@ -1382,9 +1375,14 @@ impl StudioBridge {
                     break;
                 }
                 let child = Uuid::new_v4().to_string();
-                self.state()
-                    .verify_children
-                    .insert(id.clone(), (session_id.to_owned(), child.clone()));
+                // The caller's request ID only covered `sources`, which has
+                // finished, so a cancel for it lands in `cancelled` or, once
+                // the batch is registered, cancels the batch. Checking one and
+                // registering under the same lock leaves no gap between them.
+                if !self.begin_child(&id, session_id, &child) {
+                    errors.push("Cancelled before every script was fixed".to_owned());
+                    break;
+                }
                 // Removes the record however this future ends, including when
                 // the caller disconnects and it is dropped mid-await.
                 let _child_record = ChildRecord {
@@ -1435,9 +1433,9 @@ impl StudioBridge {
         )
     }
 
-    /// Removes a cancellation of `id` that arrived after it finished, telling
-    /// whether there was one.
-    fn take_cancelled(&self, id: &str, session_id: &str) -> bool {
+    /// Registers `child` as the batch the verify `id` waits on, unless a
+    /// cancellation of `id` arrived first, which it then uses up.
+    fn begin_child(&self, id: &str, session_id: &str, child: &str) -> bool {
         let mut state = self.state();
         Self::prune(&mut state);
         if state
@@ -1446,9 +1444,12 @@ impl StudioBridge {
             .is_some_and(|(session, _)| session == session_id)
         {
             state.cancelled.remove(id);
-            return true;
+            return false;
         }
-        false
+        state
+            .verify_children
+            .insert(id.to_owned(), (session_id.to_owned(), child.to_owned()));
+        true
     }
 
     /// Queues one command for the session and waits for Studio's result.

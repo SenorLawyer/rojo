@@ -852,7 +852,13 @@ function StudioBridge:execute(command)
 		return status
 	elseif command.action == "sources" then
 		assert(self.sync, "This bridge is not attached to a sync session")
-		return self.sync.getSourceHashes(args.verifyId)
+		return self.sync.getSourceHashes(args.verifyId, command.expiresAt, function()
+			if self.stopped then
+				return false
+			end
+			local ok = self:request("validate", { requestId = command.requestId }):await()
+			return ok and not self.stopped
+		end)
 	elseif command.action == "resync" then
 		assert(self.sync, "This bridge is not attached to a sync session")
 		-- Cancelling a verify removes its batch on the server, and the server

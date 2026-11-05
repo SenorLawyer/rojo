@@ -577,6 +577,51 @@ return function()
 			expect(module.Source).to.equal(kept)
 		end)
 
+		it("never lets a source write empty a script that is held when it commits", function()
+			session:__setHold("UI", module, { path = "UI", lines = 5, heldAt = 0 })
+			module.Source = "return 1"
+			session:__writeSource({ id = "UI", instance = module, target = "" })
+			task.wait(0.2)
+			expect(module.Source).to.equal("return 1")
+			session:__clearHold("UI")
+		end)
+
+		it("lets only the latest source write for a script finish", function()
+			session:__writeSource({ id = "UI", instance = module, target = "return 'first'" })
+			session:__writeSource({ id = "UI", instance = module, target = "return 'second'" })
+			task.wait(0.2)
+			expect(module.Source).to.equal("return 'second'")
+		end)
+
+		it("pairs nested held scripts in any order after a reconnect", function()
+			local inner = Instance.new("ModuleScript")
+			inner.Name = "Inner"
+			inner.Source = "local a = 1\nlocal b = 2\nlocal c = 3\nlocal d = 4\nreturn a\n"
+			inner.Parent = module
+			session.__instanceMap:insert("INNER", inner)
+			session:__holdScriptWipes(sourceUpdate("UI", ""))
+			session:__holdScriptWipes({
+				removed = {},
+				added = {},
+				updated = { { id = "INNER", changedProperties = { Source = { String = "" } } } },
+			})
+			session:stop()
+			local again = ServeSession.new({ apiContext = api, twoWaySync = false })
+			again.__instanceMap:insert("FOLDER", container)
+			again:__rematchHolds({
+				FOLDER = { Name = "Folder", ClassName = "Folder", Children = { "UI2" } },
+				UI2 = { Name = "UIController", ClassName = "Script", Children = { "INNER2" }, Properties = {} },
+				INNER2 = { Name = "Inner", ClassName = "ModuleScript", Children = {}, Properties = {} },
+			})
+			expect(again.__instanceMap.fromIds["UI2"]).to.equal(module)
+			expect(again.__instanceMap.fromIds["INNER2"]).to.equal(inner)
+			again:__adoptHolds()
+			expect(again.__heldWipes["INNER2"]).to.be.ok()
+			again:__clearHold("UI2")
+			again:__clearHold("INNER2")
+			again:stop()
+		end)
+
 		it("keeps a hold when the same Studio reconnects", function()
 			session:__holdScriptWipes(sourceUpdate("UI", ""))
 			local hold = session.__heldWipes.UI

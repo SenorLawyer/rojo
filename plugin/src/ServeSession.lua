@@ -188,6 +188,9 @@ function ServeSession.new(options)
 		__heldWipes = {},
 		-- The sources recent verifies saw, by verify request ID.
 		__verifiedRecords = {},
+		-- The latest source write for each script, so an older pending write
+		-- cannot finish after a newer one. See `__writeSource`.
+		__sourceGenerations = {},
 		-- Scripts whose hold ended with a class change still to apply.
 		__refreshAfterHold = {},
 		__syncStats = {
@@ -298,8 +301,8 @@ function ServeSession:restartStudioBridge()
 		getSummary = function()
 			return self:getSyncSummary()
 		end,
-		getSourceHashes = function(verifyId)
-			return self:getSourceHashes(verifyId)
+		getSourceHashes = function(verifyId, expiresAt, isActive)
+			return self:getSourceHashes(verifyId, expiresAt, isActive)
 		end,
 		applyResync = function(patch, expect, includeHeld, expiresAt, isActive, verifyId)
 			return self:applyResync(patch, expect, includeHeld, expiresAt, isActive, verifyId)
@@ -361,25 +364,34 @@ local SCRIPT_CLASSES = { Script = true, LocalScript = true, ModuleScript = true 
 -- prevents. Pairing it by name under the same parent instead turns that into
 -- an update the guard holds back.
 function ServeSession:__rematchHolds(serverInstances)
-	for instance in heldByInstance do
-		if self.__instanceMap.fromInstances[instance] or not instance.Parent then
-			continue
-		end
-		local parentId = self.__instanceMap.fromInstances[instance.Parent]
-		local serverParent = parentId and serverInstances[parentId]
-		if not serverParent then
-			continue
-		end
-		for _, childId in serverParent.Children do
-			local child = serverInstances[childId]
-			if
-				child
-				and child.Name == instance.Name
-				and SCRIPT_CLASSES[child.ClassName]
-				and self.__instanceMap.fromIds[childId] == nil
-			then
-				self.__instanceMap:insert(childId, instance)
-				break
+	-- A held script can sit inside another held script, whose subtree
+	-- hydration skipped, so passes repeat until nothing more is paired; each
+	-- pairing also hydrates what is under it.
+	local progress = true
+	while progress do
+		progress = false
+		for instance in heldByInstance do
+			if self.__instanceMap.fromInstances[instance] or not instance.Parent then
+				continue
+			end
+			local parentId = self.__instanceMap.fromInstances[instance.Parent]
+			local serverParent = parentId and serverInstances[parentId]
+			if not serverParent then
+				continue
+			end
+			for _, childId in serverParent.Children do
+				local child = serverInstances[childId]
+				if
+					child
+					and child.Name == instance.Name
+					and SCRIPT_CLASSES[child.ClassName]
+					and self.__instanceMap.fromIds[childId] == nil
+				then
+					self.__instanceMap:insert(childId, instance)
+					self.__reconciler:hydrate(serverInstances, childId, instance)
+					progress = true
+					break
+				end
 			end
 		end
 	end
@@ -449,7 +461,7 @@ end
 	Hashes the source of every script Rojo tracks, for `rojo studio verify`.
 	Yields between batches so a large place does not freeze Studio.
 ]=]
-function ServeSession:getSourceHashes(verifyId)
+function ServeSession:getSourceHashes(verifyId, expiresAt, isActive)
 	assert(self.__status == Status.Connected, "Rojo is not syncing this place. Connect it first.")
 	local scripts = {}
 	local detached = {}
@@ -461,6 +473,8 @@ function ServeSession:getSourceHashes(verifyId)
 	-- hashes happen to match.
 	local seen = {}
 	local hashed = 0
+	local bytesSinceYield = 0
+	local lastAsked = os.clock()
 	for id, instance in tracked do
 		if not instance:IsA("LuaSourceContainer") then
 			continue
@@ -476,8 +490,21 @@ function ServeSession:getSourceHashes(verifyId)
 			seen[id] = source
 		end
 		hashed += 1
-		if hashed % 200 == 0 then
+		bytesSinceYield += if source then #source else 0
+		-- Yield by work done, so many scripts or a few huge ones both keep
+		-- Studio responsive, and stop when the request is gone.
+		if hashed % 200 == 0 or bytesSinceYield > 512 * 1024 then
+			bytesSinceYield = 0
 			task.wait()
+			assert(self.__status == Status.Connected, "Rojo stopped syncing this place during verify")
+			assert(
+				type(expiresAt) ~= "number" or DateTime.now().UnixTimestampMillis < expiresAt,
+				"The verify request expired before every script was hashed"
+			)
+			if isActive and os.clock() - lastAsked > 1 then
+				lastAsked = os.clock()
+				assert(isActive(), "The verify request was cancelled")
+			end
 		end
 	end
 	local held = {}
@@ -1177,6 +1204,90 @@ function ServeSession:__applyPatch(patch, options)
 	return result
 end
 
+--[=[
+	Takes the source changes of existing scripts out of the patch the
+	reconciler applies, so they can be written by `__writeSource`. Returns the
+	patch for the reconciler and the writes. The patch itself is left as it
+	is, since hooks show its changes to the user.
+]=]
+function ServeSession:__splitSourceWrites(patch)
+	local writes = {}
+	local updated = {}
+	for _, update in patch.updated do
+		local encoded = update.changedProperties and update.changedProperties.Source
+		local ty, target
+		if type(encoded) == "table" then
+			ty, target = next(encoded)
+		end
+		local instance = self.__instanceMap.fromIds[update.id]
+		-- A class change recreates the instance, so the reconciler sets its
+		-- source along with everything else.
+		if
+			ty ~= "String"
+			or type(target) ~= "string"
+			or update.changedClassName ~= nil
+			or not (instance and instance:IsA("LuaSourceContainer"))
+		then
+			table.insert(updated, update)
+			continue
+		end
+		table.insert(writes, { id = update.id, instance = instance, target = target })
+		local rest = table.clone(update)
+		rest.changedProperties = table.clone(update.changedProperties)
+		rest.changedProperties.Source = nil
+		local empty = next(rest.changedProperties) == nil and rest.changedName == nil and rest.changedMetadata == nil
+		if not empty then
+			table.insert(updated, rest)
+		end
+	end
+	return { removed = patch.removed, added = patch.added, updated = updated }, writes
+end
+
+--[=[
+	Writes a script's source as the reconciler would, but decides in the
+	editor's update callback, which runs when Studio commits the write: by
+	then a newer change may have replaced this one, or a hold may have started
+	for the script, and either cancels it.
+]=]
+function ServeSession:__writeSource(write)
+	local generation = (self.__sourceGenerations[write.id] or 0) + 1
+	self.__sourceGenerations[write.id] = generation
+	self.__instanceMap:pauseInstance(write.instance)
+	task.spawn(function()
+		local ok, err = pcall(function()
+			ScriptEditorService:UpdateSourceAsync(write.instance, function(current)
+				if self.__sourceGenerations[write.id] ~= generation then
+					return nil
+				end
+				local blank = not string.find(write.target, "%S")
+				if blank and Settings:get("guardScriptWipes") then
+					local held = self.__heldWipes[write.id] or heldByInstance[write.instance]
+					local lines = countNonBlankLines(current)
+					if held or lines >= WIPE_GUARD_MIN_LINES then
+						if not held then
+							Log.warn(
+								"Rojo held back emptying {} ({} lines of code) because its file on disk is now empty.",
+								write.instance:GetFullName(),
+								lines
+							)
+							self:__setHold(
+								write.id,
+								write.instance,
+								{ path = write.instance:GetFullName(), lines = lines, heldAt = nowMillis() }
+							)
+						end
+						return nil
+					end
+				end
+				return write.target
+			end)
+		end)
+		if not ok then
+			Log.warn("Could not write the source of {}: {}", write.instance:GetFullName(), err)
+		end
+	end)
+end
+
 function ServeSession:__applyPatchInRecording(patch)
 	Timer.start("precommitCallbacks")
 	-- Precommit callbacks must be serial in order to obey the contract that
@@ -1189,7 +1300,11 @@ function ServeSession:__applyPatchInRecording(patch)
 	end
 	Timer.stop()
 
-	local unappliedPatch = self.__reconciler:applyPatch(patch)
+	local reconcilerPatch, sourceWrites = self:__splitSourceWrites(patch)
+	local unappliedPatch = self.__reconciler:applyPatch(reconcilerPatch)
+	for _, write in sourceWrites do
+		self:__writeSource(write)
+	end
 
 	-- The fallback replaces an instance with the server's whole copy, which
 	-- for a held script has the empty source the guard held back. Those

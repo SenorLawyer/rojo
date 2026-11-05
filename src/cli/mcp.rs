@@ -499,7 +499,9 @@ fn command(
         | "studio_backup_list" => {
             command.args(["studio", "--json"]);
             if name == "studio_backup_list" {
-                command.args(["backup", "list"]);
+                // Keeps the listing within the output limit however many
+                // backups there are; it reports the total.
+                command.args(["backup", "list", "--limit=200"]);
             } else {
                 command.args(["lock", &name["studio_lock_".len()..]]);
                 if let Some(lock) = arguments.get("lock").and_then(Value::as_str) {
@@ -695,7 +697,7 @@ fn catalog() -> Vec<Value> {
         ("studio_verify", "Check that every script Rojo syncs has the same source in the selected Studio as in its file, after a crash, a reconnect, an undo or whenever Studio may be out of date. Lists scripts that differ, are missing from Studio or were removed there, each with its file. With fix, sets differing scripts back to their files' contents (held wipes stay unless includeHeld). A place that does not match is a result (inSync false), not a tool error.", json!({"session":session,"fix":{"type":"boolean"},"includeHeld":{"type":"boolean"}}), vec!["session"]),
         ("studio_backup", "Save a copy of an instance (such as game/Workspace/Map) outside the place, in the repository's backup folder, before rebuilding or replacing it. Use this instead of copying it into ServerStorage. Restore with `rojo studio backup restore`.", json!({"session":session,"instance":instance,"name":{"type":"string","minLength":1,"maxLength":64},"note":{"type":"string","minLength":1,"maxLength":512}}), vec!["session","instance"]),
         ("studio_backup_list", "List saved Studio backups, newest first.", json!({}), vec![]),
-        ("studio_lock_acquire", "Take or renew a named advisory lease on a shared Studio window before using it, such as `main` for Edit work (shared) or `build` for a play test (exclusive). Locks are shared by every worktree of the project and need no Studio connection. Returns granted false with the holders when the lock is busy; retry later or pass wait (seconds). Release it when done. Studio tools such as execute_luau do not check locks, so take one first.", json!({"lock":lock,"owner":owner,"exclusive":{"type":"boolean"},"limit":{"type":"integer","minimum":1,"maximum":64},"ttl":{"type":"integer","minimum":1,"maximum":3600},"wait":{"type":"integer","minimum":0,"maximum":60},"note":{"type":"string","minLength":1,"maxLength":512}}), vec!["lock","owner"]),
+        ("studio_lock_acquire", "Take or renew a named advisory lease on a shared Studio window before using it, such as `main` for Edit work (shared) or `build` for a play test (exclusive). Locks are shared by every worktree of the project and need no Studio connection. Returns granted false with the holders when the lock is busy; retry later or pass wait (seconds). Release it when done. Studio tools such as execute_luau do not check locks, so take one first.", json!({"lock":lock,"owner":owner,"exclusive":{"type":"boolean"},"limit":{"type":"integer","minimum":1,"maximum":64},"ttl":{"type":"integer","minimum":1,"maximum":3600},"wait":{"type":"integer","minimum":0,"maximum":60},"note":{"type":"string","minLength":1,"maxLength":500}}), vec!["lock","owner"]),
         ("studio_lock_release", "Give up a lease or place in line taken with studio_lock_acquire.", json!({"lock":lock,"owner":owner}), vec!["lock","owner"]),
         ("studio_lock_status", "Show who holds and waits for a Studio lock, or every lock when lock is omitted.", json!({"lock":lock}), vec![]),
         ("checkpoint_list", "List archived checkpoints for the fixed project.", json!({}), vec![]),

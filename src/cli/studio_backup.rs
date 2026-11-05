@@ -210,8 +210,11 @@ impl Store {
             if path.extension().and_then(|e| e.to_str()) != Some("json") {
                 continue;
             }
-            let record: Record = match fs::read(&path)
-                .ok()
+            // Records are a few hundred bytes; a large file is not one.
+            let small = entry_len(&path).is_some_and(|len| len <= MAX_RECORD_BYTES);
+            let record: Record = match small
+                .then(|| fs::read(&path).ok())
+                .flatten()
                 .and_then(|bytes| serde_json::from_slice(&bytes).ok())
             {
                 Some(record) => record,
@@ -250,6 +253,12 @@ impl Store {
         fs::remove_file(model)?;
         Ok(())
     }
+}
+
+const MAX_RECORD_BYTES: u64 = 64 * 1024;
+
+fn entry_len(path: &Path) -> Option<u64> {
+    fs::metadata(path).ok().map(|metadata| metadata.len())
 }
 
 pub fn now_millis() -> u64 {
