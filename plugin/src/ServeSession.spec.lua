@@ -697,6 +697,30 @@ return function()
 			expect(session.__heldWipes.UI).to.be.ok()
 		end)
 
+		it("does not carry a hold when several same-named scripts are replaced", function()
+			session:__holdScriptWipes(sourceUpdate("UI", ""))
+			local twin = Instance.new("ModuleScript")
+			twin.Name = "UIController"
+			twin.Parent = container
+			session.__instanceMap:insert("TWIN", twin)
+			session.__instanceMap:insert("FOLDER", container)
+			local function added(id)
+				return {
+					Id = id,
+					Parent = "FOLDER",
+					Name = "UIController",
+					ClassName = "Script",
+					Properties = { Source = { String = "" } },
+					Children = {},
+				}
+			end
+			local replacement = { removed = { "UI", "TWIN" }, added = { A = added("A"), B = added("B") }, updated = {} }
+			session:__holdScriptWipes(replacement)
+			expect(replacement.added.A.Properties.Source.String).to.equal("")
+			expect(replacement.added.B.Properties.Source.String).to.equal("")
+			expect(next(session.__pendingHoldTransfers)).to.equal(nil)
+		end)
+
 		it("carries a hold to a script that replaces a held one", function()
 			session:__holdScriptWipes(sourceUpdate("UI", ""))
 			local kept = module.Source
@@ -833,6 +857,21 @@ return function()
 			Settings:set("guardScriptWipes", true)
 			expect(held).to.equal(nil)
 			expect(summary.heldWipeCount).to.equal(0)
+		end)
+
+		it("syncs a held script's source in place when the guard is turned off", function()
+			session.__status = ServeSession.Status.Connected
+			session:__holdScriptWipes(sourceUpdate("UI", ""))
+			module:SetAttribute("StudioOnly", true)
+			api.read = function()
+				return Promise.resolve({ instances = { UI = { Properties = { Source = { String = "" } } } } })
+			end
+			Settings:set("guardScriptWipes", false)
+			task.wait(0.3)
+			Settings:set("guardScriptWipes", true)
+			expect(session.__instanceMap.fromIds.UI).to.equal(module)
+			expect(module.Source).to.equal("")
+			expect(module:GetAttribute("StudioOnly")).to.equal(true)
 		end)
 
 		it("does nothing when the setting is off", function()

@@ -222,22 +222,45 @@ function ServeSession.new(options)
 end
 
 function ServeSession:__releaseAllHolds()
-	local ids = {}
-	for id in table.clone(self.__heldWipes) do
-		table.insert(ids, id)
+	local sourceOnly, replace = {}, {}
+	for id, entry in table.clone(self.__heldWipes) do
+		table.insert(if entry.deferredClass then replace else sourceOnly, id)
+		-- Cleared here without queueing a refresh; the class changes are
+		-- handled below.
+		entry.deferredClass = nil
 		self:__clearHold(id)
 	end
 	table.clear(heldByInstance)
-	table.clear(self.__refreshAfterHold)
-	if #ids > 0 and self.__status == Status.Connected then
-		-- The changes the guard held back were never applied, so the server's
-		-- current copies replace these scripts, as the sync fallback would.
-		task.spawn(function()
-			if not self:__replaceInstances(ids) then
-				Log.warn("Could not sync {} scripts the wipe guard was holding; reconnect to sync them.", #ids)
-			end
-		end)
+	if self.__status ~= Status.Connected or (#sourceOnly == 0 and #replace == 0) then
+		return
 	end
+	-- The changes the guard held back were never applied. A held source
+	-- becomes the file's current source on the same instance, as ordinary
+	-- sync would write it, so nothing else about the script changes; only a
+	-- class change held back with it needs the server's whole copy.
+	task.spawn(function()
+		if #sourceOnly > 0 then
+			local ok, body = self.__apiContext:read(sourceOnly):await()
+			for _, id in sourceOnly do
+				local instance = self.__instanceMap.fromIds[id]
+				local server = ok and body.instances and body.instances[id]
+				local encoded = server and server.Properties and server.Properties.Source
+				local ty, value
+				if type(encoded) == "table" then
+					ty, value = next(encoded)
+				end
+				if instance and ty == "String" and type(value) == "string" then
+					self:__writeSource({ id = id, instance = instance, target = value })
+				end
+			end
+			if not ok then
+				Log.warn("Could not read {} scripts the wipe guard was holding; reconnect to sync them.", #sourceOnly)
+			end
+		end
+		if #replace > 0 and not self:__replaceInstances(replace) then
+			Log.warn("Could not sync {} scripts the wipe guard was holding; reconnect to sync them.", #replace)
+		end
+	end)
 end
 
 --[=[
@@ -886,14 +909,42 @@ function ServeSession:__holdScriptWipes(patch)
 		table.clear(heldByInstance)
 		return
 	end
+	-- Code moves to a replacement only when exactly one script of that name
+	-- goes and exactly one comes under the same parent. Otherwise it is not
+	-- clear which new script is which, and copying held code into a script
+	-- that was never held would be worse than not carrying it over.
 	local removedHeld = {}
+	local removedCount = {}
+	for _, removed in patch.removed do
+		local instance = self.__instanceMap.fromIds[removed]
+		if guard and instance and instance.Parent and instance:IsA("LuaSourceContainer") then
+			local parentId = self.__instanceMap.fromInstances[instance.Parent]
+			if parentId then
+				local key = parentId .. "/" .. instance.Name
+				removedCount[key] = (removedCount[key] or 0) + 1
+			end
+		end
+	end
+	local addedCount = {}
+	for _, virtual in patch.added do
+		if SCRIPT_CLASSES[virtual.ClassName] and virtual.Parent then
+			local key = virtual.Parent .. "/" .. virtual.Name
+			addedCount[key] = (addedCount[key] or 0) + 1
+		end
+	end
 	for _, removed in patch.removed do
 		local entry = self.__heldWipes[removed]
 		local instance = self.__instanceMap.fromIds[removed]
 		if guard and entry and instance and instance.Parent then
 			local parentId = self.__instanceMap.fromInstances[instance.Parent]
-			if parentId then
-				removedHeld[parentId .. "/" .. instance.Name] = { entry = entry, source = readSource(instance) or "" }
+			local key = parentId and parentId .. "/" .. instance.Name
+			if key and removedCount[key] == 1 and addedCount[key] == 1 then
+				removedHeld[key] = { entry = entry, source = readSource(instance) or "" }
+			elseif key then
+				Log.warn(
+					"Could not tell which new script replaces {}, whose code Rojo was holding back, because several share its name; its code is not carried over.",
+					instance:GetFullName()
+				)
 			end
 		end
 		if entry then
