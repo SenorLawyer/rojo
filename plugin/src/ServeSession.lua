@@ -73,9 +73,6 @@ local function countNonBlankLines(source: string): number
 	return count
 end
 
--- How long a resync waits to see its sources written.
-local RESYNC_CONFIRM_SECONDS = 3
-
 -- Reads a script's source the way the reconciler does: from its editor when
 -- it is open in Studio, since that can differ from `Source` until saved.
 local function readSource(instance): string?
@@ -402,8 +399,11 @@ end
 	undoes a newer sync. Without `includeHeld` the wipe guard still applies,
 	which covers a file that became empty after the check.
 
-	Studio may write a script's source asynchronously, so each script counts as
-	updated, and its hold ends, only once its source is seen to have changed.
+	The sources are written here with `UpdateSourceAsync`, whose callback
+	checks `from` against the source at the moment of writing, so the check
+	and the write cannot be split by a newer edit. The writes are awaited
+	inside one undo step, so a script counts as updated only once its source
+	was written and the whole resync undoes together.
 ]=]
 function ServeSession:applyResync(patch, expect, includeHeld)
 	assert(self.__status == Status.Connected, "Rojo is not syncing this place. Connect it first.")
@@ -415,49 +415,93 @@ function ServeSession:applyResync(patch, expect, includeHeld)
 		"A resync may only update existing instances"
 	)
 	assert(type(expect) == "table", "A resync needs the expected script hashes")
-	local updated = {}
+	local writes = {}
 	local skipped = 0
 	for _, update in patch.updated do
 		local expected = expect[update.id]
+		local encoded = update.changedProperties and update.changedProperties.Source
+		local ty, target
+		if type(encoded) == "table" then
+			ty, target = next(encoded)
+		end
 		local instance = self.__instanceMap.fromIds[update.id]
-		local source = instance and readSource(instance)
-		if type(expected) ~= "table" or source == nil or hashSource(source) ~= expected.from then
+		if
+			type(expected) ~= "table"
+			or ty ~= "String"
+			or type(target) ~= "string"
+			or instance == nil
+			or not instance:IsA("LuaSourceContainer")
+		then
 			skipped += 1
 			continue
 		end
-		table.insert(updated, update)
+		table.insert(writes, { id = update.id, instance = instance, target = target, from = expected.from })
 	end
-	local resync = { removed = {}, added = {}, updated = updated }
-	-- Kept before applying, since the wipe guard takes held updates out.
-	local targets = {}
-	for _, update in updated do
-		targets[update.id] = expect[update.id].to
-	end
-	self:__applyPatch(resync, { force = includeHeld == true, waypoint = RESYNC_WAYPOINT_PREFIX })
-
-	local pending = table.clone(targets)
-	local confirmed = 0
-	local deadline = os.clock() + RESYNC_CONFIRM_SECONDS
-	repeat
-		for id, target in pending do
-			local instance = self.__instanceMap.fromIds[id]
-			local source = instance and readSource(instance)
-			if source and hashSource(source) == target then
-				pending[id] = nil
-				confirmed += 1
-				self.__heldWipes[id] = nil
+	if not includeHeld then
+		-- A file may have become empty after verify checked it. The guard
+		-- holds such a write back exactly as it would hold a normal sync.
+		local guarded = { removed = {}, added = {}, updated = {} }
+		for _, write in writes do
+			table.insert(guarded.updated, {
+				id = write.id,
+				changedProperties = { Source = { String = write.target } },
+			})
+		end
+		self:__holdScriptWipes(guarded)
+		local allowed = {}
+		for _, update in guarded.updated do
+			allowed[update.id] = true
+		end
+		local kept = {}
+		for _, write in writes do
+			if allowed[write.id] then
+				table.insert(kept, write)
+			else
+				skipped += 1
 			end
 		end
-		if next(pending) == nil then
-			break
-		end
-		task.wait(0.05)
-	until os.clock() > deadline
-	local failed = 0
-	for _ in pending do
-		failed += 1
+		writes = kept
 	end
-	return { updated = confirmed, failed = failed, skipped = skipped }
+
+	local updated, failed = 0, 0
+	local recording =
+		ChangeHistoryService:TryBeginRecording(RESYNC_WAYPOINT_PREFIX .. DateTime.now():FormatLocalTime("LTS", "en-us"))
+	local ok, err = pcall(function()
+		for _, write in writes do
+			-- Only the hold that existed before this write may end with it. A
+			-- hold made while the write yielded is for a newer empty file.
+			local holdBefore = self.__heldWipes[write.id]
+			local changed = false
+			self.__instanceMap:pauseInstance(write.instance)
+			local wrote = pcall(function()
+				ScriptEditorService:UpdateSourceAsync(write.instance, function(current)
+					if hashSource(current) ~= write.from then
+						changed = true
+						-- Returning nil cancels the update.
+						return nil
+					end
+					return write.target
+				end)
+			end)
+			if changed then
+				skipped += 1
+			elseif wrote then
+				updated += 1
+				if holdBefore and self.__heldWipes[write.id] == holdBefore then
+					self.__heldWipes[write.id] = nil
+				end
+			else
+				failed += 1
+			end
+		end
+	end)
+	if recording then
+		ChangeHistoryService:FinishRecording(recording, Enum.FinishRecordingOperation.Commit)
+	end
+	if not ok then
+		error(err, 0)
+	end
+	return { updated = updated, failed = failed, skipped = skipped }
 end
 
 --[=[

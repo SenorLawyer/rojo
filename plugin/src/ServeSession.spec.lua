@@ -502,13 +502,24 @@ return function()
 			expect(session.__heldWipes.UI).to.equal(nil)
 		end)
 
+		it("writes the resync inside one undo step", function()
+			session.__status = ServeSession.Status.Connected
+			local ChangeHistoryService = game:GetService("ChangeHistoryService")
+			local kept = module.Source
+			session:applyResync(sourceUpdate("UI", "return 'resynced'"), expectFrom(kept, "return 'resynced'"), false)
+			expect(module.Source).to.equal("return 'resynced'")
+			local canUndo, waypoint = ChangeHistoryService:GetCanUndo()
+			expect(canUndo).to.equal(true)
+			expect(string.sub(waypoint, 1, 13)).to.equal("Rojo: Resync ")
+		end)
+
 		it("still guards against wipes in a resync without includeHeld", function()
 			session.__status = ServeSession.Status.Connected
 			local kept = module.Source
 			local result = session:applyResync(sourceUpdate("UI", ""), expectFrom(kept, ""), false)
 			expect(module.Source).to.equal(kept)
 			expect(result.updated).to.equal(0)
-			expect(result.failed).to.equal(1)
+			expect(result.skipped).to.equal(1)
 			expect(session.__heldWipes.UI).to.be.ok()
 		end)
 

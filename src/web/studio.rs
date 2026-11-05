@@ -84,9 +84,12 @@ const MAX_COMMAND_BYTES: usize = MAX_BODY - 64 * 1024;
 const MAX_SESSION_PENDING_BYTES: usize = 64 * 1024 * 1024;
 pub(crate) const MAX_MODEL_BYTES: usize = 5 * 1024 * 1024;
 const MAX_MODEL_INSTANCES: usize = 10_000;
-/// How long `verify --fix` keeps sending batches, so it ends before the CLI,
-/// which waits [`MAX_COMMAND_REQUEST`] plus 5 seconds, gives up on it.
-const VERIFY_FIX_BUDGET: Duration = Duration::from_secs(40);
+/// How long after `verify` starts it may begin another `--fix` batch. The CLI
+/// waits 65 seconds for the whole request, which before `verify` starts may
+/// already have spent up to 15 seconds waiting for Git and 10 reading the
+/// body, and the last batch may take its full 15-second deadline: 15 + 10 +
+/// 20 + 15 leaves 5 seconds to spare.
+const VERIFY_FIX_BUDGET: Duration = Duration::from_secs(20);
 /// Bound on the sync summary a plugin sends with each poll.
 const MAX_SYNC_SUMMARY_BYTES: usize = 16 * 1024;
 
