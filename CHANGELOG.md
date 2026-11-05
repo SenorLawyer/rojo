@@ -31,6 +31,8 @@ Making a new release? Simply add the new header with the version and date undern
 
 ## Unreleased
 
+## [8.0.0] (November 5th, 2026)
+
 * `rojo doc --agent` now bundles detailed guides, printed with `rojo doc --agent <topic>` and listed with `--list`, and its main guide lists what this fork adds over upstream Rojo. `rojo doc --agent --write <dir>` replaces a project's ROJO_AGENT.md with the installed version's guide and creates an AGENTS.md pointing to it if there is none, and `rojo init` now creates that AGENTS.md too, so agents find the guide on their own. ([fork#5])
 * Fixed the Studio bridge stalling after a minute or two of use, with commands returning HTTP 504 and the session expiring while sync stayed connected. Studio slows a plugin's RequestAsync calls more and more once it long-polls with them, so the bridge now polls over its own HTTP stream, sharing a budget of 3 streams with sync so that neither can use up Studio's limit of 4 per plugin. ([fork#4])
 * Added `rojo assets sync`, which uploads new and changed images, audio and models from a folder through Open Cloud and writes a Luau module of their ids, such as `Assets.Icons.Coin`. A committed `assets.lock.json` records each file's content hash and asset id, so unchanged, renamed and copied files are never uploaded again, and an interrupted sync keeps what it already uploaded. An upload Roblox accepted but whose processing could not be followed, for example during a network outage, is recorded as pending under its contents and resumed by the next sync for the same creator instead of being uploaded again, even if the file was renamed and new contents were written under its old name. Contents Roblox rejected in moderation are recorded and not sent again until they change (or with `--retry-rejected`), and only one sync per config runs at a time (a sync stopped with Ctrl+C or killed leaves its `.lock` file behind; docs/assets.md explains how to remove it). Files are checked against Open Cloud's size and format limits before anything is uploaded. `rojo assets status` shows what is new, changed, renamed or missing without network access. See [docs/assets.md](docs/assets.md). ([fork#4])
@@ -149,6 +151,7 @@ Making a new release? Simply add the new header with the version and date undern
 * LocalizationTables no longer report as changed when nothing changes. ([#1333])
 * Sounds now preloaded correctly. The warning "*ContentId: rbxassetid://203785492 failed due to: Asset type does not match requested type*" is fixed. ([#1351])
 
+[8.0.0]: https://github.com/SenorLawyer/rojo/releases/tag/v8.0.0
 [#1333]: https://github.com/rojo-rbx/rojo/pull/1333
 [#1351]: https://github.com/rojo-rbx/rojo/pull/1351
 [fork#1]: https://github.com/SenorLawyer/rojo/pull/1
