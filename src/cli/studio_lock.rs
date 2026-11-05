@@ -125,10 +125,16 @@ pub(crate) struct WaiterView {
 pub(crate) struct LockStatus {
     pub name: String,
     pub paused: Option<Pause>,
+    /// At most [`MAX_LISTED`] of them, so a lock with many holders still
+    /// prints a result that fits an MCP response; the totals count all.
     pub holders: Vec<HolderView>,
     /// Oldest first, which is the order they are served in.
     pub waiters: Vec<WaiterView>,
+    pub holders_total: usize,
+    pub waiters_total: usize,
 }
+
+const MAX_LISTED: usize = 50;
 
 #[derive(Debug, Clone)]
 pub(crate) struct AcquireRequest {
@@ -272,16 +278,26 @@ impl LockStore {
         // whose common directory cannot be found is an error, since silently
         // using a per-directory store would let two worktrees both take a
         // lock meant to be exclusive.
-        if super::lifecycle::git(start, ["rev-parse", "--git-dir"]).is_ok() {
-            let common = super::lifecycle::git_common_dir(start)?;
-            // Git prints forward slashes on Windows; rebuilding the path from
-            // its components gives one separator style in printed paths.
-            let common: PathBuf = common.components().collect();
-            Ok(Self::new(common.join("rojo-state").join("studio-locks")))
-        } else {
-            Ok(Self::new(
+        match super::lifecycle::git(start, ["rev-parse", "--git-dir"]) {
+            Ok(_) => {
+                let common = super::lifecycle::git_common_dir(start)?;
+                // Git prints forward slashes on Windows; rebuilding the path
+                // from its components gives one separator style in printed paths.
+                let common: PathBuf = common.components().collect();
+                Ok(Self::new(common.join("rojo-state").join("studio-locks")))
+            }
+            // Git failing inside a repository, for example because it is not
+            // installed for this process, must not move this process to a
+            // store of its own, where it could take a lock another process
+            // holds in the shared one.
+            Err(error) if super::has_git_marker(start) => Err(error.context(format!(
+                "{} is in a Git repository, but Git could not read it, so its shared locks \
+                 cannot be found. Fix Git, or pass --dir.",
+                start.display()
+            ))),
+            Err(_) => Ok(Self::new(
                 super::project_state_dir(start)?.join("studio-locks"),
-            ))
+            )),
         }
     }
 
@@ -803,18 +819,23 @@ fn view(name: &str, state: &State, now: u64) -> LockStatus {
     waiters.sort_by(|a, b| {
         (a.waiter.since_ms, &a.waiter.owner).cmp(&(b.waiter.since_ms, &b.waiter.owner))
     });
+    let waiters_total = waiters.len();
+    waiters.truncate(MAX_LISTED);
     LockStatus {
         name: name.to_owned(),
         paused: state.paused.clone(),
         holders: state
             .holders
             .iter()
+            .take(MAX_LISTED)
             .map(|holder| HolderView {
                 holder: holder.clone(),
                 expires_in_secs: secs_until(holder.expires_ms, now),
             })
             .collect(),
         waiters,
+        holders_total: state.holders.len(),
+        waiters_total,
     }
 }
 
@@ -1230,7 +1251,7 @@ impl LockCommand {
 }
 
 fn print_status(status: &LockStatus) {
-    let summary = match status.holders.len() {
+    let summary = match status.holders_total {
         0 => "free".to_owned(),
         1 => "1 holder".to_owned(),
         n => format!("{n} holders"),
@@ -1474,6 +1495,17 @@ mod tests {
         assert!(f.store.status("main").is_ok());
         assert!(f.store.release("main", "a").unwrap().released);
         assert_ne!(fs::read(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn an_unreadable_repository_does_not_fall_back_to_a_store_of_its_own() {
+        let dir = tempfile::tempdir().unwrap();
+        // A `.git` pointer to a repository Git cannot read.
+        fs::write(dir.path().join(".git"), "gitdir: missing-repository").unwrap();
+        assert!(LockStore::discover(dir.path()).is_err());
+        // Outside any repository the per-user store is used.
+        let plain = tempfile::tempdir().unwrap();
+        assert!(LockStore::discover(plain.path()).is_ok());
     }
 
     #[test]

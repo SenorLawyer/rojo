@@ -1410,6 +1410,9 @@ impl StudioBridge {
                 let result = &value["result"];
                 if status == StatusCode::OK && result["ok"] == json!(true) {
                     updated += result["value"]["updated"].as_u64().unwrap_or(0);
+                    // A released hold whose class change still has to sync
+                    // counts as handled: the user asked for it.
+                    updated += result["value"]["released"].as_u64().unwrap_or(0);
                     failed += result["value"]["failed"].as_u64().unwrap_or(0);
                     skipped += result["value"]["skipped"].as_u64().unwrap_or(0);
                     remaining -= batch.count as u64;

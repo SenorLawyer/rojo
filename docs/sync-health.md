@@ -42,7 +42,7 @@ Scripts are read as the reconciler reads them: from the script editor when a scr
 
 When a script with 5 or more non-blank lines would become empty because its file on disk became empty, the plugin keeps the old source in Studio and prints a warning instead. An editor or agent that saves an empty file by mistake then cannot wipe the script in Studio, which used to reach the place before anyone noticed. The hold ends as soon as the file has code again, or the file (or a folder containing it) is deleted. The sync fallback, which replaces an instance with the server's copy when a change cannot be applied, leaves held scripts alone. While it lasts, the script shows up in `rojo studio sessions` and as *different* (and `held`) in `verify`.
 
-To empty the script on purpose, write at least one non-blank line, delete the file, or run `verify --fix --include-held`. A plain `--fix` leaves held scripts alone.
+To empty the script on purpose, write at least one non-blank line, delete the file, or run `verify --fix --include-held`. When the script's class changed on disk too while it was held, `--include-held` ends the hold and the class change applies with the next change Rojo syncs, or when Studio reconnects. A plain `--fix` leaves held scripts alone.
 
 The guard checks each change from disk when it arrives. Studio writes a script's new source a moment later, so a change that emptied a small script and is still being written when a later change makes the script long and a hold starts can still finish; this needs several changes to the same script within a fraction of a second.
 

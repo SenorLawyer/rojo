@@ -253,14 +253,22 @@ impl StudioCommand {
                             .count();
                         backups.truncate(fits);
                     }
+                    let orphans = store.orphans()?;
                     if self.json {
                         return print_json(
                             &json!({
                                 "backups": backups,
                                 "total": total,
                                 "truncated": backups.len() < total,
+                                "orphaned": orphans,
                             }),
                             true,
+                        );
+                    }
+                    if !orphans.is_empty() {
+                        eprintln!(
+                            "Models without a record, left by an interrupted backup (remove them with `rojo studio backup remove <id>`): {}",
+                            orphans.join(", ")
                         );
                     }
                     backup::print_list(&store, &backups);

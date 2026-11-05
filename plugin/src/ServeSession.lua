@@ -519,7 +519,12 @@ function ServeSession:getSourceHashes(verifyId, expiresAt, isActive)
 	end
 	-- Kept per verify, so two verifies at once cannot replace each other's
 	-- record, and only for the last few, so memory stays bounded.
-	self:__rememberVerified(verifyId, seen, table.clone(self.__sourceGenerations))
+	-- Only the generations of the scripts seen, not every one ever written.
+	local generations = {}
+	for id in seen do
+		generations[id] = self.__sourceGenerations[id]
+	end
+	self:__rememberVerified(verifyId, seen, generations)
 	return { scripts = scripts, detached = detached, held = held }
 end
 
@@ -620,7 +625,7 @@ function ServeSession:applyResync(patch, expect, includeHeld, expiresAt, isActiv
 	-- whose hashes match, so every write is skipped.
 	local record = self:__verifiedRecordFor(verifyId)
 	local verified = record and record.sources
-	local updated, failed = 0, 0
+	local updated, failed, released = 0, 0, 0
 	local ok, err = pcall(function()
 		local cancelled = false
 		for _, write in writes do
@@ -654,9 +659,13 @@ function ServeSession:applyResync(patch, expect, includeHeld, expiresAt, isActiv
 			-- reconnecting, which applies the class with its source.
 			local holdNow = self.__heldWipes[write.id]
 			if includeHeld and holdNow and holdNow.deferredClass then
-				failed += 1
+				-- Asked to give up the hold: it ends here, and the class change
+				-- that waited with it is applied, with its source, by the next
+				-- change Rojo syncs or by reconnecting.
+				self:__clearHold(write.id)
+				released += 1
 				Log.warn(
-					"{} also has a class change from disk that was held back; reconnect Studio to apply both.",
+					"Released the hold on {}. Its class change from disk applies with the next sync; reconnect Studio to apply it now.",
 					holdNow.path
 				)
 				continue
@@ -743,7 +752,7 @@ function ServeSession:applyResync(patch, expect, includeHeld, expiresAt, isActiv
 	if not ok then
 		error(err, 0)
 	end
-	return { updated = updated, failed = failed, skipped = skipped }
+	return { updated = updated, failed = failed, skipped = skipped, released = released }
 end
 
 --[=[
@@ -1269,6 +1278,14 @@ function ServeSession:__applyPatch(patch, options)
 	for id in self.__heldWipes do
 		if self.__instanceMap.fromIds[id] == nil then
 			self:__clearHold(id)
+		end
+	end
+	-- Generations of removed scripts are forgotten, so they do not pile up
+	-- over a long session. A pending write for one then sees no generation,
+	-- which cancels it as superseded.
+	for id in self.__sourceGenerations do
+		if self.__instanceMap.fromIds[id] == nil then
+			self.__sourceGenerations[id] = nil
 		end
 	end
 	local stats = self.__syncStats

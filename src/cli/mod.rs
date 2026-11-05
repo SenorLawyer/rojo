@@ -218,6 +218,22 @@ pub(crate) fn project_state_dir(workdir: &Path) -> anyhow::Result<PathBuf> {
     Ok(base.join("projects").join(&id[..16]))
 }
 
+/// Whether `start` or one of its parents looks like a repository: a `.git`
+/// folder with a `HEAD` file, or a `.git` file pointing at one (`gitdir:`),
+/// as Git itself requires. This tells that `start` is in a repository even
+/// when Git cannot run, while a stray `.git` folder, such as an empty one in a
+/// home directory, does not count.
+pub(crate) fn has_git_marker(start: &Path) -> bool {
+    start.ancestors().any(|dir| {
+        let marker = dir.join(".git");
+        if marker.is_dir() {
+            marker.join("HEAD").is_file()
+        } else {
+            std::fs::read(&marker).is_ok_and(|contents| contents.starts_with(b"gitdir:"))
+        }
+    })
+}
+
 pub(super) fn resolve_path(path: &Path) -> anyhow::Result<Cow<'_, Path>> {
     if path.is_absolute() {
         Ok(Cow::Borrowed(path))

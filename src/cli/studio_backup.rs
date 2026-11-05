@@ -115,7 +115,15 @@ impl Store {
     pub fn at_workdir(workdir: &Path) -> anyhow::Result<Store> {
         // Only "not a repository" (or no Git) falls back, like the locks: a
         // repository whose common directory cannot be read is an error.
-        let dir = if git(workdir, &["rev-parse", "--git-dir"]).is_some() {
+        let in_repository = git(workdir, &["rev-parse", "--git-dir"]).is_some();
+        // As for the locks: Git failing inside a repository must not send the
+        // backups somewhere the other worktrees and processes do not look.
+        anyhow::ensure!(
+            in_repository || !crate::cli::has_git_marker(workdir),
+            "{} is in a Git repository, but Git could not read it. Fix Git and try again.",
+            workdir.display()
+        );
+        let dir = if in_repository {
             let common = crate::cli::lifecycle::git_common_dir(workdir)?;
             // Git prints forward slashes on Windows; rebuilding the path from
             // its components gives one separator style in printed paths.
@@ -196,15 +204,22 @@ impl Store {
             .context("Could not save the backup model")?;
         // The record is written last, so a backup that `list` shows always
         // has its model.
-        let mut record_file = tempfile::NamedTempFile::new_in(&self.dir)?;
-        std::io::Write::write_all(
-            &mut record_file,
-            serde_json::to_string_pretty(&record)?.as_bytes(),
-        )?;
-        record_file
-            .persist_noclobber(self.record_path(&id))
-            .map_err(|error| error.error)
-            .context("Could not save the backup record")?;
+        let written = (|| -> anyhow::Result<()> {
+            let mut record_file = tempfile::NamedTempFile::new_in(&self.dir)?;
+            std::io::Write::write_all(
+                &mut record_file,
+                serde_json::to_string_pretty(&record)?.as_bytes(),
+            )?;
+            record_file
+                .persist_noclobber(self.record_path(&id))
+                .map_err(|error| error.error)?;
+            Ok(())
+        })();
+        if let Err(error) = written {
+            // A model without its record could not be listed or restored.
+            let _ = fs::remove_file(self.model_path(&id));
+            return Err(error.context("Could not save the backup record"));
+        }
         Ok(record)
     }
 
@@ -256,7 +271,36 @@ impl Store {
         Ok((record, model))
     }
 
+    /// Models whose record is missing, left by a process that stopped between
+    /// writing the two. `remove` deletes them by ID.
+    pub fn orphans(&self) -> anyhow::Result<Vec<String>> {
+        let entries = match fs::read_dir(&self.dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error).context("Could not read the backup folder"),
+        };
+        let mut orphans = Vec::new();
+        for entry in entries {
+            let path = entry?.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("rbxm") {
+                continue;
+            }
+            let Some(id) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            if valid_id(id) && !self.record_path(id).exists() {
+                orphans.push(id.to_owned());
+            }
+        }
+        orphans.sort();
+        Ok(orphans)
+    }
+
     pub fn remove(&self, id: &str) -> anyhow::Result<()> {
+        if valid_id(id) && !self.record_path(id).exists() && self.model_path(id).is_file() {
+            fs::remove_file(self.model_path(id))?;
+            return Ok(());
+        }
         let (_, model) = self.get(id)?;
         // The record goes first, so a half-removed backup is not listed.
         fs::remove_file(self.record_path(id))?;
@@ -378,6 +422,17 @@ mod tests {
         big.note = Some("x".repeat(5000));
         assert!(store.save(big, b"model").is_err());
         assert!(store.list().unwrap().is_empty());
+    }
+
+    #[test]
+    fn models_without_records_are_reported_and_removable() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::in_dir(dir.path());
+        let saved = store.save(record("Map", 1_000), b"model").unwrap();
+        fs::remove_file(store.record_path(&saved.id)).unwrap();
+        assert_eq!(store.orphans().unwrap(), vec![saved.id.clone()]);
+        store.remove(&saved.id).unwrap();
+        assert!(store.orphans().unwrap().is_empty());
     }
 
     #[test]
