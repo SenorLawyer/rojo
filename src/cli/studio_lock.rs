@@ -269,7 +269,7 @@ impl LockStore {
         }
     }
 
-    /// The default store for `start`: `rojo-state/studio-locks` in the Git
+    /// The default store for `start`: a per-user folder chosen by the Git
     /// common directory, so every worktree of a repository shares its locks,
     /// or a per-user directory for `start` outside a Git repository (see
     /// [`super::project_state_dir`]), never inside the project.
@@ -284,7 +284,9 @@ impl LockStore {
                 // Git prints forward slashes on Windows; rebuilding the path
                 // from its components gives one separator style in printed paths.
                 let common: PathBuf = common.components().collect();
-                Ok(Self::new(common.join("rojo-state").join("studio-locks")))
+                Ok(Self::new(
+                    super::repository_state_dir(&common)?.join("studio-locks"),
+                ))
             }
             // Git failing inside a repository, for example because it is not
             // installed for this process, must not move this process to a
@@ -594,7 +596,13 @@ impl LockStore {
             .with_context(|| format!("Cannot create {}", self.dir.display()))?;
         let path = self.state_path(&name);
         let _guard = StateMutex::acquire(&path)?;
-        let previous = match fs::read(&path) {
+        // Only the start is kept for the log, so a huge state file is never
+        // read whole.
+        let previous = match fs::File::open(&path).and_then(|file| {
+            let mut bytes = Vec::new();
+            io::Read::read_to_end(&mut io::Read::take(file, 8 * 1024), &mut bytes)?;
+            Ok(bytes)
+        }) {
             Ok(bytes) => bytes,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
             Err(error) => {
@@ -783,11 +791,21 @@ fn decide(
             if let Some(limit) = limit {
                 let held = others().filter(|h| h.mode == LockMode::Shared).count();
                 if held >= limit as usize {
+                    // Named up to a few, so the reason stays short however many
+                    // hold the lock.
                     let holders: Vec<_> = others().map(|h| h.owner.as_str()).collect();
-                    return Err(format!(
-                        "all {limit} shared slots are taken ({})",
-                        holders.join(", ")
-                    ));
+                    let named = holders
+                        .iter()
+                        .take(5)
+                        .copied()
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let more = holders.len().saturating_sub(5);
+                    return Err(if more > 0 {
+                        format!("all {limit} shared slots are taken ({named} and {more} more)")
+                    } else {
+                        format!("all {limit} shared slots are taken ({named})")
+                    });
                 }
                 let queued = state
                     .waiters
@@ -995,7 +1013,7 @@ impl StateMutex {
 /// Needs no token or `rojo serve`. See `rojo doc --agent studio-locks`.
 #[derive(Debug, Parser)]
 pub struct LockCommand {
-    /// Directory holding the lock files. Defaults to rojo-state/studio-locks in
+    /// Directory holding the lock files. Defaults to a per-user folder chosen by
     /// the Git common directory, shared by all worktrees, or a per-user folder
     /// for the current directory outside Git, never inside the project.
     #[clap(long, global = true)]

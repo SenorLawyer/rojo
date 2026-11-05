@@ -127,11 +127,8 @@ impl Store {
             let common = crate::cli::lifecycle::git_common_dir(workdir)?;
             // Git prints forward slashes on Windows; rebuilding the path from
             // its components gives one separator style in printed paths.
-            common
-                .components()
-                .collect::<PathBuf>()
-                .join("rojo-state")
-                .join("backups")
+            let common: PathBuf = common.components().collect();
+            crate::cli::repository_state_dir(&common)?.join("backups")
         } else {
             // Never inside the project: a folder that `rojo serve` maps would
             // sync the backups into the place.
@@ -260,8 +257,10 @@ impl Store {
         if !valid_id(id) {
             bail!("Unknown backup '{id}'. Run `rojo studio backup list` for backup IDs.");
         }
-        let record: Record = fs::read(self.record_path(id))
-            .ok()
+        let small = entry_len(&self.record_path(id)).is_some_and(|len| len <= MAX_RECORD_BYTES);
+        let record: Record = small
+            .then(|| fs::read(self.record_path(id)).ok())
+            .flatten()
             .and_then(|bytes| serde_json::from_slice(&bytes).ok())
             .with_context(|| {
                 format!("Unknown backup '{id}'. Run `rojo studio backup list` for backup IDs.")
@@ -301,7 +300,11 @@ impl Store {
             fs::remove_file(self.model_path(id))?;
             return Ok(());
         }
-        let (_, model) = self.get(id)?;
+        anyhow::ensure!(
+            valid_id(id) && self.record_path(id).exists() && self.model_path(id).is_file(),
+            "Unknown backup '{id}'. Run `rojo studio backup list` for backup IDs."
+        );
+        let model = self.model_path(id);
         // The record goes first, so a half-removed backup is not listed.
         fs::remove_file(self.record_path(id))?;
         fs::remove_file(model)?;

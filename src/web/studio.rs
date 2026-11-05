@@ -1383,7 +1383,7 @@ impl StudioBridge {
                 let tree = self.serve.tree();
                 verify::resync_batches(&tree, &fixes)
             };
-            let (mut updated, mut failed, mut skipped, mut released) = (0, 0, 0, 0);
+            let (mut updated, mut failed, mut skipped) = (0, 0, 0);
             let mut errors = Vec::new();
             let mut remaining: u64 = batches.iter().map(|batch| batch.count as u64).sum();
             for batch in batches {
@@ -1424,10 +1424,6 @@ impl StudioBridge {
                 let result = &value["result"];
                 if status == StatusCode::OK && result["ok"] == json!(true) {
                     updated += result["value"]["updated"].as_u64().unwrap_or(0);
-                    // A released hold's script is not fixed yet: its class
-                    // change applies with the next sync, so it is reported
-                    // apart and the fix does not count as complete.
-                    released += result["value"]["released"].as_u64().unwrap_or(0);
                     failed += result["value"]["failed"].as_u64().unwrap_or(0);
                     skipped += result["value"]["skipped"].as_u64().unwrap_or(0);
                     remaining -= batch.count as u64;
@@ -1449,7 +1445,6 @@ impl StudioBridge {
                 "updated": updated,
                 "failed": failed + remaining,
                 "skippedChanged": skipped,
-                "released": released,
                 "skippedHeld": if include_held { 0 } else { comparison.held_count() },
                 "errors": errors,
             });

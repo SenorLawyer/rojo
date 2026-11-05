@@ -684,15 +684,17 @@ return function()
 			again:stop()
 		end)
 
-		it("lets the replacement through once include-held released the hold", function()
-			session.__authorizedReplace.UI = true
-			serverCopy("Script", "")
-			local ok = session:__replaceInstances({ "UI" })
-			expect(ok).to.equal(true)
-			local now = session.__instanceMap.fromIds.UI
-			expect(now).never.to.equal(module)
-			expect(now.ClassName).to.equal("Script")
-			expect(session.__authorizedReplace.UI).to.equal(nil)
+		it("does not empty a held script whose class changed too, even with includeHeld", function()
+			session.__status = ServeSession.Status.Connected
+			session:__holdScriptWipes(sourceUpdate("UI", ""))
+			session.__heldWipes.UI.deferredClass = true
+			local kept = module.Source
+			session.__verifiedRecords = { { id = "VERIFY", sources = { UI = kept }, generations = {} } }
+			local expected = { UI = { from = hashSource(kept), to = hashSource("") } }
+			local result = resyncAs(sourceUpdate("UI", ""), expected, true)
+			expect(result.skipped).to.equal(1)
+			expect(module.Source).to.equal(kept)
+			expect(session.__heldWipes.UI).to.be.ok()
 		end)
 
 		it("keeps a hold when the same Studio reconnects", function()

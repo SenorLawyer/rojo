@@ -54,7 +54,7 @@ Pass `--json` before the subcommand (`rojo studio --json lock status`) for one c
 
 ## Storage
 
-Inside a Git repository, locks live in `<git common dir>/rojo-state/studio-locks/`, the directory `git rev-parse --git-common-dir` names, so every worktree of a repository shares them. Outside Git they live in a per-user folder for the current directory, `%LOCALAPPDATA%\Rojo\projects\<id>\studio-locks` on Windows (`$XDG_STATE_HOME/rojo/projects/<id>` or `~/.local/state/rojo/projects/<id>` elsewhere), so they can never be synced into a place. `--dir <path>` uses another directory; give every agent the same one.
+Locks live in a per-user folder, never inside the project, where `rojo serve` could sync them into a place. Inside a Git repository the folder is chosen by the repository's common Git directory (the one `git rev-parse --git-common-dir` names), so every worktree of a repository shares it: `%LOCALAPPDATA%\Rojo\projects\<id>\studio-locks` on Windows. Outside Git it is chosen by the current directory, in the same place `%LOCALAPPDATA%\Rojo\projects\<id>\studio-locks` on Windows (`$XDG_STATE_HOME/rojo/projects/<id>` or `~/.local/state/rojo/projects/<id>` elsewhere), so they can never be synced into a place. `--dir <path>` uses another directory; give every agent the same one.
 
 Each lock has three files:
 

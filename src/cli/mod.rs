@@ -203,6 +203,14 @@ pub fn exit_status(error: &anyhow::Error) -> (i32, bool) {
 /// Windows, `$XDG_STATE_HOME/rojo/projects/<id>` (or `~/.local/state/...`)
 /// elsewhere. It must not be inside the project, because `rojo serve` would
 /// sync any JSON or model file placed in a mapped folder into the place.
+/// Rojo's per-user state for the repository whose Git common directory is
+/// `common_dir`, shared by all of its worktrees. It is outside the repository,
+/// because a project can map a folder that contains `.git`, and `rojo serve`
+/// would then sync anything stored there into the place.
+pub(crate) fn repository_state_dir(common_dir: &Path) -> anyhow::Result<PathBuf> {
+    project_state_dir(common_dir)
+}
+
 pub(crate) fn project_state_dir(workdir: &Path) -> anyhow::Result<PathBuf> {
     let base = if cfg!(windows) {
         env::var_os("LOCALAPPDATA").map(|dir| PathBuf::from(dir).join("Rojo"))

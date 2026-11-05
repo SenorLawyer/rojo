@@ -42,7 +42,7 @@ Scripts are read as the reconciler reads them: from the script editor when a scr
 
 When a script with 5 or more non-blank lines would become empty because its file on disk became empty, the plugin keeps the old source in Studio and prints a warning instead. An editor or agent that saves an empty file by mistake then cannot wipe the script in Studio, which used to reach the place before anyone noticed. The hold ends as soon as the file has code again, or the file (or a folder containing it) is deleted. The sync fallback, which replaces an instance with the server's copy when a change cannot be applied, leaves held scripts alone. While it lasts, the script shows up in `rojo studio sessions` and as *different* (and `held`) in `verify`.
 
-To empty the script on purpose, write at least one non-blank line, delete the file, or run `verify --fix --include-held`. When the script's class changed on disk too while it was held, `--include-held` ends the hold and reports the script as `released` rather than fixed (verify still exits with 1): the class change and the empty source apply with the next change Rojo syncs, or when Studio reconnects. A plain `--fix` leaves held scripts alone.
+To empty the script on purpose, write at least one non-blank line, delete the file, or run `verify --fix --include-held`. When the script's class changed on disk too while it was held, `--include-held` cannot empty it, since the class change replaces the instance; it is reported as skipped, and writing code to its file or deleting the file ends the hold as usual. A plain `--fix` leaves held scripts alone.
 
 The guard checks each change from disk when it arrives. Studio writes a script's new source a moment later, so a change that emptied a small script and is still being written when a later change makes the script long and a hold starts can still finish; this needs several changes to the same script within a fraction of a second.
 
@@ -63,7 +63,7 @@ rojo studio --token-file <token> backup restore <backup-id> --session <id> --par
 rojo studio backup remove <backup-id>
 ```
 
-A backup is the instance's native `.rbxm` export, the same as `rojo studio export`, saved with a record of the place, the instance's path and the Git commit. They live in `rojo-state/backups` in the repository's Git directory, shared by all of its worktrees, or outside Git in a per-user folder for the current directory (`%LOCALAPPDATA%\Rojo\projects\<id>\backups` on Windows). Neither is inside the project, so `rojo serve` never syncs them. `list` and `remove` do not need the bridge.
+A backup is the instance's native `.rbxm` export, the same as `rojo studio export`, saved with a record of the place, the instance's path and the Git commit. They live in a per-user folder (`%LOCALAPPDATA%\Rojo\projects\<id>\backups` on Windows), chosen by the repository's common Git directory so every worktree shares it, or by the current directory outside Git. It is never inside the project, so `rojo serve` never syncs them. `list` and `remove` do not need the bridge.
 
 Restoring inserts the copy under the given parent next to what is there now; it does not replace anything, so remove or rename the current instance first if needed. Restoring scripts needs `--allow-scripts`, and restored Script and LocalScript instances stay disabled, like any [import](studio-bridge.md). The export limits apply: services cannot be backed up directly (back up their children instead), and a backup holds at most 10,000 instances and 5 MiB.
 

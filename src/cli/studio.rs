@@ -253,7 +253,9 @@ impl StudioCommand {
                             .count();
                         backups.truncate(fits);
                     }
-                    let orphans = store.orphans()?;
+                    let mut orphans = store.orphans()?;
+                    let orphans_total = orphans.len();
+                    orphans.truncate(100);
                     if self.json {
                         return print_json(
                             &json!({
@@ -261,6 +263,7 @@ impl StudioCommand {
                                 "total": total,
                                 "truncated": backups.len() < total,
                                 "orphaned": orphans,
+                                "orphanedTotal": orphans_total,
                             }),
                             true,
                         );
@@ -625,7 +628,6 @@ fn verify_passed(report: &Value) -> bool {
         && fixed["failed"].as_u64() == Some(0)
         && fixed["skippedHeld"].as_u64() == Some(0)
         && fixed["skippedChanged"].as_u64().unwrap_or(0) == 0
-        && fixed["released"].as_u64().unwrap_or(0) == 0
         && fixed["updated"].as_u64() == Some(count("differentCount"))
 }
 
@@ -689,13 +691,6 @@ fn describe_verify(report: &Value) -> String {
             fixed["updated"].as_u64().unwrap_or(0),
             fixed["attempted"].as_u64().unwrap_or(0)
         );
-        if fixed["released"].as_u64().unwrap_or(0) > 0 {
-            let _ = writeln!(
-                out,
-                "Released the hold on {} scripts whose class changed too; they sync with the next change, or reconnect Studio now.",
-                fixed["released"]
-            );
-        }
         if fixed["skippedChanged"].as_u64().unwrap_or(0) > 0 {
             let _ = writeln!(
                 out,
