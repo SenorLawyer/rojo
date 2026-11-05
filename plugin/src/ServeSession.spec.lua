@@ -684,6 +684,17 @@ return function()
 			again:stop()
 		end)
 
+		it("lets the replacement through once include-held released the hold", function()
+			session.__authorizedReplace.UI = true
+			serverCopy("Script", "")
+			local ok = session:__replaceInstances({ "UI" })
+			expect(ok).to.equal(true)
+			local now = session.__instanceMap.fromIds.UI
+			expect(now).never.to.equal(module)
+			expect(now.ClassName).to.equal("Script")
+			expect(session.__authorizedReplace.UI).to.equal(nil)
+		end)
+
 		it("keeps a hold when the same Studio reconnects", function()
 			session:__holdScriptWipes(sourceUpdate("UI", ""))
 			local hold = session.__heldWipes.UI

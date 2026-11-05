@@ -193,6 +193,9 @@ function ServeSession.new(options)
 		__sourceGenerations = {},
 		-- Scripts whose hold ended with a class change still to apply.
 		__refreshAfterHold = {},
+		-- Scripts whose next fallback replacement may empty them, because
+		-- `verify --fix --include-held` released their hold.
+		__authorizedReplace = {},
 		__syncStats = {
 			connectedAt = nil,
 			lastPatchAt = nil,
@@ -661,7 +664,10 @@ function ServeSession:applyResync(patch, expect, includeHeld, expiresAt, isActiv
 			if includeHeld and holdNow and holdNow.deferredClass then
 				-- Asked to give up the hold: it ends here, and the class change
 				-- that waited with it is applied, with its source, by the next
-				-- change Rojo syncs or by reconnecting.
+				-- change Rojo syncs or by reconnecting. That replacement empties
+				-- the script, which the user has now allowed, so the guard lets
+				-- it through once. Until then the script still differs.
+				self.__authorizedReplace[write.id] = true
 				self:__clearHold(write.id)
 				released += 1
 				Log.warn(
@@ -1171,7 +1177,11 @@ function ServeSession:__replaceInstances(idList)
 			local newSource = readSource(replacement) or ""
 			local oldSource = readSource(oldInstance) or ""
 			local lines = countNonBlankLines(oldSource)
-			if not string.find(newSource, "%S") and (self.__heldWipes[id] or lines >= WIPE_GUARD_MIN_LINES) then
+			if
+				not self.__authorizedReplace[id]
+				and not string.find(newSource, "%S")
+				and (self.__heldWipes[id] or lines >= WIPE_GUARD_MIN_LINES)
+			then
 				if not self.__heldWipes[id] then
 					Log.warn(
 						"Rojo held back replacing {} ({} lines of code) with an empty copy, because its file on disk is now empty.",
@@ -1192,6 +1202,7 @@ function ServeSession:__replaceInstances(idList)
 			end
 		end
 
+		self.__authorizedReplace[id] = nil
 		self.__instanceMap:insert(id, replacement)
 		Log.trace("Swapping Instance {} out via api/models/ endpoint", id)
 		local oldParent = oldInstance.Parent

@@ -1,7 +1,7 @@
 //! Opt-in, authenticated local transport between a CLI and connected Studio plugins.
 
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     fs, io,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     path::{Path, PathBuf},
@@ -415,6 +415,8 @@ struct State {
     /// The `resync` batch a running `verify --fix` is waiting on, by the
     /// verify's own request ID, so cancelling the verify cancels it too.
     verify_children: HashMap<String, (String, String)>,
+    /// Request IDs of verifies still running, which no other command may use.
+    active_verifies: HashSet<String>,
     next_generation: u64,
 }
 
@@ -1301,6 +1303,18 @@ impl StudioBridge {
     /// [`super::verify`].
     async fn verify(&self, session_id: &str, id: String, args: &Value) -> Response<Body> {
         let started = Instant::now();
+        // The request ID stays reserved until this verify ends, so another
+        // command cannot reuse it in between and take its cancellations.
+        {
+            let mut state = self.state();
+            if state.pending.contains_key(&id) || !state.active_verifies.insert(id.clone()) {
+                return failure(StatusCode::CONFLICT, "requestId is already pending");
+            }
+        }
+        let _reservation = VerifyReservation {
+            bridge: self,
+            id: id.clone(),
+        };
         // Callers may reuse a request ID, so the plugin's record of what this
         // verify saw gets an ID of its own.
         let verify_id = Uuid::new_v4().to_string();
@@ -1369,7 +1383,7 @@ impl StudioBridge {
                 let tree = self.serve.tree();
                 verify::resync_batches(&tree, &fixes)
             };
-            let (mut updated, mut failed, mut skipped) = (0, 0, 0);
+            let (mut updated, mut failed, mut skipped, mut released) = (0, 0, 0, 0);
             let mut errors = Vec::new();
             let mut remaining: u64 = batches.iter().map(|batch| batch.count as u64).sum();
             for batch in batches {
@@ -1410,9 +1424,10 @@ impl StudioBridge {
                 let result = &value["result"];
                 if status == StatusCode::OK && result["ok"] == json!(true) {
                     updated += result["value"]["updated"].as_u64().unwrap_or(0);
-                    // A released hold whose class change still has to sync
-                    // counts as handled: the user asked for it.
-                    updated += result["value"]["released"].as_u64().unwrap_or(0);
+                    // A released hold's script is not fixed yet: its class
+                    // change applies with the next sync, so it is reported
+                    // apart and the fix does not count as complete.
+                    released += result["value"]["released"].as_u64().unwrap_or(0);
                     failed += result["value"]["failed"].as_u64().unwrap_or(0);
                     skipped += result["value"]["skipped"].as_u64().unwrap_or(0);
                     remaining -= batch.count as u64;
@@ -1434,6 +1449,7 @@ impl StudioBridge {
                 "updated": updated,
                 "failed": failed + remaining,
                 "skippedChanged": skipped,
+                "released": released,
                 "skippedHeld": if include_held { 0 } else { comparison.held_count() },
                 "errors": errors,
             });
@@ -1519,7 +1535,11 @@ impl StudioBridge {
                     "Target Studio session does not exist or expired",
                 );
             }
-            if state.pending.contains_key(&id) {
+            // A running verify reserves its ID; only its own `sources` step,
+            // sent with that ID, may use it.
+            if state.pending.contains_key(&id)
+                || (action != "sources" && state.active_verifies.contains(&id))
+            {
                 return failure(StatusCode::CONFLICT, "requestId is already pending");
             }
             if state
@@ -1587,6 +1607,18 @@ impl StudioBridge {
             state.pending.remove(&id);
         }
         response
+    }
+}
+
+/// Ends a verify's reservation of its request ID when dropped.
+struct VerifyReservation<'a> {
+    bridge: &'a StudioBridge,
+    id: String,
+}
+
+impl Drop for VerifyReservation<'_> {
+    fn drop(&mut self) {
+        self.bridge.state().active_verifies.remove(&self.id);
     }
 }
 
@@ -2761,6 +2793,14 @@ mod tests {
         assert_eq!(resync["action"], "resync");
         assert_ne!(resync["requestId"], json!(id));
 
+        // While the verify runs, no other command may take its ID.
+        let (status, _) = cli(
+            &bridge,
+            "/api/studio/command",
+            json!({"sessionId":session,"action":"status","requestId":id}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
         // The verify's own ID is no longer pending, but cancelling it must
         // still stop the batch it is waiting on.
         let (status, _) = cli(
@@ -2785,6 +2825,7 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::GONE);
         assert!(bridge.state().verify_children.is_empty());
+        assert!(bridge.state().active_verifies.is_empty());
     }
 
     #[tokio::test]
