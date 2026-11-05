@@ -1997,6 +1997,10 @@ struct RemapReport {
     /// Bare numbers equal to an old id, left alone because `--bare` was not
     /// given.
     bare_skipped: usize,
+    /// Files with references that changed on disk between being read and
+    /// being rewritten, such as an editor saving them. They are left as they
+    /// are, so the other edit is kept; running remap again picks them up.
+    changed_during_remap: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     map_out: Option<String>,
 }
@@ -2335,6 +2339,16 @@ fn walk_text(dir: &Path, files: &mut BTreeSet<PathBuf>) -> anyhow::Result<()> {
 /// Finds references to the old ids recorded under `replaced`, and rewrites
 /// them with `write`.
 fn remap(config_path: &Path, options: &RemapOptions) -> anyhow::Result<RemapReport> {
+    remap_with(config_path, options, &mut |_| {})
+}
+
+/// `remap`, calling `before_write` with each file just before it is checked
+/// again and rewritten, so tests can change a file at that moment.
+fn remap_with(
+    config_path: &Path,
+    options: &RemapOptions,
+    before_write: &mut dyn FnMut(&Path),
+) -> anyhow::Result<RemapReport> {
     let config = load_config(config_path)?;
     let lock_path = normalize(&config.lock);
     // `--map-out` is written even without `--write`, so a mistyped path must
@@ -2412,6 +2426,16 @@ fn remap(config_path: &Path, options: &RemapOptions) -> anyhow::Result<RemapRepo
                     at = found.end;
                 }
                 rewritten.extend_from_slice(&text[at..]);
+                before_write(&path);
+                // The replacement was computed from `text`, so writing it over
+                // a file that changed since would throw away that change. A
+                // save between this check and the rename can still be lost;
+                // closing that gap would need file locking that editors do
+                // not honour, and the window is a few milliseconds.
+                if fs::read(&path).ok().as_deref() != Some(text.as_slice()) {
+                    report.changed_during_remap.push(rel);
+                    continue;
+                }
                 write_atomic(&path, &rewritten)?;
                 report.files_rewritten += 1;
                 report.references_rewritten += found.len();
@@ -2463,6 +2487,14 @@ fn describe_remap(report: &RemapReport, out: &mut dyn Write) -> io::Result<()> {
                 "Rewrote {} reference(s) in {} file(s).",
                 report.references_rewritten, report.files_rewritten
             )?;
+            if !report.changed_during_remap.is_empty() {
+                writeln!(
+                    out,
+                    "Not rewritten, because they changed while remap ran: {}. Run `rojo assets \
+                     remap --write` again to update them.",
+                    report.changed_during_remap.join(", ")
+                )?;
+            }
         } else if !report.references.is_empty() {
             writeln!(
                 out,
@@ -4150,6 +4182,58 @@ mod tests {
         for url in kept {
             assert!(expected.contains(url));
         }
+    }
+
+    #[test]
+    fn remap_keeps_edits_saved_while_it_runs() {
+        let fixture = Fixture::new();
+        fixture.write_replaced(&[(123456789, 987654321)]);
+        fixture.write_project("src/A.luau", SHOP.as_bytes());
+        fixture.write_project("src/B.luau", SHOP.as_bytes());
+        let edited = format!("{SHOP}-- saved by an editor\n");
+        let b = fixture.dir.path().join("src/B.luau");
+
+        let report = remap_with(
+            &fixture.config(),
+            &RemapOptions {
+                write: true,
+                ..RemapOptions::default()
+            },
+            &mut |path| {
+                if path == b {
+                    fs::write(path, &edited).unwrap();
+                }
+            },
+        )
+        .unwrap();
+
+        assert_eq!(fixture.read_project("src/B.luau"), edited);
+        assert_ne!(fixture.read_project("src/A.luau"), SHOP);
+        assert_eq!(report.changed_during_remap, ["src/B.luau"]);
+        assert_eq!(report.files_rewritten, 1);
+        assert_eq!(report.references_rewritten, 4);
+        let mut out = Vec::new();
+        describe_remap(&report, &mut out).unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert!(
+            out.contains("Not rewritten, because they changed while remap ran: src/B.luau."),
+            "{out}"
+        );
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["changedDuringRemap"][0], "src/B.luau");
+
+        // The next run rewrites it and keeps the edit.
+        let (report, _) = fixture.remap(RemapOptions {
+            write: true,
+            ..RemapOptions::default()
+        });
+        assert!(report.changed_during_remap.is_empty());
+        assert!(fixture
+            .read_project("src/B.luau")
+            .ends_with("-- saved by an editor\n"));
+        assert!(!fixture
+            .read_project("src/B.luau")
+            .contains("rbxassetid://123456789\""));
     }
 
     #[test]
