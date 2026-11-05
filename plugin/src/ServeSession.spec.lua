@@ -545,6 +545,33 @@ return function()
 			expect(now.Source).to.equal("print('code again')")
 		end)
 
+		it("pairs a held script with the server's after its class changed", function()
+			session:__holdScriptWipes(sourceUpdate("UI", ""))
+			session:stop()
+			local again = ServeSession.new({ apiContext = api, twoWaySync = false })
+			again.__instanceMap:insert("FOLDER", container)
+			again:__rematchHolds({
+				FOLDER = { Name = "Folder", ClassName = "Folder", Children = { "NEW-ID" } },
+				["NEW-ID"] = { Name = "UIController", ClassName = "Script", Children = {} },
+			})
+			again:__adoptHolds()
+			expect(again.__instanceMap.fromIds["NEW-ID"]).to.equal(module)
+			expect(again.__heldWipes["NEW-ID"]).to.be.ok()
+			again:__clearHold("NEW-ID")
+			again:stop()
+		end)
+
+		it("refuses to write a script whose source changed even when its hash matches", function()
+			session.__status = ServeSession.Status.Connected
+			local kept = module.Source
+			local expected = { UI = { from = hashSource(kept), to = hashSource("return 'x'") } }
+			-- verify saw different text that happens to hash the same.
+			session.__verifiedSources = { UI = "something else" }
+			local result = session:applyResync(sourceUpdate("UI", "return 'x'"), expected, false)
+			expect(result.skipped).to.equal(1)
+			expect(module.Source).to.equal(kept)
+		end)
+
 		it("keeps a hold when the same Studio reconnects", function()
 			session:__holdScriptWipes(sourceUpdate("UI", ""))
 			local hold = session.__heldWipes.UI
@@ -590,7 +617,9 @@ return function()
 			expect(#patch.updated).to.equal(1)
 		end)
 
+		-- Also records `source` as what verify saw, as `getSourceHashes` does.
 		local function expectFrom(source, target)
+			session.__verifiedSources = { UI = source }
 			return { UI = { from = hashSource(source), to = hashSource(target) } }
 		end
 

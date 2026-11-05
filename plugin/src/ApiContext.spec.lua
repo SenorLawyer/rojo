@@ -578,10 +578,10 @@ return function()
 			expect(message:find('"servePlaceIds": [111, 222, 123]', 1, true) ~= nil).to.equal(true)
 		end)
 
-		it("explains that an unpublished place cannot be listed", function()
+		it("explains how to allow unpublished places", function()
 			local message = ApiContext.unlistedPlaceMessage(0, { 111 })
 			expect(message:find("not published", 1, true) ~= nil).to.equal(true)
-			expect(message:find('"servePlaceIds"', 1, true)).to.equal(nil)
+			expect(message:find("add 0 to 'servePlaceIds'", 1, true) ~= nil).to.equal(true)
 		end)
 
 		it("says which side to update on a protocol mismatch", function()

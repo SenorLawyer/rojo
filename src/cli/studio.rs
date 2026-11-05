@@ -151,6 +151,9 @@ pub enum StudioSubcommand {
         /// List at most this many scripts of each kind (1 to 10,000).
         #[clap(long)]
         limit: Option<usize>,
+        /// Bytes of JSON the lists may use together (1,024 to 4 MiB).
+        #[clap(long)]
+        max_bytes: Option<usize>,
     },
     /// Save copies of Studio instances outside the place, and put them back.
     Backup {
@@ -272,6 +275,7 @@ impl StudioCommand {
             include_held,
             all,
             limit,
+            max_bytes,
         } = &self.command
         {
             let mut args = json!({"fix": fix, "includeHeld": include_held});
@@ -279,6 +283,9 @@ impl StudioCommand {
                 args["listLimit"] = json!(crate::web::verify::MAX_LISTED);
             } else if let Some(limit) = limit {
                 args["listLimit"] = json!(limit);
+            }
+            if let Some(max_bytes) = max_bytes {
+                args["maxBytes"] = json!(max_bytes);
             }
             let result = request(
                 &client,

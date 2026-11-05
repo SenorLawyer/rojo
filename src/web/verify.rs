@@ -50,6 +50,24 @@ pub(crate) fn hash_source(source: &str) -> (u32, usize) {
     (hash, normalized.len())
 }
 
+/// 32-bit djb2 (xor variant) of `source` with CRLF turned into LF, a second
+/// hash independent of [`hash_source`], so that two versions of a script
+/// match only when both hashes and the length do. Must match
+/// `plugin/src/hashSource.lua`. Neither hash resists sources made to collide on
+/// purpose; `verify --fix` also checks the exact source the plugin saw.
+pub(crate) fn second_hash(source: &str) -> u32 {
+    let normalized: Cow<str> = if source.contains("\r\n") {
+        Cow::Owned(source.replace("\r\n", "\n"))
+    } else {
+        Cow::Borrowed(source)
+    };
+    let mut hash: u32 = 5381;
+    for byte in normalized.bytes() {
+        hash = hash.wrapping_mul(33) ^ u32::from(byte);
+    }
+    hash
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct TreeScript {
     pub id: String,
@@ -57,6 +75,7 @@ pub(crate) struct TreeScript {
     pub path: String,
     pub file: Option<String>,
     pub hash: u32,
+    pub hash2: u32,
     pub length: usize,
 }
 
@@ -157,6 +176,7 @@ pub(crate) fn tree_scripts(tree: &RojoTree, root_dir: &Path) -> Vec<TreeScript> 
             continue;
         };
         let (hash, length) = hash_source(source);
+        let hash2 = second_hash(source);
         let id = instance.id();
         scripts.push(TreeScript {
             id: ref_string(id),
@@ -164,6 +184,7 @@ pub(crate) fn tree_scripts(tree: &RojoTree, root_dir: &Path) -> Vec<TreeScript> 
             path: instance_path(tree, id),
             file: source_file(tree, id, root_dir),
             hash,
+            hash2,
             length,
         });
     }
@@ -209,7 +230,8 @@ pub(crate) fn compare(scripts: Vec<TreeScript>, studio: &Value) -> anyhow::Resul
         .get("scripts")
         .and_then(Value::as_array)
         .ok_or_else(|| anyhow::anyhow!("Studio's answer has no script list"))?;
-    let mut in_studio: HashMap<&str, (u32, usize)> = HashMap::with_capacity(entries.len());
+    let mut in_studio: HashMap<&str, (u32, usize, Option<u32>)> =
+        HashMap::with_capacity(entries.len());
     for entry in entries {
         let (Some(id), Some(hash), Some(length)) = (
             entry.get("id").and_then(Value::as_str),
@@ -220,7 +242,19 @@ pub(crate) fn compare(scripts: Vec<TreeScript>, studio: &Value) -> anyhow::Resul
         };
         let hash = u32::try_from(hash)
             .map_err(|_| anyhow::anyhow!("Studio's answer has a hash outside 32 bits"))?;
-        in_studio.insert(id, (hash, length as usize));
+        // Plugins from before the second hash leave it out.
+        let hash2 = match entry.get("hash2") {
+            None => None,
+            Some(value) => Some(
+                value
+                    .as_u64()
+                    .and_then(|value| u32::try_from(value).ok())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("Studio's answer has a malformed second hash")
+                    })?,
+            ),
+        };
+        in_studio.insert(id, (hash, length as usize, hash2));
     }
     let detached = string_list(studio.get("detached"));
     let held = string_list(studio.get("held"));
@@ -231,10 +265,14 @@ pub(crate) fn compare(scripts: Vec<TreeScript>, studio: &Value) -> anyhow::Resul
     };
     for script in scripts {
         match in_studio.get(script.id.as_str()) {
-            Some(&(hash, length)) if hash == script.hash && length == script.length => {
+            Some(&(hash, length, hash2))
+                if hash == script.hash
+                    && length == script.length
+                    && hash2.is_none_or(|hash2| hash2 == script.hash2) =>
+            {
                 comparison.matching += 1;
             }
-            Some(&(hash, length)) => comparison.different.push(Different {
+            Some(&(hash, length, _)) => comparison.different.push(Different {
                 script,
                 studio_hash: hash,
                 studio_length: length,
@@ -246,16 +284,53 @@ pub(crate) fn compare(scripts: Vec<TreeScript>, studio: &Value) -> anyhow::Resul
     Ok(comparison)
 }
 
-fn describe(script: &TreeScript) -> Value {
-    json!({"id": script.id, "path": script.path, "file": script.file, "diskLength": script.length})
+/// Paths longer than this are shortened in reports. Instances inside model
+/// files can have very long paths, and a few hundred of them must still fit
+/// the caller's output limit.
+const MAX_REPORTED_PATH: usize = 1024;
+
+fn shorten(text: &str) -> String {
+    if text.len() <= MAX_REPORTED_PATH {
+        return text.to_owned();
+    }
+    let mut cut = MAX_REPORTED_PATH;
+    while !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    format!("{}...", &text[..cut])
 }
 
+fn describe(script: &TreeScript) -> Value {
+    json!({
+        "id": script.id,
+        "path": shorten(&script.path),
+        "file": script.file.as_deref().map(shorten),
+        "diskLength": script.length,
+    })
+}
+
+/// The default byte budget for listed scripts, well under the CLI's 8 MiB
+/// response limit.
+pub(crate) const DEFAULT_LIST_BYTES: usize = 4 * 1024 * 1024;
+
+/// Takes up to `limit` items while their serialized size fits in `budget`,
+/// which they then use up. Returns them and how many there were in all.
 fn listed<'a>(
     items: impl ExactSizeIterator<Item = Value> + 'a,
     limit: usize,
+    budget: &mut usize,
 ) -> (Vec<Value>, usize) {
     let total = items.len();
-    (items.take(limit).collect(), total)
+    let mut taken = Vec::new();
+    for item in items.take(limit) {
+        let size = item.to_string().len() + 1;
+        if size > *budget {
+            break;
+        }
+        *budget -= size;
+        taken.push(item);
+    }
+    (taken, total)
 }
 
 impl Comparison {
@@ -263,8 +338,11 @@ impl Comparison {
         self.different.is_empty() && self.missing.is_empty() && self.detached.is_empty()
     }
 
-    /// The report, listing at most `limit` scripts of each kind.
-    pub(crate) fn report(&self, limit: usize) -> Value {
+    /// The report, listing at most `limit` scripts of each kind, in at most
+    /// `max_bytes` of JSON for the lists together. The counts cover every
+    /// script either way.
+    pub(crate) fn report(&self, limit: usize, max_bytes: usize) -> Value {
+        let mut budget = max_bytes;
         let (different, different_count) = listed(
             self.different.iter().map(|different| {
                 let mut value = describe(&different.script);
@@ -273,9 +351,12 @@ impl Comparison {
                 value
             }),
             limit,
+            &mut budget,
         );
-        let (missing, missing_count) = listed(self.missing.iter().map(describe), limit);
-        let (detached, detached_count) = listed(self.detached.iter().map(describe), limit);
+        let (missing, missing_count) =
+            listed(self.missing.iter().map(describe), limit, &mut budget);
+        let (detached, detached_count) =
+            listed(self.detached.iter().map(describe), limit, &mut budget);
         json!({
             "inSync": self.in_sync(),
             "checked": self.checked,
@@ -287,7 +368,9 @@ impl Comparison {
             "detachedCount": detached_count,
             "detached": detached,
             "heldCount": self.held.len(),
-            "truncated": different_count > limit || missing_count > limit || detached_count > limit,
+            "truncated": different.len() < different_count
+                || missing.len() < missing_count
+                || detached.len() < detached_count,
         })
     }
 
@@ -385,6 +468,27 @@ mod test {
         assert_eq!(hash_source("a"), (0xe40c_292c, 1));
         assert_eq!(hash_source("foobar"), (0xbf9c_f968, 6));
         assert_eq!(hash_source("print(\"Hello, Rojo!\")\n"), (0x8d5c_0b3a, 22));
+        assert_eq!(second_hash(""), 5381);
+        assert_eq!(second_hash("a"), 177_604);
+        assert_eq!(second_hash("print(\"Hello, Rojo!\")\n"), 911_966_760);
+    }
+
+    #[test]
+    fn the_second_hash_tells_apart_a_first_hash_collision() {
+        // Two sources found to collide on FNV-1a and length.
+        let (a, b) = ("return '07ilh49'", "return '0v3kbm8'");
+        assert_eq!(hash_source(a), hash_source(b));
+        assert_ne!(second_hash(a), second_hash(b));
+        let tree = RojoTree::new(
+            InstanceSnapshot::new()
+                .name("game")
+                .class_name("DataModel")
+                .children(vec![script("S", a)]),
+        );
+        let scripts = tree_scripts(&tree, Path::new("/"));
+        let (hash, length) = hash_source(b);
+        let answer = json!({"scripts":[{"id": scripts[0].id, "hash": hash, "hash2": second_hash(b), "length": length}]});
+        assert!(!compare(scripts, &answer).unwrap().in_sync());
     }
 
     #[test]
@@ -480,7 +584,7 @@ mod test {
         assert!(!comparison.in_sync());
         assert_eq!(comparison.checked, 5);
         assert_eq!(comparison.matching, 2);
-        let report = comparison.report(DEFAULT_LISTED);
+        let report = comparison.report(DEFAULT_LISTED, DEFAULT_LIST_BYTES);
         assert_eq!(report["differentCount"], 1);
         assert_eq!(
             report["different"][0]["path"],
@@ -499,13 +603,18 @@ mod test {
         let tree = tree();
         let scripts = tree_scripts(&tree, Path::new("/"));
         let comparison = compare(scripts, &json!({"scripts": []})).unwrap();
-        let short = comparison.report(2);
+        let short = comparison.report(2, DEFAULT_LIST_BYTES);
         assert_eq!(short["missingCount"], 5);
         assert_eq!(short["missing"].as_array().unwrap().len(), 2);
         assert_eq!(short["truncated"], true);
-        let full = comparison.report(MAX_LISTED);
+        let full = comparison.report(MAX_LISTED, DEFAULT_LIST_BYTES);
         assert_eq!(full["missing"].as_array().unwrap().len(), 5);
         assert_eq!(full["truncated"], false);
+        // A small byte budget lists fewer, but still counts all.
+        let tight = comparison.report(MAX_LISTED, 300);
+        assert!(tight["missing"].as_array().unwrap().len() < 5);
+        assert_eq!(tight["missingCount"], 5);
+        assert_eq!(tight["truncated"], true);
     }
 
     #[test]
@@ -536,7 +645,7 @@ mod test {
         assert_eq!(comparison.fixable(true).len(), 1);
         assert_eq!(comparison.held_count(), 1);
         assert_eq!(
-            comparison.report(DEFAULT_LISTED)["different"][0]["held"],
+            comparison.report(DEFAULT_LISTED, DEFAULT_LIST_BYTES)["different"][0]["held"],
             true
         );
     }

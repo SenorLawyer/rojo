@@ -1338,7 +1338,21 @@ impl StudioBridge {
                 )
             }
         };
-        let mut report = comparison.report(list_limit);
+        let list_bytes = match args.get("maxBytes") {
+            None => verify::DEFAULT_LIST_BYTES,
+            Some(bytes) => match bytes.as_u64() {
+                Some(bytes @ 1024..) if bytes as usize <= verify::DEFAULT_LIST_BYTES => {
+                    bytes as usize
+                }
+                _ => {
+                    return failure(
+                        StatusCode::BAD_REQUEST,
+                        format!("maxBytes must be 1024 to {}", verify::DEFAULT_LIST_BYTES),
+                    )
+                }
+            },
+        };
+        let mut report = comparison.report(list_limit, list_bytes);
         if fix {
             let fixes = comparison.fixable(include_held);
             let batches = {
@@ -1369,6 +1383,13 @@ impl StudioBridge {
                 self.state()
                     .verify_children
                     .insert(id.clone(), (session_id.to_owned(), child.clone()));
+                // Removes the record however this future ends, including when
+                // the caller disconnects and it is dropped mid-await.
+                let _child_record = ChildRecord {
+                    bridge: self,
+                    id: id.clone(),
+                    child: child.clone(),
+                };
                 let response = self
                     .dispatch(
                         session_id,
@@ -1377,7 +1398,6 @@ impl StudioBridge {
                         json!({"patch": batch.patch, "expect": batch.expect, "includeHeld": include_held}),
                     )
                     .await;
-                self.state().verify_children.remove(&id);
                 let (status, value) = response_value(response).await;
                 let result = &value["result"];
                 if status == StatusCode::OK && result["ok"] == json!(true) {
@@ -1553,6 +1573,27 @@ impl StudioBridge {
             state.pending.remove(&id);
         }
         response
+    }
+}
+
+/// Removes a `verify --fix` batch's record from `verify_children` when
+/// dropped, if it still names that batch.
+struct ChildRecord<'a> {
+    bridge: &'a StudioBridge,
+    id: String,
+    child: String,
+}
+
+impl Drop for ChildRecord<'_> {
+    fn drop(&mut self) {
+        let mut state = self.bridge.state();
+        if state
+            .verify_children
+            .get(&self.id)
+            .is_some_and(|(_, child)| *child == self.child)
+        {
+            state.verify_children.remove(&self.id);
+        }
     }
 }
 

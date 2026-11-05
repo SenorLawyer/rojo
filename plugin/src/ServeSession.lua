@@ -349,6 +349,38 @@ function ServeSession:__clearHold(id)
 	end
 end
 
+local SCRIPT_CLASSES = { Script = true, LocalScript = true, ModuleScript = true }
+
+-- Hydration pairs instances by name and class. A held script whose class
+-- change was held back no longer matches the server's, so the catch-up
+-- patch would remove it and add the server's empty copy, the wipe the hold
+-- prevents. Pairing it by name under the same parent instead turns that into
+-- an update the guard holds back.
+function ServeSession:__rematchHolds(serverInstances)
+	for instance in heldByInstance do
+		if self.__instanceMap.fromInstances[instance] or not instance.Parent then
+			continue
+		end
+		local parentId = self.__instanceMap.fromInstances[instance.Parent]
+		local serverParent = parentId and serverInstances[parentId]
+		if not serverParent then
+			continue
+		end
+		for _, childId in serverParent.Children do
+			local child = serverInstances[childId]
+			if
+				child
+				and child.Name == instance.Name
+				and SCRIPT_CLASSES[child.ClassName]
+				and self.__instanceMap.fromIds[childId] == nil
+			then
+				self.__instanceMap:insert(childId, instance)
+				break
+			end
+		end
+	end
+end
+
 -- Takes over holds from an earlier session of this Studio for the instances
 -- this session now tracks.
 function ServeSession:__adoptHolds()
@@ -420,6 +452,10 @@ function ServeSession:getSourceHashes()
 	-- Patches may add or remove IDs while this yields, which would break
 	-- iterating the live table.
 	local tracked = table.clone(self.__instanceMap.fromIds)
+	-- The exact sources seen, which a following `verify --fix` compares with
+	-- before writing, so a newer edit is never overwritten even if its
+	-- hashes happen to match.
+	local seen = {}
 	local hashed = 0
 	for id, instance in tracked do
 		if not instance:IsA("LuaSourceContainer") then
@@ -431,8 +467,9 @@ function ServeSession:getSourceHashes()
 		end
 		local source = readSource(instance)
 		if source then
-			local hash, length = hashSource(source)
-			table.insert(scripts, { id = id, hash = hash, length = length })
+			local hash, length, second = hashSource(source)
+			table.insert(scripts, { id = id, hash = hash, hash2 = second, length = length })
+			seen[id] = source
 		end
 		hashed += 1
 		if hashed % 200 == 0 then
@@ -443,6 +480,7 @@ function ServeSession:getSourceHashes()
 	for id in self.__heldWipes do
 		table.insert(held, id)
 	end
+	self.__verifiedSources = seen
 	return { scripts = scripts, detached = detached, held = held }
 end
 
@@ -534,6 +572,7 @@ function ServeSession:applyResync(patch, expect, includeHeld, expiresAt, isActiv
 			-- Only the hold that existed before this write may end with it. A
 			-- hold made while the write yielded is for a newer empty file.
 			local holdBefore = self.__heldWipes[write.id]
+			local seenSource = self.__verifiedSources and self.__verifiedSources[write.id]
 			local changed, held, late = false, nil, false
 			self.__instanceMap:pauseInstance(write.instance)
 			local wrote = pcall(function()
@@ -544,7 +583,7 @@ function ServeSession:applyResync(patch, expect, includeHeld, expiresAt, isActiv
 						late = true
 						return nil
 					end
-					if hashSource(current) ~= write.from then
+					if seenSource == nil or current ~= seenSource or hashSource(current) ~= write.from then
 						changed = true
 						return nil
 					end
@@ -1215,6 +1254,7 @@ function ServeSession:__initialSync(serverInfo)
 		self:setLoadingText("Hydrating instance map...")
 		self.__reconciler:hydrate(readResponseBody.instances, serverInfo.rootInstanceId, game)
 		-- Before the catch-up patch, which the wipe guard checks against them.
+		self:__rematchHolds(readResponseBody.instances)
 		self:__adoptHolds()
 
 		-- Calculate the initial patch to apply to the DataModel to catch us

@@ -41,8 +41,8 @@ function ApiContext.unlistedPlaceMessage(placeId, expectedPlaceIds)
 	if placeId == 0 then
 		-- An unpublished place has no ID to add, which is easy to miss when
 		-- the error only lists numbers.
-		hint = "\n\nThis place is not published (its place ID is 0), so it cannot be listed."
-			.. " Open the published place instead, or publish this one first."
+		hint = "\n\nThis place is not published, so its place ID is 0. To sync unpublished places with this"
+			.. " project, add 0 to 'servePlaceIds' in your .project.json file; otherwise open the published place."
 	else
 		table.insert(entries, tostring(placeId))
 		hint = ("\n\nTo sync this place too, add it to 'servePlaceIds' in your .project.json file:\n\"servePlaceIds\": [%s]"):format(
