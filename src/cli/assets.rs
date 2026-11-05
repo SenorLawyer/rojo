@@ -2020,6 +2020,11 @@ struct RemapReport {
     /// uses, so they are current and are not rewritten. `sync` drops such
     /// records; these come from a lockfile edited or merged by hand.
     live_ids_skipped: Vec<u64>,
+    /// Files with references that are symbolic links and so were not
+    /// rewritten: the atomic write renames a new file over the path, which
+    /// would replace the link with a regular file. Their targets need to be
+    /// edited directly.
+    symlinks_skipped: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     map_out: Option<String>,
 }
@@ -2466,6 +2471,12 @@ fn remap_with(
                 }
                 rewritten.extend_from_slice(&text[at..]);
                 before_write(&path);
+                if fs::symlink_metadata(&path)
+                    .is_ok_and(|metadata| metadata.file_type().is_symlink())
+                {
+                    report.symlinks_skipped.push(rel);
+                    continue;
+                }
                 // The replacement was computed from `text`, so writing it over
                 // a file that changed since would throw away that change. A
                 // save between this check and the rename can still be lost;
@@ -2544,6 +2555,14 @@ fn describe_remap(report: &RemapReport, out: &mut dyn Write) -> io::Result<()> {
                     "Not rewritten, because they changed while remap ran: {}. Run `rojo assets \
                      remap --write` again to update them.",
                     report.changed_during_remap.join(", ")
+                )?;
+            }
+            if !report.symlinks_skipped.is_empty() {
+                writeln!(
+                    out,
+                    "Not rewritten because they are symbolic links: {}; edit their targets \
+                     directly.",
+                    report.symlinks_skipped.join(", ")
                 )?;
             }
         } else if !report.references.is_empty() {
@@ -4333,6 +4352,53 @@ mod tests {
         );
         let json = serde_json::to_value(&report).unwrap();
         assert_eq!(json["liveIdsSkipped"][0], 123456789);
+    }
+
+    #[test]
+    fn remap_does_not_replace_file_symlinks() {
+        let fixture = Fixture::new();
+        fixture.write_replaced(&[(123456789, 987654321)]);
+        // Outside the project, so only the link is scanned.
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("Shop.luau");
+        fs::write(&target, SHOP).unwrap();
+        let link = fixture.dir.path().join("src/Shop.luau");
+        fs::create_dir_all(link.parent().unwrap()).unwrap();
+        #[cfg(unix)]
+        let created = std::os::unix::fs::symlink(&target, &link);
+        #[cfg(windows)]
+        let created = std::os::windows::fs::symlink_file(&target, &link);
+        if created.is_err() {
+            // Creating links needs a privilege on Windows that test runs
+            // often lack.
+            return;
+        }
+
+        let (report, _) = fixture.remap(RemapOptions::default());
+        assert_eq!(report.references.len(), 4);
+        assert!(report.symlinks_skipped.is_empty());
+
+        let (report, out) = fixture.remap(RemapOptions {
+            write: true,
+            ..RemapOptions::default()
+        });
+
+        assert_eq!(report.symlinks_skipped, ["src/Shop.luau"]);
+        assert_eq!(report.files_rewritten, 0);
+        assert!(fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(fs::read_to_string(&target).unwrap(), SHOP);
+        assert!(
+            out.contains(
+                "Not rewritten because they are symbolic links: src/Shop.luau; edit their \
+                 targets directly."
+            ),
+            "{out}"
+        );
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["symlinksSkipped"][0], "src/Shop.luau");
     }
 
     #[test]
