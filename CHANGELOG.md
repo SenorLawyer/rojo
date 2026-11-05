@@ -31,6 +31,8 @@ Making a new release? Simply add the new header with the version and date undern
 
 ## Unreleased
 
+## [8.1.0] (November 5th, 2026)
+
 * Added `rojo studio verify`, which checks that every script Rojo syncs has the same source in a connected Studio as in its file, and lists, with each script's file, those that differ, are missing from Studio or were removed there. It exits with 1 when something does not match. `--fix` sets the scripts that differ back to their files' contents, one undo step named `Rojo: Resync` per batch of up to 2 MiB of source, without overwriting a script that changed in Studio since the check. `--all` lists every script that differs instead of the first 200 of each kind. The plugin sends hashes rather than sources, and line endings are ignored. `rojo mcp` offers it as `studio_verify`. See [docs/sync-health.md](docs/sync-health.md). ([fork#9])
 * `rojo studio sessions` now reports each Studio's sync health, which the plugin sends with every bridge poll: whether it is connected, when it last applied a change, how many instances in that change could not be applied, how many Rojo changes were undone in Studio, which scripts the wipe guard is holding back and the plugin and server versions. In a terminal it also prints a short summary with warnings to stderr; stdout stays JSON. The bridge's `status` reports the same and the plugin version. ([fork#9])
 * Added an experimental script wipe guard, off by default: with Guard Against Script Wipes turned on in Rojo's settings, when a script with 5 or more non-blank lines would become empty because its file became empty, such as a broken save, the plugin keeps the script's source in Studio and warns until the file has code again or is deleted. `rojo studio verify --fix --include-held` empties it on purpose. Some rarer sequences are not covered yet; see the known gaps in [docs/sync-health.md](docs/sync-health.md#known-gaps). Agent control can turn the guard on, and off only when Agent Can Skip Confirmation is on. ([fork#9])
@@ -39,6 +41,9 @@ Making a new release? Simply add the new header with the version and date undern
 * Added `rojo studio lock`, which lets agents share a few Studio windows by taking named, expiring leases before using one: shared by default, `--exclusive` for play tests, or shared with `--limit N` for heavy jobs. Waiters keep their place in line, so an exclusive waiter is not starved by new shared holders. `pause` stops new grants (for example while Rojo is down), and `status` and `log` show who holds, waits for and recently used each lock. `acquire` exits with 3 when the lock is busy. Locks are files in a per-user folder shared by every worktree of the repository and never inside the project, and they need no `--token-file` or `rojo serve`. They are advisory: Studio tools do not check them. `rojo mcp` offers `studio_lock_acquire`, `studio_lock_release` and `studio_lock_status`. See [docs/studio-locks.md](docs/studio-locks.md). ([fork#9])
 * Added `rojo assets remap` for moving a game to another creator, such as from your account to a group. When `[creator]` changes, `rojo assets sync` now records each old asset id and the id it was uploaded again as under `replaced` in `assets.lock.json`, found by path and by contents and resolved to the newest id across repeated moves; an interrupted sync keeps what it recorded, including an old id whose contents moved to a path that was not uploaded yet. `rojo assets remap` lists the `rbxassetid://` URIs and Roblox asset URLs in the project's scripts and data files that still use an old id, rewrites them with `--write` while leaving everything else byte for byte, also matches bare numbers with `--bare`, prints a JSON report with `--json`, and writes the mapping with `--map-out` for updating place content in Studio. `rojo assets status` says how many ids were replaced. Lockfiles with replacements have version 2, which Rojo 8.0.0 refuses rather than dropping them. Assets that were never uploaded through `rojo assets sync` are not tracked. See [docs/assets.md](docs/assets.md#moving-to-a-group). ([fork#9])
 * Connection errors now say what to do: a place that is not in `servePlaceIds` gets the exact `"servePlaceIds": [...]` line that would allow it (or, for an unpublished place, that listing 0 allows unpublished places), and a protocol mismatch says whether to update the plugin or the server. A plugin and server with different major or minor versions now warn in Studio's output when they connect. ([fork#9])
+
+[8.1.0]: https://github.com/SenorLawyer/rojo/releases/tag/v8.1.0
+[fork#9]: https://github.com/SenorLawyer/rojo/pull/9
 
 ## [8.0.0] (November 5th, 2026)
 
@@ -167,7 +172,6 @@ Making a new release? Simply add the new header with the version and date undern
 [fork#2]: https://github.com/SenorLawyer/rojo/pull/2
 [fork#4]: https://github.com/SenorLawyer/rojo/pull/4
 [fork#5]: https://github.com/SenorLawyer/rojo/pull/5
-[fork#9]: https://github.com/SenorLawyer/rojo/pull/9
 
 ## [7.7.1] (October 1st, 2026)
 
