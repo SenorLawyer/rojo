@@ -160,8 +160,26 @@ impl Store {
         self.dir.join(format!("{id}.json"))
     }
 
+    /// An operating system lock on the store, held while a backup is saved,
+    /// orphans are found or one is removed, so cleanup cannot mistake a
+    /// backup still being written for one left by an interrupted save. The
+    /// system releases it if the process dies.
+    fn lock(&self) -> anyhow::Result<fs::File> {
+        fs::create_dir_all(&self.dir)
+            .with_context(|| format!("Could not create {}", self.dir.display()))?;
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(self.dir.join(".store.lock"))
+            .context("Could not open the backup store lock")?;
+        file.lock().context("Could not lock the backup store")?;
+        Ok(file)
+    }
+
     /// Saves `model` and its record. Never overwrites an existing backup.
     pub fn save(&self, mut record: Record, model: &[u8]) -> anyhow::Result<Record> {
+        let _lock = self.lock()?;
         // `list` skips records over this size, so a larger one would vanish.
         anyhow::ensure!(
             record.name.len() <= 64 && record.note.as_ref().is_none_or(|note| note.len() <= 4096),
@@ -273,6 +291,10 @@ impl Store {
     /// Models whose record is missing, left by a process that stopped between
     /// writing the two. `remove` deletes them by ID.
     pub fn orphans(&self) -> anyhow::Result<Vec<String>> {
+        if !self.dir.is_dir() {
+            return Ok(Vec::new());
+        }
+        let _lock = self.lock()?;
         let entries = match fs::read_dir(&self.dir) {
             Ok(entries) => entries,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -296,6 +318,7 @@ impl Store {
     }
 
     pub fn remove(&self, id: &str) -> anyhow::Result<()> {
+        let _lock = self.lock()?;
         if valid_id(id) && !self.record_path(id).exists() && self.model_path(id).is_file() {
             fs::remove_file(self.model_path(id))?;
             return Ok(());

@@ -193,6 +193,8 @@ function ServeSession.new(options)
 		__sourceGenerations = {},
 		-- Scripts whose hold ended with a class change still to apply.
 		__refreshAfterHold = {},
+		-- Holds moving to a script that replaces a held one, by the new ID.
+		__pendingHoldTransfers = {},
 		__syncStats = {
 			connectedAt = nil,
 			lastPatchAt = nil,
@@ -760,11 +762,43 @@ end
 	gives the script source again, or removes it, ends the hold.
 ]=]
 function ServeSession:__holdScriptWipes(patch)
+	-- The server can replace a script by removing it and adding a new one
+	-- with the same name, for example when its class changes between
+	-- LocalScript and Script. If the old one is held and the new one would
+	-- be empty, the new one gets the old code and the hold instead.
+	local guard = Settings:get("guardScriptWipes")
+	local removedHeld = {}
 	for _, removed in patch.removed do
+		local entry = self.__heldWipes[removed]
+		local instance = self.__instanceMap.fromIds[removed]
+		if guard and entry and instance and instance.Parent then
+			local parentId = self.__instanceMap.fromInstances[instance.Parent]
+			if parentId then
+				removedHeld[parentId .. "/" .. instance.Name] = { entry = entry, source = readSource(instance) or "" }
+			end
+		end
+		if entry then
+			-- The instance goes away, so there is nothing left to refresh.
+			entry.deferredClass = nil
+		end
 		self:__clearHold(removed)
 	end
-	if not Settings:get("guardScriptWipes") then
+	if not guard then
 		return
+	end
+	for id, virtual in patch.added do
+		local carried = SCRIPT_CLASSES[virtual.ClassName]
+			and virtual.Parent
+			and removedHeld[virtual.Parent .. "/" .. virtual.Name]
+		local encoded = carried and virtual.Properties and virtual.Properties.Source
+		local ty, value
+		if type(encoded) == "table" then
+			ty, value = next(encoded)
+		end
+		if carried and ty == "String" and type(value) == "string" and not string.find(value, "%S") then
+			virtual.Properties.Source = { String = carried.source }
+			self.__pendingHoldTransfers[id] = carried.entry
+		end
 	end
 	local index = 1
 	while index <= #patch.updated do
@@ -791,11 +825,18 @@ function ServeSession:__holdScriptWipes(patch)
 				continue
 			end
 			if self.__heldWipes[update.id] and update.changedClassName ~= nil then
-				Log.warn(
-					"Rojo held back changing the class of {} because its file on disk is empty.",
-					self.__heldWipes[update.id].path
-				)
-				self.__heldWipes[update.id].deferredClass = true
+				local instance = self.__instanceMap.fromIds[update.id]
+				-- Changing back to the class Studio already has needs no
+				-- replacement any more.
+				if instance and instance.ClassName == update.changedClassName then
+					self.__heldWipes[update.id].deferredClass = nil
+				else
+					Log.warn(
+						"Rojo held back changing the class of {} because its file on disk is empty.",
+						self.__heldWipes[update.id].path
+					)
+					self.__heldWipes[update.id].deferredClass = update.changedClassName
+				end
 				table.remove(patch.updated, index)
 				continue
 			end
@@ -835,7 +876,10 @@ function ServeSession:__holdScriptWipes(patch)
 			self:__setHold(update.id, instance, { path = path, lines = lines, heldAt = nowMillis() })
 		end
 		if update.changedClassName ~= nil then
-			self.__heldWipes[update.id].deferredClass = true
+			self.__heldWipes[update.id].deferredClass = if instance
+					and instance.ClassName == update.changedClassName
+				then nil
+				else update.changedClassName
 		end
 		update.changedProperties.Source = nil
 		local empty = next(update.changedProperties) == nil
@@ -1183,7 +1227,7 @@ function ServeSession:__replaceInstances(idList)
 					)
 				end
 				if replacement.ClassName ~= oldInstance.ClassName then
-					self.__heldWipes[id].deferredClass = true
+					self.__heldWipes[id].deferredClass = replacement.ClassName
 				end
 				replacement:Destroy()
 				continue
@@ -1372,7 +1416,7 @@ function ServeSession:__writeSource(write)
 	task.spawn(function()
 		local ok, err = pcall(function()
 			ScriptEditorService:UpdateSourceAsync(write.instance, function(current)
-				if self.__sourceGenerations[write.id] ~= generation then
+				if self.__status == Status.Disconnected or self.__sourceGenerations[write.id] ~= generation then
 					return nil
 				end
 				local blank = not string.find(write.target, "%S")
@@ -1424,8 +1468,17 @@ function ServeSession:__applyPatchInRecording(patch)
 		write.instance = self.__instanceMap.fromIds[write.id]
 		if write.instance and write.instance:IsA("LuaSourceContainer") then
 			self:__writeSource(write)
+			local carried = self.__pendingHoldTransfers[write.id]
+			if carried then
+				self:__setHold(write.id, write.instance, {
+					path = write.instance:GetFullName(),
+					lines = carried.lines,
+					heldAt = carried.heldAt,
+				})
+			end
 		end
 	end
+	table.clear(self.__pendingHoldTransfers)
 
 	-- The fallback replaces an instance with the server's whole copy, which
 	-- for a held script has the empty source the guard held back. Those

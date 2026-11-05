@@ -540,7 +540,7 @@ return function()
 				added = {},
 				updated = { { id = "UI", changedClassName = "Script", changedProperties = {} } },
 			})
-			expect(session.__heldWipes.UI.deferredClass).to.equal(true)
+			expect(session.__heldWipes.UI.deferredClass).to.equal("Script")
 			serverCopy("Script", "print('code again')")
 			session.__status = ServeSession.Status.Connected
 			session:__applyPatch(sourceUpdate("UI", "print('code again')"))
@@ -695,6 +695,46 @@ return function()
 			expect(result.skipped).to.equal(1)
 			expect(module.Source).to.equal(kept)
 			expect(session.__heldWipes.UI).to.be.ok()
+		end)
+
+		it("carries a hold to a script that replaces a held one", function()
+			session:__holdScriptWipes(sourceUpdate("UI", ""))
+			local kept = module.Source
+			session.__instanceMap:insert("FOLDER", container)
+			local replacement = {
+				removed = { "UI" },
+				added = {
+					NEW = {
+						Id = "NEW",
+						Parent = "FOLDER",
+						Name = "UIController",
+						ClassName = "LocalScript",
+						Properties = { Source = { String = "" } },
+						Children = {},
+					},
+				},
+				updated = {},
+			}
+			session:__holdScriptWipes(replacement)
+			expect(replacement.added.NEW.Properties.Source.String).to.equal(kept)
+			expect(session.__pendingHoldTransfers.NEW).to.be.ok()
+			expect(session.__heldWipes.UI).to.equal(nil)
+			table.clear(session.__pendingHoldTransfers)
+		end)
+
+		it("forgets a held class change that was changed back", function()
+			session:__holdScriptWipes(sourceUpdate("UI", ""))
+			local change = function(className)
+				session:__holdScriptWipes({
+					removed = {},
+					added = {},
+					updated = { { id = "UI", changedClassName = className, changedProperties = {} } },
+				})
+			end
+			change("Script")
+			expect(session.__heldWipes.UI.deferredClass).to.equal("Script")
+			change("ModuleScript")
+			expect(session.__heldWipes.UI.deferredClass).to.equal(nil)
 		end)
 
 		it("keeps a hold when the same Studio reconnects", function()
