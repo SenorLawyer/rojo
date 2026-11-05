@@ -47,7 +47,7 @@ pub const AGENT_TOPICS: &[(&str, &str, &str)] = &[
     ),
     (
         "assets",
-        "rojo assets sync: upload images, audio and models, generate an id module",
+        "rojo assets: upload images, audio and models, id module, remap after a creator move",
         include_str!("../../docs/assets.md"),
     ),
     (
@@ -64,6 +64,16 @@ pub const AGENT_TOPICS: &[(&str, &str, &str)] = &[
         "studio-bridge",
         "rojo studio: sessions, tree, properties, logs --follow, import/export",
         include_str!("../../docs/studio-bridge.md"),
+    ),
+    (
+        "sync-health",
+        "rojo studio verify, sync status, the wipe guard and backups",
+        include_str!("../../docs/sync-health.md"),
+    ),
+    (
+        "studio-locks",
+        "rojo studio lock: advisory leases for agents sharing Studio windows",
+        include_str!("../../docs/studio-locks.md"),
     ),
     (
         "mcp",

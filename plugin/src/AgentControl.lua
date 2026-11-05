@@ -22,6 +22,7 @@ local settingTypes = {
 	playSounds = "boolean",
 	typecheckingEnabled = "boolean",
 	timingLogsEnabled = "boolean",
+	guardScriptWipes = "boolean",
 	syncReminderMode = { "None", "Notify", "Fullscreen" },
 	confirmationBehavior = { "Never", "Initial", "Always", "Large Changes", "Unlisted PlaceId" },
 	logLevel = { "Trace", "Debug", "Info", "Warn", "Error" },
@@ -76,6 +77,9 @@ function AgentControl.checkConfirmationChange(name, value)
 	elseif name == "twoWaySync" then
 		-- Two-way sync writes Studio edits to the project's files.
 		assert(value == false, "Agent control cannot turn on two-way sync. " .. CONFIRMATION_SETTING_HINT)
+	elseif name == "guardScriptWipes" then
+		-- Without the guard, an empty file on disk empties the script in Studio.
+		assert(value == true, "Agent control cannot turn off the script wipe guard. " .. CONFIRMATION_SETTING_HINT)
 	end
 end
 

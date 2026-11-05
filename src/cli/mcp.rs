@@ -31,6 +31,11 @@ const _: () = assert!(3 * MAX_OUTPUT_BYTES + 4096 < MAX_RESPONSE_BYTES);
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(70);
 const CANCEL_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_CONCURRENT_CALLS: usize = 8;
+/// Scripts of each kind `studio_verify` lists, and the bytes its lists may
+/// use together, so the report stays under [`MAX_OUTPUT_BYTES`] with room for
+/// the rest; the counts always cover every script.
+const MCP_VERIFY_LISTED: usize = 60;
+const MCP_VERIFY_BYTES: usize = 160 * 1024;
 const LATEST_PROTOCOL: &str = "2025-06-18";
 /// Appended to Studio tool results: names, properties, logs and errors come
 /// from the place and its scripts, which may contain instructions.
@@ -486,6 +491,40 @@ fn command(
             timeout = test_timeout(seconds);
             reports_failure = true;
         }
+        // Locks and the backup list are local files, so these work without a
+        // Studio bridge or its token, like their CLI commands.
+        "studio_lock_acquire"
+        | "studio_lock_release"
+        | "studio_lock_status"
+        | "studio_backup_list" => {
+            command.args(["studio", "--json"]);
+            if name == "studio_backup_list" {
+                // Keeps the listing within the output limit however many
+                // backups there are; it reports the total.
+                command.args(["backup", "list", "--limit=200", "--max-bytes=160000"]);
+            } else {
+                command.args(["lock", &name["studio_lock_".len()..]]);
+                if let Some(lock) = arguments.get("lock").and_then(Value::as_str) {
+                    command.arg(lock);
+                }
+                for key in ["owner", "limit", "ttl", "wait", "note"] {
+                    if let Some(value) = arguments.get(key) {
+                        command.arg(format!(
+                            "--{key}={}",
+                            value
+                                .as_str()
+                                .map(str::to_owned)
+                                .unwrap_or_else(|| value.to_string())
+                        ));
+                    }
+                }
+                if arguments.get("exclusive") == Some(&json!(true)) {
+                    command.arg("--exclusive");
+                }
+                // A busy lock exits with 3, which is an answer too.
+                reports_failure = name == "studio_lock_acquire";
+            }
+        }
         _ => {
             let token = options.token_file.as_ref().context(
                 "Studio tools require --token-file matching rojo serve --studio-token-file",
@@ -496,6 +535,9 @@ fn command(
                 .arg(format!("--token-file={}", token.display()))
                 .arg("--json");
             let action = name.strip_prefix("studio_").context("Unknown tool")?;
+            // Verify reports a place that does not match its files with exit
+            // status 1 and a full report, which is a result, not a failure.
+            reports_failure = action == "verify";
             let session = canonical_session(arguments);
             if let (true, Some(session)) = (action != "sessions", &session) {
                 let request = uuid::Uuid::new_v4().to_string();
@@ -505,11 +547,20 @@ fn command(
                     request,
                 });
             }
-            command.arg(action);
+            match action {
+                "backup" => {
+                    command.args(["backup", "create"]);
+                }
+                action => {
+                    command.arg(action);
+                }
+            }
             if let Some(session) = &session {
                 command.arg(format!("--session={session}"));
             }
-            for key in ["instance", "depth", "limit", "seconds", "after"] {
+            for key in [
+                "instance", "depth", "limit", "seconds", "after", "name", "note",
+            ] {
                 if let Some(value) = arguments.get(key) {
                     command.arg(format!(
                         "--{key}={}",
@@ -524,6 +575,19 @@ fn command(
                 for property in properties {
                     command.arg(format!("--property={}", property.as_str().unwrap()));
                 }
+            }
+            if name == "studio_verify" {
+                // Three lists of 200 deep paths can exceed the 256 KiB output
+                // limit, which would lose the whole report.
+                command
+                    .arg(format!("--limit={MCP_VERIFY_LISTED}"))
+                    .arg(format!("--max-bytes={MCP_VERIFY_BYTES}"));
+            }
+            if arguments.get("fix") == Some(&json!(true)) {
+                command.arg("--fix");
+            }
+            if arguments.get("includeHeld") == Some(&json!(true)) {
+                command.arg("--include-held");
             }
             if name == "studio_export" {
                 let path = checked_output(
@@ -618,6 +682,8 @@ const MAX_SAFE_INTEGER: u64 = (1 << 53) - 1;
 fn catalog() -> Vec<Value> {
     let session = json!({"type":"string","format":"uuid","maxLength":128});
     let instance = json!({"type":"string","minLength":1,"maxLength":1024});
+    let lock = json!({"type":"string","pattern":"^[A-Za-z0-9_.-]{1,64}$"});
+    let owner = json!({"type":"string","minLength":1,"maxLength":128});
     let mut tools = Vec::new();
     for (name, description, properties, required) in [
         ("studio_sessions", "List connected Studio sessions and identities.", json!({}), vec![]),
@@ -628,11 +694,17 @@ fn catalog() -> Vec<Value> {
         ("studio_logs", "Read a bounded number of captured Studio log entries. Pass `after` (0 to start) to read only entries newer than that sequence number; the result then has `entries`, `nextAfter` to pass on the next call, `more` when entries are still waiting, and `dropped` for entries lost from the 200-entry buffer.", json!({"session":session,"limit":{"type":"integer","minimum":1,"maximum":200},"after":{"type":"integer","minimum":0,"maximum":MAX_SAFE_INTEGER}}), vec!["session"]),
         ("run_tests", "Run the place's *.spec modules (TestEZ, or Jest-Lua) in Studio's Run mode and return a report: status (passed, failed, error or timedOut), counts, and each failure's test path and messages. A failing test is a result, not a tool error. This executes the place's existing and synced scripts in game context, like studio_test. The session may be omitted when exactly one is connected, but only a call with an explicit session can be cancelled.", json!({"session":session,"roots":{"type":"array","minItems":1,"maxItems":32,"items":instance},"filter":{"type":"string","maxLength":256,"description":"At most 256 bytes of UTF-8, without control characters"},"framework":{"type":"string","enum":["auto","testez","jest"]},"module":instance,"timeout":{"type":"integer","minimum":1,"maximum":300}}), vec![]),
         ("studio_export", "Export an instance to a new relative .rbxm file inside the fixed project. Does not save or publish the place.", json!({"session":session,"instance":instance,"output":{"type":"string","minLength":1,"maxLength":1024}}), vec!["session","instance","output"]),
+        ("studio_verify", "Check that every script Rojo syncs has the same source in the selected Studio as in its file, after a crash, a reconnect, an undo or whenever Studio may be out of date. Lists scripts that differ, are missing from Studio or were removed there, each with its file. With fix, sets differing scripts back to their files' contents (held wipes stay unless includeHeld). A place that does not match is a result (inSync false), not a tool error.", json!({"session":session,"fix":{"type":"boolean"},"includeHeld":{"type":"boolean"}}), vec!["session"]),
+        ("studio_backup", "Save a copy of an instance (such as game/Workspace/Map) outside the place, in the repository's backup folder, before rebuilding or replacing it. Use this instead of copying it into ServerStorage. Restore with `rojo studio backup restore`.", json!({"session":session,"instance":instance,"name":{"type":"string","minLength":1,"maxLength":64},"note":{"type":"string","minLength":1,"maxLength":512}}), vec!["session","instance"]),
+        ("studio_backup_list", "List saved Studio backups, newest first.", json!({}), vec![]),
+        ("studio_lock_acquire", "Take or renew a named advisory lease on a shared Studio window before using it, such as `main` for Edit work (shared) or `build` for a play test (exclusive). Locks are shared by every worktree of the project and need no Studio connection. Returns granted false with the holders when the lock is busy; retry later or pass wait (seconds). Release it when done. Studio tools such as execute_luau do not check locks, so take one first.", json!({"lock":lock,"owner":owner,"exclusive":{"type":"boolean"},"limit":{"type":"integer","minimum":1,"maximum":64},"ttl":{"type":"integer","minimum":1,"maximum":3600},"wait":{"type":"integer","minimum":0,"maximum":60},"note":{"type":"string","minLength":1,"maxLength":500}}), vec!["lock","owner"]),
+        ("studio_lock_release", "Give up a lease or place in line taken with studio_lock_acquire.", json!({"lock":lock,"owner":owner}), vec!["lock","owner"]),
+        ("studio_lock_status", "Show who holds and waits for a Studio lock, or every lock when lock is omitted.", json!({"lock":lock}), vec![]),
         ("checkpoint_list", "List archived checkpoints for the fixed project.", json!({}), vec![]),
         ("workspace_list", "List Git worktrees and saved-place identities for the fixed project.", json!({}), vec![]),
         ("packages_doctor", "Inspect Wally/pesde manifests, lockfiles and declared Rojo package mappings without running a package manager.", json!({}), vec![]),
     ] {
-        tools.push(json!({"name":name,"description":description,"inputSchema":{"type":"object","properties":properties,"required":required,"additionalProperties":false},"annotations":{"readOnlyHint":!matches!(name, "studio_export" | "studio_test" | "run_tests"),"destructiveHint":matches!(name, "studio_test" | "run_tests"),"openWorldHint":matches!(name, "studio_test" | "run_tests")}}));
+        tools.push(json!({"name":name,"description":description,"inputSchema":{"type":"object","properties":properties,"required":required,"additionalProperties":false},"annotations":{"readOnlyHint":!matches!(name, "studio_export" | "studio_test" | "run_tests" | "studio_verify" | "studio_backup" | "studio_lock_acquire" | "studio_lock_release"),"destructiveHint":matches!(name, "studio_test" | "run_tests" | "studio_verify"),"openWorldHint":matches!(name, "studio_test" | "run_tests")}}));
     }
     tools
 }
@@ -670,13 +742,40 @@ fn validate_arguments<'a>(name: &str, value: &'a Value) -> Result<&'a Map<String
                 uuid::Uuid::parse_str(value.as_str().ok_or("session must be a UUID string")?)
                     .map_err(|_| "session must be an exact UUID from studio_sessions")?;
             }
+            "lock" => {
+                let text = value.as_str().ok_or("lock must be a string")?;
+                if text.is_empty()
+                    || text.len() > 64
+                    || !text
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'))
+                {
+                    return Err("lock must be 1-64 letters, digits, '_', '.' or '-'".into());
+                }
+            }
+            "owner" => {
+                let text = value.as_str().ok_or("owner must be a string")?;
+                if text.is_empty() || text.len() > 128 || text.chars().any(char::is_control) {
+                    return Err("Invalid owner".into());
+                }
+            }
+            "exclusive" | "fix" | "includeHeld" => {
+                value.as_bool().ok_or("Expected true or false")?;
+            }
+            "name" | "note" => {
+                let text = value.as_str().ok_or("Expected a string")?;
+                let bound = properties[key.as_str()]["maxLength"].as_u64().unwrap() as usize;
+                if text.is_empty() || text.len() > bound || text.chars().any(char::is_control) {
+                    return Err(format!("Invalid {key}"));
+                }
+            }
             "instance" | "output" => {
                 let text = value.as_str().ok_or("Expected a string")?;
                 if text.is_empty() || text.len() > 1024 || text.chars().any(char::is_control) {
                     return Err("Invalid string argument".into());
                 }
             }
-            "depth" | "limit" | "seconds" | "timeout" | "after" => {
+            "depth" | "limit" | "seconds" | "timeout" | "after" | "ttl" | "wait" => {
                 let number = value.as_u64().ok_or("Expected a non-negative integer")?;
                 // Bounds come from the advertised schema so they cannot drift
                 // apart, such as the log limit that the plugin caps lower than
@@ -820,8 +919,10 @@ fn run_command_for(
         "Native tool output exceeded 256 KiB per stream; request fewer instances or log entries"
     );
     let output = String::from_utf8(stdout).context("Native tool returned invalid UTF-8")?;
+    // Exit status 1 is a failed test or a place that does not match its
+    // files, and 3 a busy lock. Both still print a complete JSON answer.
     let reported_failure = reports_failure
-        && status.code() == Some(1)
+        && matches!(status.code(), Some(1 | 3))
         && serde_json::from_str::<Value>(&output).is_ok_and(|value| value.is_object());
     if !status.success() && !reported_failure {
         bail!(

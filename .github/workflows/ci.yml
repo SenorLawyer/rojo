@@ -118,7 +118,7 @@ jobs:
     - name: Install Rust
       uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
       with:
-        toolchain: 1.88.0
+        toolchain: 1.89.0
 
     - name: Restore Rust Cache
       uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0

@@ -30,9 +30,14 @@ fn initialized() -> Value {
 }
 
 fn exchange(directory: &std::path::Path, input: &[u8]) -> Vec<Value> {
+    // Lock and backup state outside Git goes to a per-user folder, which a
+    // test must not touch.
+    let state = directory.join(".test-state");
     let mut child = Command::new(env!("CARGO_BIN_EXE_rojo"))
         .args(["mcp", "--project"])
         .arg(directory)
+        .env("LOCALAPPDATA", &state)
+        .env("XDG_STATE_HOME", &state)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -100,8 +105,10 @@ fn stdio_handshake_catalog_native_call_and_error_recovery() {
         .iter()
         .map(|tool| tool["name"].as_str().unwrap())
         .collect();
-    assert_eq!(names.len(), 11);
+    assert_eq!(names.len(), 17);
     assert!(names.contains(&"studio_test") && names.contains(&"run_tests"));
+    assert!(names.contains(&"studio_verify") && names.contains(&"studio_backup"));
+    assert!(names.contains(&"studio_lock_acquire") && names.contains(&"studio_lock_status"));
     assert!(names.contains(&"studio_export") && names.contains(&"workspace_list"));
     assert!(!names.iter().any(|name| name.contains("publish")
         || name.contains("import")
@@ -404,4 +411,53 @@ fn failed_studio_calls_are_cancelled_at_the_bridge() {
             .any(|line| line.starts_with("POST /api/studio/cancel")),
         "{seen:?}"
     );
+}
+
+#[test]
+fn lock_and_backup_list_tools_work_without_a_bridge_token() {
+    let directory = fixture();
+    let call = |id: i64, name: &str, arguments: Value| {
+        let replies = exchange_messages(
+            directory.path(),
+            &[
+                initialize("2025-06-18"),
+                initialized(),
+                json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{"name":name,"arguments":arguments}}),
+            ],
+        );
+        reply(&replies, id)["result"].clone()
+    };
+    let granted = call(
+        2,
+        "studio_lock_acquire",
+        json!({"lock":"main","owner":"agent-a"}),
+    );
+    assert_eq!(granted["isError"], false, "{granted}");
+    assert_eq!(granted["structuredContent"]["granted"], true);
+    // Calls run concurrently within one session, so the busy check uses its own.
+    let busy = call(
+        3,
+        "studio_lock_acquire",
+        json!({"lock":"main","owner":"agent-b","exclusive":true}),
+    );
+    assert_eq!(busy["isError"], false, "{busy}");
+    assert_eq!(busy["structuredContent"]["granted"], false);
+    let status = call(4, "studio_lock_status", json!({}));
+    assert_eq!(status["isError"], false, "{status}");
+    assert_eq!(
+        status["structuredContent"]["locks"][0]["holders"][0]["owner"],
+        "agent-a"
+    );
+    let released = call(
+        5,
+        "studio_lock_release",
+        json!({"lock":"main","owner":"agent-a"}),
+    );
+    assert_eq!(
+        released["structuredContent"]["released"], true,
+        "{released}"
+    );
+    let backups = call(6, "studio_backup_list", json!({}));
+    assert_eq!(backups["isError"], false, "{backups}");
+    assert_eq!(backups["structuredContent"]["backups"], json!([]));
 }

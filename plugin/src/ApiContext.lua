@@ -15,6 +15,48 @@ local validateApiSocketPacket = Types.ifEnabled(Types.ApiSocketPacket)
 local validateApiSerialize = Types.ifEnabled(Types.ApiSerializeResponse)
 local validateApiRefPatch = Types.ifEnabled(Types.ApiRefPatchResponse)
 
+-- Declared before the functions below so their messages can use these
+-- helpers, which are kept on the module so specs can check the wording.
+local ApiContext = {}
+
+-- Says which side to update, so the user does not have to work out from two
+-- protocol numbers whether the plugin or the server is behind.
+function ApiContext.protocolFixHint(serverProtocol)
+	if type(serverProtocol) == "number" and serverProtocol > Config.protocolVersion then
+		return "The server is newer than this plugin. Run `rojo plugin install` with the same Rojo that runs"
+			.. " `rojo serve`, then restart Studio."
+	end
+	return "The server is older than this plugin. Update Rojo in the project's rokit.toml (then `rokit install`),"
+		.. " or install the plugin that matches the server with its `rojo plugin install`."
+end
+
+function ApiContext.unlistedPlaceMessage(placeId, expectedPlaceIds)
+	local idList = {}
+	local entries = {}
+	for _, id in ipairs(expectedPlaceIds) do
+		table.insert(idList, "- " .. tostring(id))
+		table.insert(entries, tostring(id))
+	end
+	local hint
+	if placeId == 0 then
+		-- An unpublished place has no ID to add, which is easy to miss when
+		-- the error only lists numbers.
+		hint = "\n\nThis place is not published, so its place ID is 0. To sync unpublished places with this"
+			.. " project, add 0 to 'servePlaceIds' in your .project.json file; otherwise open the published place."
+	else
+		table.insert(entries, tostring(placeId))
+		hint = ("\n\nTo sync this place too, add it to 'servePlaceIds' in your .project.json file:\n\"servePlaceIds\": [%s]"):format(
+			table.concat(entries, ", ")
+		) .. "\nthen restart `rojo serve`. Moving a game to a group or copying a place gives it a new place ID."
+	end
+	return (
+		"Found a Rojo server, but its project is set to only be used with a specific list of places."
+		.. "\nYour place ID is %u, but needs to be one of these:"
+		.. "\n%s"
+		.. "%s"
+	):format(placeId, table.concat(idList, "\n"), hint)
+end
+
 local function rejectFailedRequests(response)
 	if response.code >= 400 then
 		local message = string.format("HTTP %s:\n%s", tostring(response.code), response.body)
@@ -38,13 +80,15 @@ local function rejectWrongProtocolVersion(infoResponseBody)
 			.. "\nMake sure you have matching versions of both the Rojo plugin and server!"
 			.. "\n\nYour client is version %s, with protocol version %s. It expects server version %s."
 			.. "\nYour server is version %s, with protocol version %s."
+			.. "\n\n%s"
 			.. "\n\nGo to https://github.com/SenorLawyer/rojo for more details."
 		):format(
 			Version.display(Config.version),
 			Config.protocolVersion,
 			Config.expectedServerVersionString,
 			infoResponseBody.serverVersion,
-			infoResponseBody.protocolVersion
+			infoResponseBody.protocolVersion,
+			ApiContext.protocolFixHint(infoResponseBody.protocolVersion)
 		)
 
 		return Promise.reject(message)
@@ -58,19 +102,7 @@ local function rejectWrongPlaceId(infoResponseBody)
 		local foundId = table.find(infoResponseBody.expectedPlaceIds, game.PlaceId)
 
 		if not foundId then
-			local idList = {}
-			for _, id in ipairs(infoResponseBody.expectedPlaceIds) do
-				table.insert(idList, "- " .. tostring(id))
-			end
-
-			local message = (
-				"Found a Rojo server, but its project is set to only be used with a specific list of places."
-				.. "\nYour place ID is %u, but needs to be one of these:"
-				.. "\n%s"
-				.. "\n\nTo change this list, edit 'servePlaceIds' in your .project.json file."
-			):format(game.PlaceId, table.concat(idList, "\n"))
-
-			return Promise.reject(message)
+			return Promise.reject(ApiContext.unlistedPlaceMessage(game.PlaceId, infoResponseBody.expectedPlaceIds))
 		end
 	end
 
@@ -97,7 +129,6 @@ local function rejectWrongPlaceId(infoResponseBody)
 	return Promise.resolve(infoResponseBody)
 end
 
-local ApiContext = {}
 ApiContext.__index = ApiContext
 
 function ApiContext.new(baseUrl)

@@ -410,4 +410,857 @@ return function()
 			expect(refPatchCalls).to.equal(0)
 		end)
 	end)
+
+	describe("script wipe guard", function()
+		local Settings = require(script.Parent.Settings)
+		local hashSource = require(script.Parent.hashSource)
+		local container
+		local module
+
+		-- A resync as the verify that `expectFrom` recorded sends it.
+		local function resyncAs(patch, expected, includeHeld, expiresAt, isActive)
+			return session:applyResync(patch, expected, includeHeld, expiresAt, isActive, "VERIFY")
+		end
+
+		local function sourceUpdate(id, source, extra)
+			local update = { id = id, changedProperties = { Source = { String = source } } }
+			for key, value in extra or {} do
+				update.changedProperties[key] = value
+			end
+			return { removed = {}, added = {}, updated = { update } }
+		end
+
+		beforeEach(function()
+			container = Instance.new("Folder")
+			module = Instance.new("ModuleScript")
+			module.Name = "UIController"
+			module.Source = "local a = 1\nlocal b = 2\nlocal c = 3\nlocal d = 4\nreturn a + b + c + d\n"
+			module.Parent = container
+			container.Parent = workspace
+			session.__instanceMap:insert("UI", module)
+			Settings:set("guardScriptWipes", true)
+		end)
+
+		afterEach(function()
+			container:Destroy()
+		end)
+
+		it("holds back emptying a script with several lines", function()
+			local patch = sourceUpdate("UI", "")
+			session:__holdScriptWipes(patch)
+			expect(#patch.updated).to.equal(0)
+			expect(session.__heldWipes.UI).to.be.ok()
+			expect(session.__heldWipes.UI.lines).to.equal(5)
+			expect(session:getSyncSummary().heldWipeCount).to.equal(1)
+		end)
+
+		it("keeps the rest of an update whose source it holds back", function()
+			local patch = sourceUpdate("UI", "  \n", { Disabled = { Bool = true } })
+			session:__holdScriptWipes(patch)
+			expect(#patch.updated).to.equal(1)
+			expect(patch.updated[1].changedProperties.Source).to.equal(nil)
+			expect(patch.updated[1].changedProperties.Disabled).to.be.ok()
+		end)
+
+		it("holds back a class change of a held script", function()
+			session:__holdScriptWipes(sourceUpdate("UI", ""))
+			local classChange = {
+				removed = {},
+				added = {},
+				updated = { { id = "UI", changedClassName = "Script", changedProperties = {} } },
+			}
+			session:__holdScriptWipes(classChange)
+			expect(#classChange.updated).to.equal(0)
+			local combined = sourceUpdate("UI", "")
+			combined.updated[1].changedClassName = "Script"
+			session:__holdScriptWipes(combined)
+			expect(#combined.updated).to.equal(0)
+			expect(session.__heldWipes.UI).to.be.ok()
+		end)
+
+		it("keeps holding a held script that was shortened in Studio", function()
+			session:__holdScriptWipes(sourceUpdate("UI", ""))
+			local hold = session.__heldWipes.UI
+			module.Source = "return 1"
+			local again = sourceUpdate("UI", " ")
+			session:__holdScriptWipes(again)
+			expect(#again.updated).to.equal(0)
+			expect(session.__heldWipes.UI).to.equal(hold)
+		end)
+
+		it("lists held scripts within a byte budget", function()
+			for index = 1, 40 do
+				session.__heldWipes["ID" .. index] = { path = string.rep("x", 900) .. index, lines = 9, heldAt = 0 }
+			end
+			local summary = session:getSyncSummary()
+			expect(summary.heldWipeCount).to.equal(40)
+			local bytes = 0
+			for _, entry in summary.heldWipes do
+				expect(#entry.path <= 256).to.equal(true)
+				bytes += #entry.path
+			end
+			expect(bytes <= 4096).to.equal(true)
+			expect(#summary.heldWipes > 0).to.equal(true)
+		end)
+
+		local function serverCopy(className, source)
+			api.serialize = function()
+				return Promise.resolve({ modelContents = buffer.create(0) })
+			end
+			api.refPatch = function()
+				return Promise.resolve({ patch = PatchSet.newEmpty() })
+			end
+			session.__deserializeInstances = function()
+				local root = Instance.new("Folder")
+				local pointer = Instance.new("ObjectValue")
+				pointer.Name = "UI"
+				local copy = Instance.new(className)
+				copy.Name = "UIController"
+				(copy :: any).Source = source
+				pointer.Value = copy
+				pointer.Parent = root
+				return { root }
+			end
+		end
+
+		it("does not let the sync fallback swap in an empty copy", function()
+			serverCopy("ModuleScript", "")
+			local ok = session:__replaceInstances({ "UI" })
+			expect(ok).to.equal(true)
+			expect(session.__instanceMap.fromIds.UI).to.equal(module)
+			expect(module.Parent).to.equal(container)
+			expect(string.find(module.Source, "return a") ~= nil).to.equal(true)
+			expect(session.__heldWipes.UI).to.be.ok()
+		end)
+
+		it("applies a held class change once the file has code again", function()
+			session:__holdScriptWipes(sourceUpdate("UI", ""))
+			session:__holdScriptWipes({
+				removed = {},
+				added = {},
+				updated = { { id = "UI", changedClassName = "Script", changedProperties = {} } },
+			})
+			expect(session.__heldWipes.UI.deferredClass).to.equal("Script")
+			serverCopy("Script", "print('code again')")
+			session.__status = ServeSession.Status.Connected
+			session:__applyPatch(sourceUpdate("UI", "print('code again')"))
+			expect(session.__heldWipes.UI).to.equal(nil)
+			local now = session.__instanceMap.fromIds.UI
+			expect(now.ClassName).to.equal("Script")
+			expect(now.Source).to.equal("print('code again')")
+		end)
+
+		it("pairs a held script with the server's after its class changed", function()
+			session:__holdScriptWipes(sourceUpdate("UI", ""))
+			session:stop()
+			local again = ServeSession.new({ apiContext = api, twoWaySync = false })
+			again.__instanceMap:insert("FOLDER", container)
+			again:__rematchHolds({
+				FOLDER = { Name = "Folder", ClassName = "Folder", Children = { "NEW-ID" } },
+				["NEW-ID"] = { Name = "UIController", ClassName = "Script", Children = {} },
+			})
+			again:__adoptHolds()
+			expect(again.__instanceMap.fromIds["NEW-ID"]).to.equal(module)
+			expect(again.__heldWipes["NEW-ID"]).to.be.ok()
+			again:__clearHold("NEW-ID")
+			again:stop()
+		end)
+
+		it("keeps a recovered script's code when it is rebuilt with a new class on reconnect", function()
+			local kept = module.Source
+			module:SetAttribute("Tag", "kept")
+			session:__holdScriptWipes(sourceUpdate("UI", ""))
+			session:stop()
+			local again = ServeSession.new({ apiContext = api, twoWaySync = false })
+			again.__status = ServeSession.Status.Connected
+			again.__instanceMap:insert("FOLDER", container)
+			local instances = {
+				FOLDER = {
+					Id = "FOLDER",
+					Name = container.Name,
+					ClassName = "Folder",
+					Properties = {},
+					Children = { "NEW-ID" },
+				},
+				["NEW-ID"] = {
+					Id = "NEW-ID",
+					Name = "UIController",
+					ClassName = "Script",
+					Properties = {
+						Source = { String = kept },
+						Attributes = { Attributes = { Tag = { String = "kept" } } },
+					},
+					Children = {},
+				},
+			}
+			-- The same steps as reconnecting with the guard on.
+			local rematched = again:__rematchHolds(instances)
+			again:__adoptHolds()
+			again:__releaseRecoveredHolds(instances)
+			expect(again.__heldWipes["NEW-ID"]).to.equal(nil)
+			local ok, patch = again.__reconciler:diff(instances, "FOLDER", container)
+			expect(ok).to.equal(true)
+			expect(patch.updated[1].changedProperties.Source).to.equal(nil)
+			again:__completeRematchedClassChanges(patch, instances, rematched)
+			expect(patch.updated[1].changedProperties.Source.String).to.equal(kept)
+			again:__applyPatch(patch)
+			task.wait(0.3)
+			local now = again.__instanceMap.fromIds["NEW-ID"]
+			expect(now.ClassName).to.equal("Script")
+			expect(now.Source).to.equal(kept)
+			expect(now:GetAttribute("Tag")).to.equal("kept")
+			again:stop()
+		end)
+
+		it("ends holds from an earlier session when it reconnects with the guard off", function()
+			session:__holdScriptWipes(sourceUpdate("UI", ""))
+			session:stop()
+			local again = ServeSession.new({ apiContext = api, twoWaySync = false })
+			local rematches = 0
+			again.__rematchHolds = function()
+				rematches += 1
+				return {}
+			end
+			again.__reconciler = {
+				hydrate = function() end,
+				diff = function()
+					return true, PatchSet.newEmpty()
+				end,
+			}
+			again.__applyPatch = function() end
+			Settings:set("guardScriptWipes", false)
+			local pending = again:__initialSync({ rootInstanceId = "ROOT" })
+			readResolve({ messageCursor = 0, instances = {} })
+			pending:await()
+			Settings:set("guardScriptWipes", true)
+			expect(rematches).to.equal(0)
+			again.__instanceMap:insert("UI", module)
+			again:__adoptHolds()
+			expect(again.__heldWipes.UI).to.equal(nil)
+			again:stop()
+		end)
+
+		it("refuses to write a script whose source changed even when its hash matches", function()
+			session.__status = ServeSession.Status.Connected
+			local kept = module.Source
+			local expected = { UI = { from = hashSource(kept), to = hashSource("return 'x'") } }
+			-- verify saw different text that happens to hash the same.
+			session.__verifiedRecords = { { id = "VERIFY", sources = { UI = "something else" } } }
+			local result = resyncAs(sourceUpdate("UI", "return 'x'"), expected, false)
+			expect(result.skipped).to.equal(1)
+			expect(module.Source).to.equal(kept)
+		end)
+
+		it("never lets a source write empty a script that is held when it commits", function()
+			session:__setHold("UI", module, { path = "UI", lines = 5, heldAt = 0 })
+			module.Source = "return 1"
+			session:__writeSource({ id = "UI", instance = module, target = "" })
+			task.wait(0.2)
+			expect(module.Source).to.equal("return 1")
+			session:__clearHold("UI")
+		end)
+
+		it("gives way to a sync write started after verify looked", function()
+			session.__status = ServeSession.Status.Connected
+			local kept = module.Source
+			session.__verifiedRecords = {
+				{ id = "VERIFY", sources = { UI = kept }, generations = { UI = 0 } },
+			}
+			local expected = { UI = { from = hashSource(kept), to = hashSource("return 'stale fix'") } }
+			-- A newer change from disk started writing after verify.
+			session.__sourceGenerations.UI = 1
+			local result = resyncAs(sourceUpdate("UI", "return 'stale fix'"), expected, false)
+			expect(result.skipped).to.equal(1)
+			expect(module.Source).to.equal(kept)
+		end)
+
+		it("ends a hold when the held script's file is deleted and its folder stays", function()
+			session:__holdScriptWipes(sourceUpdate("UI", ""))
+			local deleted = {
+				removed = {},
+				added = {},
+				updated = { { id = "UI", changedClassName = "Folder", changedProperties = {} } },
+			}
+			session:__holdScriptWipes(deleted)
+			expect(#deleted.updated).to.equal(1)
+			expect(session.__heldWipes.UI).to.equal(nil)
+		end)
+
+		it("writes the sources of new scripts through the guarded writer", function()
+			local reconcilerPatch, writes = session:__splitSourceWrites({
+				removed = {},
+				added = {
+					NEW = {
+						Id = "NEW",
+						ClassName = "ModuleScript",
+						Name = "New",
+						Parent = "FOLDER",
+						Properties = { Source = { String = "return 'new'" } },
+						Children = {},
+					},
+				},
+				updated = {},
+			})
+			expect(reconcilerPatch.added.NEW.Properties.Source).to.equal(nil)
+			expect(#writes).to.equal(1)
+			expect(writes[1].target).to.equal("return 'new'")
+		end)
+
+		it("lets a fix cancel an older pending sync write", function()
+			session.__status = ServeSession.Status.Connected
+			local kept = module.Source
+			-- An ordinary write started before verify looked, then the fix took over.
+			local generation = (session.__sourceGenerations.UI or 0) + 1
+			session.__sourceGenerations.UI = generation
+			session.__verifiedRecords = {
+				{ id = "VERIFY", sources = { UI = kept }, generations = { UI = generation } },
+			}
+			local expected = { UI = { from = hashSource(kept), to = hashSource("return 'fixed'") } }
+			local result = resyncAs(sourceUpdate("UI", "return 'fixed'"), expected, false)
+			expect(result.updated).to.equal(1)
+			expect(session.__sourceGenerations.UI > generation).to.equal(true)
+			expect(module.Source).to.equal("return 'fixed'")
+		end)
+
+		it("lets only the latest source write for a script finish", function()
+			session:__writeSource({ id = "UI", instance = module, target = "return 'first'" })
+			session:__writeSource({ id = "UI", instance = module, target = "return 'second'" })
+			task.wait(0.2)
+			expect(module.Source).to.equal("return 'second'")
+		end)
+
+		it("pairs nested held scripts in any order after a reconnect", function()
+			local inner = Instance.new("ModuleScript")
+			inner.Name = "Inner"
+			inner.Source = "local a = 1\nlocal b = 2\nlocal c = 3\nlocal d = 4\nreturn a\n"
+			inner.Parent = module
+			session.__instanceMap:insert("INNER", inner)
+			session:__holdScriptWipes(sourceUpdate("UI", ""))
+			session:__holdScriptWipes({
+				removed = {},
+				added = {},
+				updated = { { id = "INNER", changedProperties = { Source = { String = "" } } } },
+			})
+			session:stop()
+			local again = ServeSession.new({ apiContext = api, twoWaySync = false })
+			again.__instanceMap:insert("FOLDER", container)
+			again:__rematchHolds({
+				FOLDER = { Name = "Folder", ClassName = "Folder", Children = { "UI2" } },
+				UI2 = { Name = "UIController", ClassName = "Script", Children = { "INNER2" }, Properties = {} },
+				INNER2 = { Name = "Inner", ClassName = "ModuleScript", Children = {}, Properties = {} },
+			})
+			expect(again.__instanceMap.fromIds["UI2"]).to.equal(module)
+			expect(again.__instanceMap.fromIds["INNER2"]).to.equal(inner)
+			again:__adoptHolds()
+			expect(again.__heldWipes["INNER2"]).to.be.ok()
+			again:__clearHold("UI2")
+			again:__clearHold("INNER2")
+			again:stop()
+		end)
+
+		it("does not empty a held script whose class changed too, even with includeHeld", function()
+			session.__status = ServeSession.Status.Connected
+			session:__holdScriptWipes(sourceUpdate("UI", ""))
+			session.__heldWipes.UI.deferredClass = true
+			local kept = module.Source
+			session.__verifiedRecords = { { id = "VERIFY", sources = { UI = kept }, generations = {} } }
+			local expected = { UI = { from = hashSource(kept), to = hashSource("") } }
+			local result = resyncAs(sourceUpdate("UI", ""), expected, true)
+			expect(result.skipped).to.equal(1)
+			expect(module.Source).to.equal(kept)
+			expect(session.__heldWipes.UI).to.be.ok()
+		end)
+
+		it("does not carry a hold when several same-named scripts are replaced", function()
+			session:__holdScriptWipes(sourceUpdate("UI", ""))
+			local twin = Instance.new("ModuleScript")
+			twin.Name = "UIController"
+			twin.Parent = container
+			session.__instanceMap:insert("TWIN", twin)
+			session.__instanceMap:insert("FOLDER", container)
+			local function added(id)
+				return {
+					Id = id,
+					Parent = "FOLDER",
+					Name = "UIController",
+					ClassName = "Script",
+					Properties = { Source = { String = "" } },
+					Children = {},
+				}
+			end
+			local replacement = { removed = { "UI", "TWIN" }, added = { A = added("A"), B = added("B") }, updated = {} }
+			session:__holdScriptWipes(replacement)
+			expect(replacement.added.A.Properties.Source.String).to.equal("")
+			expect(replacement.added.B.Properties.Source.String).to.equal("")
+			expect(next(session.__pendingHoldTransfers)).to.equal(nil)
+		end)
+
+		it("carries a hold to a script that replaces a held one", function()
+			session:__holdScriptWipes(sourceUpdate("UI", ""))
+			local kept = module.Source
+			session.__instanceMap:insert("FOLDER", container)
+			local replacement = {
+				removed = { "UI" },
+				added = {
+					NEW = {
+						Id = "NEW",
+						Parent = "FOLDER",
+						Name = "UIController",
+						ClassName = "LocalScript",
+						Properties = { Source = { String = "" } },
+						Children = {},
+					},
+				},
+				updated = {},
+			}
+			session:__holdScriptWipes(replacement)
+			expect(replacement.added.NEW.Properties.Source.String).to.equal(kept)
+			expect(session.__pendingHoldTransfers.NEW).to.be.ok()
+			expect(session.__heldWipes.UI).to.equal(nil)
+			table.clear(session.__pendingHoldTransfers)
+		end)
+
+		it("forgets a held class change that was changed back", function()
+			session:__holdScriptWipes(sourceUpdate("UI", ""))
+			local change = function(className)
+				session:__holdScriptWipes({
+					removed = {},
+					added = {},
+					updated = { { id = "UI", changedClassName = className, changedProperties = {} } },
+				})
+			end
+			change("Script")
+			expect(session.__heldWipes.UI.deferredClass).to.equal("Script")
+			change("ModuleScript")
+			expect(session.__heldWipes.UI.deferredClass).to.equal(nil)
+		end)
+
+		it("pairs a held script under a parent whose class changed", function()
+			session:__holdScriptWipes(sourceUpdate("UI", ""))
+			session:stop()
+			local again = ServeSession.new({ apiContext = api, twoWaySync = false })
+			-- Only the workspace is paired; the folder became a Model on disk.
+			again.__instanceMap:insert("WS", workspace)
+			again:__rematchHolds({
+				WS = { Name = "Workspace", ClassName = "Workspace", Children = { "MODEL" } },
+				MODEL = { Name = container.Name, ClassName = "Model", Children = { "UI2" }, Properties = {} },
+				UI2 = { Name = "UIController", ClassName = "ModuleScript", Children = {}, Properties = {} },
+			})
+			expect(again.__instanceMap.fromIds.MODEL).to.equal(container)
+			expect(again.__instanceMap.fromIds.UI2).to.equal(module)
+			again:__adoptHolds()
+			expect(again.__heldWipes.UI2).to.be.ok()
+			again:__clearHold("UI2")
+			again:stop()
+		end)
+
+		it("releases an adopted hold whose file has code again", function()
+			session:__holdScriptWipes(sourceUpdate("UI", ""))
+			session:stop()
+			local again = ServeSession.new({ apiContext = api, twoWaySync = false })
+			again.__instanceMap:insert("UI", module)
+			again:__adoptHolds()
+			expect(again.__heldWipes.UI).to.be.ok()
+			again:__releaseRecoveredHolds({
+				UI = { Properties = { Source = { String = module.Source } } },
+			})
+			expect(again.__heldWipes.UI).to.equal(nil)
+			again:stop()
+		end)
+
+		it("keeps a held script that could not be paired out of the catch-up removals", function()
+			session:__holdScriptWipes(sourceUpdate("UI", ""))
+			session:stop()
+			local again = ServeSession.new({ apiContext = api, twoWaySync = false })
+			local catchUp = { removed = { container }, added = {}, updated = {} }
+			again:__keepUnpairedHolds(catchUp)
+			expect(#catchUp.removed).to.equal(0)
+			local other = Instance.new("Folder")
+			local unrelated = { removed = { other }, added = {}, updated = {} }
+			again:__keepUnpairedHolds(unrelated)
+			expect(#unrelated.removed).to.equal(1)
+			other:Destroy()
+			again:stop()
+		end)
+
+		it("keeps a hold when the same Studio reconnects", function()
+			session:__holdScriptWipes(sourceUpdate("UI", ""))
+			local hold = session.__heldWipes.UI
+			session:stop()
+			local again = ServeSession.new({ apiContext = api, twoWaySync = false })
+			again.__instanceMap:insert("NEW-ID", module)
+			again:__adoptHolds()
+			expect(again.__heldWipes["NEW-ID"]).to.equal(hold)
+			module.Source = "return 1"
+			local empty = sourceUpdate("NEW-ID", "")
+			again:__holdScriptWipes(empty)
+			expect(#empty.updated).to.equal(0)
+			again:__clearHold("NEW-ID")
+			again:stop()
+		end)
+
+		it("lets small scripts be emptied", function()
+			module.Source = "return 1"
+			local patch = sourceUpdate("UI", "")
+			session:__holdScriptWipes(patch)
+			expect(#patch.updated).to.equal(1)
+			expect(session.__heldWipes.UI).to.equal(nil)
+		end)
+
+		it("ends the hold when the file has code again or is removed", function()
+			session:__holdScriptWipes(sourceUpdate("UI", ""))
+			expect(session.__heldWipes.UI).to.be.ok()
+			local fixed = sourceUpdate("UI", "return 'fixed'")
+			session:__holdScriptWipes(fixed)
+			expect(session.__heldWipes.UI).to.equal(nil)
+			expect(#fixed.updated).to.equal(1)
+
+			session:__holdScriptWipes(sourceUpdate("UI", ""))
+			session:__holdScriptWipes({ removed = { "UI" }, added = {}, updated = {} })
+			expect(session.__heldWipes.UI).to.equal(nil)
+		end)
+
+		it("ends existing holds as soon as the setting is turned off", function()
+			session:__holdScriptWipes(sourceUpdate("UI", ""))
+			expect(session.__heldWipes.UI).to.be.ok()
+			-- No patch arrives: the setting change alone ends the hold.
+			Settings:set("guardScriptWipes", false)
+			task.wait()
+			local held = session.__heldWipes.UI
+			local summary = session:getSyncSummary()
+			Settings:set("guardScriptWipes", true)
+			expect(held).to.equal(nil)
+			expect(summary.heldWipeCount).to.equal(0)
+		end)
+
+		it("leaves held scripts as they are when the guard is turned off", function()
+			session.__status = ServeSession.Status.Connected
+			session:__holdScriptWipes(sourceUpdate("UI", ""))
+			local kept = module.Source
+			local reads = 0
+			api.read = function()
+				reads += 1
+				return Promise.resolve({ instances = {} })
+			end
+			Settings:set("guardScriptWipes", false)
+			task.wait(0.2)
+			Settings:set("guardScriptWipes", true)
+			expect(session.__instanceMap.fromIds.UI).to.equal(module)
+			expect(module.Source).to.equal(kept)
+			expect(reads).to.equal(0)
+			expect(session.__heldWipes.UI).to.equal(nil)
+		end)
+
+		it("still applies a held class change after the guard is turned off", function()
+			session.__status = ServeSession.Status.Connected
+			session:__holdScriptWipes(sourceUpdate("UI", ""))
+			session:__holdScriptWipes({
+				removed = {},
+				added = {},
+				updated = { { id = "UI", changedClassName = "Script", changedProperties = {} } },
+			})
+			expect(session.__heldWipes.UI.deferredClass).to.equal("Script")
+			Settings:set("guardScriptWipes", false)
+			expect(session.__heldWipes.UI).to.equal(nil)
+			expect(session.__refreshAfterHold.UI).to.equal(true)
+			serverCopy("Script", "print('code again')")
+			session:__applyPatch(sourceUpdate("UI", "print('code again')"))
+			Settings:set("guardScriptWipes", true)
+			local now = session.__instanceMap.fromIds.UI
+			expect(now.ClassName).to.equal("Script")
+			expect(now.Source).to.equal("print('code again')")
+			expect(next(session.__refreshAfterHold)).to.equal(nil)
+		end)
+
+		it("does nothing when the setting is off", function()
+			Settings:set("guardScriptWipes", false)
+			local patch = sourceUpdate("UI", "")
+			session:__holdScriptWipes(patch)
+			Settings:set("guardScriptWipes", true)
+			expect(#patch.updated).to.equal(1)
+		end)
+
+		-- Also records `source` as what verify saw, as `getSourceHashes` does.
+		local function expectFrom(source, target)
+			session.__verifiedRecords = { { id = "VERIFY", sources = { UI = source } } }
+			return { UI = { from = hashSource(source), to = hashSource(target) } }
+		end
+
+		it("applies a held wipe when resynced with includeHeld", function()
+			session.__status = ServeSession.Status.Connected
+			session:__applyPatch(sourceUpdate("UI", ""))
+			local kept = module.Source
+			expect(string.find(kept, "return a") ~= nil).to.equal(true)
+			local result = resyncAs(sourceUpdate("UI", ""), expectFrom(kept, ""), true)
+			expect(result.updated).to.equal(1)
+			expect(result.failed).to.equal(0)
+			expect(module.Source).to.equal("")
+			expect(session.__heldWipes.UI).to.equal(nil)
+		end)
+
+		it("leaves a held script alone in a fix without includeHeld", function()
+			session.__status = ServeSession.Status.Connected
+			local kept = module.Source
+			local expected = expectFrom(kept, "return 'one line'")
+			-- The file became empty after verify built the fix.
+			session:__holdScriptWipes(sourceUpdate("UI", ""))
+			local hold = session.__heldWipes.UI
+			local result = resyncAs(sourceUpdate("UI", "return 'one line'"), expected, false)
+			expect(result.skipped).to.equal(1)
+			expect(module.Source).to.equal(kept)
+			expect(session.__heldWipes.UI).to.equal(hold)
+		end)
+
+		it("keeps an existing hold when a stale resync is skipped", function()
+			session.__status = ServeSession.Status.Connected
+			session:__holdScriptWipes(sourceUpdate("UI", ""))
+			local hold = session.__heldWipes.UI
+			expect(hold).to.be.ok()
+			local result = resyncAs(
+				sourceUpdate("UI", "return 'from disk'"),
+				expectFrom("return 'what verify saw'", "return 'from disk'"),
+				false
+			)
+			expect(result.skipped).to.equal(1)
+			expect(session.__heldWipes.UI).to.equal(hold)
+		end)
+
+		it("stops writing once the server says the batch was cancelled", function()
+			session.__status = ServeSession.Status.Connected
+			local kept = module.Source
+			local asked = 0
+			local result = resyncAs(
+				sourceUpdate("UI", "return 'cancelled'"),
+				expectFrom(kept, "return 'cancelled'"),
+				false,
+				nil,
+				function()
+					asked += 1
+					return false
+				end
+			)
+			expect(asked).to.equal(1)
+			expect(result.failed).to.equal(1)
+			expect(module.Source).to.equal(kept)
+		end)
+
+		it("skips a script removed from the place since the batch was built", function()
+			session.__status = ServeSession.Status.Connected
+			local kept = module.Source
+			module.Parent = nil
+			local result = resyncAs(sourceUpdate("UI", "return 'x'"), expectFrom(kept, "return 'x'"), false)
+			expect(result.skipped).to.equal(1)
+			expect(module.Source).to.equal(kept)
+		end)
+
+		it("writes nothing once the command expired", function()
+			session.__status = ServeSession.Status.Connected
+			local kept = module.Source
+			local result = resyncAs(
+				sourceUpdate("UI", "return 'late'"),
+				expectFrom(kept, "return 'late'"),
+				false,
+				DateTime.now().UnixTimestampMillis - 1
+			)
+			expect(result.failed).to.equal(1)
+			expect(module.Source).to.equal(kept)
+		end)
+
+		it("refuses to write without its own undo step", function()
+			session.__status = ServeSession.Status.Connected
+			local ChangeHistoryService = game:GetService("ChangeHistoryService")
+			local other = ChangeHistoryService:TryBeginRecording("Another change")
+			local kept = module.Source
+			local ok = pcall(
+				session.applyResync,
+				session,
+				sourceUpdate("UI", "return 'x'"),
+				expectFrom(kept, "return 'x'"),
+				false
+			)
+			if other then
+				ChangeHistoryService:FinishRecording(other, Enum.FinishRecordingOperation.Cancel)
+			end
+			expect(other ~= nil).to.equal(true)
+			expect(ok).to.equal(false)
+			expect(module.Source).to.equal(kept)
+		end)
+
+		it("writes the resync inside one undo step", function()
+			session.__status = ServeSession.Status.Connected
+			local ChangeHistoryService = game:GetService("ChangeHistoryService")
+			local kept = module.Source
+			resyncAs(sourceUpdate("UI", "return 'resynced'"), expectFrom(kept, "return 'resynced'"), false)
+			expect(module.Source).to.equal("return 'resynced'")
+			local canUndo, waypoint = ChangeHistoryService:GetCanUndo()
+			expect(canUndo).to.equal(true)
+			expect(string.sub(waypoint, 1, 13)).to.equal("Rojo: Resync ")
+		end)
+
+		it("still guards against wipes in a resync without includeHeld", function()
+			session.__status = ServeSession.Status.Connected
+			local kept = module.Source
+			local result = resyncAs(sourceUpdate("UI", ""), expectFrom(kept, ""), false)
+			expect(module.Source).to.equal(kept)
+			expect(result.updated).to.equal(0)
+			expect(result.skipped).to.equal(1)
+			expect(session.__heldWipes.UI).to.be.ok()
+		end)
+
+		it("starts no hold when the guard is turned off while a resync waits", function()
+			session.__status = ServeSession.Status.Connected
+			local kept = module.Source
+			local isActive = function()
+				-- The server check yields, and the user turns the guard off meanwhile.
+				Settings:set("guardScriptWipes", false)
+				task.wait()
+				return true
+			end
+			local result =
+				session:applyResync(sourceUpdate("UI", ""), expectFrom(kept, ""), false, nil, isActive, "VERIFY")
+			Settings:set("guardScriptWipes", true)
+			expect(result.updated).to.equal(1)
+			expect(module.Source).to.equal("")
+			expect(session.__heldWipes.UI).to.equal(nil)
+			expect(session:getSyncSummary().heldWipeCount).to.equal(0)
+		end)
+
+		it("skips a script that changed since verify checked it", function()
+			session.__status = ServeSession.Status.Connected
+			local result = resyncAs(
+				sourceUpdate("UI", "return 'from disk'"),
+				expectFrom("return 'what verify saw'", "return 'from disk'"),
+				false
+			)
+			expect(result.skipped).to.equal(1)
+			expect(result.updated).to.equal(0)
+			expect(string.find(module.Source, "return a") ~= nil).to.equal(true)
+		end)
+
+		it("refuses a resync that adds or removes instances or has no expectations", function()
+			session.__status = ServeSession.Status.Connected
+			local ok = pcall(session.applyResync, session, { removed = { "UI" }, added = {}, updated = {} }, {})
+			expect(ok).to.equal(false)
+			expect(pcall(session.applyResync, session, sourceUpdate("UI", "x"), nil)).to.equal(false)
+		end)
+
+		it("keeps held scripts out of the sync fallback", function()
+			session.__status = ServeSession.Status.Connected
+			session:__holdScriptWipes(sourceUpdate("UI", ""))
+			session.__reconciler = {
+				applyPatch = function()
+					return {
+						removed = {},
+						added = {},
+						updated = { { id = "UI", changedProperties = {}, changedMetadata = {} } },
+					}
+				end,
+			}
+			local replaced = {}
+			session.__replaceInstances = function(_, ids)
+				for _, id in ids do
+					table.insert(replaced, id)
+				end
+				return true, PatchSet.newEmpty()
+			end
+			local unapplied = session:__applyPatchInRecording(PatchSet.newEmpty())
+			expect(#replaced).to.equal(0)
+			expect(#unapplied.updated).to.equal(1)
+			expect(string.find(module.Source, "return a") ~= nil).to.equal(true)
+		end)
+
+		it("drops holds of scripts removed with their parent", function()
+			session.__status = ServeSession.Status.Connected
+			session:__holdScriptWipes(sourceUpdate("UI", ""))
+			expect(session.__heldWipes.UI).to.be.ok()
+			-- The server removes the parent; the instance map forgets its
+			-- descendants, which the patch does not list.
+			session.__instanceMap:removeId("UI")
+			session:__applyPatch({ removed = { "PARENT" }, added = {}, updated = {} })
+			expect(session.__heldWipes.UI).to.equal(nil)
+		end)
+	end)
+
+	describe("verify support", function()
+		local hashSource = require(script.Parent.hashSource)
+
+		it("hashes tracked scripts and lists ones removed from the place", function()
+			local container = Instance.new("Folder")
+			local inPlace = Instance.new("ModuleScript")
+			inPlace.Source = "return 1\n"
+			inPlace.Parent = container
+			container.Parent = workspace
+			local removed = Instance.new("ModuleScript")
+			session.__instanceMap:insert("IN", inPlace)
+			session.__instanceMap:insert("OUT", removed)
+			session.__instanceMap:insert("FOLDER", container)
+			session.__status = ServeSession.Status.Connected
+
+			local report = session:getSourceHashes()
+			container:Destroy()
+			expect(#report.scripts).to.equal(1)
+			local hash, length = hashSource("return 1\n")
+			expect(report.scripts[1].id).to.equal("IN")
+			expect(report.scripts[1].hash).to.equal(hash)
+			expect(report.scripts[1].length).to.equal(length)
+			expect(#report.detached).to.equal(1)
+			expect(report.detached[1]).to.equal("OUT")
+		end)
+
+		it("keeps each verify's sources apart and only the last few", function()
+			session:__rememberVerified("A", { UI = "first" })
+			session:__rememberVerified("B", { UI = "second" })
+			expect(session:__verifiedSourcesFor("A").UI).to.equal("first")
+			expect(session:__verifiedSourcesFor("B").UI).to.equal("second")
+			for index = 1, 10 do
+				session:__rememberVerified("X" .. index, {})
+			end
+			expect(session:__verifiedSourcesFor("A")).to.equal(nil)
+			expect(#session.__verifiedRecords <= 4).to.equal(true)
+		end)
+
+		it("refuses to hash before syncing starts", function()
+			expect(pcall(session.getSourceHashes, session)).to.equal(false)
+		end)
+
+		it("counts undone Rojo changes, but not other undo steps", function()
+			session.__status = ServeSession.Status.Connected
+			session:__onRojoHistoryChanged("Rojo: Patch 10:00:00 AM", 1)
+			session:__onRojoHistoryChanged("Move Part", 1)
+			expect(session:getSyncSummary().undoneRojoPatches).to.equal(1)
+			session:__onRojoHistoryChanged("Rojo: Patch 10:00:00 AM", -1)
+			expect(session:getSyncSummary().undoneRojoPatches).to.equal(0)
+		end)
+
+		it("records patch counts in the sync summary", function()
+			session.__status = ServeSession.Status.Connected
+			session:__applyPatch(PatchSet.newEmpty())
+			local summary = session:getSyncSummary()
+			expect(summary.patchesApplied).to.equal(1)
+			expect(summary.lastPatchUnapplied).to.equal(0)
+			expect(type(summary.lastPatchAt)).to.equal("number")
+		end)
+	end)
+
+	describe("versionMismatchWarning", function()
+		local Config = require(script.Parent.Config)
+		local Version = require(script.Parent.Version)
+
+		it("stays quiet for the same major and minor version", function()
+			local same = string.format("%d.%d.99", Config.version[1], Config.version[2])
+			expect(ServeSession.versionMismatchWarning(same)).to.equal(nil)
+			expect(ServeSession.versionMismatchWarning(nil)).to.equal(nil)
+			expect(ServeSession.versionMismatchWarning("garbage")).to.equal(nil)
+		end)
+
+		it("says which side to update", function()
+			local newer = string.format("%d.%d.0", Config.version[1], Config.version[2] + 1)
+			local older = string.format("%d.%d.0", Config.version[1] - 1, 0)
+			local newerWarning = ServeSession.versionMismatchWarning(newer)
+			local olderWarning = ServeSession.versionMismatchWarning(older)
+			expect(newerWarning:find("rojo plugin install", 1, true) ~= nil).to.equal(true)
+			expect(olderWarning:find("rokit.toml", 1, true) ~= nil).to.equal(true)
+			expect(newerWarning:find(Version.display(Config.version), 1, true) ~= nil).to.equal(true)
+		end)
+	end)
 end

@@ -11,6 +11,7 @@ pub(crate) mod studio;
 mod ui;
 mod untrusted_model;
 mod util;
+pub(crate) mod verify;
 
 use std::convert::Infallible;
 use std::net::SocketAddr;

@@ -13,12 +13,18 @@ mod plugin;
 mod serve;
 mod sourcemap;
 mod studio;
+mod studio_lock;
 mod syncback;
 mod test;
 mod typecheck;
 mod upload;
 
-use std::{borrow::Cow, env, path::Path, str::FromStr};
+use std::{
+    borrow::Cow,
+    env,
+    path::{Path, PathBuf},
+    str::FromStr,
+};
 
 use anyhow::Context;
 use clap::Parser;
@@ -190,6 +196,50 @@ pub fn exit_status(error: &anyhow::Error) -> (i32, bool) {
     } else {
         (1, true)
     }
+}
+
+/// A per-user directory for state about the project in `workdir`, for when
+/// it is not in a Git repository: `%LOCALAPPDATA%\Rojo\projects\<id>` on
+/// Windows, `$XDG_STATE_HOME/rojo/projects/<id>` (or `~/.local/state/...`)
+/// elsewhere. It must not be inside the project, because `rojo serve` would
+/// sync any JSON or model file placed in a mapped folder into the place.
+/// Rojo's per-user state for the repository whose Git common directory is
+/// `common_dir`, shared by all of its worktrees. It is outside the repository,
+/// because a project can map a folder that contains `.git`, and `rojo serve`
+/// would then sync anything stored there into the place.
+pub(crate) fn repository_state_dir(common_dir: &Path) -> anyhow::Result<PathBuf> {
+    project_state_dir(common_dir)
+}
+
+pub(crate) fn project_state_dir(workdir: &Path) -> anyhow::Result<PathBuf> {
+    let base = if cfg!(windows) {
+        env::var_os("LOCALAPPDATA").map(|dir| PathBuf::from(dir).join("Rojo"))
+    } else {
+        env::var_os("XDG_STATE_HOME")
+            .map(PathBuf::from)
+            .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/state")))
+            .map(|dir| dir.join("rojo"))
+    }
+    .context("Could not find a per-user directory for Rojo's state (LOCALAPPDATA, XDG_STATE_HOME or HOME)")?;
+    let canonical = dunce::canonicalize(workdir).unwrap_or_else(|_| workdir.to_owned());
+    let id = blake3::hash(canonical.to_string_lossy().as_bytes()).to_hex();
+    Ok(base.join("projects").join(&id[..16]))
+}
+
+/// Whether `start` or one of its parents looks like a repository: a `.git`
+/// folder with a `HEAD` file, or a `.git` file pointing at one (`gitdir:`),
+/// as Git itself requires. This tells that `start` is in a repository even
+/// when Git cannot run, while a stray `.git` folder, such as an empty one in a
+/// home directory, does not count.
+pub(crate) fn has_git_marker(start: &Path) -> bool {
+    start.ancestors().any(|dir| {
+        let marker = dir.join(".git");
+        if marker.is_dir() {
+            marker.join("HEAD").is_file()
+        } else {
+            std::fs::read(&marker).is_ok_and(|contents| contents.starts_with(b"gitdir:"))
+        }
+    })
 }
 
 pub(super) fn resolve_path(path: &Path) -> anyhow::Result<Cow<'_, Path>> {

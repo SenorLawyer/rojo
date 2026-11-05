@@ -24,7 +24,9 @@ this guide, `--help` and the bundled topics over them. Each topic prints with
 * Assets: `rojo assets sync` uploads new and changed images, audio and models
   through Open Cloud and writes a Luau module of their ids; `rojo assets
   status` shows what would change without network access. Refer to assets
-  through the generated module, not hard-coded ids. Read
+  through the generated module, not hard-coded ids. After the creator changes,
+  such as a move to a group, `rojo assets remap` lists and with `--write`
+  rewrites the old ids still in the project. Read
   `rojo doc --agent assets`.
 * Data modules: a `.data.csv` file becomes a ModuleScript returning its rows
   as typed Luau tables. Edit the CSV, not generated code. Read
@@ -37,6 +39,17 @@ this guide, `--help` and the bundled topics over them. Each topic prints with
   models, and follows Studio's output with `rojo studio logs --follow`. Read
   `rojo doc --agent studio-bridge`; `rojo mcp` serves the same operations as
   MCP tools, see `rojo doc --agent mcp`.
+* Sync health: `rojo studio sessions` shows whether each Studio is still
+  syncing and whether it fell behind the files. After a crash, a reconnect,
+  an undo or whenever Studio may be out of date, run `rojo studio verify
+  --session <id>` instead of asking the user, and `--fix` to sync the scripts
+  that differ. Back up instances with `rojo studio backup create` instead of
+  copying them into ServerStorage. Read `rojo doc --agent sync-health`.
+* Shared Studio windows: before using a Studio that other agents also use,
+  take a lease with `rojo studio lock acquire <name> --owner <you>` (add
+  `--exclusive` for a play test) and release it when done. Locks are
+  advisory; Studio tools do not check them. Read
+  `rojo doc --agent studio-locks`.
 * Versions and releases: `rojo checkpoint`, `rojo workspace` and `rojo
   release` (`prepare`, `stage`, `promote`, `publish`, `rollback`) capture
   places, keep hotfix work separate and publish through a staging place

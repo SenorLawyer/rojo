@@ -1,7 +1,7 @@
 //! Opt-in, authenticated local transport between a CLI and connected Studio plugins.
 
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     fs, io,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     path::{Path, PathBuf},
@@ -18,7 +18,7 @@ use serde_json::{json, Value};
 use tokio::sync::{oneshot, Notify, Semaphore};
 use uuid::Uuid;
 
-use super::{model_check, origin::canonical, untrusted_model, util::json as json_response};
+use super::{model_check, origin::canonical, untrusted_model, util::json as json_response, verify};
 use crate::serve_session::ServeSession;
 
 pub(super) const MAX_BODY: usize = 8 * 1024 * 1024;
@@ -84,6 +84,14 @@ const MAX_COMMAND_BYTES: usize = MAX_BODY - 64 * 1024;
 const MAX_SESSION_PENDING_BYTES: usize = 64 * 1024 * 1024;
 pub(crate) const MAX_MODEL_BYTES: usize = 5 * 1024 * 1024;
 const MAX_MODEL_INSTANCES: usize = 10_000;
+/// How long after `verify` starts it may begin another `--fix` batch. The CLI
+/// waits 65 seconds for the whole request, which before `verify` starts may
+/// already have spent up to 15 seconds waiting for Git and 10 reading the
+/// body, and the last batch may take its full 15-second deadline: 15 + 10 +
+/// 20 + 15 leaves 5 seconds to spare.
+const VERIFY_FIX_BUDGET: Duration = Duration::from_secs(20);
+/// Bound on the sync summary a plugin sends with each poll.
+const MAX_SYNC_SUMMARY_BYTES: usize = 16 * 1024;
 
 /// Why requests and sync stop after the checkout changes. Returning to the
 /// accepted branch and commit lets the same server continue. It also fits in a
@@ -377,6 +385,9 @@ struct Session {
     description: Value,
     last_seen: Instant,
     queue: VecDeque<String>,
+    /// The plugin's latest sync health summary, sent with each poll, and
+    /// when it arrived.
+    sync: Option<(Value, Instant)>,
 }
 
 enum Outcome {
@@ -401,6 +412,11 @@ struct State {
     /// Request IDs cancelled before they were queued, with their session and
     /// when the cancellation lapses.
     cancelled: HashMap<String, (String, Instant)>,
+    /// The `resync` batch a running `verify --fix` is waiting on, by the
+    /// verify's own request ID, so cancelling the verify cancels it too.
+    verify_children: HashMap<String, (String, String)>,
+    /// Request IDs of verifies still running, which no other command may use.
+    active_verifies: HashSet<String>,
     next_generation: u64,
 }
 
@@ -685,6 +701,8 @@ pub struct StudioBridge {
     /// unauthenticated responses do not reveal local paths.
     plugin_identity: Value,
     git: Option<Arc<GitWatch>>,
+    /// The tree `verify` compares Studio with.
+    serve: Arc<ServeSession>,
     state: Mutex<State>,
     changed: Notify,
     decodes: Arc<Semaphore>,
@@ -695,6 +713,17 @@ fn reply(status: StatusCode, value: Value) -> Response<Body> {
 }
 fn failure(status: StatusCode, message: impl Into<String>) -> Response<Body> {
     reply(status, json!({"error": message.into()}))
+}
+
+/// Reads back a response built by [`reply`], for actions made of several
+/// Studio commands.
+async fn response_value(response: Response<Body>) -> (StatusCode, Value) {
+    let status = response.status();
+    let value = match hyper::body::to_bytes(response.into_body()).await {
+        Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+        Err(_) => Value::Null,
+    };
+    (status, value)
 }
 
 /// Whether the Host header names the loopback interface literally. A DNS
@@ -726,12 +755,12 @@ fn loopback_host(request: &Request<Body>) -> bool {
 }
 
 impl StudioBridge {
-    pub fn new(session: &ServeSession, token_file: &Path) -> anyhow::Result<Arc<Self>> {
+    pub fn new(session: &Arc<ServeSession>, token_file: &Path) -> anyhow::Result<Arc<Self>> {
         Self::with_lock_wait(session, token_file, GIT_LOCK_WAIT)
     }
 
     fn with_lock_wait(
-        session: &ServeSession,
+        session: &Arc<ServeSession>,
         token_file: &Path,
         lock_wait: Duration,
     ) -> anyhow::Result<Arc<Self>> {
@@ -802,6 +831,7 @@ impl StudioBridge {
             identity_json,
             plugin_identity,
             git,
+            serve: Arc::clone(session),
             state: Mutex::new(State::default()),
             changed: Notify::new(),
             decodes: Arc::new(Semaphore::new(MAX_CONCURRENT_DECODES)),
@@ -953,6 +983,10 @@ impl StudioBridge {
                     let mut description = session.description.clone();
                     description["lastSeenMs"] =
                         json!(session.last_seen.elapsed().as_millis() as u64);
+                    if let Some((sync, at)) = &session.sync {
+                        description["sync"] = sync.clone();
+                        description["syncAgeMs"] = json!(at.elapsed().as_millis() as u64);
+                    }
                     description
                 })
                 .collect();
@@ -1030,6 +1064,24 @@ impl StudioBridge {
                     }
                     Self::prune(&mut state);
                     reply(StatusCode::OK, json!({"cancelled":true,"requestId":id}))
+                } else if let Some((_, child)) = state
+                    .verify_children
+                    .get(id)
+                    .filter(|(session, _)| session_id(&value).as_ref() == Some(session))
+                    .cloned()
+                {
+                    // A verify past its `sources` step: stop its current batch,
+                    // whether it is queued or about to be, and the batches after.
+                    let session = session_id(&value).unwrap_or_default();
+                    match state.pending.remove(&child) {
+                        Some(pending) => {
+                            let _ = pending.result.send(Outcome::Cancelled);
+                        }
+                        None => remember(&mut state.cancelled, &child, session.clone()),
+                    }
+                    remember(&mut state.cancelled, id, session);
+                    Self::prune(&mut state);
+                    reply(StatusCode::OK, json!({"cancelled":true,"requestId":id}))
                 } else {
                     // The command may still be waiting for Git or its import
                     // check, so it must not be queued once it gets there. A
@@ -1105,6 +1157,7 @@ impl StudioBridge {
                 description: stored,
                 last_seen: Instant::now(),
                 queue: VecDeque::new(),
+                sync: None,
             },
         );
         reply(StatusCode::OK, json!({"registered":true,"sessionId":id}))
@@ -1115,6 +1168,17 @@ impl StudioBridge {
             return failure(StatusCode::BAD_REQUEST, "A UUID sessionId is required");
         };
         let id = id.as_str();
+        // Older plugins send no summary. A summary is a few hundred bytes, so
+        // anything much larger is not one and is ignored.
+        // A summary that is too large replaces the last one with a marker,
+        // so `sessions` does not keep showing health that is out of date.
+        let sync = value.get("sync").filter(|sync| sync.is_object()).map(|sync| {
+            if sync.to_string().len() <= MAX_SYNC_SUMMARY_BYTES {
+                sync.clone()
+            } else {
+                json!({"status":"unknown","error":"The plugin sent a sync summary over 16 KiB, which was ignored"})
+            }
+        });
         // Leave room for Studio's HTTP queue and background UI scheduling before
         // the plugin's request deadline, even when no agent is issuing commands.
         let deadline = Instant::now() + Duration::from_secs(2);
@@ -1135,6 +1199,9 @@ impl StudioBridge {
                     );
                 };
                 session.last_seen = Instant::now();
+                if let Some(sync) = &sync {
+                    session.sync = Some((sync.clone(), Instant::now()));
+                }
                 // Commands are delivered at most once: a delivered command is
                 // never resent, so a lost poll response surfaces as a timeout
                 // instead of a duplicated import. Larger batches stay queued for
@@ -1202,6 +1269,8 @@ impl StudioBridge {
         let Some(action) = value.get("action").and_then(Value::as_str) else {
             return failure(StatusCode::BAD_REQUEST, "action is required");
         };
+        // `sources` and `resync` are only sent by `verify`, so callers cannot
+        // set script sources to anything but the server's own files.
         if !matches!(
             action,
             "status"
@@ -1213,6 +1282,7 @@ impl StudioBridge {
                 | "import"
                 | "test"
                 | "spec"
+                | "verify"
         ) {
             return failure(StatusCode::BAD_REQUEST, "Unsupported action. Arbitrary Luau execution, whole-place save, publish and play control are unavailable through this bridge.");
         }
@@ -1222,6 +1292,196 @@ impl StudioBridge {
             _ => return failure(StatusCode::BAD_REQUEST, "requestId must be a UUID"),
         };
         let args = value.get("args").cloned().unwrap_or(json!({}));
+        if action == "verify" {
+            return self.verify(session_id, id, &args).await;
+        }
+        self.dispatch(session_id, id, action, args).await
+    }
+
+    /// Compares the session's scripts with the server's tree and, with
+    /// `fix`, sets those that differ back to their files' contents. See
+    /// [`super::verify`].
+    async fn verify(&self, session_id: &str, id: String, args: &Value) -> Response<Body> {
+        let started = Instant::now();
+        // The request ID stays reserved until this verify ends, so another
+        // command cannot reuse it in between and take its cancellations.
+        {
+            let mut state = self.state();
+            if state.pending.contains_key(&id) || !state.active_verifies.insert(id.clone()) {
+                return failure(StatusCode::CONFLICT, "requestId is already pending");
+            }
+        }
+        let _reservation = VerifyReservation {
+            bridge: self,
+            id: id.clone(),
+        };
+        // Callers may reuse a request ID, so the plugin's record of what this
+        // verify saw gets an ID of its own.
+        let verify_id = Uuid::new_v4().to_string();
+        let fix = args.get("fix").and_then(Value::as_bool).unwrap_or(false);
+        let include_held = args
+            .get("includeHeld")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let list_limit = match args.get("listLimit") {
+            None => verify::DEFAULT_LISTED,
+            Some(limit) => match limit.as_u64() {
+                Some(limit @ 1..) if limit as usize <= verify::MAX_LISTED => limit as usize,
+                _ => {
+                    return failure(
+                        StatusCode::BAD_REQUEST,
+                        format!("listLimit must be 1 to {}", verify::MAX_LISTED),
+                    )
+                }
+            },
+        };
+        let response = self
+            // The plugin keeps the sources it hashes under this verify's ID,
+            // so its fix compares with exactly what this verify saw.
+            .dispatch(
+                session_id,
+                id.clone(),
+                "sources",
+                json!({"verifyId": verify_id}),
+            )
+            .await;
+        let (status, value) = response_value(response).await;
+        if status != StatusCode::OK || value["result"]["ok"] != json!(true) {
+            return reply(status, value);
+        }
+        let scripts = {
+            let tree = self.serve.tree();
+            verify::tree_scripts(&tree, self.serve.root_dir())
+        };
+        let comparison = match verify::compare(scripts, &value["result"]["value"]) {
+            Ok(comparison) => comparison,
+            Err(error) => {
+                return failure(
+                    StatusCode::BAD_GATEWAY,
+                    format!("Could not compare Studio's scripts: {error}"),
+                )
+            }
+        };
+        let list_bytes = match args.get("maxBytes") {
+            None => verify::DEFAULT_LIST_BYTES,
+            Some(bytes) => match bytes.as_u64() {
+                Some(bytes @ 1024..) if bytes as usize <= verify::DEFAULT_LIST_BYTES => {
+                    bytes as usize
+                }
+                _ => {
+                    return failure(
+                        StatusCode::BAD_REQUEST,
+                        format!("maxBytes must be 1024 to {}", verify::DEFAULT_LIST_BYTES),
+                    )
+                }
+            },
+        };
+        let mut report = comparison.report(list_limit, list_bytes);
+        if fix {
+            let fixes = comparison.fixable(include_held);
+            let batches = {
+                let tree = self.serve.tree();
+                verify::resync_batches(&tree, &fixes)
+            };
+            let (mut updated, mut failed, mut skipped) = (0, 0, 0);
+            let mut errors = Vec::new();
+            let mut remaining: u64 = batches.iter().map(|batch| batch.count as u64).sum();
+            for batch in batches {
+                // The caller stops waiting after its own timeout, and a fix it
+                // no longer hears about must not keep changing Studio.
+                if started.elapsed() > VERIFY_FIX_BUDGET {
+                    errors.push(format!(
+                        "Stopped after {} seconds; run verify --fix again for the rest",
+                        VERIFY_FIX_BUDGET.as_secs()
+                    ));
+                    break;
+                }
+                let child = Uuid::new_v4().to_string();
+                // The caller's request ID only covered `sources`, which has
+                // finished, so a cancel for it lands in `cancelled` or, once
+                // the batch is registered, cancels the batch. Checking one and
+                // registering under the same lock leaves no gap between them.
+                if !self.begin_child(&id, session_id, &child) {
+                    errors.push("Cancelled before every script was fixed".to_owned());
+                    break;
+                }
+                // Removes the record however this future ends, including when
+                // the caller disconnects and it is dropped mid-await.
+                let _child_record = ChildRecord {
+                    bridge: self,
+                    id: id.clone(),
+                    child: child.clone(),
+                };
+                let response = self
+                    .dispatch(
+                        session_id,
+                        child,
+                        "resync",
+                        json!({"patch": batch.patch, "expect": batch.expect, "includeHeld": include_held, "verifyId": verify_id}),
+                    )
+                    .await;
+                let (status, value) = response_value(response).await;
+                let result = &value["result"];
+                if status == StatusCode::OK && result["ok"] == json!(true) {
+                    updated += result["value"]["updated"].as_u64().unwrap_or(0);
+                    failed += result["value"]["failed"].as_u64().unwrap_or(0);
+                    skipped += result["value"]["skipped"].as_u64().unwrap_or(0);
+                    remaining -= batch.count as u64;
+                } else {
+                    // Later batches would most likely fail the same way, and
+                    // the report must say what is still out of date.
+                    errors.push(
+                        result["error"]
+                            .as_str()
+                            .or(value["error"].as_str())
+                            .unwrap_or("Studio did not apply the resync")
+                            .to_owned(),
+                    );
+                    break;
+                }
+            }
+            report["fixed"] = json!({
+                "attempted": fixes.len(),
+                "updated": updated,
+                "failed": failed + remaining,
+                "skippedChanged": skipped,
+                "skippedHeld": if include_held { 0 } else { comparison.held_count() },
+                "errors": errors,
+            });
+        }
+        reply(
+            StatusCode::OK,
+            json!({"sessionId":session_id,"requestId":id,"result":{"ok":true,"value":report}}),
+        )
+    }
+
+    /// Registers `child` as the batch the verify `id` waits on, unless a
+    /// cancellation of `id` arrived first, which it then uses up.
+    fn begin_child(&self, id: &str, session_id: &str, child: &str) -> bool {
+        let mut state = self.state();
+        Self::prune(&mut state);
+        if state
+            .cancelled
+            .get(id)
+            .is_some_and(|(session, _)| session == session_id)
+        {
+            state.cancelled.remove(id);
+            return false;
+        }
+        state
+            .verify_children
+            .insert(id.to_owned(), (session_id.to_owned(), child.to_owned()));
+        true
+    }
+
+    /// Queues one command for the session and waits for Studio's result.
+    async fn dispatch(
+        &self,
+        session_id: &str,
+        id: String,
+        action: &str,
+        args: Value,
+    ) -> Response<Body> {
         let deadline = match studio_deadline(action, &args) {
             Ok(deadline) => deadline,
             Err(message) => return failure(StatusCode::BAD_REQUEST, message),
@@ -1270,7 +1530,11 @@ impl StudioBridge {
                     "Target Studio session does not exist or expired",
                 );
             }
-            if state.pending.contains_key(&id) {
+            // A running verify reserves its ID; only its own `sources` step,
+            // sent with that ID, may use it.
+            if state.pending.contains_key(&id)
+                || (action != "sources" && state.active_verifies.contains(&id))
+            {
                 return failure(StatusCode::CONFLICT, "requestId is already pending");
             }
             if state
@@ -1338,6 +1602,39 @@ impl StudioBridge {
             state.pending.remove(&id);
         }
         response
+    }
+}
+
+/// Ends a verify's reservation of its request ID when dropped.
+struct VerifyReservation<'a> {
+    bridge: &'a StudioBridge,
+    id: String,
+}
+
+impl Drop for VerifyReservation<'_> {
+    fn drop(&mut self) {
+        self.bridge.state().active_verifies.remove(&self.id);
+    }
+}
+
+/// Removes a `verify --fix` batch's record from `verify_children` when
+/// dropped, if it still names that batch.
+struct ChildRecord<'a> {
+    bridge: &'a StudioBridge,
+    id: String,
+    child: String,
+}
+
+impl Drop for ChildRecord<'_> {
+    fn drop(&mut self) {
+        let mut state = self.bridge.state();
+        if state
+            .verify_children
+            .get(&self.id)
+            .is_some_and(|(_, child)| *child == self.child)
+        {
+            state.verify_children.remove(&self.id);
+        }
     }
 }
 
@@ -1463,7 +1760,7 @@ mod tests {
     }
 
     fn bridge_for(dir: &Path, lock_wait: Duration) -> Arc<StudioBridge> {
-        let session = ServeSession::new(Vfs::new_default().unwrap(), dir).unwrap();
+        let session = Arc::new(ServeSession::new(Vfs::new_default().unwrap(), dir).unwrap());
         StudioBridge::with_lock_wait(&session, &dir.join("token"), lock_wait).unwrap()
     }
 
@@ -2430,6 +2727,100 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    /// Polls as the plugin until a command arrives, so a spawned request can
+    /// make progress in between.
+    async fn next_command(bridge: &Arc<StudioBridge>, session: &str) -> Value {
+        for _ in 0..50 {
+            let (_, value) = plugin(bridge, "/api/studio/poll", json!({"sessionId":session})).await;
+            if let Some(command) = value["commands"].as_array().and_then(|c| c.first()) {
+                return command.clone();
+            }
+        }
+        panic!("no command arrived");
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_verify_cancels_its_queued_fix_batch() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(
+            dir.path().join("default.project.json"),
+            r#"{"name":"v","tree":{"$className":"DataModel","ReplicatedStorage":{"Shared":{"$path":"src"}}}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("src/Main.luau"),
+            "return 'disk'
+",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("token"), "0123456789abcdef0123456789abcdef").unwrap();
+        let bridge = bridge_for(dir.path(), GIT_LOCK_WAIT);
+        let session = register(&bridge).await;
+        let id = Uuid::new_v4().to_string();
+        let request = request(
+            "POST",
+            "/api/studio/command",
+            &bridge.token,
+            Some(json!({"sessionId":session,"action":"verify","requestId":id,"args":{"fix":true}})),
+        );
+        let verify = tokio::spawn(bridge.clone().call(PEER.parse().unwrap(), request));
+
+        let sources = next_command(&bridge, &session).await;
+        assert_eq!(sources["action"], "sources");
+        let script = {
+            let tree = bridge.serve.tree();
+            verify::tree_scripts(&tree, bridge.serve.root_dir())
+                .into_iter()
+                .next()
+                .unwrap()
+        };
+        plugin(
+            &bridge,
+            "/api/studio/result",
+            json!({"requestId":sources["requestId"],"sessionId":session,"result":{"ok":true,"value":{
+                "scripts":[{"id":script.id,"hash":1,"length":1}],"detached":[],"held":[]}}}),
+        )
+        .await;
+        let resync = next_command(&bridge, &session).await;
+        assert_eq!(resync["action"], "resync");
+        assert_ne!(resync["requestId"], json!(id));
+
+        // While the verify runs, no other command may take its ID.
+        let (status, _) = cli(
+            &bridge,
+            "/api/studio/command",
+            json!({"sessionId":session,"action":"status","requestId":id}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        // The verify's own ID is no longer pending, but cancelling it must
+        // still stop the batch it is waiting on.
+        let (status, _) = cli(
+            &bridge,
+            "/api/studio/cancel",
+            json!({"sessionId":session,"requestId":id}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, value) = into_value(verify.await.unwrap()).await;
+        assert_eq!(status, StatusCode::OK, "{value}");
+        let fixed = &value["result"]["value"]["fixed"];
+        assert_eq!(fixed["updated"], 0);
+        assert_eq!(fixed["failed"], 1);
+        assert!(!fixed["errors"].as_array().unwrap().is_empty());
+        // Studio's late answer for the cancelled batch is refused.
+        let (status, _) = plugin(
+            &bridge,
+            "/api/studio/result",
+            json!({"requestId":resync["requestId"],"sessionId":session,"result":{"ok":true,"value":{"updated":1}}}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::GONE);
+        assert!(bridge.state().verify_children.is_empty());
+        assert!(bridge.state().active_verifies.is_empty());
     }
 
     #[tokio::test]

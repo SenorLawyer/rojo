@@ -1276,4 +1276,51 @@ return function()
 			expect(logs.maxEntries).to.equal(200)
 		end)
 	end)
+
+	describe("sync session attachment", function()
+		it("keeps the registered description free of changing sync state", function()
+			local status = bridge:status()
+			expect(type(status.pluginVersion)).to.equal("string")
+			expect(status.sync).to.equal(nil)
+			expect(status.capabilities.sources.available).to.equal(false)
+		end)
+
+		it("answers status, sources and resync through the sync session", function()
+			local calls = {}
+			bridge.sync = {
+				getSummary = function()
+					return { status = "Connected", patchesApplied = 3 }
+				end,
+				getSourceHashes = function()
+					table.insert(calls, "sources")
+					return { scripts = {}, detached = {}, held = {} }
+				end,
+				applyResync = function(patch)
+					table.insert(calls, "resync")
+					return { updated = #patch.updated, failed = 0 }
+				end,
+			}
+			local status = bridge:execute(command("status", {}))
+			expect(status.sync.patchesApplied).to.equal(3)
+			expect(status.capabilities.sources.available).to.equal(true)
+			expect(#bridge:execute(command("sources", {})).scripts).to.equal(0)
+			local result = bridge:execute(command("resync", { patch = { updated = { {}, {} } } }))
+			expect(result.updated).to.equal(2)
+			expect(table.concat(calls, ",")).to.equal("sources,resync")
+		end)
+
+		it("refuses sources and resync without a sync session", function()
+			expect(pcall(bridge.execute, bridge, command("sources", {}))).to.equal(false)
+			expect(pcall(bridge.execute, bridge, command("resync", { patch = { updated = {} } }))).to.equal(false)
+		end)
+
+		it("sends no summary when the sync session cannot give one", function()
+			bridge.sync = {
+				getSummary = function()
+					error("broken")
+				end,
+			}
+			expect(bridge:syncSummary()).to.equal(nil)
+		end)
+	end)
 end
