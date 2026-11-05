@@ -737,6 +737,39 @@ return function()
 			expect(session.__heldWipes.UI.deferredClass).to.equal(nil)
 		end)
 
+		it("pairs a held script under a parent whose class changed", function()
+			session:__holdScriptWipes(sourceUpdate("UI", ""))
+			session:stop()
+			local again = ServeSession.new({ apiContext = api, twoWaySync = false })
+			-- Only the workspace is paired; the folder became a Model on disk.
+			again.__instanceMap:insert("WS", workspace)
+			again:__rematchHolds({
+				WS = { Name = "Workspace", ClassName = "Workspace", Children = { "MODEL" } },
+				MODEL = { Name = container.Name, ClassName = "Model", Children = { "UI2" }, Properties = {} },
+				UI2 = { Name = "UIController", ClassName = "ModuleScript", Children = {}, Properties = {} },
+			})
+			expect(again.__instanceMap.fromIds.MODEL).to.equal(container)
+			expect(again.__instanceMap.fromIds.UI2).to.equal(module)
+			again:__adoptHolds()
+			expect(again.__heldWipes.UI2).to.be.ok()
+			again:__clearHold("UI2")
+			again:stop()
+		end)
+
+		it("releases an adopted hold whose file has code again", function()
+			session:__holdScriptWipes(sourceUpdate("UI", ""))
+			session:stop()
+			local again = ServeSession.new({ apiContext = api, twoWaySync = false })
+			again.__instanceMap:insert("UI", module)
+			again:__adoptHolds()
+			expect(again.__heldWipes.UI).to.be.ok()
+			again:__releaseRecoveredHolds({
+				UI = { Properties = { Source = { String = module.Source } } },
+			})
+			expect(again.__heldWipes.UI).to.equal(nil)
+			again:stop()
+		end)
+
 		it("keeps a hold when the same Studio reconnects", function()
 			session:__holdScriptWipes(sourceUpdate("UI", ""))
 			local hold = session.__heldWipes.UI

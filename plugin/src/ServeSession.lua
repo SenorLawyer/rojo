@@ -369,10 +369,34 @@ local SCRIPT_CLASSES = { Script = true, LocalScript = true, ModuleScript = true 
 -- patch would remove it and add the server's empty copy, the wipe the hold
 -- prevents. Pairing it by name under the same parent instead turns that into
 -- an update the guard holds back.
+-- The one unpaired child of `serverParent` named `name`, if exactly one is.
+local function onlyChildNamed(self, serverInstances, serverParent, name, scriptsOnly)
+	local found
+	for _, childId in serverParent.Children do
+		local child = serverInstances[childId]
+		if
+			child
+			and child.Name == name
+			and (not scriptsOnly or SCRIPT_CLASSES[child.ClassName])
+			and self.__instanceMap.fromIds[childId] == nil
+		then
+			if found then
+				return nil
+			end
+			found = childId
+		end
+	end
+	return found
+end
+
 function ServeSession:__rematchHolds(serverInstances)
-	-- A held script can sit inside another held script, whose subtree
-	-- hydration skipped, so passes repeat until nothing more is paired; each
-	-- pairing also hydrates what is under it.
+	-- A held script's ancestors may not have hydrated either, for example a
+	-- folder that became a Model on disk, and then the catch-up patch would
+	-- replace the whole subtree. So each held script is paired by name from
+	-- its nearest paired ancestor down; a class that differs then arrives as
+	-- an update, which keeps the children. Passes repeat until nothing more is
+	-- paired, since one held script can sit inside another; each pairing
+	-- also hydrates what is under it.
 	local progress = true
 	while progress do
 		progress = false
@@ -380,25 +404,47 @@ function ServeSession:__rematchHolds(serverInstances)
 			if self.__instanceMap.fromInstances[instance] or not instance.Parent then
 				continue
 			end
-			local parentId = self.__instanceMap.fromInstances[instance.Parent]
-			local serverParent = parentId and serverInstances[parentId]
-			if not serverParent then
-				continue
+			local chain = { instance }
+			local ancestor = instance.Parent
+			while ancestor and not self.__instanceMap.fromInstances[ancestor] do
+				table.insert(chain, 1, ancestor)
+				ancestor = ancestor.Parent
 			end
-			for _, childId in serverParent.Children do
-				local child = serverInstances[childId]
-				if
-					child
-					and child.Name == instance.Name
-					and SCRIPT_CLASSES[child.ClassName]
-					and self.__instanceMap.fromIds[childId] == nil
-				then
-					self.__instanceMap:insert(childId, instance)
-					self.__reconciler:hydrate(serverInstances, childId, instance)
-					progress = true
+			local serverId = ancestor and self.__instanceMap.fromInstances[ancestor]
+			for index, link in chain do
+				local serverParent = serverId and serverInstances[serverId]
+				if not serverParent then
+					serverId = nil
 					break
 				end
+				local childId = onlyChildNamed(self, serverInstances, serverParent, link.Name, index == #chain)
+				if not childId then
+					serverId = nil
+					break
+				end
+				self.__instanceMap:insert(childId, link)
+				self.__reconciler:hydrate(serverInstances, childId, link)
+				serverId = childId
+				progress = true
 			end
+		end
+	end
+end
+
+-- A file that has code again while Studio was disconnected ends its hold,
+-- even when its code matches what Studio kept and so no change arrives.
+function ServeSession:__releaseRecoveredHolds(serverInstances)
+	for id, entry in self.__heldWipes do
+		local server = serverInstances[id]
+		local encoded = server and server.Properties and server.Properties.Source
+		local ty, value
+		if type(encoded) == "table" then
+			ty, value = next(encoded)
+		end
+		if ty == "String" and type(value) == "string" and string.find(value, "%S") then
+			-- The catch-up patch applies any class change itself.
+			entry.deferredClass = nil
+			self:__clearHold(id)
 		end
 	end
 end
@@ -1574,6 +1620,7 @@ function ServeSession:__initialSync(serverInfo)
 		-- Before the catch-up patch, which the wipe guard checks against them.
 		self:__rematchHolds(readResponseBody.instances)
 		self:__adoptHolds()
+		self:__releaseRecoveredHolds(readResponseBody.instances)
 
 		-- Calculate the initial patch to apply to the DataModel to catch us
 		-- up to what Rojo thinks the place should look like.
