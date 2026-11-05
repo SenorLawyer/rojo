@@ -1510,8 +1510,8 @@ fn sync(
         .iter()
         .map(|source| source.hash.as_str())
         .collect();
-    let set_entry = |lock: &mut LockFile, source: &Source, entry: LockEntry| {
-        replace_entry(lock, &old_lock, &current_hashes, source, entry)
+    let set_entry = |lock: &mut LockFile, source: &Source, entry: LockEntry, from: Option<&str>| {
+        replace_entry(lock, &old_lock, &current_hashes, source, entry, from)
     };
     // Recording reused ids first keeps them when an upload below replaces the
     // entry they were copied from and the run is then interrupted.
@@ -1519,7 +1519,7 @@ fn sync(
         if let Action::Reuse { entry, .. } = action {
             // A sync for a new creator that was interrupted reuses the new
             // creator's id on its next run, so this is a replacement too.
-            set_entry(&mut lock, source, entry.clone());
+            set_entry(&mut lock, source, entry.clone(), None);
         }
     }
     if lock != old_lock {
@@ -1585,9 +1585,17 @@ fn sync(
             report.uploaded.push((source.rel.clone(), entry.asset_id));
             // Contents retried with --retry-rejected that passed this time.
             lock.rejected.remove(&source.hash);
+            // A resumed upload was sent from the path its pending record
+            // names, which may have been renamed since; the entry it was
+            // replacing is the one at that path.
+            let sent_from = resume
+                .as_ref()
+                .and_then(|resume| old_lock.pending.get(&resume.key))
+                .map(|pending| pending.path.as_str())
+                .filter(|path| !path.is_empty());
             // Recorded in the same write as the entry that overwrites the
             // old id, so an interrupted run never loses the old id.
-            set_entry(&mut lock, source, entry);
+            set_entry(&mut lock, source, entry, sent_from);
             write_atomic(&config.lock, render_lock(&lock))?;
         }
     }
@@ -1595,7 +1603,7 @@ fn sync(
     for (source, action) in &plan.items {
         if let Action::SameAs { from } = action {
             let entry = lock.assets[from].clone();
-            set_entry(&mut lock, source, entry);
+            set_entry(&mut lock, source, entry, None);
         }
     }
     // Every file now has an entry for this creator, so a displaced id whose
@@ -1605,7 +1613,7 @@ fn sync(
         for source in &scan.sources {
             if lock.displaced.values().any(|old| old.hash == source.hash) {
                 let entry = lock.assets[&source.rel].clone();
-                record_replacements(&mut lock, &old_lock, &current_hashes, source, &entry);
+                record_replacements(&mut lock, &old_lock, &current_hashes, source, &entry, None);
             }
         }
         lock.displaced.clear();
@@ -1673,8 +1681,9 @@ fn replace_entry(
     current_hashes: &HashSet<&str>,
     source: &Source,
     entry: LockEntry,
+    sent_from: Option<&str>,
 ) {
-    record_replacements(lock, old_lock, current_hashes, source, &entry);
+    record_replacements(lock, old_lock, current_hashes, source, &entry, sent_from);
     // A held id that is in use again is no longer held.
     lock.displaced.remove(&entry.asset_id.to_string());
     if let Some(previous) = lock.assets.get(&source.rel) {
@@ -1697,12 +1706,16 @@ fn replace_entry(
 /// and any previous entry with the same contents. Entries of the same creator
 /// are never recorded, since a changed file for the same creator is a new
 /// asset, not a move, and code using its old id may mean the old contents.
+///
+/// `sent_from` is the path a resumed upload was sent from, when the file has
+/// been renamed since: the entry at that path is a predecessor too.
 fn record_replacements(
     lock: &mut LockFile,
     old_lock: &LockFile,
     current_hashes: &HashSet<&str>,
     source: &Source,
     entry: &LockEntry,
+    sent_from: Option<&str>,
 ) {
     // Displaced entries from an earlier, interrupted run have no path any
     // more, so they are only found by contents.
@@ -1722,7 +1735,8 @@ fn record_replacements(
                     // When the old contents still exist at another path,
                     // their id moves with them rather than to whatever
                     // now sits at this path.
-                    || (*rel == Some(&source.rel)
+                    || ((*rel == Some(&source.rel)
+                        || rel.is_some_and(|rel| Some(rel.as_str()) == sent_from))
                         && !current_hashes.contains(old.hash.as_str())))
         })
         .map(|(_, old)| old.asset_id)
@@ -3893,6 +3907,43 @@ mod tests {
         assert_ne!(new_b, 1001);
         assert_eq!(lock.replaced["1001"].new_asset_id, new_b);
         assert_eq!(lock.replaced["1001"].path, "B.png");
+    }
+
+    #[test]
+    fn a_resumed_upload_of_a_renamed_file_records_the_id_it_replaced() {
+        let fixture = Fixture::new();
+        fixture.write("A.png", &png(8, 8, "x"));
+        let cloud = FakeCloud::start(None);
+        fixture.sync(&cloud).unwrap();
+
+        // The new creator's upload of A.png's new contents is accepted, but
+        // following it fails.
+        fixture.set_creator("group_id = 7");
+        fixture.write("A.png", &png(8, 8, "y"));
+        cloud.defer.store(true, Ordering::SeqCst);
+        cloud.refuse_polls.store(true, Ordering::SeqCst);
+        fixture.sync(&cloud).unwrap_err();
+        let lock = fixture.lock();
+        assert_eq!(lock.pending.values().next().unwrap().path, "A.png");
+        assert!(lock.replaced.is_empty());
+
+        // Renamed before the upload is resumed.
+        cloud.refuse_polls.store(false, Ordering::SeqCst);
+        fixture.rename("A.png", "B.png");
+        let (report, out) = fixture.sync(&cloud).unwrap();
+
+        assert!(
+            out.contains("Checking on the earlier upload of B.png (operations/op2)"),
+            "{out}"
+        );
+        assert_eq!(report.uploaded, ids(&[("B.png", 1002)]));
+        assert_eq!(cloud.uploads(), ["test-A", "test-A"]);
+        assert_eq!(fixture.replaced(), ids(&[("1001", 1002)]));
+        let replaced = &fixture.lock().replaced["1001"];
+        assert_eq!(replaced.path, "B.png");
+        assert_eq!(replaced.from_creator, "user:42");
+        assert_eq!(replaced.to_creator, "group:7");
+        assert!(fixture.lock().pending.is_empty());
     }
 
     #[test]
