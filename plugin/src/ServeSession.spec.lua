@@ -822,13 +822,17 @@ return function()
 			expect(session.__heldWipes.UI).to.equal(nil)
 		end)
 
-		it("ends existing holds once the setting is turned off", function()
+		it("ends existing holds as soon as the setting is turned off", function()
 			session:__holdScriptWipes(sourceUpdate("UI", ""))
 			expect(session.__heldWipes.UI).to.be.ok()
+			-- No patch arrives: the setting change alone ends the hold.
 			Settings:set("guardScriptWipes", false)
-			session:__holdScriptWipes({ removed = {}, added = {}, updated = {} })
+			task.wait()
+			local held = session.__heldWipes.UI
+			local summary = session:getSyncSummary()
 			Settings:set("guardScriptWipes", true)
-			expect(session.__heldWipes.UI).to.equal(nil)
+			expect(held).to.equal(nil)
+			expect(summary.heldWipeCount).to.equal(0)
 		end)
 
 		it("does nothing when the setting is off", function()

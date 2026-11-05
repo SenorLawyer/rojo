@@ -210,7 +210,34 @@ function ServeSession.new(options)
 
 	setmetatable(self, ServeSession)
 
+	-- Turning the guard off ends its holds at once, rather than at the next
+	-- change from disk, and brings those scripts back in line with the files.
+	self.__disconnectGuardSetting = Settings:onChanged("guardScriptWipes", function(enabled)
+		if not enabled then
+			self:__releaseAllHolds()
+		end
+	end)
+
 	return self
+end
+
+function ServeSession:__releaseAllHolds()
+	local ids = {}
+	for id in table.clone(self.__heldWipes) do
+		table.insert(ids, id)
+		self:__clearHold(id)
+	end
+	table.clear(heldByInstance)
+	table.clear(self.__refreshAfterHold)
+	if #ids > 0 and self.__status == Status.Connected then
+		-- The changes the guard held back were never applied, so the server's
+		-- current copies replace these scripts, as the sync fallback would.
+		task.spawn(function()
+			if not self:__replaceInstances(ids) then
+				Log.warn("Could not sync {} scripts the wipe guard was holding; reconnect to sync them.", #ids)
+			end
+		end)
+	end
 end
 
 --[=[
@@ -1755,6 +1782,10 @@ function ServeSession:__stopInternal(err)
 	end
 
 	self.__status = Status.Disconnected
+	if self.__disconnectGuardSetting then
+		self.__disconnectGuardSetting()
+		self.__disconnectGuardSetting = nil
+	end
 	if self.__studioBridge then
 		self.__studioBridge:stop()
 		self.__studioBridge = nil
