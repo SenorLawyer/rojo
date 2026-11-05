@@ -877,6 +877,27 @@ return function()
 			expect(session.__heldWipes.UI).to.equal(nil)
 		end)
 
+		it("still applies a held class change after the guard is turned off", function()
+			session.__status = ServeSession.Status.Connected
+			session:__holdScriptWipes(sourceUpdate("UI", ""))
+			session:__holdScriptWipes({
+				removed = {},
+				added = {},
+				updated = { { id = "UI", changedClassName = "Script", changedProperties = {} } },
+			})
+			expect(session.__heldWipes.UI.deferredClass).to.equal("Script")
+			Settings:set("guardScriptWipes", false)
+			expect(session.__heldWipes.UI).to.equal(nil)
+			expect(session.__refreshAfterHold.UI).to.equal(true)
+			serverCopy("Script", "print('code again')")
+			session:__applyPatch(sourceUpdate("UI", "print('code again')"))
+			Settings:set("guardScriptWipes", true)
+			local now = session.__instanceMap.fromIds.UI
+			expect(now.ClassName).to.equal("Script")
+			expect(now.Source).to.equal("print('code again')")
+			expect(next(session.__refreshAfterHold)).to.equal(nil)
+		end)
+
 		it("does nothing when the setting is off", function()
 			Settings:set("guardScriptWipes", false)
 			local patch = sourceUpdate("UI", "")

@@ -226,9 +226,11 @@ function ServeSession:__releaseAllHolds()
 	-- disk, and `rojo studio verify --fix` brings the scripts in line now,
 	-- with its checks against newer changes. Writing anything here would race
 	-- the ordinary sync of a file that gets its code back meanwhile.
+	-- A class change held back with a wipe is kept: the server will not send
+	-- it again, so clearing the hold queues the script to be fetched whole
+	-- with the next patch, which runs in order with the rest of the sync.
 	local count = 0
-	for id, entry in table.clone(self.__heldWipes) do
-		entry.deferredClass = nil
+	for id in table.clone(self.__heldWipes) do
 		self:__clearHold(id)
 		count += 1
 	end
