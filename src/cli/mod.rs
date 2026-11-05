@@ -13,6 +13,7 @@ mod plugin;
 mod serve;
 mod sourcemap;
 mod studio;
+mod studio_lock;
 mod syncback;
 mod test;
 mod typecheck;

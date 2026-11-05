@@ -17,6 +17,7 @@ mod backup;
 
 use std::io::IsTerminal;
 
+use super::studio_lock::LockCommand;
 use crate::web::{
     model_check,
     studio::{read_token_file, IMPORT_CHECK_LIMIT, MAX_COMMAND_REQUEST, MAX_MODEL_BYTES},
@@ -149,6 +150,10 @@ pub enum StudioSubcommand {
         #[clap(subcommand)]
         command: BackupCommand,
     },
+    /// Advisory leases that agents take before using a shared Studio window,
+    /// for example one exclusive play test at a time. Needs no --token-file
+    /// or rojo serve.
+    Lock(LockCommand),
     /// Insert a validated model into Studio. This does not save or publish a place.
     Import {
         #[clap(flatten)]
@@ -203,6 +208,11 @@ pub enum BackupCommand {
 
 impl StudioCommand {
     pub fn run(self) -> anyhow::Result<()> {
+        // Locks are files, so they work without the bridge or its token, for
+        // Studios that are not connected to rojo serve too.
+        if let StudioSubcommand::Lock(lock) = self.command {
+            return lock.run(self.json);
+        }
         // Listing and removing backups only reads local files, so they work
         // without a running server.
         if let StudioSubcommand::Backup { command } = &self.command {

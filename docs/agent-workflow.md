@@ -37,6 +37,11 @@ this guide, `--help` and the bundled topics over them. Each topic prints with
   models, and follows Studio's output with `rojo studio logs --follow`. Read
   `rojo doc --agent studio-bridge`; `rojo mcp` serves the same operations as
   MCP tools, see `rojo doc --agent mcp`.
+* Shared Studio windows: before using a Studio that other agents also use,
+  take a lease with `rojo studio lock acquire <name> --owner <you>` (add
+  `--exclusive` for a play test) and release it when done. Locks are
+  advisory; Studio tools do not check them. Read
+  `rojo doc --agent studio-locks`.
 * Versions and releases: `rojo checkpoint`, `rojo workspace` and `rojo
   release` (`prepare`, `stage`, `promote`, `publish`, `rollback`) capture
   places, keep hotfix work separate and publish through a staging place

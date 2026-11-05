@@ -2865,7 +2865,7 @@ fn package_file_hashes(
 /// `rev-parse --path-format` needs Git 2.31. Older versions echo the unknown
 /// option back as output instead of failing, so check that the result is
 /// one absolute path.
-fn git_common_dir(directory: &Path) -> anyhow::Result<PathBuf> {
+pub(super) fn git_common_dir(directory: &Path) -> anyhow::Result<PathBuf> {
     let output = git(
         directory,
         ["rev-parse", "--path-format=absolute", "--git-common-dir"],
@@ -2942,7 +2942,7 @@ fn ensure_no_case_conflict(
     Ok(())
 }
 
-fn git<I, S>(directory: &Path, args: I) -> anyhow::Result<String>
+pub(super) fn git<I, S>(directory: &Path, args: I) -> anyhow::Result<String>
 where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,

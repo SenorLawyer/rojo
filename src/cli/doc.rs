@@ -66,6 +66,11 @@ pub const AGENT_TOPICS: &[(&str, &str, &str)] = &[
         include_str!("../../docs/studio-bridge.md"),
     ),
     (
+        "studio-locks",
+        "rojo studio lock: advisory leases for agents sharing Studio windows",
+        include_str!("../../docs/studio-locks.md"),
+    ),
+    (
         "mcp",
         "rojo mcp: the Studio bridge as MCP tools",
         include_str!("../../docs/mcp.md"),
