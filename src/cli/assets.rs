@@ -412,12 +412,11 @@ impl HeldEntry {
 /// drops the pending upload.
 fn release_claim(lock: &mut LockFile, pending: PendingUpload) {
     if let Some(replaces) = pending.replaces {
-        lock.displaced
+        let held = lock
+            .displaced
             .entry(replaces.asset_id.to_string())
-            .or_insert(HeldEntry {
-                entry: replaces,
-                successor_hash: Some(pending.hash),
-            });
+            .or_insert_with(|| HeldEntry::new(replaces));
+        held.successor_hash.get_or_insert(pending.hash);
     }
 }
 
@@ -1760,7 +1759,27 @@ fn replace_entry(
     lock.displaced.remove(&entry.asset_id.to_string());
     if let Some(previous) = lock.assets.get(&source.rel) {
         let recorded = lock.replaced.contains_key(&previous.asset_id.to_string());
-        if previous.creator != entry.creator
+        let claim = lock.pending.values().find(|pending| {
+            pending
+                .replaces
+                .as_ref()
+                .is_some_and(|replaces| replaces.asset_id == previous.asset_id)
+        });
+        if let Some(claim) = claim
+            .filter(|_| previous.creator != entry.creator && previous.asset_id != entry.asset_id)
+        {
+            // An unfinished upload claims this entry as the one it replaces,
+            // so it is held for that upload rather than dropped with the
+            // overwrite, whatever this upload's contents are.
+            let successor_hash = claim.hash.clone();
+            lock.displaced.insert(
+                previous.asset_id.to_string(),
+                HeldEntry {
+                    entry: previous.clone(),
+                    successor_hash: Some(successor_hash),
+                },
+            );
+        } else if previous.creator != entry.creator
             && previous.asset_id != entry.asset_id
             && previous.hash != source.hash
             && current_hashes.contains(previous.hash.as_str())
@@ -1793,37 +1812,66 @@ fn record_replacements(
     entry: &LockEntry,
     predecessor: Option<&LockEntry>,
 ) {
-    // An upload's own pending record is removed once it finishes, so these
-    // are only other uploads' claims.
+    let replaceable = |old: &LockEntry| {
+        old.creator != entry.creator
+            && old.asset_type == entry.asset_type
+            && old.asset_id != entry.asset_id
+    };
+    // Claims are the lineage: the entry an upload recorded as the one it
+    // replaces when it was sent (its pending record's `replaces`, or a held
+    // entry released for these contents) goes to this upload, whatever
+    // the contents or paths look like now.
+    let held_for_these: Vec<&LockEntry> = old_lock
+        .displaced
+        .values()
+        .filter(|held| held.successor_hash.as_deref() == Some(source.hash.as_str()))
+        .map(|held| &held.entry)
+        .collect();
+    let explicit: BTreeSet<u64> = predecessor
+        .into_iter()
+        .chain(held_for_these)
+        .filter(|old| replaceable(old))
+        .map(|old| old.asset_id)
+        .collect();
+    // Ids other uploads claim, by a pending record (an upload's own record
+    // is removed once it finishes) or a held entry waiting for other
+    // contents, are left to those uploads.
     let claimed: BTreeSet<u64> = lock
         .pending
         .values()
         .filter_map(|pending| pending.replaces.as_ref())
         .map(|replaces| replaces.asset_id)
+        .chain(
+            old_lock
+                .displaced
+                .values()
+                .chain(lock.displaced.values())
+                .filter(|held| held.successor_hash.is_some())
+                .map(|held| held.entry.asset_id),
+        )
         .collect();
-    // Displaced entries from an earlier, interrupted run have no path any
-    // more, so they are only found by contents. The predecessor matches as if
-    // it were at this path.
-    let source_rel = &source.rel;
-    // A held entry released by a dropped upload also matches an upload of
-    // that upload's contents, as if it were at this path.
-    let candidates = || {
-        old_lock
-            .assets
-            .iter()
-            .map(|(rel, old)| (Some(rel), old))
-            .chain(old_lock.displaced.values().map(|held| {
-                let successor = held.successor_hash.as_deref() == Some(source.hash.as_str());
-                (successor.then_some(source_rel), &held.entry)
-            }))
-            .chain(predecessor.map(|old| (Some(source_rel), old)))
-    };
-    let old_ids: BTreeSet<u64> = candidates()
+    // Inferred from paths and contents. Held entries without a claim have no
+    // path any more, so they are only found by contents. An id that an
+    // earlier upload for this creator already resolved keeps that mapping,
+    // so the order files are processed in does not decide it.
+    let inferred = old_lock
+        .assets
+        .iter()
+        .map(|(rel, old)| (Some(rel), old))
+        .chain(
+            old_lock
+                .displaced
+                .values()
+                .filter(|held| held.successor_hash.is_none())
+                .map(|held| (None, &held.entry)),
+        )
         .filter(|(rel, old)| {
-            old.creator != entry.creator
-                && old.asset_type == entry.asset_type
-                && old.asset_id != entry.asset_id
+            replaceable(old)
                 && !claimed.contains(&old.asset_id)
+                && !lock
+                    .replaced
+                    .get(&old.asset_id.to_string())
+                    .is_some_and(|replaced| replaced.to_creator == entry.creator)
                 && (old.hash == source.hash
                     // When the old contents still exist at another path,
                     // their id moves with them rather than to whatever
@@ -1831,8 +1879,8 @@ fn record_replacements(
                     || (*rel == Some(&source.rel)
                         && !current_hashes.contains(old.hash.as_str())))
         })
-        .map(|(_, old)| old.asset_id)
-        .collect();
+        .map(|(_, old)| old.asset_id);
+    let old_ids: BTreeSet<u64> = explicit.iter().copied().chain(inferred).collect();
     for old_id in old_ids {
         let key = old_id.to_string();
         // Recorded now, so it no longer needs holding.
@@ -1844,9 +1892,12 @@ fn record_replacements(
         {
             continue;
         }
-        let from_creator = candidates()
-            .find(|(_, old)| old.asset_id == old_id)
-            .map(|(_, old)| old.creator.clone())
+        let from_creator = predecessor
+            .into_iter()
+            .chain(old_lock.assets.values())
+            .chain(old_lock.displaced.values().map(|held| &held.entry))
+            .find(|old| old.asset_id == old_id)
+            .map(|old| old.creator.clone())
             .unwrap_or_default();
         // Ids that earlier creator changes replaced with `old_id` now resolve
         // straight to the newest id.
@@ -4156,6 +4207,82 @@ mod tests {
             .into_iter()
             .map(|(old, held)| (old, held.successor_hash))
             .collect()
+    }
+
+    /// X at `x_path` is 1001 under the user. Under the group, `x_path`
+    /// becomes Y, whose upload is left pending claiming 1001; Y then moves to
+    /// `y_path` and X is restored at `x_path`, and the next sync finishes.
+    /// Returns the final ids and replacements.
+    type Ids = Vec<(String, u64)>;
+
+    fn move_with_restored_contents(x_path: &str, y_path: &str) -> (Ids, Ids) {
+        let fixture = Fixture::new();
+        let cloud = FakeCloud::start(None);
+        fixture.write(x_path, &png(8, 8, "x"));
+        fixture.sync(&cloud).unwrap();
+        fixture.set_creator("group_id = 7");
+        fixture.write(x_path, &png(8, 8, "y"));
+        cloud.defer.store(true, Ordering::SeqCst);
+        cloud.refuse_polls.store(true, Ordering::SeqCst);
+        fixture.sync(&cloud).unwrap_err();
+        cloud.defer.store(false, Ordering::SeqCst);
+        cloud.refuse_polls.store(false, Ordering::SeqCst);
+
+        fixture.rename(x_path, y_path);
+        fixture.write(x_path, &png(8, 8, "x"));
+        fixture.sync(&cloud).unwrap();
+
+        assert!(fixture.lock().pending.is_empty());
+        assert!(fixture.lock().displaced.is_empty());
+        (fixture.ids(), fixture.replaced())
+    }
+
+    #[test]
+    fn a_claim_resolves_to_its_upload_whatever_order_files_are_processed_in() {
+        // X is restored at A.png, which is processed before Z.png resumes Y.
+        let (ids_x_first, replaced_x_first) = move_with_restored_contents("A.png", "Z.png");
+        // Y resumes at A.png before X is uploaded at Z.png.
+        let (ids_y_first, replaced_y_first) = move_with_restored_contents("Z.png", "A.png");
+
+        // Y's upload is operations/op2, so 1002; X is uploaded again as 1003.
+        assert_eq!(ids_x_first, ids(&[("A.png", 1003), ("Z.png", 1002)]));
+        assert_eq!(ids_y_first, ids(&[("A.png", 1002), ("Z.png", 1003)]));
+        assert_eq!(replaced_x_first, ids(&[("1001", 1002)]));
+        assert_eq!(replaced_y_first, replaced_x_first);
+    }
+
+    #[test]
+    fn an_overwritten_claimed_entry_is_held_until_its_upload_finishes() {
+        let fixture = Fixture::new();
+        let cloud = FakeCloud::start(None);
+        fixture.write("A.png", &png(8, 8, "x"));
+        fixture.sync(&cloud).unwrap();
+        fixture.set_creator("group_id = 7");
+        fixture.write("A.png", &png(8, 8, "y"));
+        cloud.defer.store(true, Ordering::SeqCst);
+        cloud.refuse_polls.store(true, Ordering::SeqCst);
+        fixture.sync(&cloud).unwrap_err();
+        fixture.rename("A.png", "Z.png");
+        fixture.write("A.png", &png(8, 8, "x"));
+
+        // X at A.png finishes at once and overwrites the claimed entry, then
+        // following Y's upload fails again.
+        cloud.defer.store(false, Ordering::SeqCst);
+        fixture.sync(&cloud).unwrap_err();
+        let lock = fixture.lock();
+        assert_eq!(lock.assets["A.png"].asset_id, 1003);
+        assert!(lock.replaced.is_empty());
+        let y = blake3::hash(&png(8, 8, "y")).to_hex().to_string();
+        assert_eq!(
+            lock.displaced["1001"].successor_hash.as_deref(),
+            Some(y.as_str())
+        );
+
+        cloud.refuse_polls.store(false, Ordering::SeqCst);
+        fixture.sync(&cloud).unwrap();
+        assert_eq!(fixture.replaced(), ids(&[("1001", 1002)]));
+        assert!(fixture.lock().displaced.is_empty());
+        assert!(fixture.lock().pending.is_empty());
     }
 
     #[test]
