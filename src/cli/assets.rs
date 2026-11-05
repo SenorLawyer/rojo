@@ -1072,6 +1072,15 @@ fn plan(sources: &[Source], lock: &LockFile, config: &Config, retry_rejected: bo
             by_hash.entry(&entry.hash).or_insert((rel, entry));
         }
     }
+    // An id held for contents that moved while a creator change was
+    // interrupted belongs to this creator again if the config switched back,
+    // so those contents get it back instead of a new upload. It has no path,
+    // which `from` marks with an empty string.
+    for entry in lock.displaced.values() {
+        if entry.creator == creator {
+            by_hash.entry(&entry.hash).or_insert(("", entry));
+        }
+    }
     let mut uploading: HashMap<&str, &str> = HashMap::new();
     let mut items = Vec::new();
     for source in sources {
@@ -1187,6 +1196,11 @@ fn describe_plan(
                 source.rel,
                 source.kind.name(),
                 format_size(source.size)
+            )?,
+            Action::Reuse { from, entry } if from.is_empty() => writeln!(
+                out,
+                "  restore   {} (gets back asset {}, held by an interrupted sync)",
+                source.rel, entry.asset_id
             )?,
             Action::Reuse { from, entry } if plan.removed.contains(from) => writeln!(
                 out,
@@ -1646,6 +1660,8 @@ fn replace_entry(
     entry: LockEntry,
 ) {
     record_replacements(lock, old_lock, current_hashes, source, &entry);
+    // A held id that is in use again is no longer held.
+    lock.displaced.remove(&entry.asset_id.to_string());
     if let Some(previous) = lock.assets.get(&source.rel) {
         let recorded = lock.replaced.contains_key(&previous.asset_id.to_string());
         if previous.creator != entry.creator
@@ -2240,30 +2256,17 @@ fn is_asset_url(text: &[u8], start: usize, end: usize) -> bool {
         && ASSET_URL_PATHS.contains(&path)
         && !path_and_query.contains('#')
 }
-/// Whether the digits at `start..end` are a number of their own rather than
-/// part of a word, such as `id123`, or of a decimal or version, such as
-/// `1.5` or `1.2.3`.
+/// Whether the digits at `start..end` are a complete integer token rather
+/// than part of a word (`id123`, `x123_`), a hexadecimal or exponent
+/// (`0x123`, `123e3`, `1e123`) or a decimal or version (`.5`, `1.5`, `123.`,
+/// `1.2.3`). A `.` on either side rules it out, even at the end of a
+/// sentence, since rewriting part of a number would silently change it.
 fn is_bare_number(text: &[u8], start: usize, end: usize) -> bool {
-    let is_word = |byte: u8| byte.is_ascii_alphanumeric() || byte == b'_';
-    let is_digit_at = |index: Option<usize>| {
-        index
-            .and_then(|index| text.get(index))
-            .is_some_and(|byte| byte.is_ascii_digit())
-    };
+    let joins = |byte: u8| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'.';
     let before = start.checked_sub(1).map(|index| text[index]);
     let after = text.get(end).copied();
-    if before.is_some_and(is_word) || after.is_some_and(is_word) {
-        return false;
-    }
-    if before == Some(b'.') && is_digit_at(start.checked_sub(2)) {
-        return false;
-    }
-    if after == Some(b'.') && is_digit_at(Some(end + 1)) {
-        return false;
-    }
-    true
+    !before.is_some_and(joins) && !after.is_some_and(joins)
 }
-
 /// Lists the files `remap` reads under `roots`, in a stable order.
 fn remap_files(roots: &[PathBuf], skipped: &[PathBuf]) -> anyhow::Result<BTreeSet<PathBuf>> {
     let mut files = BTreeSet::new();
@@ -3751,6 +3754,41 @@ mod tests {
     }
 
     #[test]
+    fn switching_back_after_an_interrupted_creator_change_gets_held_ids_back() {
+        let fixture = Fixture::new();
+        let cloud = FakeCloud::start(Some(3));
+        interrupt_a_move_during_a_creator_change(&fixture, &cloud);
+
+        fixture.set_creator("user_id = 42");
+        let status = fixture.status();
+        assert!(
+            status.contains("restore   B.png (gets back asset 1001"),
+            "{status}"
+        );
+        let (report, _) = fixture.sync(&cloud).unwrap();
+
+        // Only A.png's new contents are uploaded for the user; B.png gets
+        // back the user's id for its contents.
+        assert_eq!(report.uploaded, ids(&[("A.png", 1004)]));
+        assert_eq!(cloud.uploads(), ["test-A", "test-A", "test-B", "test-A"]);
+        let lock = fixture.lock();
+        assert_eq!(lock.assets["B.png"].asset_id, 1001);
+        assert_eq!(lock.assets["B.png"].creator, "user:42");
+        assert!(lock.displaced.is_empty());
+        assert!(!lock.replaced.contains_key("1001"));
+        assert!(fixture.module().contains("B = \"rbxassetid://1001\""));
+
+        // A later move to the group maps the restored id.
+        fixture.set_creator("group_id = 7");
+        fixture.sync(&cloud).unwrap();
+        let lock = fixture.lock();
+        let new_b = lock.assets["B.png"].asset_id;
+        assert_ne!(new_b, 1001);
+        assert_eq!(lock.replaced["1001"].new_asset_id, new_b);
+        assert_eq!(lock.replaced["1001"].path, "B.png");
+    }
+
+    #[test]
     fn a_held_id_whose_contents_are_gone_is_dropped_by_the_next_sync() {
         let fixture = Fixture::new();
         let cloud = FakeCloud::start(Some(3));
@@ -4147,6 +4185,49 @@ mod tests {
         assert_eq!(fixture.read_project("assets.toml"), config_before);
         assert_eq!(fixture.read_project("src/Assets.luau"), "return {}\n");
         assert_eq!(fixture.read_project("src/Shop.luau"), SHOP);
+    }
+
+    #[test]
+    fn remap_with_bare_leaves_parts_of_other_numbers_alone() {
+        let fixture = Fixture::new();
+        fixture.write_replaced(&[(123456789, 987654321)]);
+        let kept = [
+            "local a = .123456789",
+            "local b = 123456789.",
+            "local c = 123456789.5",
+            "local d = 0x123456789",
+            "local e = 123456789e3",
+            "local f = 1e123456789",
+            "local g = a123456789",
+            "local h = 123456789_",
+        ];
+        let rewritten = ["local i = 123456789,", "local j = {123456789}"];
+        let text = kept
+            .iter()
+            .chain(&rewritten)
+            .copied()
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        fixture.write_project("src/Numbers.luau", text.as_bytes());
+
+        let (report, _) = fixture.remap(RemapOptions {
+            write: true,
+            bare: true,
+            ..RemapOptions::default()
+        });
+
+        assert_eq!(report.references_rewritten, 2);
+        let lines: Vec<usize> = report
+            .references
+            .iter()
+            .map(|reference| reference.line)
+            .collect();
+        assert_eq!(lines, [9, 10]);
+        let expected = text
+            .replace("= 123456789,", "= 987654321,")
+            .replace("{123456789}", "{987654321}");
+        assert_eq!(fixture.read_project("src/Numbers.luau"), expected);
     }
 
     #[test]
