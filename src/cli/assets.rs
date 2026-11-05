@@ -1997,17 +1997,45 @@ fn resolve_replacements(lock: &LockFile, lock_path: &Path) -> anyhow::Result<BTr
                 lock_path.display()
             )
         })?;
+        if old_id == 0 {
+            bail!(
+                "{}: \"0\" under \"replaced\" is not an asset id; fix or remove that record \
+                 before remapping",
+                lock_path.display()
+            );
+        }
+        // A cycle, such as 123 -> 456 -> 123 from a bad merge or edit, has
+        // no newest id: accepting wherever the walk stops would swap ids on
+        // every run. So the whole mapping is refused before anything is read
+        // or written.
+        let mut chain = vec![old_id];
         let mut new_id = replaced.new_asset_id;
-        // Bounded, so that a hand-edited cycle cannot loop forever.
-        for _ in 0..lock.replaced.len() {
+        loop {
+            if new_id == 0 {
+                bail!(
+                    "{}: the record for {} under \"replaced\" leads to the asset id 0, which \
+                     is not an asset id; fix or remove it before remapping",
+                    lock_path.display(),
+                    chain.last().copied().unwrap_or(old_id)
+                );
+            }
+            if chain.contains(&new_id) {
+                chain.push(new_id);
+                let ids: Vec<String> = chain.iter().map(u64::to_string).collect();
+                bail!(
+                    "{}: the records under \"replaced\" form a cycle ({}), so there is no \
+                     newest id to remap to. Fix or remove those records; nothing was written.",
+                    lock_path.display(),
+                    ids.join(" -> ")
+                );
+            }
+            chain.push(new_id);
             match lock.replaced.get(&new_id.to_string()) {
                 Some(next) => new_id = next.new_asset_id,
                 None => break,
             }
         }
-        if new_id != old_id {
-            map.insert(old_id, new_id);
-        }
+        map.insert(old_id, new_id);
     }
     Ok(map)
 }
@@ -2072,7 +2100,7 @@ fn find_references(text: &[u8], map: &BTreeMap<u64, u64>) -> Vec<Found> {
         let before = &text[..start];
         let kind = if ends_with_ignore_case(before, b"rbxassetid://") {
             ReferenceKind::AssetId
-        } else if is_asset_url(before) {
+        } else if is_asset_url(text, start, end) {
             ReferenceKind::Url
         } else if is_bare_number(text, start, end) {
             ReferenceKind::Bare
@@ -2095,35 +2123,79 @@ fn ends_with_ignore_case(text: &[u8], suffix: &[u8]) -> bool {
     text.len() >= suffix.len() && text[text.len() - suffix.len()..].eq_ignore_ascii_case(suffix)
 }
 
-/// Whether `before` ends with the `?id=` or `&id=` of a Roblox asset URL,
-/// such as `https://www.roblox.com/asset/?id=`,
-/// `https://assetdelivery.roblox.com/v1/asset/?id=` or
-/// `rbxthumb://type=Asset&id=`.
-fn is_asset_url(before: &[u8]) -> bool {
+/// Hosts whose `/asset` URLs take an asset id. Matched exactly, so that
+/// look-alikes such as `notroblox.com` or `roblox.com.example.com` are left
+/// alone.
+const ASSET_URL_HOSTS: &[&str] = &["roblox.com", "www.roblox.com", "assetdelivery.roblox.com"];
+
+/// Paths of those hosts that take `id=<asset id>` in their query.
+const ASSET_URL_PATHS: &[&str] = &["/asset", "/asset/", "/v1/asset", "/v1/asset/"];
+
+fn is_url_delimiter(byte: u8) -> bool {
+    byte.is_ascii_whitespace()
+        || matches!(
+            byte,
+            b'"' | b'\'' | b'`' | b'(' | b')' | b'<' | b'>' | b'[' | b']'
+        )
+}
+
+/// Whether the digits at `start..end` are the `id=` query parameter of a
+/// Roblox asset URL, such as `https://www.roblox.com/asset/?id=` or
+/// `https://assetdelivery.roblox.com/v1/asset/?id=`, or of an
+/// `rbxthumb://type=Asset&id=` URI. Thumbnails of other types, such as
+/// `Avatar` or `GameIcon`, take user or universe ids and are left alone.
+fn is_asset_url(text: &[u8], start: usize, end: usize) -> bool {
+    let before = &text[..start];
     if !ends_with_ignore_case(before, b"id=") {
         return false;
     }
     let rest = &before[..before.len() - 3];
-    if !matches!(rest.last(), Some(b'?' | b'&')) {
+    // `rbxthumb://` URIs have no `?`, so their first parameter follows the
+    // scheme directly.
+    if !matches!(rest.last(), Some(b'?' | b'&')) && !ends_with_ignore_case(rest, b"rbxthumb://") {
         return false;
     }
     let window = &rest[rest.len().saturating_sub(MAX_URL_BYTES)..];
     // The URL starts after the nearest character that cannot be in one.
     let url_start = window
         .iter()
-        .rposition(|byte| {
-            byte.is_ascii_whitespace()
-                || matches!(
-                    byte,
-                    b'"' | b'\'' | b'`' | b'(' | b')' | b'<' | b'>' | b'[' | b']'
-                )
-        })
+        .rposition(|byte| is_url_delimiter(*byte))
         .map_or(0, |position| position + 1);
-    let url = window[url_start..].to_ascii_lowercase();
-    let contains = |needle: &[u8]| url.windows(needle.len()).any(|window| window == needle);
-    url.starts_with(b"rbxthumb://") || (contains(b"roblox.com/") && contains(b"/asset"))
-}
+    let url = String::from_utf8_lossy(&window[url_start..]).to_ascii_lowercase();
 
+    if let Some(params) = url.strip_prefix("rbxthumb://") {
+        // `type` may come after the id, so the rest of the URI is read too.
+        let after = &text[end..text.len().min(end + MAX_URL_BYTES)];
+        let after_end = after
+            .iter()
+            .position(|byte| is_url_delimiter(*byte))
+            .unwrap_or(after.len());
+        let after = String::from_utf8_lossy(&after[..after_end]).to_ascii_lowercase();
+        return params
+            .split('&')
+            .chain(after.split('&'))
+            .any(|param| param == "type=asset");
+    }
+
+    let Some(after_scheme) = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+    else {
+        return false;
+    };
+    let authority_end = after_scheme
+        .find(['/', '?', '#'])
+        .unwrap_or(after_scheme.len());
+    let (host, path_and_query) = after_scheme.split_at(authority_end);
+    // `rest` ends just before `id=`, so this is the path and the earlier
+    // query parameters, ending in `?` or `&`.
+    let Some((path, _query)) = path_and_query.split_once('?') else {
+        return false;
+    };
+    ASSET_URL_HOSTS.contains(&host)
+        && ASSET_URL_PATHS.contains(&path)
+        && !path_and_query.contains('#')
+}
 /// Whether the digits at `start..end` are a number of their own rather than
 /// part of a word, such as `id123`, or of a decimal or version, such as
 /// `1.5` or `1.2.3`.
@@ -3827,6 +3899,111 @@ mod tests {
             .map(|reference| reference.path.as_str())
             .collect();
         assert_eq!(paths, ["Packages/Lib.lua", "notes.rtf"]);
+    }
+
+    #[test]
+    fn remap_refuses_cyclic_or_zero_replacements_before_writing() {
+        let fixture = Fixture::new();
+        fixture.write_project("src/Shop.luau", SHOP.as_bytes());
+        let map_out = fixture.dir.path().join("ids.json");
+        let options = || RemapOptions {
+            write: true,
+            bare: true,
+            map_out: Some(map_out.clone()),
+            ..RemapOptions::default()
+        };
+
+        fixture.write_replaced(&[(123456789, 456), (456, 123456789)]);
+        let error = format!(
+            "{:#}",
+            super::remap(&fixture.config(), &options()).unwrap_err()
+        );
+        assert!(
+            error.contains("form a cycle (123456789 -> 456 -> 123456789)"),
+            "{error}"
+        );
+        assert!(error.contains("nothing was written"), "{error}");
+        assert_eq!(fixture.read_project("src/Shop.luau"), SHOP);
+        assert!(!map_out.exists());
+
+        // A record pointing at itself is a cycle too.
+        fixture.write_replaced(&[(123456789, 123456789)]);
+        let error = format!(
+            "{:#}",
+            super::remap(&fixture.config(), &options()).unwrap_err()
+        );
+        assert!(
+            error.contains("form a cycle (123456789 -> 123456789)"),
+            "{error}"
+        );
+
+        fixture.write_replaced(&[(123456789, 456), (456, 0)]);
+        let error = format!(
+            "{:#}",
+            super::remap(&fixture.config(), &options()).unwrap_err()
+        );
+        assert!(
+            error.contains("the record for 456 under \"replaced\" leads to the asset id 0"),
+            "{error}"
+        );
+        assert_eq!(fixture.read_project("src/Shop.luau"), SHOP);
+        assert!(!map_out.exists());
+    }
+
+    #[test]
+    fn remap_only_rewrites_urls_of_roblox_asset_hosts() {
+        let fixture = Fixture::new();
+        fixture.write_replaced(&[(123456789, 987654321)]);
+        let kept = [
+            "https://notroblox.com/asset/?id=123456789",
+            "https://roblox.com.evil.com/asset/?id=123456789",
+            "https://www.roblox.com.evil/asset/?id=123456789",
+            "https://evil.com/www.roblox.com/asset/?id=123456789",
+            "https://user@www.roblox.com/asset/?id=123456789",
+            "https://www.roblox.com/library/?id=123456789",
+            "https://www.roblox.com/asset&id=123456789",
+            "rbxthumb://type=Avatar&id=123456789&w=150&h=150",
+            "rbxthumb://type=AvatarHeadShot&id=123456789&w=48&h=48",
+            "rbxthumb://type=GameIcon&id=123456789&w=150&h=150",
+        ];
+        let rewritten = [
+            "http://www.roblox.com/asset/?id=123456789",
+            "https://roblox.com/asset?id=123456789",
+            "HTTPS://WWW.ROBLOX.COM/Asset/?ID=123456789",
+            "https://assetdelivery.roblox.com/v1/asset/?id=123456789",
+            "https://assetdelivery.roblox.com/v1/asset?version=2&id=123456789",
+            "rbxthumb://type=Asset&id=123456789&w=150&h=150",
+            "rbxthumb://id=123456789&type=Asset&w=150&h=150",
+        ];
+        let lines: Vec<String> = kept
+            .iter()
+            .chain(&rewritten)
+            .map(|url| format!("x = \"{url}\""))
+            .collect();
+        let text = lines.join("\n") + "\n";
+        fixture.write_project("src/Urls.luau", text.as_bytes());
+
+        let (report, _) = fixture.remap(RemapOptions {
+            write: true,
+            ..RemapOptions::default()
+        });
+
+        let lines_found: Vec<usize> = report
+            .references
+            .iter()
+            .map(|reference| reference.line)
+            .collect();
+        let expected: Vec<usize> = (kept.len() + 1..=kept.len() + rewritten.len()).collect();
+        assert_eq!(lines_found, expected);
+        assert!(report
+            .references
+            .iter()
+            .all(|reference| reference.kind == ReferenceKind::Url));
+        let after = fixture.read_project("src/Urls.luau");
+        for (line, original) in after.lines().zip(&lines) {
+            let is_kept = kept.iter().any(|url| original.contains(url));
+            assert_eq!(line == original, is_kept, "{line}");
+        }
     }
 
     #[test]
