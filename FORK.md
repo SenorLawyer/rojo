@@ -16,7 +16,7 @@ Windows x64 is the primary supported target. Windows ARM is excluded from CI and
 
 ## Compatibility
 
-Use this fork's Studio plugin (7.7.2-fork.2 or later) with this fork's server at the same version. Encoded HTTP transfers, which keep binary responses intact in Studio, need this fork's server at 7.7.2-fork.2 or later. The plugin detects servers that don't encode responses and uses plain HTTP requests for them, so it still connects to upstream and older servers, with the issues listed below.
+Use this fork's Studio plugin (7.7.2 or later) with this fork's server at the same version. Encoded HTTP transfers, which keep binary responses intact in Studio, need this fork's server at 7.7.2 or later. The plugin detects servers that don't encode responses and uses plain HTTP requests for them, so it still connects to upstream and older servers, with the issues listed below.
 
 Mixing the upstream plugin with this fork's server has these known issues:
 

@@ -31,6 +31,8 @@ Making a new release? Simply add the new header with the version and date undern
 
 ## Unreleased
 
+## [7.7.2] (November 5th, 2026)
+
 * The Studio plugin now cancels abandoned connections and prevents overlapping sessions. When the server asks it to resync, the session ends with a readable error; reconnect to resync. ([fork#1])
 * The Studio plugin now disconnects when the place ID changes, including when a local file is published or the initial sync is waiting for confirmation. Reconnect to sync the new place. ([fork#1])
 * Update checks now look for releases of SenorLawyer/rojo instead of upstream Rojo. ([fork#1])
@@ -96,6 +98,7 @@ Making a new release? Simply add the new header with the version and date undern
 * LocalizationTables no longer report as changed when nothing changes. ([#1333])
 * Sounds now preloaded correctly. The warning "*ContentId: rbxassetid://203785492 failed due to: Asset type does not match requested type*" is fixed. ([#1351])
 
+[7.7.2]: https://github.com/SenorLawyer/rojo/releases/tag/v7.7.2
 [#1333]: https://github.com/rojo-rbx/rojo/pull/1333
 [#1351]: https://github.com/rojo-rbx/rojo/pull/1351
 [fork#1]: https://github.com/SenorLawyer/rojo/pull/1
