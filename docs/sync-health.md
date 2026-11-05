@@ -47,7 +47,7 @@ The guard is the plugin setting **Guard Against Script Wipes**, on by default. A
 
 ## Undoing a Rojo change
 
-Each change Rojo applies is its own undo step, named `Rojo: Patch <time>`. Undoing one puts back what Studio had before, so Studio no longer matches the files, and with two-way sync the undone values may be written back to disk. The plugin now warns in Studio's output when that happens and counts it in `undoneRojoPatches`, until the step is redone. Run `verify --fix`, or reconnect, to sync the files again.
+Each change Rojo applies is normally its own undo step, named `Rojo: Patch <time>`. When another plugin or tool is recording a change at that moment, Rojo's change becomes part of that recording instead, and undoing it is not detected; `verify` still finds the difference. Undoing one puts back what Studio had before, so Studio no longer matches the files, and with two-way sync the undone values may be written back to disk. The plugin now warns in Studio's output when that happens and counts it in `undoneRojoPatches`, until the step is redone. Run `verify --fix`, or reconnect, to sync the files again.
 
 ## Backups outside the place
 

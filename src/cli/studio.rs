@@ -1372,6 +1372,22 @@ mod tests {
     }
 
     #[test]
+    fn summaries_escape_text_from_studio() {
+        let esc = '\u{1b}';
+        let sessions = json!({"sessions":[{
+            "mode":"Edit","placeName":format!("Evil{esc}]0;title"),"placeId":1,
+            "sessionId":"s","sync":{"status":format!("Connected{esc}[2J"),"patchesApplied":1}
+        }]});
+        let text = describe_sessions(&sessions);
+        assert!(!text.contains(esc), "{text:?}");
+        assert!(text.contains("\\u{1b}"));
+        let report = json!({"checked":1,"matching":0,"differentCount":1,"different":[
+            {"path":format!("game/A{esc}[31m"),"file":"src/A.luau","held":false}]});
+        let text = describe_verify(&report);
+        assert!(!text.contains(esc), "{text:?}");
+    }
+
+    #[test]
     fn read_model_shares_server_import_validation() {
         use rbx_dom_weak::{InstanceBuilder, WeakDom};
         let dir = tempfile::tempdir().unwrap();
