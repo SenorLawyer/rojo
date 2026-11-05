@@ -457,6 +457,22 @@ return function()
 			expect(patch.updated[1].changedProperties.Disabled).to.be.ok()
 		end)
 
+		it("holds back a class change of a held script", function()
+			session:__holdScriptWipes(sourceUpdate("UI", ""))
+			local classChange = {
+				removed = {},
+				added = {},
+				updated = { { id = "UI", changedClassName = "Script", changedProperties = {} } },
+			}
+			session:__holdScriptWipes(classChange)
+			expect(#classChange.updated).to.equal(0)
+			local combined = sourceUpdate("UI", "")
+			combined.updated[1].changedClassName = "Script"
+			session:__holdScriptWipes(combined)
+			expect(#combined.updated).to.equal(0)
+			expect(session.__heldWipes.UI).to.be.ok()
+		end)
+
 		it("lets small scripts be emptied", function()
 			module.Source = "return 1"
 			local patch = sourceUpdate("UI", "")

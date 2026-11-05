@@ -22,9 +22,12 @@ use crate::snapshot::{InstigatingSource, RojoTree};
 /// Script classes whose `Source` the plugin can read.
 const SCRIPT_CLASSES: [&str; 3] = ["Script", "LocalScript", "ModuleScript"];
 
-/// Lists in a report are cut to this many entries, so the response stays
-/// readable and small even when a whole place is out of date.
-pub(crate) const MAX_LISTED: usize = 200;
+/// Lists in a report are cut to this many entries by default, so the response
+/// stays readable and small even when a whole place is out of date.
+pub(crate) const DEFAULT_LISTED: usize = 200;
+/// The most entries a caller may ask for per list. A few hundred bytes each,
+/// so three full lists stay well under the bridge's 8 MiB response limit.
+pub(crate) const MAX_LISTED: usize = 10_000;
 
 /// How many bytes of source one resync command may carry. Each command must
 /// fit in a single poll response (`MAX_POLL_BYTES` in studio.rs) with room
@@ -224,9 +227,12 @@ fn describe(script: &TreeScript) -> Value {
     json!({"id": script.id, "path": script.path, "file": script.file, "diskLength": script.length})
 }
 
-fn listed<'a>(items: impl ExactSizeIterator<Item = Value> + 'a) -> (Vec<Value>, usize) {
+fn listed<'a>(
+    items: impl ExactSizeIterator<Item = Value> + 'a,
+    limit: usize,
+) -> (Vec<Value>, usize) {
     let total = items.len();
-    (items.take(MAX_LISTED).collect(), total)
+    (items.take(limit).collect(), total)
 }
 
 impl Comparison {
@@ -234,15 +240,19 @@ impl Comparison {
         self.different.is_empty() && self.missing.is_empty() && self.detached.is_empty()
     }
 
-    pub(crate) fn report(&self) -> Value {
-        let (different, different_count) = listed(self.different.iter().map(|different| {
-            let mut value = describe(&different.script);
-            value["studioLength"] = json!(different.studio_length);
-            value["held"] = json!(self.held.contains(&different.script.id));
-            value
-        }));
-        let (missing, missing_count) = listed(self.missing.iter().map(describe));
-        let (detached, detached_count) = listed(self.detached.iter().map(describe));
+    /// The report, listing at most `limit` scripts of each kind.
+    pub(crate) fn report(&self, limit: usize) -> Value {
+        let (different, different_count) = listed(
+            self.different.iter().map(|different| {
+                let mut value = describe(&different.script);
+                value["studioLength"] = json!(different.studio_length);
+                value["held"] = json!(self.held.contains(&different.script.id));
+                value
+            }),
+            limit,
+        );
+        let (missing, missing_count) = listed(self.missing.iter().map(describe), limit);
+        let (detached, detached_count) = listed(self.detached.iter().map(describe), limit);
         json!({
             "inSync": self.in_sync(),
             "checked": self.checked,
@@ -254,7 +264,7 @@ impl Comparison {
             "detachedCount": detached_count,
             "detached": detached,
             "heldCount": self.held.len(),
-            "truncated": different_count > MAX_LISTED || missing_count > MAX_LISTED || detached_count > MAX_LISTED,
+            "truncated": different_count > limit || missing_count > limit || detached_count > limit,
         })
     }
 
@@ -441,7 +451,7 @@ mod test {
         assert!(!comparison.in_sync());
         assert_eq!(comparison.checked, 5);
         assert_eq!(comparison.matching, 2);
-        let report = comparison.report();
+        let report = comparison.report(DEFAULT_LISTED);
         assert_eq!(report["differentCount"], 1);
         assert_eq!(
             report["different"][0]["path"],
@@ -453,6 +463,20 @@ mod test {
             "game/ReplicatedStorage/Detached"
         );
         assert_eq!(report["truncated"], false);
+    }
+
+    #[test]
+    fn reports_list_as_many_scripts_as_asked() {
+        let tree = tree();
+        let scripts = tree_scripts(&tree, Path::new("/"));
+        let comparison = compare(scripts, &json!({"scripts": []})).unwrap();
+        let short = comparison.report(2);
+        assert_eq!(short["missingCount"], 5);
+        assert_eq!(short["missing"].as_array().unwrap().len(), 2);
+        assert_eq!(short["truncated"], true);
+        let full = comparison.report(MAX_LISTED);
+        assert_eq!(full["missing"].as_array().unwrap().len(), 5);
+        assert_eq!(full["truncated"], false);
     }
 
     #[test]
@@ -482,7 +506,10 @@ mod test {
         assert!(comparison.fixable(false).is_empty());
         assert_eq!(comparison.fixable(true).len(), 1);
         assert_eq!(comparison.held_count(), 1);
-        assert_eq!(comparison.report()["different"][0]["held"], true);
+        assert_eq!(
+            comparison.report(DEFAULT_LISTED)["different"][0]["held"],
+            true
+        );
     }
 
     #[test]

@@ -412,6 +412,9 @@ struct State {
     /// Request IDs cancelled before they were queued, with their session and
     /// when the cancellation lapses.
     cancelled: HashMap<String, (String, Instant)>,
+    /// The `resync` batch a running `verify --fix` is waiting on, by the
+    /// verify's own request ID, so cancelling the verify cancels it too.
+    verify_children: HashMap<String, (String, String)>,
     next_generation: u64,
 }
 
@@ -1059,6 +1062,24 @@ impl StudioBridge {
                     }
                     Self::prune(&mut state);
                     reply(StatusCode::OK, json!({"cancelled":true,"requestId":id}))
+                } else if let Some((_, child)) = state
+                    .verify_children
+                    .get(id)
+                    .filter(|(session, _)| session_id(&value).as_ref() == Some(session))
+                    .cloned()
+                {
+                    // A verify past its `sources` step: stop its current batch,
+                    // whether it is queued or about to be, and the batches after.
+                    let session = session_id(&value).unwrap_or_default();
+                    match state.pending.remove(&child) {
+                        Some(pending) => {
+                            let _ = pending.result.send(Outcome::Cancelled);
+                        }
+                        None => remember(&mut state.cancelled, &child, session.clone()),
+                    }
+                    remember(&mut state.cancelled, id, session);
+                    Self::prune(&mut state);
+                    reply(StatusCode::OK, json!({"cancelled":true,"requestId":id}))
                 } else {
                     // The command may still be waiting for Git or its import
                     // check, so it must not be queued once it gets there. A
@@ -1280,6 +1301,18 @@ impl StudioBridge {
             .get("includeHeld")
             .and_then(Value::as_bool)
             .unwrap_or(false);
+        let list_limit = match args.get("listLimit") {
+            None => verify::DEFAULT_LISTED,
+            Some(limit) => match limit.as_u64() {
+                Some(limit @ 1..) if limit as usize <= verify::MAX_LISTED => limit as usize,
+                _ => {
+                    return failure(
+                        StatusCode::BAD_REQUEST,
+                        format!("listLimit must be 1 to {}", verify::MAX_LISTED),
+                    )
+                }
+            },
+        };
         let response = self
             .dispatch(session_id, id.clone(), "sources", json!({}))
             .await;
@@ -1300,7 +1333,7 @@ impl StudioBridge {
                 )
             }
         };
-        let mut report = comparison.report();
+        let mut report = comparison.report(list_limit);
         if fix {
             let fixes = comparison.fixable(include_held);
             let batches = {
@@ -1327,14 +1360,19 @@ impl StudioBridge {
                     ));
                     break;
                 }
+                let child = Uuid::new_v4().to_string();
+                self.state()
+                    .verify_children
+                    .insert(id.clone(), (session_id.to_owned(), child.clone()));
                 let response = self
                     .dispatch(
                         session_id,
-                        Uuid::new_v4().to_string(),
+                        child,
                         "resync",
                         json!({"patch": batch.patch, "expect": batch.expect, "includeHeld": include_held}),
                     )
                     .await;
+                self.state().verify_children.remove(&id);
                 let (status, value) = response_value(response).await;
                 let result = &value["result"];
                 if status == StatusCode::OK && result["ok"] == json!(true) {
@@ -2602,6 +2640,91 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    /// Polls as the plugin until a command arrives, so a spawned request can
+    /// make progress in between.
+    async fn next_command(bridge: &Arc<StudioBridge>, session: &str) -> Value {
+        for _ in 0..50 {
+            let (_, value) = plugin(bridge, "/api/studio/poll", json!({"sessionId":session})).await;
+            if let Some(command) = value["commands"].as_array().and_then(|c| c.first()) {
+                return command.clone();
+            }
+        }
+        panic!("no command arrived");
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_verify_cancels_its_queued_fix_batch() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(
+            dir.path().join("default.project.json"),
+            r#"{"name":"v","tree":{"$className":"DataModel","ReplicatedStorage":{"Shared":{"$path":"src"}}}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("src/Main.luau"),
+            "return 'disk'
+",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("token"), "0123456789abcdef0123456789abcdef").unwrap();
+        let bridge = bridge_for(dir.path(), GIT_LOCK_WAIT);
+        let session = register(&bridge).await;
+        let id = Uuid::new_v4().to_string();
+        let request = request(
+            "POST",
+            "/api/studio/command",
+            &bridge.token,
+            Some(json!({"sessionId":session,"action":"verify","requestId":id,"args":{"fix":true}})),
+        );
+        let verify = tokio::spawn(bridge.clone().call(PEER.parse().unwrap(), request));
+
+        let sources = next_command(&bridge, &session).await;
+        assert_eq!(sources["action"], "sources");
+        let script = {
+            let tree = bridge.serve.tree();
+            verify::tree_scripts(&tree, bridge.serve.root_dir())
+                .into_iter()
+                .next()
+                .unwrap()
+        };
+        plugin(
+            &bridge,
+            "/api/studio/result",
+            json!({"requestId":sources["requestId"],"sessionId":session,"result":{"ok":true,"value":{
+                "scripts":[{"id":script.id,"hash":1,"length":1}],"detached":[],"held":[]}}}),
+        )
+        .await;
+        let resync = next_command(&bridge, &session).await;
+        assert_eq!(resync["action"], "resync");
+        assert_ne!(resync["requestId"], json!(id));
+
+        // The verify's own ID is no longer pending, but cancelling it must
+        // still stop the batch it is waiting on.
+        let (status, _) = cli(
+            &bridge,
+            "/api/studio/cancel",
+            json!({"sessionId":session,"requestId":id}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, value) = into_value(verify.await.unwrap()).await;
+        assert_eq!(status, StatusCode::OK, "{value}");
+        let fixed = &value["result"]["value"]["fixed"];
+        assert_eq!(fixed["updated"], 0);
+        assert_eq!(fixed["failed"], 1);
+        assert!(!fixed["errors"].as_array().unwrap().is_empty());
+        // Studio's late answer for the cancelled batch is refused.
+        let (status, _) = plugin(
+            &bridge,
+            "/api/studio/result",
+            json!({"requestId":resync["requestId"],"sessionId":session,"result":{"ok":true,"value":{"updated":1}}}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::GONE);
+        assert!(bridge.state().verify_children.is_empty());
     }
 
     #[tokio::test]

@@ -486,6 +486,38 @@ fn command(
             timeout = test_timeout(seconds);
             reports_failure = true;
         }
+        // Locks and the backup list are local files, so these work without a
+        // Studio bridge or its token, like their CLI commands.
+        "studio_lock_acquire"
+        | "studio_lock_release"
+        | "studio_lock_status"
+        | "studio_backup_list" => {
+            command.args(["studio", "--json"]);
+            if name == "studio_backup_list" {
+                command.args(["backup", "list"]);
+            } else {
+                command.args(["lock", &name["studio_lock_".len()..]]);
+                if let Some(lock) = arguments.get("lock").and_then(Value::as_str) {
+                    command.arg(lock);
+                }
+                for key in ["owner", "limit", "ttl", "wait", "note"] {
+                    if let Some(value) = arguments.get(key) {
+                        command.arg(format!(
+                            "--{key}={}",
+                            value
+                                .as_str()
+                                .map(str::to_owned)
+                                .unwrap_or_else(|| value.to_string())
+                        ));
+                    }
+                }
+                if arguments.get("exclusive") == Some(&json!(true)) {
+                    command.arg("--exclusive");
+                }
+                // A busy lock exits with 3, which is an answer too.
+                reports_failure = name == "studio_lock_acquire";
+            }
+        }
         _ => {
             let token = options.token_file.as_ref().context(
                 "Studio tools require --token-file matching rojo serve --studio-token-file",
@@ -498,8 +530,7 @@ fn command(
             let action = name.strip_prefix("studio_").context("Unknown tool")?;
             // Verify reports a place that does not match its files with exit
             // status 1 and a full report, which is a result, not a failure.
-            // A busy lock exits with 3, which is an answer too.
-            reports_failure = matches!(action, "verify" | "lock_acquire");
+            reports_failure = action == "verify";
             let session = canonical_session(arguments);
             if let (true, Some(session)) = (action != "sessions", &session) {
                 let request = uuid::Uuid::new_v4().to_string();
@@ -513,15 +544,6 @@ fn command(
                 "backup" => {
                     command.args(["backup", "create"]);
                 }
-                "backup_list" => {
-                    command.args(["backup", "list"]);
-                }
-                "lock_acquire" | "lock_release" | "lock_status" => {
-                    command.args(["lock", &action["lock_".len()..]]);
-                    if let Some(lock) = arguments.get("lock").and_then(Value::as_str) {
-                        command.arg(lock);
-                    }
-                }
                 action => {
                     command.arg(action);
                 }
@@ -530,8 +552,7 @@ fn command(
                 command.arg(format!("--session={session}"));
             }
             for key in [
-                "instance", "depth", "limit", "seconds", "after", "name", "note", "owner", "ttl",
-                "wait",
+                "instance", "depth", "limit", "seconds", "after", "name", "note",
             ] {
                 if let Some(value) = arguments.get(key) {
                     command.arg(format!(
@@ -547,9 +568,6 @@ fn command(
                 for property in properties {
                     command.arg(format!("--property={}", property.as_str().unwrap()));
                 }
-            }
-            if arguments.get("exclusive") == Some(&json!(true)) {
-                command.arg("--exclusive");
             }
             if arguments.get("fix") == Some(&json!(true)) {
                 command.arg("--fix");

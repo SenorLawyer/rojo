@@ -409,8 +409,10 @@ function ServeSession:applyResync(patch, expect, includeHeld, expiresAt)
 	assert(self.__status == Status.Connected, "Rojo is not syncing this place. Connect it first.")
 	-- The server stops waiting at `expiresAt` and reports the batch as failed,
 	-- so nothing may change after it.
+	-- A disconnected session has stopped syncing, so its resync must stop too.
 	local function expired()
-		return type(expiresAt) == "number" and DateTime.now().UnixTimestampMillis >= expiresAt
+		return self.__status ~= Status.Connected
+			or (type(expiresAt) == "number" and DateTime.now().UnixTimestampMillis >= expiresAt)
 	end
 	assert(
 		type(patch) == "table"
@@ -541,6 +543,17 @@ function ServeSession:__holdScriptWipes(patch)
 			ty, value = next(encoded)
 		end
 		if ty ~= "String" or type(value) ~= "string" then
+			-- Changing the class recreates the instance from the update's other
+			-- properties, without the source the hold keeps, so it waits until
+			-- the hold ends.
+			if self.__heldWipes[update.id] and update.changedClassName ~= nil then
+				Log.warn(
+					"Rojo held back changing the class of {} because its file on disk is empty.",
+					self.__heldWipes[update.id].path
+				)
+				table.remove(patch.updated, index)
+				continue
+			end
 			index += 1
 			continue
 		end
@@ -577,7 +590,9 @@ function ServeSession:__holdScriptWipes(patch)
 			and update.changedName == nil
 			and update.changedClassName == nil
 			and update.changedMetadata == nil
-		if empty then
+		-- A class change would recreate the script without its source, which is
+		-- the wipe the hold prevents, so the whole update waits.
+		if empty or update.changedClassName ~= nil then
 			table.remove(patch.updated, index)
 		else
 			index += 1

@@ -731,10 +731,17 @@ fn decide(
             if let Some(holder) = others().next() {
                 return Err(held_by(holder));
             }
-            if let Some(waiter) = exclusive_ahead {
+            // Any waiter that came first goes first, shared ones included, or
+            // a steady stream of exclusive requests would starve them.
+            if let Some(waiter) =
+                state.waiters.iter().filter(ahead).min_by(|a, b| {
+                    (a.since_ms, a.owner.as_str()).cmp(&(b.since_ms, b.owner.as_str()))
+                })
+            {
                 return Err(format!(
-                    "{} has been waiting longer for exclusive",
-                    waiter.owner
+                    "{} has been waiting longer for {}",
+                    waiter.owner,
+                    waiter.mode.as_str()
                 ));
             }
         }
@@ -1392,6 +1399,23 @@ mod tests {
         assert!(!busy.granted);
         assert!(busy.reason.unwrap().contains("b has been waiting longer"));
         assert!(f.wait_lock("b", Exclusive).granted);
+    }
+
+    #[test]
+    fn a_later_exclusive_waiter_does_not_overtake_an_earlier_shared_one() {
+        let f = Fixture::new();
+        assert!(f.try_lock("a", Exclusive, None).granted);
+        assert!(!f.wait_lock("shared", Shared).granted);
+        f.advance(Duration::from_secs(1));
+        assert!(!f.wait_lock("late", Exclusive).granted);
+        f.store.release("main", "a").unwrap();
+        let busy = f.wait_lock("late", Exclusive);
+        assert!(!busy.granted);
+        assert!(busy
+            .reason
+            .unwrap()
+            .contains("shared has been waiting longer"));
+        assert!(f.wait_lock("shared", Shared).granted);
     }
 
     #[test]

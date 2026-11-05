@@ -144,6 +144,10 @@ pub enum StudioSubcommand {
         /// because their file became empty.
         #[clap(long, requires = "fix")]
         include_held: bool,
+        /// List every script that differs, not just the first 200 of each kind
+        /// (up to 10,000).
+        #[clap(long)]
+        all: bool,
     },
     /// Save copies of Studio instances outside the place, and put them back.
     Backup {
@@ -263,8 +267,13 @@ impl StudioCommand {
             target,
             fix,
             include_held,
+            all,
         } = &self.command
         {
+            let mut args = json!({"fix": fix, "includeHeld": include_held});
+            if *all {
+                args["listLimit"] = json!(crate::web::verify::MAX_LISTED);
+            }
             let result = request(
                 &client,
                 &address,
@@ -272,7 +281,7 @@ impl StudioCommand {
                 Some(json!({
                     "sessionId": target.session,
                     "action": "verify",
-                    "args": {"fix": fix, "includeHeld": include_held},
+                    "args": args,
                     "requestId": self.request_id.clone().unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
                 })),
             )?;
@@ -593,7 +602,10 @@ fn describe_verify(report: &Value) -> String {
         }
     }
     if report["truncated"] == json!(true) {
-        let _ = writeln!(out, "(Lists are cut short; --json has the counts.)");
+        let _ = writeln!(
+            out,
+            "(Lists are cut short; --all lists every script, and --json has the counts.)"
+        );
     }
     let fixed = &report["fixed"];
     if fixed.is_object() {

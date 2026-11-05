@@ -407,3 +407,52 @@ fn failed_studio_calls_are_cancelled_at_the_bridge() {
         "{seen:?}"
     );
 }
+
+#[test]
+fn lock_and_backup_list_tools_work_without_a_bridge_token() {
+    let directory = fixture();
+    let call = |id: i64, name: &str, arguments: Value| {
+        let replies = exchange_messages(
+            directory.path(),
+            &[
+                initialize("2025-06-18"),
+                initialized(),
+                json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{"name":name,"arguments":arguments}}),
+            ],
+        );
+        reply(&replies, id)["result"].clone()
+    };
+    let granted = call(
+        2,
+        "studio_lock_acquire",
+        json!({"lock":"main","owner":"agent-a"}),
+    );
+    assert_eq!(granted["isError"], false, "{granted}");
+    assert_eq!(granted["structuredContent"]["granted"], true);
+    // Calls run concurrently within one session, so the busy check uses its own.
+    let busy = call(
+        3,
+        "studio_lock_acquire",
+        json!({"lock":"main","owner":"agent-b","exclusive":true}),
+    );
+    assert_eq!(busy["isError"], false, "{busy}");
+    assert_eq!(busy["structuredContent"]["granted"], false);
+    let status = call(4, "studio_lock_status", json!({}));
+    assert_eq!(status["isError"], false, "{status}");
+    assert_eq!(
+        status["structuredContent"]["locks"][0]["holders"][0]["owner"],
+        "agent-a"
+    );
+    let released = call(
+        5,
+        "studio_lock_release",
+        json!({"lock":"main","owner":"agent-a"}),
+    );
+    assert_eq!(
+        released["structuredContent"]["released"], true,
+        "{released}"
+    );
+    let backups = call(6, "studio_backup_list", json!({}));
+    assert_eq!(backups["isError"], false, "{backups}");
+    assert_eq!(backups["structuredContent"]["backups"], json!([]));
+}
