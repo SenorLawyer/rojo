@@ -498,6 +498,69 @@ return function()
 			expect(#summary.heldWipes > 0).to.equal(true)
 		end)
 
+		local function serverCopy(className, source)
+			api.serialize = function()
+				return Promise.resolve({ modelContents = buffer.create(0) })
+			end
+			api.refPatch = function()
+				return Promise.resolve({ patch = PatchSet.newEmpty() })
+			end
+			session.__deserializeInstances = function()
+				local root = Instance.new("Folder")
+				local pointer = Instance.new("ObjectValue")
+				pointer.Name = "UI"
+				local copy = Instance.new(className)
+				copy.Name = "UIController"
+				(copy :: any).Source = source
+				pointer.Value = copy
+				pointer.Parent = root
+				return { root }
+			end
+		end
+
+		it("does not let the sync fallback swap in an empty copy", function()
+			serverCopy("ModuleScript", "")
+			local ok = session:__replaceInstances({ "UI" })
+			expect(ok).to.equal(true)
+			expect(session.__instanceMap.fromIds.UI).to.equal(module)
+			expect(module.Parent).to.equal(container)
+			expect(string.find(module.Source, "return a") ~= nil).to.equal(true)
+			expect(session.__heldWipes.UI).to.be.ok()
+		end)
+
+		it("applies a held class change once the file has code again", function()
+			session:__holdScriptWipes(sourceUpdate("UI", ""))
+			session:__holdScriptWipes({
+				removed = {},
+				added = {},
+				updated = { { id = "UI", changedClassName = "Script", changedProperties = {} } },
+			})
+			expect(session.__heldWipes.UI.deferredClass).to.equal(true)
+			serverCopy("Script", "print('code again')")
+			session.__status = ServeSession.Status.Connected
+			session:__applyPatch(sourceUpdate("UI", "print('code again')"))
+			expect(session.__heldWipes.UI).to.equal(nil)
+			local now = session.__instanceMap.fromIds.UI
+			expect(now.ClassName).to.equal("Script")
+			expect(now.Source).to.equal("print('code again')")
+		end)
+
+		it("keeps a hold when the same Studio reconnects", function()
+			session:__holdScriptWipes(sourceUpdate("UI", ""))
+			local hold = session.__heldWipes.UI
+			session:stop()
+			local again = ServeSession.new({ apiContext = api, twoWaySync = false })
+			again.__instanceMap:insert("NEW-ID", module)
+			again:__adoptHolds()
+			expect(again.__heldWipes["NEW-ID"]).to.equal(hold)
+			module.Source = "return 1"
+			local empty = sourceUpdate("NEW-ID", "")
+			again:__holdScriptWipes(empty)
+			expect(#empty.updated).to.equal(0)
+			again:__clearHold("NEW-ID")
+			again:stop()
+		end)
+
 		it("lets small scripts be emptied", function()
 			module.Source = "return 1"
 			local patch = sourceUpdate("UI", "")

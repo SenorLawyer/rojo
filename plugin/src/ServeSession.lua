@@ -92,6 +92,11 @@ local function readSource(instance): string?
 	return nil
 end
 
+-- Holds by the Studio instance they protect. A reconnect makes a new session
+-- with new IDs, and the file may still be empty, so the new session adopts
+-- these instead of starting without holds. Weak keys let destroyed scripts go.
+local heldByInstance = setmetatable({}, { __mode = "k" })
+
 local function nowMillis()
 	return DateTime.now().UnixTimestampMillis
 end
@@ -179,6 +184,8 @@ function ServeSession.new(options)
 		__updateLoadingText = function() end,
 		-- Scripts whose emptying was held back, by ID. See `__holdScriptWipes`.
 		__heldWipes = {},
+		-- Scripts whose hold ended with a class change still to apply.
+		__refreshAfterHold = {},
 		__syncStats = {
 			connectedAt = nil,
 			lastPatchAt = nil,
@@ -316,6 +323,40 @@ function ServeSession:__onRojoHistoryChanged(waypoint, delta)
 			waypoint,
 			if self.__twoWaySync then ", and two-way sync may write the undone values back to disk" else ""
 		)
+	end
+end
+
+function ServeSession:__setHold(id, instance, entry)
+	self.__heldWipes[id] = entry
+	if instance then
+		entry.instance = instance
+		heldByInstance[instance] = entry
+	end
+end
+
+function ServeSession:__clearHold(id)
+	local entry = self.__heldWipes[id]
+	if entry then
+		if entry.instance then
+			heldByInstance[entry.instance] = nil
+		end
+		self.__heldWipes[id] = nil
+		-- A class change held back with the wipe was never applied, and the
+		-- server will not send it again, so the instance is fetched whole.
+		if entry.deferredClass and self.__instanceMap.fromIds[id] then
+			self.__refreshAfterHold[id] = true
+		end
+	end
+end
+
+-- Takes over holds from an earlier session of this Studio for the instances
+-- this session now tracks.
+function ServeSession:__adoptHolds()
+	for instance, entry in heldByInstance do
+		local id = self.__instanceMap.fromInstances[instance]
+		if id and not self.__heldWipes[id] then
+			self.__heldWipes[id] = entry
+		end
 	end
 end
 
@@ -520,15 +561,18 @@ function ServeSession:applyResync(patch, expect, includeHeld, expiresAt, isActiv
 			if held then
 				skipped += 1
 				if not self.__heldWipes[write.id] then
-					self.__heldWipes[write.id] =
+					self:__setHold(
+						write.id,
+						write.instance,
 						{ path = write.instance:GetFullName(), lines = held, heldAt = nowMillis() }
+					)
 				end
 			elseif changed then
 				skipped += 1
 			elseif wrote and not late then
 				updated += 1
 				if holdBefore and self.__heldWipes[write.id] == holdBefore then
-					self.__heldWipes[write.id] = nil
+					self:__clearHold(write.id)
 				end
 			else
 				-- The write failed, or was cancelled because the command expired.
@@ -553,7 +597,7 @@ end
 ]=]
 function ServeSession:__holdScriptWipes(patch)
 	for _, removed in patch.removed do
-		self.__heldWipes[removed] = nil
+		self:__clearHold(removed)
 	end
 	if not Settings:get("guardScriptWipes") then
 		return
@@ -575,6 +619,7 @@ function ServeSession:__holdScriptWipes(patch)
 					"Rojo held back changing the class of {} because its file on disk is empty.",
 					self.__heldWipes[update.id].path
 				)
+				self.__heldWipes[update.id].deferredClass = true
 				table.remove(patch.updated, index)
 				continue
 			end
@@ -582,7 +627,7 @@ function ServeSession:__holdScriptWipes(patch)
 			continue
 		end
 		if string.find(value, "%S") then
-			self.__heldWipes[update.id] = nil
+			self:__clearHold(update.id)
 			index += 1
 			continue
 		end
@@ -611,7 +656,10 @@ function ServeSession:__holdScriptWipes(patch)
 			)
 		end
 		if not self.__heldWipes[update.id] then
-			self.__heldWipes[update.id] = { path = path, lines = lines, heldAt = nowMillis() }
+			self:__setHold(update.id, instance, { path = path, lines = lines, heldAt = nowMillis() })
+		end
+		if update.changedClassName ~= nil then
+			self.__heldWipes[update.id].deferredClass = true
 		end
 		update.changedProperties.Source = nil
 		local empty = next(update.changedProperties) == nil
@@ -937,6 +985,35 @@ function ServeSession:__replaceInstances(idList)
 	for _, swap in orderSwaps(swaps) do
 		local id, replacement, oldInstance = swap.id, swap.replacement, swap.oldInstance
 
+		-- The server's copy is read when the fallback runs, so its file may
+		-- have become empty since the patch was sent, and a hold may have
+		-- started while the fallback waited. The swap is the wipe the guard
+		-- prevents, so it is held like any other.
+		if Settings:get("guardScriptWipes") and replacement:IsA("LuaSourceContainer") then
+			local newSource = readSource(replacement) or ""
+			local oldSource = readSource(oldInstance) or ""
+			local lines = countNonBlankLines(oldSource)
+			if not string.find(newSource, "%S") and (self.__heldWipes[id] or lines >= WIPE_GUARD_MIN_LINES) then
+				if not self.__heldWipes[id] then
+					Log.warn(
+						"Rojo held back replacing {} ({} lines of code) with an empty copy, because its file on disk is now empty.",
+						oldInstance:GetFullName(),
+						lines
+					)
+					self:__setHold(
+						id,
+						oldInstance,
+						{ path = oldInstance:GetFullName(), lines = lines, heldAt = nowMillis() }
+					)
+				end
+				if replacement.ClassName ~= oldInstance.ClassName then
+					self.__heldWipes[id].deferredClass = true
+				end
+				replacement:Destroy()
+				continue
+			end
+		end
+
 		self.__instanceMap:insert(id, replacement)
 		Log.trace("Swapping Instance {} out via api/models/ endpoint", id)
 		local oldParent = oldInstance.Parent
@@ -1022,7 +1099,7 @@ function ServeSession:__applyPatch(patch, options)
 	-- scripts inside it are found by what the instance map still tracks.
 	for id in self.__heldWipes do
 		if self.__instanceMap.fromIds[id] == nil then
-			self.__heldWipes[id] = nil
+			self:__clearHold(id)
 		end
 	end
 	local stats = self.__syncStats
@@ -1087,6 +1164,17 @@ function ServeSession:__applyPatchInRecording(patch)
 	for _, update in heldUpdates do
 		table.insert(unappliedPatch.updated, update)
 	end
+	local refresh = {}
+	for id in self.__refreshAfterHold do
+		table.insert(refresh, id)
+	end
+	if #refresh > 0 then
+		table.clear(self.__refreshAfterHold)
+		local refreshed = self:__replaceInstances(refresh)
+		if not refreshed then
+			Log.warn("Could not apply a class change Rojo held back with a script's wipe. Reconnect to sync it.")
+		end
+	end
 
 	if not PatchSet.isEmpty(unappliedPatch) then
 		Log.debug(
@@ -1126,6 +1214,8 @@ function ServeSession:__initialSync(serverInfo)
 		Log.trace("Matching existing Roblox instances to Rojo IDs")
 		self:setLoadingText("Hydrating instance map...")
 		self.__reconciler:hydrate(readResponseBody.instances, serverInfo.rootInstanceId, game)
+		-- Before the catch-up patch, which the wipe guard checks against them.
+		self:__adoptHolds()
 
 		-- Calculate the initial patch to apply to the DataModel to catch us
 		-- up to what Rojo thinks the place should look like.

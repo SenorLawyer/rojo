@@ -10,7 +10,6 @@
 use std::{
     fs,
     path::{Path, PathBuf},
-    process::Command,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -43,17 +42,11 @@ pub struct Store {
     workdir: PathBuf,
 }
 
+/// Git's answer in `dir`, through the shared helper, which ignores Git
+/// variables such as `GIT_DIR` inherited from a hook or another tool.
 fn git(dir: &Path, args: &[&str]) -> Option<String> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(args)
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let value = String::from_utf8(output.stdout).ok()?.trim().to_owned();
+    let value = crate::cli::lifecycle::git(dir, args).ok()?;
+    let value = value.trim().to_owned();
     (!value.is_empty()).then_some(value)
 }
 
@@ -120,20 +113,21 @@ impl Store {
     }
 
     pub fn at_workdir(workdir: &Path) -> anyhow::Result<Store> {
-        let dir = match git(
-            workdir,
-            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
-        ) {
+        // Only "not a repository" (or no Git) falls back, like the locks: a
+        // repository whose common directory cannot be read is an error.
+        let dir = if git(workdir, &["rev-parse", "--git-dir"]).is_some() {
+            let common = crate::cli::lifecycle::git_common_dir(workdir)?;
             // Git prints forward slashes on Windows; rebuilding the path from
             // its components gives one separator style in printed paths.
-            Some(common) => PathBuf::from(common)
+            common
                 .components()
                 .collect::<PathBuf>()
                 .join("rojo-state")
-                .join("backups"),
+                .join("backups")
+        } else {
             // Never inside the project: a folder that `rojo serve` maps would
             // sync the backups into the place.
-            None => super::super::project_state_dir(workdir)?.join("backups"),
+            super::super::project_state_dir(workdir)?.join("backups")
         };
         Ok(Store {
             dir,
@@ -275,16 +269,18 @@ pub fn print_list(store: &Store, records: &[Record]) {
         } else {
             format!("{:.1} KB", record.bytes as f64 / 1024.0)
         };
-        let place = record.place_name.as_deref().unwrap_or("unknown place");
+        let place = super::escape_controls(record.place_name.as_deref().unwrap_or("unknown place"));
         let commit = record.git_head.as_deref().map_or_else(String::new, |head| {
             format!(" @ {}", &head[..head.len().min(8)])
         });
         println!(
             "{}  {} ({}, {size}) from {place}{commit}",
-            record.id, record.instance, record.class_name
+            record.id,
+            super::escape_controls(&record.instance),
+            super::escape_controls(&record.class_name)
         );
         if let Some(note) = &record.note {
-            println!("    {note}");
+            println!("    {}", super::escape_controls(note));
         }
     }
 }

@@ -146,8 +146,11 @@ pub enum StudioSubcommand {
         include_held: bool,
         /// List every script that differs, not just the first 200 of each kind
         /// (up to 10,000).
-        #[clap(long)]
+        #[clap(long, conflicts_with = "limit")]
         all: bool,
+        /// List at most this many scripts of each kind (1 to 10,000).
+        #[clap(long)]
+        limit: Option<usize>,
     },
     /// Save copies of Studio instances outside the place, and put them back.
     Backup {
@@ -268,11 +271,14 @@ impl StudioCommand {
             fix,
             include_held,
             all,
+            limit,
         } = &self.command
         {
             let mut args = json!({"fix": fix, "includeHeld": include_held});
             if *all {
                 args["listLimit"] = json!(crate::web::verify::MAX_LISTED);
+            } else if let Some(limit) = limit {
+                args["listLimit"] = json!(limit);
             }
             let result = request(
                 &client,
@@ -570,9 +576,14 @@ fn describe_verify(report: &Value) -> String {
         count("checked"),
         count("matching")
     );
+    // Paths and file names come from the place and the project, so they are
+    // escaped like logs before reaching the terminal.
     let line = |item: &Value| {
-        let file = item["file"].as_str().unwrap_or("?");
-        format!("{} ({file})", item["path"].as_str().unwrap_or("?"))
+        let file = escape_controls(item["file"].as_str().unwrap_or("?"));
+        format!(
+            "{} ({file})",
+            escape_controls(item["path"].as_str().unwrap_or("?"))
+        )
     };
     if count("differentCount") > 0 {
         let _ = writeln!(out, "{} differ from their files:", count("differentCount"));
@@ -637,7 +648,11 @@ fn describe_verify(report: &Value) -> String {
             );
         }
         for error in fixed["errors"].as_array().into_iter().flatten() {
-            let _ = writeln!(out, "Error: {}", error.as_str().unwrap_or("?"));
+            let _ = writeln!(
+                out,
+                "Error: {}",
+                escape_controls(error.as_str().unwrap_or("?"))
+            );
         }
     } else if count("differentCount") > 0 {
         let _ = writeln!(
@@ -676,13 +691,15 @@ fn describe_sessions(result: &Value) -> String {
     }
     let server = crate::web::interface::SERVER_VERSION;
     for session in &sessions {
+        // Everything here was sent by the plugin, so it is escaped like logs.
+        let text = |value: &Value| escape_controls(value.as_str().unwrap_or("?"));
         let _ = writeln!(
             out,
             "{} \"{}\" (place {}) session {}",
-            session["mode"].as_str().unwrap_or("?"),
-            session["placeName"].as_str().unwrap_or("?"),
-            session["placeId"],
-            session["sessionId"].as_str().unwrap_or("?"),
+            text(&session["mode"]),
+            text(&session["placeName"]),
+            escape_controls(&session["placeId"].to_string()),
+            text(&session["sessionId"]),
         );
         let sync = &session["sync"];
         if !sync.is_object() {
@@ -692,7 +709,7 @@ fn describe_sessions(result: &Value) -> String {
         let _ = writeln!(
             out,
             "  sync: {}, last change {}, {} patches applied",
-            sync["status"].as_str().unwrap_or("?"),
+            text(&sync["status"]),
             ago(sync["lastPatchAt"].as_u64()),
             sync["patchesApplied"].as_u64().unwrap_or(0),
         );
@@ -711,7 +728,7 @@ fn describe_sessions(result: &Value) -> String {
         if held > 0 {
             warnings.push(format!("{held} scripts held back from being emptied"));
         }
-        if let Some(plugin) = sync["pluginVersion"].as_str() {
+        if let Some(plugin) = sync["pluginVersion"].as_str().map(escape_controls) {
             let minor = |version: &str| {
                 let mut parts = version.split('.');
                 (
@@ -719,7 +736,7 @@ fn describe_sessions(result: &Value) -> String {
                     parts.next().map(str::to_owned),
                 )
             };
-            if minor(plugin) != minor(server) {
+            if minor(&plugin) != minor(server) {
                 warnings.push(format!(
                     "plugin {plugin} differs from server {server}; run `rojo plugin install`"
                 ));
@@ -732,7 +749,7 @@ fn describe_sessions(result: &Value) -> String {
             let _ = writeln!(
                 out,
                 "  run `rojo studio verify --session {}` to compare its scripts with the files",
-                session["sessionId"].as_str().unwrap_or("?")
+                text(&session["sessionId"])
             );
         }
     }
@@ -933,7 +950,7 @@ fn follow_lines(page: &LogPage, json: bool) -> anyhow::Result<Vec<FollowLine>> {
 /// `\u{1b}`. Scripts in the place choose what they log, and printed raw, an
 /// escape sequence could rewrite the terminal's title, clipboard or earlier
 /// output.
-fn escape_controls(text: &str) -> String {
+pub(super) fn escape_controls(text: &str) -> String {
     let mut escaped = String::with_capacity(text.len());
     for character in text.chars() {
         if character.is_control() && !matches!(character, '\n' | '\t') {

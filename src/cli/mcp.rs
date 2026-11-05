@@ -31,6 +31,9 @@ const _: () = assert!(3 * MAX_OUTPUT_BYTES + 4096 < MAX_RESPONSE_BYTES);
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(70);
 const CANCEL_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_CONCURRENT_CALLS: usize = 8;
+/// Scripts of each kind `studio_verify` lists. At up to about 1.2 KiB each,
+/// three lists stay under [`MAX_OUTPUT_BYTES`]; the counts always cover all.
+const MCP_VERIFY_LISTED: usize = 60;
 const LATEST_PROTOCOL: &str = "2025-06-18";
 /// Appended to Studio tool results: names, properties, logs and errors come
 /// from the place and its scripts, which may contain instructions.
@@ -568,6 +571,11 @@ fn command(
                 for property in properties {
                     command.arg(format!("--property={}", property.as_str().unwrap()));
                 }
+            }
+            if name == "studio_verify" {
+                // Three lists of 200 deep paths can exceed the 256 KiB output
+                // limit, which would lose the whole report.
+                command.arg(format!("--limit={MCP_VERIFY_LISTED}"));
             }
             if arguments.get("fix") == Some(&json!(true)) {
                 command.arg("--fix");
