@@ -12,6 +12,7 @@ Rojo keeps Studio in step with the files on disk, but some things leave them apa
 | `projectName`, `serverVersion`, `pluginVersion` | What is connected. A plugin and server with different major or minor versions sync, but their features differ, and the plugin warns in Studio's output when they do. |
 | `connectedAt`, `lastPatchAt` | Unix milliseconds of the connection and of the last change Rojo applied. |
 | `patchesApplied` | Changes applied since connecting, including the initial sync. |
+| `pendingSourceWrites`, `failedSourceWrites` | Script sources Studio is still writing, and those it could not write since connecting. Not 0 failed means Studio is behind the files. |
 | `lastPatchUnapplied` | Instances in the last change that the plugin could not apply, even after its fallback. Not 0 means Studio is behind the files. |
 | `undoneRojoPatches` | Rojo changes undone in Studio and not redone. Not 0 means Studio is behind the files. |
 | `heldWipeCount`, `heldWipes` | Scripts the wipe guard is holding back, see below. Up to 20 are listed with their path and line count. |

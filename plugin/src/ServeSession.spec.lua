@@ -685,6 +685,19 @@ return function()
 			expect(session.__heldWipes.UI).to.equal(nil)
 		end)
 
+		it("leaves a held script alone in a fix without includeHeld", function()
+			session.__status = ServeSession.Status.Connected
+			local kept = module.Source
+			local expected = expectFrom(kept, "return 'one line'")
+			-- The file became empty after verify built the fix.
+			session:__holdScriptWipes(sourceUpdate("UI", ""))
+			local hold = session.__heldWipes.UI
+			local result = resyncAs(sourceUpdate("UI", "return 'one line'"), expected, false)
+			expect(result.skipped).to.equal(1)
+			expect(module.Source).to.equal(kept)
+			expect(session.__heldWipes.UI).to.equal(hold)
+		end)
+
 		it("keeps an existing hold when a stale resync is skipped", function()
 			session.__status = ServeSession.Status.Connected
 			session:__holdScriptWipes(sourceUpdate("UI", ""))

@@ -198,6 +198,10 @@ function ServeSession.new(options)
 			lastPatchAt = nil,
 			patchesApplied = 0,
 			lastPatchUnapplied = 0,
+			-- Script sources Studio is still writing, and those it could not
+			-- write since connecting.
+			pendingSourceWrites = 0,
+			failedSourceWrites = 0,
 			undoneRojoPatches = 0,
 		},
 	}
@@ -452,6 +456,8 @@ function ServeSession:getSyncSummary()
 		patchesApplied = stats.patchesApplied,
 		lastPatchUnapplied = stats.lastPatchUnapplied,
 		undoneRojoPatches = stats.undoneRojoPatches,
+		pendingSourceWrites = stats.pendingSourceWrites,
+		failedSourceWrites = stats.failedSourceWrites,
 		heldWipeCount = heldCount,
 		heldWipes = held,
 	}
@@ -643,9 +649,17 @@ function ServeSession:applyResync(patch, expect, includeHeld, expiresAt, isActiv
 						changed = true
 						return nil
 					end
+					-- Without includeHeld a held script is left alone whatever the
+					-- fix would write: a hold may have started after verify
+					-- built the fix, and only code on disk, deletion or an
+					-- explicit --include-held ends it.
+					if not includeHeld and (self.__heldWipes[write.id] or heldByInstance[write.instance]) then
+						held = self.__heldWipes[write.id] and self.__heldWipes[write.id].lines or 0
+						return nil
+					end
 					if guardWipes and not string.find(write.target, "%S") then
 						local lines = countNonBlankLines(current)
-						if lines >= WIPE_GUARD_MIN_LINES or self.__heldWipes[write.id] then
+						if lines >= WIPE_GUARD_MIN_LINES then
 							held = lines
 							return nil
 						end
@@ -1253,6 +1267,7 @@ function ServeSession:__writeSource(write)
 	local generation = (self.__sourceGenerations[write.id] or 0) + 1
 	self.__sourceGenerations[write.id] = generation
 	self.__instanceMap:pauseInstance(write.instance)
+	self.__syncStats.pendingSourceWrites += 1
 	task.spawn(function()
 		local ok, err = pcall(function()
 			ScriptEditorService:UpdateSourceAsync(write.instance, function(current)
@@ -1282,7 +1297,9 @@ function ServeSession:__writeSource(write)
 				return write.target
 			end)
 		end)
+		self.__syncStats.pendingSourceWrites -= 1
 		if not ok then
+			self.__syncStats.failedSourceWrites += 1
 			Log.warn("Could not write the source of {}: {}", write.instance:GetFullName(), err)
 		end
 	end)

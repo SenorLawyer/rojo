@@ -157,6 +157,11 @@ impl Store {
 
     /// Saves `model` and its record. Never overwrites an existing backup.
     pub fn save(&self, mut record: Record, model: &[u8]) -> anyhow::Result<Record> {
+        // `list` skips records over this size, so a larger one would vanish.
+        anyhow::ensure!(
+            record.name.len() <= 64 && record.note.as_ref().is_none_or(|note| note.len() <= 4096),
+            "A backup name is at most 64 bytes and a note at most 4096"
+        );
         fs::create_dir_all(&self.dir)
             .with_context(|| format!("Could not create {}", self.dir.display()))?;
         record.git_head = git(&self.workdir, &["rev-parse", "HEAD"]);
@@ -178,6 +183,11 @@ impl Store {
             id = format!("{base}-{attempt}");
         }
         record.id = id.clone();
+        anyhow::ensure!(
+            serde_json::to_vec_pretty(&record)?.len() as u64 <= MAX_RECORD_BYTES,
+            "The backup record would be larger than {} KiB",
+            MAX_RECORD_BYTES / 1024
+        );
         let mut model_file = tempfile::NamedTempFile::new_in(&self.dir)?;
         std::io::Write::write_all(&mut model_file, model)?;
         model_file
@@ -358,6 +368,16 @@ mod tests {
         assert!(store.get("../secret").is_err());
         assert!(store.get("a/b").is_err());
         assert!(store.remove("..").is_err());
+    }
+
+    #[test]
+    fn records_that_list_would_skip_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::in_dir(dir.path());
+        let mut big = record("Map", 1_000);
+        big.note = Some("x".repeat(5000));
+        assert!(store.save(big, b"model").is_err());
+        assert!(store.list().unwrap().is_empty());
     }
 
     #[test]

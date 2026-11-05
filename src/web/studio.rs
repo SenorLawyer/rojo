@@ -1301,6 +1301,9 @@ impl StudioBridge {
     /// [`super::verify`].
     async fn verify(&self, session_id: &str, id: String, args: &Value) -> Response<Body> {
         let started = Instant::now();
+        // Callers may reuse a request ID, so the plugin's record of what this
+        // verify saw gets an ID of its own.
+        let verify_id = Uuid::new_v4().to_string();
         let fix = args.get("fix").and_then(Value::as_bool).unwrap_or(false);
         let include_held = args
             .get("includeHeld")
@@ -1321,7 +1324,12 @@ impl StudioBridge {
         let response = self
             // The plugin keeps the sources it hashes under this verify's ID,
             // so its fix compares with exactly what this verify saw.
-            .dispatch(session_id, id.clone(), "sources", json!({"verifyId": id}))
+            .dispatch(
+                session_id,
+                id.clone(),
+                "sources",
+                json!({"verifyId": verify_id}),
+            )
             .await;
         let (status, value) = response_value(response).await;
         if status != StatusCode::OK || value["result"]["ok"] != json!(true) {
@@ -1395,7 +1403,7 @@ impl StudioBridge {
                         session_id,
                         child,
                         "resync",
-                        json!({"patch": batch.patch, "expect": batch.expect, "includeHeld": include_held, "verifyId": id}),
+                        json!({"patch": batch.patch, "expect": batch.expect, "includeHeld": include_held, "verifyId": verify_id}),
                     )
                     .await;
                 let (status, value) = response_value(response).await;

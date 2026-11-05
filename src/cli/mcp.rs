@@ -501,7 +501,7 @@ fn command(
             if name == "studio_backup_list" {
                 // Keeps the listing within the output limit however many
                 // backups there are; it reports the total.
-                command.args(["backup", "list", "--limit=200"]);
+                command.args(["backup", "list", "--limit=200", "--max-bytes=160000"]);
             } else {
                 command.args(["lock", &name["studio_lock_".len()..]]);
                 if let Some(lock) = arguments.get("lock").and_then(Value::as_str) {

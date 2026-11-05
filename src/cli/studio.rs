@@ -199,6 +199,9 @@ pub enum BackupCommand {
         /// List at most this many, the newest.
         #[clap(long)]
         limit: Option<usize>,
+        /// With --json, list at most this many bytes of records.
+        #[clap(long)]
+        max_bytes: Option<usize>,
     },
     /// Insert a backup into Studio under a parent instance.
     Restore {
@@ -231,12 +234,24 @@ impl StudioCommand {
         // without a running server.
         if let StudioSubcommand::Backup { command } = &self.command {
             match command {
-                BackupCommand::List { limit } => {
+                BackupCommand::List { limit, max_bytes } => {
                     let store = backup::Store::open()?;
                     let mut backups = store.list()?;
                     let total = backups.len();
                     if let Some(limit) = limit {
                         backups.truncate(*limit);
+                    }
+                    if let Some(max_bytes) = max_bytes {
+                        let mut used = 0;
+                        let fits = backups
+                            .iter()
+                            .take_while(|record| {
+                                used += serde_json::to_string(record)
+                                    .map_or(usize::MAX, |s| s.len() + 1);
+                                used <= *max_bytes
+                            })
+                            .count();
+                        backups.truncate(fits);
                     }
                     if self.json {
                         return print_json(
@@ -362,6 +377,18 @@ impl StudioCommand {
                     );
                     let status = bridge.command("status", json!({}))?;
                     let described = &exported["instance"];
+                    if let Some(name) = name {
+                        anyhow::ensure!(
+                            !name.is_empty() && name.len() <= 64,
+                            super::UsageError(anyhow::anyhow!("--name must be 1 to 64 bytes"))
+                        );
+                    }
+                    if let Some(note) = note {
+                        anyhow::ensure!(
+                            note.len() <= 4096,
+                            super::UsageError(anyhow::anyhow!("--note must be at most 4096 bytes"))
+                        );
+                    }
                     let record = store.save(
                         backup::Record {
                             id: String::new(),
@@ -747,6 +774,12 @@ fn describe_sessions(result: &Value) -> String {
                 "{unapplied} instances in the last change could not be applied"
             ));
         }
+        let failed_writes = sync["failedSourceWrites"].as_u64().unwrap_or(0);
+        if failed_writes > 0 {
+            warnings.push(format!(
+                "{failed_writes} script sources could not be written in Studio"
+            ));
+        }
         let undone = sync["undoneRojoPatches"].as_u64().unwrap_or(0);
         if undone > 0 {
             warnings.push(format!("{undone} Rojo changes were undone in Studio"));
@@ -772,7 +805,7 @@ fn describe_sessions(result: &Value) -> String {
         for warning in &warnings {
             let _ = writeln!(out, "  warning: {warning}");
         }
-        if unapplied > 0 || undone > 0 || held > 0 {
+        if unapplied > 0 || undone > 0 || held > 0 || failed_writes > 0 {
             let _ = writeln!(
                 out,
                 "  run `rojo studio verify --session {}` to compare its scripts with the files",
