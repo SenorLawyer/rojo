@@ -637,36 +637,59 @@ function ServeSession:applyResync(patch, expect, includeHeld, expiresAt, isActiv
 			local seenSource = verified and verified[write.id]
 			local changed, held, late = false, nil, false
 			self.__instanceMap:pauseInstance(write.instance)
-			local wrote = pcall(function()
-				ScriptEditorService:UpdateSourceAsync(write.instance, function(current)
-					-- Returning nil cancels the update. The callback can run
-					-- again when Studio retries, so each check is repeated.
-					if expired() then
-						late = true
-						return nil
-					end
-					if seenSource == nil or current ~= seenSource or hashSource(current) ~= write.from then
-						changed = true
-						return nil
-					end
-					-- Without includeHeld a held script is left alone whatever the
-					-- fix would write: a hold may have started after verify
-					-- built the fix, and only code on disk, deletion or an
-					-- explicit --include-held ends it.
-					if not includeHeld and (self.__heldWipes[write.id] or heldByInstance[write.instance]) then
-						held = self.__heldWipes[write.id] and self.__heldWipes[write.id].lines or 0
-						return nil
-					end
-					if guardWipes and not string.find(write.target, "%S") then
-						local lines = countNonBlankLines(current)
-						if lines >= WIPE_GUARD_MIN_LINES then
-							held = lines
+			-- Shared with ordinary sync writes: whichever write was started
+			-- last for a script is the only one that may still commit.
+			local generation = (self.__sourceGenerations[write.id] or 0) + 1
+			self.__sourceGenerations[write.id] = generation
+			local done, wrote, abandoned = false, false, false
+			task.spawn(function()
+				wrote = pcall(function()
+					ScriptEditorService:UpdateSourceAsync(write.instance, function(current)
+						-- Returning nil cancels the update. The callback can run
+						-- again when Studio retries, so each check is repeated.
+						if abandoned or self.__sourceGenerations[write.id] ~= generation then
+							late = true
 							return nil
 						end
-					end
-					return write.target
+						if expired() then
+							late = true
+							return nil
+						end
+						if seenSource == nil or current ~= seenSource or hashSource(current) ~= write.from then
+							changed = true
+							return nil
+						end
+						-- Without includeHeld a held script is left alone whatever
+						-- the fix would write: a hold may have started after
+						-- verify built the fix, and only code on disk, deletion
+						-- or an explicit --include-held ends it.
+						if not includeHeld and (self.__heldWipes[write.id] or heldByInstance[write.instance]) then
+							held = self.__heldWipes[write.id] and self.__heldWipes[write.id].lines or 0
+							return nil
+						end
+						if guardWipes and not string.find(write.target, "%S") then
+							local lines = countNonBlankLines(current)
+							if lines >= WIPE_GUARD_MIN_LINES then
+								held = lines
+								return nil
+							end
+						end
+						return write.target
+					end)
 				end)
+				done = true
 			end)
+			-- Studio can keep a write waiting. The server stops waiting at the
+			-- deadline, so the write is abandoned then: its callback refuses to
+			-- commit if it runs later, and the undo recording is closed.
+			while not done and not expired() do
+				task.wait(0.05)
+			end
+			if not done then
+				abandoned = true
+				late = true
+				wrote = false
+			end
 			if held then
 				skipped += 1
 				if not self.__heldWipes[write.id] then
@@ -686,6 +709,19 @@ function ServeSession:applyResync(patch, expect, includeHeld, expiresAt, isActiv
 			else
 				-- The write failed, or was cancelled because the command expired.
 				failed += 1
+			end
+		end
+		-- A hold this fix ended may have held back a class change, which is
+		-- applied now, in the same undo step, rather than waiting for the next
+		-- change from disk.
+		local refresh = {}
+		for id in self.__refreshAfterHold do
+			table.insert(refresh, id)
+		end
+		if #refresh > 0 and not expired() then
+			table.clear(self.__refreshAfterHold)
+			if not self:__replaceInstances(refresh) then
+				Log.warn("Could not apply a class change Rojo held back with a script's wipe. Reconnect to sync it.")
 			end
 		end
 	end)

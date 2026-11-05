@@ -989,7 +989,9 @@ function StudioBridge:execute(command)
 			instance ~= game and instance.Parent ~= game,
 			"Services and DataModel cannot be exported as native models"
 		)
-		assert(#instance:GetDescendants() <= 10_000, "Export exceeds 10,000 instances")
+		-- Import counts the root too, so an export must fit the same limit or
+		-- it could never be restored.
+		assert(#instance:GetDescendants() + 1 <= 10_000, "Export exceeds 10,000 instances")
 		local model = SerializationService:SerializeInstancesAsync({ instance })
 		self:ensureActive(command)
 		assert(buffer.len(model) <= MAX_MODEL_BYTES, "Export exceeds 5MiB")

@@ -586,6 +586,20 @@ return function()
 			session:__clearHold("UI")
 		end)
 
+		it("lets a fix cancel an older pending sync write", function()
+			session.__status = ServeSession.Status.Connected
+			local kept = module.Source
+			session.__verifiedRecords = { { id = "VERIFY", sources = { UI = kept } } }
+			local expected = { UI = { from = hashSource(kept), to = hashSource("return 'fixed'") } }
+			-- An ordinary write started earlier, then the fix took over.
+			local generation = (session.__sourceGenerations.UI or 0) + 1
+			session.__sourceGenerations.UI = generation
+			local result = resyncAs(sourceUpdate("UI", "return 'fixed'"), expected, false)
+			expect(result.updated).to.equal(1)
+			expect(session.__sourceGenerations.UI > generation).to.equal(true)
+			expect(module.Source).to.equal("return 'fixed'")
+		end)
+
 		it("lets only the latest source write for a script finish", function()
 			session:__writeSource({ id = "UI", instance = module, target = "return 'first'" })
 			session:__writeSource({ id = "UI", instance = module, target = "return 'second'" })
