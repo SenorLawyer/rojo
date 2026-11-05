@@ -372,6 +372,15 @@ struct LockFile {
     /// Left out when empty, so lockfiles without any stay as they were.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     replaced: BTreeMap<String, ReplacedAsset>,
+    /// Entries of another creator that an upload overwrote at their path
+    /// while their contents live on at another path that has not been
+    /// uploaded for the new creator yet, keyed by old asset id. Their id
+    /// belongs to that other path's upload, so it is kept here until that
+    /// upload records it under `replaced`; otherwise a sync interrupted in
+    /// between would lose the old id for good. Emptied by every sync that
+    /// finishes.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    displaced: BTreeMap<String, LockEntry>,
 }
 
 /// An asset id replaced by an upload for another creator.
@@ -507,7 +516,7 @@ fn rekey_pending(mut lock: LockFile) -> LockFile {
 }
 
 fn render_lock(lock: &LockFile) -> String {
-    let version = if lock.replaced.is_empty() {
+    let version = if lock.replaced.is_empty() && lock.displaced.is_empty() {
         LOCK_VERSION
     } else {
         LOCK_VERSION_REPLACED
@@ -1487,8 +1496,8 @@ fn sync(
         .iter()
         .map(|source| source.hash.as_str())
         .collect();
-    let record = |lock: &mut LockFile, source: &Source, entry: &LockEntry| {
-        record_replacements(lock, &old_lock, &current_hashes, source, entry)
+    let set_entry = |lock: &mut LockFile, source: &Source, entry: LockEntry| {
+        replace_entry(lock, &old_lock, &current_hashes, source, entry)
     };
     // Recording reused ids first keeps them when an upload below replaces the
     // entry they were copied from and the run is then interrupted.
@@ -1496,8 +1505,7 @@ fn sync(
         if let Action::Reuse { entry, .. } = action {
             // A sync for a new creator that was interrupted reuses the new
             // creator's id on its next run, so this is a replacement too.
-            record(&mut lock, source, entry);
-            lock.assets.insert(source.rel.clone(), entry.clone());
+            set_entry(&mut lock, source, entry.clone());
         }
     }
     if lock != old_lock {
@@ -1565,8 +1573,7 @@ fn sync(
             lock.rejected.remove(&source.hash);
             // Recorded in the same write as the entry that overwrites the
             // old id, so an interrupted run never loses the old id.
-            record(&mut lock, source, &entry);
-            lock.assets.insert(source.rel.clone(), entry);
+            set_entry(&mut lock, source, entry);
             write_atomic(&config.lock, render_lock(&lock))?;
         }
     }
@@ -1574,9 +1581,20 @@ fn sync(
     for (source, action) in &plan.items {
         if let Action::SameAs { from } = action {
             let entry = lock.assets[from].clone();
-            record(&mut lock, source, &entry);
-            lock.assets.insert(source.rel.clone(), entry);
+            set_entry(&mut lock, source, entry);
         }
+    }
+    // Every file now has an entry for this creator, so a displaced id whose
+    // contents a file still has is recorded here at the latest, and one whose
+    // contents are gone has no new id to map to.
+    if !lock.displaced.is_empty() {
+        for source in &scan.sources {
+            if lock.displaced.values().any(|old| old.hash == source.hash) {
+                let entry = lock.assets[&source.rel].clone();
+                record_replacements(&mut lock, &old_lock, &current_hashes, source, &entry);
+            }
+        }
+        lock.displaced.clear();
     }
     for rel in &plan.removed {
         lock.assets.remove(rel);
@@ -1615,6 +1633,34 @@ fn sync(
     Ok(report)
 }
 
+/// Sets `entry` as the lockfile entry for `source`, recording the old ids it
+/// replaces. An overwritten entry of another creator whose contents still
+/// exist at another path is not replaced by `entry`, so it moves to
+/// `displaced` until that path's upload records it, in the same lockfile
+/// write as this entry.
+fn replace_entry(
+    lock: &mut LockFile,
+    old_lock: &LockFile,
+    current_hashes: &HashSet<&str>,
+    source: &Source,
+    entry: LockEntry,
+) {
+    record_replacements(lock, old_lock, current_hashes, source, &entry);
+    if let Some(previous) = lock.assets.get(&source.rel) {
+        let recorded = lock.replaced.contains_key(&previous.asset_id.to_string());
+        if previous.creator != entry.creator
+            && previous.asset_id != entry.asset_id
+            && previous.hash != source.hash
+            && current_hashes.contains(previous.hash.as_str())
+            && !recorded
+        {
+            lock.displaced
+                .insert(previous.asset_id.to_string(), previous.clone());
+        }
+    }
+    lock.assets.insert(source.rel.clone(), entry);
+}
+
 /// Records which old ids `entry`, the new lockfile entry for `source`,
 /// replaces because the creator changed: the previous entry at the same path,
 /// and any previous entry with the same contents. Entries of the same creator
@@ -1627,9 +1673,16 @@ fn record_replacements(
     source: &Source,
     entry: &LockEntry,
 ) {
-    let old_ids: BTreeSet<u64> = old_lock
-        .assets
-        .iter()
+    // Displaced entries from an earlier, interrupted run have no path any
+    // more, so they are only found by contents.
+    let candidates = || {
+        old_lock
+            .assets
+            .iter()
+            .map(|(rel, old)| (Some(rel), old))
+            .chain(old_lock.displaced.values().map(|old| (None, old)))
+    };
+    let old_ids: BTreeSet<u64> = candidates()
         .filter(|(rel, old)| {
             old.creator != entry.creator
                 && old.asset_type == entry.asset_type
@@ -1638,12 +1691,15 @@ fn record_replacements(
                     // When the old contents still exist at another path,
                     // their id moves with them rather than to whatever
                     // now sits at this path.
-                    || (**rel == source.rel && !current_hashes.contains(old.hash.as_str())))
+                    || (*rel == Some(&source.rel)
+                        && !current_hashes.contains(old.hash.as_str())))
         })
         .map(|(_, old)| old.asset_id)
         .collect();
     for old_id in old_ids {
         let key = old_id.to_string();
+        // Recorded now, so it no longer needs holding.
+        lock.displaced.remove(&key);
         if lock
             .replaced
             .get(&key)
@@ -1651,11 +1707,9 @@ fn record_replacements(
         {
             continue;
         }
-        let from_creator = old_lock
-            .assets
-            .values()
-            .find(|old| old.asset_id == old_id)
-            .map(|old| old.creator.clone())
+        let from_creator = candidates()
+            .find(|(_, old)| old.asset_id == old_id)
+            .map(|(_, old)| old.creator.clone())
             .unwrap_or_default();
         // Ids that earlier creator changes replaced with `old_id` now resolve
         // straight to the newest id.
@@ -1679,6 +1733,7 @@ fn record_replacements(
         // Switching back to an earlier creator can make an old id current
         // again; it must not be remapped, or it would point at itself.
         lock.replaced.remove(&entry.asset_id.to_string());
+        lock.displaced.remove(&entry.asset_id.to_string());
     }
 }
 
@@ -3508,6 +3563,74 @@ mod tests {
         let (report, _) = fixture.sync(&cloud).unwrap();
         assert_eq!(report.uploaded, ids(&[("B.png", 1005)]));
         assert_eq!(fixture.replaced(), ids(&[("1001", 1003), ("1002", 1005)]));
+    }
+
+    /// A.png's contents move to B.png and A.png gets new contents while the
+    /// creator changes, and the sync stops after uploading A.png: A.png's
+    /// entry is overwritten, but its old id belongs to B.png's upload.
+    fn interrupt_a_move_during_a_creator_change(fixture: &Fixture, cloud: &FakeCloud) {
+        fixture.write("A.png", &png(8, 8, "a"));
+        fixture.sync(cloud).unwrap();
+        fixture.rename("A.png", "B.png");
+        fixture.write("A.png", &png(8, 8, "a2"));
+        fixture.set_creator("group_id = 7");
+
+        let error = format!("{:#}", fixture.sync(cloud).unwrap_err());
+
+        assert!(error.contains("Could not upload B.png"), "{error}");
+        let lock = fixture.lock();
+        assert_eq!(lock.assets["A.png"].asset_id, 1002);
+        assert!(lock.replaced.is_empty());
+        let displaced: Vec<(&str, u64)> = lock
+            .displaced
+            .iter()
+            .map(|(old, entry)| (old.as_str(), entry.asset_id))
+            .collect();
+        assert_eq!(displaced, [("1001", 1001)]);
+        // Rojo 8.0.0 would drop the held id, so it must refuse the file.
+        assert!(fixture
+            .read_project("assets.lock.json")
+            .starts_with("{\n  \"version\": 2,"));
+    }
+
+    #[test]
+    fn an_interrupted_creator_change_keeps_ids_whose_contents_moved() {
+        let fixture = Fixture::new();
+        let cloud = FakeCloud::start(Some(3));
+        interrupt_a_move_during_a_creator_change(&fixture, &cloud);
+
+        let (report, out) = fixture.sync(&cloud).unwrap();
+
+        assert_eq!(report.uploaded, ids(&[("B.png", 1004)]));
+        assert_eq!(fixture.replaced(), ids(&[("1001", 1004)]));
+        let lock = fixture.lock();
+        assert!(lock.displaced.is_empty());
+        assert_eq!(lock.replaced["1001"].path, "B.png");
+        assert_eq!(lock.replaced["1001"].from_creator, "user:42");
+        assert!(
+            out.contains("1 asset id(s) of the previous creator were replaced"),
+            "{out}"
+        );
+        assert!(!fixture
+            .read_project("assets.lock.json")
+            .contains("displaced"));
+    }
+
+    #[test]
+    fn a_held_id_whose_contents_are_gone_is_dropped_by_the_next_sync() {
+        let fixture = Fixture::new();
+        let cloud = FakeCloud::start(Some(3));
+        interrupt_a_move_during_a_creator_change(&fixture, &cloud);
+        fs::remove_file(fixture.dir.path().join("assets/B.png")).unwrap();
+
+        fixture.sync(&cloud).unwrap();
+
+        let lock = fixture.lock();
+        assert!(lock.displaced.is_empty());
+        assert!(lock.replaced.is_empty());
+        assert!(fixture
+            .read_project("assets.lock.json")
+            .starts_with("{\n  \"version\": 1,"));
     }
 
     #[test]
