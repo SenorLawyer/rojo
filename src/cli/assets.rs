@@ -380,7 +380,45 @@ struct LockFile {
     /// between would lose the old id for good. Emptied by every sync that
     /// finishes.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    displaced: BTreeMap<String, LockEntry>,
+    displaced: BTreeMap<String, HeldEntry>,
+}
+
+/// An entry under `displaced`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct HeldEntry {
+    #[serde(flatten)]
+    entry: LockEntry,
+    /// The contents of an unfinished upload that claimed this entry as the
+    /// one it replaces, when that upload was dropped before finishing: Roblox
+    /// failed or rejected it, or its file changed again. A later upload of
+    /// those contents then records the old id, as that upload would have.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    successor_hash: Option<String>,
+}
+
+impl HeldEntry {
+    fn new(entry: LockEntry) -> HeldEntry {
+        HeldEntry {
+            entry,
+            successor_hash: None,
+        }
+    }
+}
+
+/// Moves the entry a dropped pending upload claimed as the one it replaces
+/// into `displaced`, so that its old id is not lost and a later upload of the
+/// same contents still records it. Called in the same lockfile write that
+/// drops the pending upload.
+fn release_claim(lock: &mut LockFile, pending: PendingUpload) {
+    if let Some(replaces) = pending.replaces {
+        lock.displaced
+            .entry(replaces.asset_id.to_string())
+            .or_insert(HeldEntry {
+                entry: replaces,
+                successor_hash: Some(pending.hash),
+            });
+    }
 }
 
 /// An asset id replaced by an upload for another creator.
@@ -1092,7 +1130,7 @@ fn plan(sources: &[Source], lock: &LockFile, config: &Config, retry_rejected: bo
     // interrupted belongs to this creator again if the config switched back,
     // so those contents get it back instead of a new upload. It has no path,
     // which `from` marks with an empty string.
-    for entry in lock.displaced.values() {
+    for entry in lock.displaced.values().map(|held| &held.entry) {
         if entry.creator == creator {
             by_hash.entry(&entry.hash).or_insert(("", entry));
         }
@@ -1637,7 +1675,10 @@ fn sync(
     // contents are gone has no new id to map to.
     if !lock.displaced.is_empty() {
         for source in &scan.sources {
-            if lock.displaced.values().any(|old| old.hash == source.hash) {
+            if lock.displaced.values().any(|held| {
+                held.entry.hash == source.hash
+                    || held.successor_hash.as_deref() == Some(source.hash.as_str())
+            }) {
                 let entry = lock.assets[&source.rel].clone();
                 record_replacements(&mut lock, &old_lock, &current_hashes, source, &entry, None);
             }
@@ -1647,8 +1688,13 @@ fn sync(
     for rel in &plan.removed {
         lock.assets.remove(rel);
     }
+    // After the clearing above, so that a claim released here is kept for a
+    // later sync, which may upload the claimed contents again; the next sync
+    // that finishes drops it if none does.
     for key in &plan.stale_pending {
-        lock.pending.remove(key);
+        if let Some(pending) = lock.pending.remove(key) {
+            release_claim(&mut lock, pending);
+        }
     }
     // An id in use by this creator is current, whatever an earlier creator
     // change recorded for it: switching back after an interrupted move can
@@ -1720,8 +1766,10 @@ fn replace_entry(
             && current_hashes.contains(previous.hash.as_str())
             && !recorded
         {
-            lock.displaced
-                .insert(previous.asset_id.to_string(), previous.clone());
+            lock.displaced.insert(
+                previous.asset_id.to_string(),
+                HeldEntry::new(previous.clone()),
+            );
         }
     }
     lock.assets.insert(source.rel.clone(), entry);
@@ -1757,12 +1805,17 @@ fn record_replacements(
     // more, so they are only found by contents. The predecessor matches as if
     // it were at this path.
     let source_rel = &source.rel;
+    // A held entry released by a dropped upload also matches an upload of
+    // that upload's contents, as if it were at this path.
     let candidates = || {
         old_lock
             .assets
             .iter()
             .map(|(rel, old)| (Some(rel), old))
-            .chain(old_lock.displaced.values().map(|old| (None, old)))
+            .chain(old_lock.displaced.values().map(|held| {
+                let successor = held.successor_hash.as_deref() == Some(source.hash.as_str());
+                (successor.then_some(source_rel), &held.entry)
+            }))
             .chain(predecessor.map(|old| (Some(source_rel), old)))
     };
     let old_ids: BTreeSet<u64> = candidates()
@@ -1889,15 +1942,15 @@ fn upload(
             (key, operation, client.finish_asset_upload(started))
         }
     };
-    let uploaded = match result {
-        Ok(uploaded) => {
-            lock.pending.remove(&key);
-            uploaded
-        }
+    let (uploaded, finished) = match result {
+        Ok(uploaded) => (uploaded, lock.pending.remove(&key)),
         // Roblox finished the operation and created nothing, so the next
-        // run should send the file again.
+        // run should send the file again. What it was replacing is held
+        // for that upload.
         Err(error @ OpenCloudError::Failed(_)) => {
-            lock.pending.remove(&key);
+            if let Some(pending) = lock.pending.remove(&key) {
+                release_claim(lock, pending);
+            }
             write_atomic(&config.lock, render_lock(lock))?;
             bail!("Could not upload {}: {error}.", source.rel);
         }
@@ -1923,6 +1976,12 @@ fn upload(
                 rejected: humantime::format_rfc3339_seconds(SystemTime::now()).to_string(),
             },
         );
+        // The rejected id is never used, so what this upload was replacing
+        // is held: a retry of these contents with --retry-rejected still
+        // records it, and otherwise the next finishing sync drops it.
+        if let Some(pending) = finished {
+            release_claim(lock, pending);
+        }
         write_atomic(&config.lock, render_lock(lock))?;
         bail!(
             "Roblox rejected {} in moderation (asset {}). The rejection is recorded in {}, so \
@@ -2685,6 +2744,8 @@ mod tests {
         requests: Arc<Mutex<Vec<String>>>,
         defer: Arc<AtomicBool>,
         refuse_polls: Arc<AtomicBool>,
+        /// Polls report the operation as finished and failed.
+        fail_polls: Arc<AtomicBool>,
     }
 
     impl FakeCloud {
@@ -2695,6 +2756,8 @@ mod tests {
             let requests = Arc::new(Mutex::new(Vec::new()));
             let defer = Arc::new(AtomicBool::new(false));
             let refuse_polls = Arc::new(AtomicBool::new(false));
+            let fail_polls = Arc::new(AtomicBool::new(false));
+            let failing = Arc::clone(&fail_polls);
             let log = Arc::clone(&uploads);
             let request_log = Arc::clone(&requests);
             let deferring = Arc::clone(&defer);
@@ -2714,7 +2777,14 @@ mod tests {
                     request_log.lock().unwrap().push(request_line.clone());
                     if let Some(number) = request_line.strip_prefix("GET /assets/v1/operations/op")
                     {
-                        let (status, reply) = if refusing.load(Ordering::SeqCst) {
+                        let (status, reply) = if failing.load(Ordering::SeqCst) {
+                            (
+                                "200 OK",
+                                format!(
+                                    r#"{{"path":"operations/op{number}","done":true,"error":{{"code":"INVALID_ARGUMENT","message":"bad file"}}}}"#
+                                ),
+                            )
+                        } else if refusing.load(Ordering::SeqCst) {
                             (
                                 "403 Forbidden",
                                 r#"{"message":"missing scope asset:read"}"#.to_owned(),
@@ -2796,6 +2866,7 @@ mod tests {
                 requests,
                 defer,
                 refuse_polls,
+                fail_polls,
             }
         }
 
@@ -3897,7 +3968,7 @@ mod tests {
         let displaced: Vec<(&str, u64)> = lock
             .displaced
             .iter()
-            .map(|(old, entry)| (old.as_str(), entry.asset_id))
+            .map(|(old, held)| (old.as_str(), held.entry.asset_id))
             .collect();
         assert_eq!(displaced, [("1001", 1001)]);
         // Rojo 8.0.0 would drop the held id, so it must refuse the file.
@@ -4058,6 +4129,107 @@ mod tests {
         assert_eq!(fixture.replaced(), uninterrupted.replaced());
         assert!(fixture.lock().pending.is_empty());
         assert_eq!(cloud.uploads(), ["test-A", "test-A", "test-A"]);
+    }
+
+    /// Under the user, A.png = X is 1001. Under the group, A.png's new
+    /// contents Y are accepted as operations/op2 claiming 1001, but following
+    /// the upload fails.
+    fn leave_a_claiming_upload_pending(fixture: &Fixture, cloud: &FakeCloud) {
+        fixture.write("A.png", &png(8, 8, "x"));
+        fixture.sync(cloud).unwrap();
+        fixture.set_creator("group_id = 7");
+        fixture.write("A.png", &png(8, 8, "y"));
+        cloud.defer.store(true, Ordering::SeqCst);
+        cloud.refuse_polls.store(true, Ordering::SeqCst);
+        fixture.sync(cloud).unwrap_err();
+        cloud.defer.store(false, Ordering::SeqCst);
+        cloud.refuse_polls.store(false, Ordering::SeqCst);
+        let lock = fixture.lock();
+        let pending = lock.pending.values().next().unwrap();
+        assert_eq!(pending.replaces.as_ref().unwrap().asset_id, 1001);
+    }
+
+    fn held(fixture: &Fixture) -> Vec<(String, Option<String>)> {
+        fixture
+            .lock()
+            .displaced
+            .into_iter()
+            .map(|(old, held)| (old, held.successor_hash))
+            .collect()
+    }
+
+    #[test]
+    fn a_failed_resumed_upload_keeps_the_id_it_claimed() {
+        let fixture = Fixture::new();
+        let cloud = FakeCloud::start(None);
+        leave_a_claiming_upload_pending(&fixture, &cloud);
+        fixture.rename("A.png", "B.png");
+
+        // Roblox reports the operation as failed, so it created nothing.
+        cloud.fail_polls.store(true, Ordering::SeqCst);
+        let error = format!("{:#}", fixture.sync(&cloud).unwrap_err());
+        assert!(error.contains("Could not upload B.png"), "{error}");
+        let y = blake3::hash(&png(8, 8, "y")).to_hex().to_string();
+        assert!(fixture.lock().pending.is_empty());
+        assert_eq!(held(&fixture), [("1001".to_owned(), Some(y.clone()))]);
+        let text = fixture.read_project("assets.lock.json");
+        assert!(text.starts_with("{\n  \"version\": 2,"), "{text}");
+        assert!(
+            text.contains(&format!("\"successorHash\": \"{y}\"")),
+            "{text}"
+        );
+
+        // The next upload of those contents takes the claim over.
+        cloud.fail_polls.store(false, Ordering::SeqCst);
+        let (report, _) = fixture.sync(&cloud).unwrap();
+        assert_eq!(report.uploaded, ids(&[("B.png", 1003)]));
+        assert_eq!(fixture.replaced(), ids(&[("1001", 1003)]));
+        assert!(fixture.lock().displaced.is_empty());
+    }
+
+    #[test]
+    fn a_stale_pending_upload_keeps_the_id_it_claimed_for_a_later_sync() {
+        let y = blake3::hash(&png(8, 8, "y")).to_hex().to_string();
+        let fixture = Fixture::new();
+        let cloud = FakeCloud::start(None);
+        leave_a_claiming_upload_pending(&fixture, &cloud);
+
+        // The file changes again, so the upload of Y is no longer needed.
+        // W does not take 1001 while Y's upload claims it.
+        fixture.write("A.png", &png(8, 8, "w"));
+        let (report, out) = fixture.sync(&cloud).unwrap();
+        assert!(
+            out.contains("stale     unfinished upload of A.png"),
+            "{out}"
+        );
+        assert_eq!(report.uploaded, ids(&[("A.png", 1003)]));
+        assert!(fixture.lock().pending.is_empty());
+        assert!(fixture.lock().replaced.is_empty());
+        assert_eq!(held(&fixture), [("1001".to_owned(), Some(y.clone()))]);
+        assert!(fixture
+            .read_project("assets.lock.json")
+            .starts_with("{\n  \"version\": 2,"));
+
+        // Y appearing again takes the claim over.
+        fixture.write("C.png", &png(8, 8, "y"));
+        let (report, _) = fixture.sync(&cloud).unwrap();
+        assert_eq!(report.uploaded, ids(&[("C.png", 1004)]));
+        assert_eq!(fixture.replaced(), ids(&[("1001", 1004)]));
+        assert!(fixture.lock().displaced.is_empty());
+
+        // Without it, the next sync that finishes drops the claim.
+        let fixture = Fixture::new();
+        let cloud = FakeCloud::start(None);
+        leave_a_claiming_upload_pending(&fixture, &cloud);
+        fixture.write("A.png", &png(8, 8, "w"));
+        fixture.sync(&cloud).unwrap();
+        assert_eq!(held(&fixture).len(), 1);
+        fixture.sync(&cloud).unwrap();
+        assert!(fixture.lock().displaced.is_empty());
+        assert!(fixture.lock().replaced.is_empty());
+        assert!(fixture
+            .read_project("assets.lock.json")
+            .starts_with("{\n  \"version\": 1,"));
     }
 
     #[test]
