@@ -566,6 +566,80 @@ return function()
 			again:stop()
 		end)
 
+		it("keeps a recovered script's code when it is rebuilt with a new class on reconnect", function()
+			local kept = module.Source
+			module:SetAttribute("Tag", "kept")
+			session:__holdScriptWipes(sourceUpdate("UI", ""))
+			session:stop()
+			local again = ServeSession.new({ apiContext = api, twoWaySync = false })
+			again.__status = ServeSession.Status.Connected
+			again.__instanceMap:insert("FOLDER", container)
+			local instances = {
+				FOLDER = {
+					Id = "FOLDER",
+					Name = container.Name,
+					ClassName = "Folder",
+					Properties = {},
+					Children = { "NEW-ID" },
+				},
+				["NEW-ID"] = {
+					Id = "NEW-ID",
+					Name = "UIController",
+					ClassName = "Script",
+					Properties = {
+						Source = { String = kept },
+						Attributes = { Attributes = { Tag = { String = "kept" } } },
+					},
+					Children = {},
+				},
+			}
+			-- The same steps as reconnecting with the guard on.
+			local rematched = again:__rematchHolds(instances)
+			again:__adoptHolds()
+			again:__releaseRecoveredHolds(instances)
+			expect(again.__heldWipes["NEW-ID"]).to.equal(nil)
+			local ok, patch = again.__reconciler:diff(instances, "FOLDER", container)
+			expect(ok).to.equal(true)
+			expect(patch.updated[1].changedProperties.Source).to.equal(nil)
+			again:__completeRematchedClassChanges(patch, instances, rematched)
+			expect(patch.updated[1].changedProperties.Source.String).to.equal(kept)
+			again:__applyPatch(patch)
+			task.wait(0.3)
+			local now = again.__instanceMap.fromIds["NEW-ID"]
+			expect(now.ClassName).to.equal("Script")
+			expect(now.Source).to.equal(kept)
+			expect(now:GetAttribute("Tag")).to.equal("kept")
+			again:stop()
+		end)
+
+		it("ends holds from an earlier session when it reconnects with the guard off", function()
+			session:__holdScriptWipes(sourceUpdate("UI", ""))
+			session:stop()
+			local again = ServeSession.new({ apiContext = api, twoWaySync = false })
+			local rematches = 0
+			again.__rematchHolds = function()
+				rematches += 1
+				return {}
+			end
+			again.__reconciler = {
+				hydrate = function() end,
+				diff = function()
+					return true, PatchSet.newEmpty()
+				end,
+			}
+			again.__applyPatch = function() end
+			Settings:set("guardScriptWipes", false)
+			local pending = again:__initialSync({ rootInstanceId = "ROOT" })
+			readResolve({ messageCursor = 0, instances = {} })
+			pending:await()
+			Settings:set("guardScriptWipes", true)
+			expect(rematches).to.equal(0)
+			again.__instanceMap:insert("UI", module)
+			again:__adoptHolds()
+			expect(again.__heldWipes.UI).to.equal(nil)
+			again:stop()
+		end)
+
 		it("refuses to write a script whose source changed even when its hash matches", function()
 			session.__status = ServeSession.Status.Connected
 			local kept = module.Source

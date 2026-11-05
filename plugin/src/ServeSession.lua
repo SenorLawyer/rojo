@@ -427,6 +427,7 @@ function ServeSession:__rematchHolds(serverInstances)
 	-- an update, which keeps the children. Passes repeat until nothing more is
 	-- paired, since one held script can sit inside another; each pairing
 	-- also hydrates what is under it.
+	local rematched = {}
 	local progress = true
 	while progress do
 		progress = false
@@ -454,8 +455,27 @@ function ServeSession:__rematchHolds(serverInstances)
 				end
 				self.__instanceMap:insert(childId, link)
 				self.__reconciler:hydrate(serverInstances, childId, link)
+				rematched[childId] = true
 				serverId = childId
 				progress = true
+			end
+		end
+	end
+	return rematched
+end
+
+-- An instance paired by name above can differ in class from the server's.
+-- The reconciler rebuilds it from only the properties in the update, which
+-- leaves out any that already matched, such as code a recovered file shares
+-- with Studio. So those updates get every property the server has.
+function ServeSession:__completeRematchedClassChanges(patch, serverInstances, rematched)
+	for _, update in patch.updated do
+		local server = serverInstances[update.id]
+		if update.changedClassName and rematched[update.id] and server and server.Properties then
+			for name, value in server.Properties do
+				if update.changedProperties[name] == nil then
+					update.changedProperties[name] = value
+				end
 			end
 		end
 	end
@@ -1722,9 +1742,16 @@ function ServeSession:__initialSync(serverInfo)
 		self:setLoadingText("Hydrating instance map...")
 		self.__reconciler:hydrate(readResponseBody.instances, serverInfo.rootInstanceId, game)
 		-- Before the catch-up patch, which the wipe guard checks against them.
-		self:__rematchHolds(readResponseBody.instances)
-		self:__adoptHolds()
-		self:__releaseRecoveredHolds(readResponseBody.instances)
+		-- Holds kept from an earlier session end if the guard was turned off
+		-- meanwhile, and their scripts then sync like any other.
+		local rematched = {}
+		if Settings:get("guardScriptWipes") then
+			rematched = self:__rematchHolds(readResponseBody.instances)
+			self:__adoptHolds()
+			self:__releaseRecoveredHolds(readResponseBody.instances)
+		else
+			table.clear(heldByInstance)
+		end
 
 		-- Calculate the initial patch to apply to the DataModel to catch us
 		-- up to what Rojo thinks the place should look like.
@@ -1735,6 +1762,8 @@ function ServeSession:__initialSync(serverInfo)
 
 		if not success then
 			Log.error("Could not compute a diff to catch up to the Rojo server: {:#?}", catchUpPatch)
+		else
+			self:__completeRematchedClassChanges(catchUpPatch, readResponseBody.instances, rematched)
 		end
 
 		-- A held script that could not be paired again, for example because
