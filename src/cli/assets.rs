@@ -1615,6 +1615,7 @@ fn sync(
                 source,
                 resume.as_ref(),
                 &creator,
+                &current_hashes,
                 &mut lock,
             )
             .map_err(|error| {
@@ -1652,7 +1653,11 @@ fn sync(
                         old_lock
                             .assets
                             .get(&pending.path)
-                            .filter(|_| !pending.path.is_empty())
+                            .filter(|previous| {
+                                !pending.path.is_empty()
+                                    && may_claim(previous, source, &current_hashes)
+                                    && !is_claimed(&lock, previous.asset_id)
+                            })
                             .cloned()
                     })
                 });
@@ -1792,6 +1797,24 @@ fn replace_entry(
         }
     }
     lock.assets.insert(source.rel.clone(), entry);
+}
+
+/// Whether an upload of `source` may claim `previous`, the entry at its path,
+/// as the one it replaces. Not when `previous`'s contents still exist at
+/// another scanned path: its id follows those contents, as it would if the
+/// sync were not interrupted, since a claim is authoritative once made.
+fn may_claim(previous: &LockEntry, source: &Source, current_hashes: &HashSet<&str>) -> bool {
+    previous.hash == source.hash || !current_hashes.contains(previous.hash.as_str())
+}
+
+/// Whether an unfinished upload claims the entry with `asset_id`.
+fn is_claimed(lock: &LockFile, asset_id: u64) -> bool {
+    lock.pending.values().any(|pending| {
+        pending
+            .replaces
+            .as_ref()
+            .is_some_and(|replaces| replaces.asset_id == asset_id)
+    })
 }
 
 /// Records which old ids `entry`, the new lockfile entry for `source`,
@@ -1940,6 +1963,7 @@ fn upload(
     source: &Source,
     resume: Option<&Resume>,
     creator: &str,
+    current_hashes: &HashSet<&str>,
     lock: &mut LockFile,
 ) -> anyhow::Result<LockEntry> {
     let (key, operation, result) = match resume {
@@ -1956,18 +1980,14 @@ fn upload(
             // sending them again, so this never replaces another operation.
             debug_assert!(!lock.pending.contains_key(&key));
             // What this upload replaces, unless another unfinished upload
-            // already claims it.
+            // already claims it or its id belongs to its contents elsewhere.
             let replaces = lock
                 .assets
                 .get(&source.rel)
                 .filter(|previous| {
                     previous.creator != creator
-                        && !lock.pending.values().any(|pending| {
-                            pending
-                                .replaces
-                                .as_ref()
-                                .is_some_and(|replaces| replaces.asset_id == previous.asset_id)
-                        })
+                        && may_claim(previous, source, current_hashes)
+                        && !is_claimed(lock, previous.asset_id)
                 })
                 .cloned();
             lock.pending.insert(
@@ -4283,6 +4303,85 @@ mod tests {
         assert_eq!(fixture.replaced(), ids(&[("1001", 1002)]));
         assert!(fixture.lock().displaced.is_empty());
         assert!(fixture.lock().pending.is_empty());
+    }
+
+    /// X at A.png is 1001 under the user; before the move to the group starts,
+    /// X moves to B.png and Y takes A.png. With `interrupt`, following A.png's
+    /// upload fails once and the next sync resumes it.
+    fn move_contents_before_changing_creator(interrupt: bool) -> (Ids, Ids, Option<u64>) {
+        let fixture = Fixture::new();
+        let cloud = FakeCloud::start(None);
+        fixture.write("A.png", &png(8, 8, "x"));
+        fixture.sync(&cloud).unwrap();
+        fixture.rename("A.png", "B.png");
+        fixture.write("A.png", &png(8, 8, "y"));
+        fixture.set_creator("group_id = 7");
+        let mut claim = None;
+        if interrupt {
+            cloud.defer.store(true, Ordering::SeqCst);
+            cloud.refuse_polls.store(true, Ordering::SeqCst);
+            let error = format!("{:#}", fixture.sync(&cloud).unwrap_err());
+            assert!(
+                error.contains("Could not finish uploading A.png"),
+                "{error}"
+            );
+            let lock = fixture.lock();
+            let pending = lock.pending.values().next().unwrap();
+            claim = pending.replaces.as_ref().map(|replaces| replaces.asset_id);
+            cloud.defer.store(false, Ordering::SeqCst);
+            cloud.refuse_polls.store(false, Ordering::SeqCst);
+        }
+        fixture.sync(&cloud).unwrap();
+        assert!(fixture.lock().pending.is_empty());
+        assert!(fixture.lock().displaced.is_empty());
+        (fixture.ids(), fixture.replaced(), claim)
+    }
+
+    #[test]
+    fn a_pending_upload_does_not_claim_an_id_whose_contents_moved() {
+        let (ids_uninterrupted, replaced_uninterrupted, _) =
+            move_contents_before_changing_creator(false);
+        let (ids_interrupted, replaced_interrupted, claim) =
+            move_contents_before_changing_creator(true);
+
+        // X still exists at B.png, so A.png's upload of Y claims nothing.
+        assert_eq!(claim, None);
+        assert_eq!(ids_uninterrupted, ids(&[("A.png", 1002), ("B.png", 1003)]));
+        assert_eq!(ids_interrupted, ids_uninterrupted);
+        // 1001 follows X to B.png either way.
+        assert_eq!(replaced_uninterrupted, ids(&[("1001", 1003)]));
+        assert_eq!(replaced_interrupted, replaced_uninterrupted);
+    }
+
+    #[test]
+    fn a_pending_upload_from_an_older_build_follows_moved_contents_too() {
+        let fixture = Fixture::new();
+        let cloud = FakeCloud::start(None);
+        fixture.write("A.png", &png(8, 8, "x"));
+        fixture.sync(&cloud).unwrap();
+        fixture.rename("A.png", "B.png");
+        fixture.write("A.png", &png(8, 8, "y"));
+        fixture.set_creator("group_id = 7");
+        cloud.defer.store(true, Ordering::SeqCst);
+        cloud.refuse_polls.store(true, Ordering::SeqCst);
+        fixture.sync(&cloud).unwrap_err();
+        // As an older build wrote it: no `replaces`, so the entry at the
+        // path it was sent from is the fallback.
+        let mut lock = fixture.lock();
+        for pending in lock.pending.values_mut() {
+            pending.replaces = None;
+        }
+        fs::write(
+            fixture.dir.path().join("assets.lock.json"),
+            render_lock(&lock),
+        )
+        .unwrap();
+        cloud.defer.store(false, Ordering::SeqCst);
+        cloud.refuse_polls.store(false, Ordering::SeqCst);
+
+        fixture.sync(&cloud).unwrap();
+
+        assert_eq!(fixture.replaced(), ids(&[("1001", 1003)]));
     }
 
     #[test]
