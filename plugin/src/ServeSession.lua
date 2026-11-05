@@ -2,6 +2,7 @@ local StudioService = game:GetService("StudioService")
 local RunService = game:GetService("RunService")
 local ChangeHistoryService = game:GetService("ChangeHistoryService")
 local SerializationService = game:GetService("SerializationService")
+local ScriptEditorService = game:GetService("ScriptEditorService")
 local Selection = game:GetService("Selection")
 
 local Packages = script.Parent.Parent.Packages
@@ -70,6 +71,27 @@ local function countNonBlankLines(source: string): number
 		end
 	end
 	return count
+end
+
+-- How long a resync waits to see its sources written.
+local RESYNC_CONFIRM_SECONDS = 3
+
+-- Reads a script's source the way the reconciler does: from its editor when
+-- it is open in Studio, since that can differ from `Source` until saved.
+local function readSource(instance): string?
+	local ok, source = pcall(function()
+		return ScriptEditorService:GetEditorSource(instance)
+	end)
+	if ok and type(source) == "string" then
+		return source
+	end
+	ok, source = pcall(function()
+		return (instance :: any).Source
+	end)
+	if ok and type(source) == "string" then
+		return source
+	end
+	return nil
 end
 
 local function nowMillis()
@@ -270,8 +292,8 @@ function ServeSession:restartStudioBridge()
 		getSourceHashes = function()
 			return self:getSourceHashes()
 		end,
-		applyResync = function(patch)
-			return self:applyResync(patch)
+		applyResync = function(patch, expect, includeHeld)
+			return self:applyResync(patch, expect, includeHeld)
 		end,
 	})
 	self.__studioBridge = bridge
@@ -355,10 +377,8 @@ function ServeSession:getSourceHashes()
 			table.insert(detached, id)
 			continue
 		end
-		local ok, source = pcall(function()
-			return (instance :: any).Source
-		end)
-		if ok and type(source) == "string" then
+		local source = readSource(instance)
+		if source then
 			local hash, length = hashSource(source)
 			table.insert(scripts, { id = id, hash = hash, length = length })
 		end
@@ -376,10 +396,16 @@ end
 
 --[=[
 	Applies the script updates that `rojo studio verify --fix` built from the
-	server's tree. They skip the wipe guard, since the agent asked for exactly
-	these files' contents.
+	server's tree. `expect` maps each ID to the hash Studio had when verify
+	checked it (`from`) and the hash of the source being sent (`to`). An
+	update whose script changed since the check is skipped, so a fix never
+	undoes a newer sync. Without `includeHeld` the wipe guard still applies,
+	which covers a file that became empty after the check.
+
+	Studio may write a script's source asynchronously, so each script counts as
+	updated, and its hold ends, only once its source is seen to have changed.
 ]=]
-function ServeSession:applyResync(patch)
+function ServeSession:applyResync(patch, expect, includeHeld)
 	assert(self.__status == Status.Connected, "Rojo is not syncing this place. Connect it first.")
 	assert(
 		type(patch) == "table"
@@ -388,14 +414,50 @@ function ServeSession:applyResync(patch)
 			and (patch.added == nil or next(patch.added) == nil),
 		"A resync may only update existing instances"
 	)
-	local resync = {
-		removed = {},
-		added = {},
-		updated = patch.updated,
-	}
-	local unapplied = self:__applyPatch(resync, { force = true, waypoint = RESYNC_WAYPOINT_PREFIX })
-	local failed = PatchSet.countInstances(unapplied)
-	return { updated = #patch.updated - failed, failed = failed }
+	assert(type(expect) == "table", "A resync needs the expected script hashes")
+	local updated = {}
+	local skipped = 0
+	for _, update in patch.updated do
+		local expected = expect[update.id]
+		local instance = self.__instanceMap.fromIds[update.id]
+		local source = instance and readSource(instance)
+		if type(expected) ~= "table" or source == nil or hashSource(source) ~= expected.from then
+			skipped += 1
+			continue
+		end
+		table.insert(updated, update)
+	end
+	local resync = { removed = {}, added = {}, updated = updated }
+	-- Kept before applying, since the wipe guard takes held updates out.
+	local targets = {}
+	for _, update in updated do
+		targets[update.id] = expect[update.id].to
+	end
+	self:__applyPatch(resync, { force = includeHeld == true, waypoint = RESYNC_WAYPOINT_PREFIX })
+
+	local pending = table.clone(targets)
+	local confirmed = 0
+	local deadline = os.clock() + RESYNC_CONFIRM_SECONDS
+	repeat
+		for id, target in pending do
+			local instance = self.__instanceMap.fromIds[id]
+			local source = instance and readSource(instance)
+			if source and hashSource(source) == target then
+				pending[id] = nil
+				confirmed += 1
+				self.__heldWipes[id] = nil
+			end
+		end
+		if next(pending) == nil then
+			break
+		end
+		task.wait(0.05)
+	until os.clock() > deadline
+	local failed = 0
+	for _ in pending do
+		failed += 1
+	end
+	return { updated = confirmed, failed = failed, skipped = skipped }
 end
 
 --[=[
@@ -431,10 +493,8 @@ function ServeSession:__holdScriptWipes(patch)
 		local instance = self.__instanceMap.fromIds[update.id]
 		local lines = 0
 		if instance and instance:IsA("LuaSourceContainer") then
-			local ok, source = pcall(function()
-				return (instance :: any).Source
-			end)
-			if ok and type(source) == "string" then
+			local source = readSource(instance)
+			if source then
 				lines = countNonBlankLines(source)
 			end
 		end
@@ -856,9 +916,11 @@ function ServeSession:__applyPatch(patch, options)
 	if not success then
 		error(result, 0)
 	end
-	if options.force then
-		for _, update in patch.updated do
-			self.__heldWipes[update.id] = nil
+	-- A removal names only the root of the removed subtree, so holds of
+	-- scripts inside it are found by what the instance map still tracks.
+	for id in self.__heldWipes do
+		if self.__instanceMap.fromIds[id] == nil then
+			self.__heldWipes[id] = nil
 		end
 	end
 	local stats = self.__syncStats
@@ -881,6 +943,19 @@ function ServeSession:__applyPatchInRecording(patch)
 	Timer.stop()
 
 	local unappliedPatch = self.__reconciler:applyPatch(patch)
+
+	-- The fallback replaces an instance with the server's whole copy, which
+	-- for a held script has the empty source the guard held back. Those
+	-- updates stay unapplied instead.
+	local heldUpdates = {}
+	local index = 1
+	while index <= #unappliedPatch.updated do
+		if self.__heldWipes[unappliedPatch.updated[index].id] then
+			table.insert(heldUpdates, table.remove(unappliedPatch.updated, index))
+		else
+			index += 1
+		end
+	end
 
 	if Settings:get("enableSyncFallback") and not PatchSet.isEmpty(unappliedPatch) then
 		-- Some changes did not apply, let's try replacing them instead
@@ -906,6 +981,9 @@ function ServeSession:__applyPatchInRecording(patch)
 			table.clear(unappliedPatch.updated)
 			PatchSet.assign(unappliedPatch, unappliedUpdateRefs)
 		end
+	end
+	for _, update in heldUpdates do
+		table.insert(unappliedPatch.updated, update)
 	end
 
 	if not PatchSet.isEmpty(unappliedPatch) then

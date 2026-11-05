@@ -547,6 +547,7 @@ fn verify_passed(report: &Value) -> bool {
         && count("detachedCount") == 0
         && fixed["failed"].as_u64() == Some(0)
         && fixed["skippedHeld"].as_u64() == Some(0)
+        && fixed["skippedChanged"].as_u64().unwrap_or(0) == 0
         && fixed["updated"].as_u64() == Some(count("differentCount"))
 }
 
@@ -602,6 +603,20 @@ fn describe_verify(report: &Value) -> String {
             fixed["updated"].as_u64().unwrap_or(0),
             fixed["attempted"].as_u64().unwrap_or(0)
         );
+        if fixed["skippedChanged"].as_u64().unwrap_or(0) > 0 {
+            let _ = writeln!(
+                out,
+                "Skipped {} scripts that changed in Studio after the check; run verify again.",
+                fixed["skippedChanged"]
+            );
+        }
+        if fixed["failed"].as_u64().unwrap_or(0) > 0 {
+            let _ = writeln!(
+                out,
+                "{} scripts did not change in Studio; run verify again, or reconnect.",
+                fixed["failed"]
+            );
+        }
         if fixed["skippedHeld"].as_u64().unwrap_or(0) > 0 {
             let _ = writeln!(
                 out,

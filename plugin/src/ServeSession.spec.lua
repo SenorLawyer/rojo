@@ -413,6 +413,7 @@ return function()
 
 	describe("script wipe guard", function()
 		local Settings = require(script.Parent.Settings)
+		local hashSource = require(script.Parent.hashSource)
 		local container
 		local module
 
@@ -485,20 +486,85 @@ return function()
 			expect(#patch.updated).to.equal(1)
 		end)
 
-		it("applies a held wipe when resynced on purpose", function()
+		local function expectFrom(source, target)
+			return { UI = { from = hashSource(source), to = hashSource(target) } }
+		end
+
+		it("applies a held wipe when resynced with includeHeld", function()
 			session.__status = ServeSession.Status.Connected
 			session:__applyPatch(sourceUpdate("UI", ""))
-			expect(string.find(module.Source, "return a") ~= nil).to.equal(true)
-			local result = session:applyResync(sourceUpdate("UI", ""))
+			local kept = module.Source
+			expect(string.find(kept, "return a") ~= nil).to.equal(true)
+			local result = session:applyResync(sourceUpdate("UI", ""), expectFrom(kept, ""), true)
 			expect(result.updated).to.equal(1)
+			expect(result.failed).to.equal(0)
 			expect(module.Source).to.equal("")
 			expect(session.__heldWipes.UI).to.equal(nil)
 		end)
 
-		it("refuses a resync that adds or removes instances", function()
+		it("still guards against wipes in a resync without includeHeld", function()
 			session.__status = ServeSession.Status.Connected
-			local ok = pcall(session.applyResync, session, { removed = { "UI" }, added = {}, updated = {} })
+			local kept = module.Source
+			local result = session:applyResync(sourceUpdate("UI", ""), expectFrom(kept, ""), false)
+			expect(module.Source).to.equal(kept)
+			expect(result.updated).to.equal(0)
+			expect(result.failed).to.equal(1)
+			expect(session.__heldWipes.UI).to.be.ok()
+		end)
+
+		it("skips a script that changed since verify checked it", function()
+			session.__status = ServeSession.Status.Connected
+			local result = session:applyResync(
+				sourceUpdate("UI", "return 'from disk'"),
+				expectFrom("return 'what verify saw'", "return 'from disk'"),
+				false
+			)
+			expect(result.skipped).to.equal(1)
+			expect(result.updated).to.equal(0)
+			expect(string.find(module.Source, "return a") ~= nil).to.equal(true)
+		end)
+
+		it("refuses a resync that adds or removes instances or has no expectations", function()
+			session.__status = ServeSession.Status.Connected
+			local ok = pcall(session.applyResync, session, { removed = { "UI" }, added = {}, updated = {} }, {})
 			expect(ok).to.equal(false)
+			expect(pcall(session.applyResync, session, sourceUpdate("UI", "x"), nil)).to.equal(false)
+		end)
+
+		it("keeps held scripts out of the sync fallback", function()
+			session.__status = ServeSession.Status.Connected
+			session:__holdScriptWipes(sourceUpdate("UI", ""))
+			session.__reconciler = {
+				applyPatch = function()
+					return {
+						removed = {},
+						added = {},
+						updated = { { id = "UI", changedProperties = {}, changedMetadata = {} } },
+					}
+				end,
+			}
+			local replaced = {}
+			session.__replaceInstances = function(_, ids)
+				for _, id in ids do
+					table.insert(replaced, id)
+				end
+				return true, PatchSet.newEmpty()
+			end
+			local unapplied = session:__applyPatchInRecording(PatchSet.newEmpty())
+			expect(#replaced).to.equal(0)
+			expect(#unapplied.updated).to.equal(1)
+			expect(string.find(module.Source, "return a") ~= nil).to.equal(true)
+		end)
+
+		it("drops holds of scripts removed with their parent", function()
+			session.__status = ServeSession.Status.Connected
+			session:__holdScriptWipes(sourceUpdate("UI", ""))
+			expect(session.__heldWipes.UI).to.be.ok()
+			-- The server removes the parent; the instance map forgets its
+			-- descendants, which the patch does not list.
+			session.__instanceMap:removeId("UI")
+			session:__applyPatch({ removed = { "PARENT" }, added = {}, updated = {} })
+			expect(session.__heldWipes.UI).to.equal(nil)
 		end)
 	end)
 
