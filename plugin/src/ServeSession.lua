@@ -431,6 +431,42 @@ function ServeSession:__rematchHolds(serverInstances)
 	end
 end
 
+-- Takes out of a catch-up patch every removal of a held script, or of
+-- something containing one, that this session could not pair with the
+-- server's tree. The kept instances are no longer synced; the user is told.
+function ServeSession:__keepUnpairedHolds(patch)
+	if not Settings:get("guardScriptWipes") then
+		return
+	end
+	local index = 1
+	while index <= #patch.removed do
+		local removed = patch.removed[index]
+		local instance = if typeof(removed) == "Instance" then removed else self.__instanceMap.fromIds[removed]
+		local keeps
+		if instance then
+			for held in heldByInstance do
+				if
+					(held == instance or held:IsDescendantOf(instance))
+					and not self.__instanceMap.fromInstances[held]
+				then
+					keeps = held
+					break
+				end
+			end
+		end
+		if keeps then
+			Log.warn(
+				"Kept {} in Studio although Rojo would remove it, because it contains {}, whose file on disk is empty and whose code Rojo is holding back. It is no longer synced: restore the file's code, or move it back where it was, and reconnect.",
+				instance:GetFullName(),
+				keeps:GetFullName()
+			)
+			table.remove(patch.removed, index)
+		else
+			index += 1
+		end
+	end
+end
+
 -- A file that has code again while Studio was disconnected ends its hold,
 -- even when its code matches what Studio kept and so no change arrives.
 function ServeSession:__releaseRecoveredHolds(serverInstances)
@@ -1632,6 +1668,11 @@ function ServeSession:__initialSync(serverInfo)
 		if not success then
 			Log.error("Could not compute a diff to catch up to the Rojo server: {:#?}", catchUpPatch)
 		end
+
+		-- A held script that could not be paired again, for example because
+		-- it was renamed or moved in Studio, would be removed with whatever
+		-- contains it. It is kept instead, unsynced, so its code is not lost.
+		self:__keepUnpairedHolds(catchUpPatch)
 
 		for _, update in catchUpPatch.updated do
 			if update.id == self.__instanceMap.fromInstances[game] and update.changedClassName ~= nil then

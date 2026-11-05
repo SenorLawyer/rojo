@@ -40,7 +40,7 @@ Scripts are read as the reconciler reads them: from the script editor when a scr
 
 ## The wipe guard
 
-When a script with 5 or more non-blank lines would become empty because its file on disk became empty, the plugin keeps the old source in Studio and prints a warning instead. An editor or agent that saves an empty file by mistake then cannot wipe the script in Studio, which used to reach the place before anyone noticed. The hold ends as soon as the file has code again, or the file (or a folder containing it) is deleted. The sync fallback, which replaces an instance with the server's copy when a change cannot be applied, leaves held scripts alone. While it lasts, the script shows up in `rojo studio sessions` and as *different* (and `held`) in `verify`.
+When a script with 5 or more non-blank lines would become empty because its file on disk became empty, the plugin keeps the old source in Studio and prints a warning instead. An editor or agent that saves an empty file by mistake then cannot wipe the script in Studio, which used to reach the place before anyone noticed. The hold ends as soon as the file has code again, or the file (or a folder containing it) is deleted. The sync fallback, which replaces an instance with the server's copy when a change cannot be applied, leaves held scripts alone. Holds last while Studio stays open, also across reconnects: a reconnecting session pairs each held script with its file by name and place in the tree. A held script that cannot be paired that way, for example because it was renamed or moved in Studio, is kept in Studio rather than removed, with a warning, but is no longer synced until it is put back or its file has code again. While it lasts, the script shows up in `rojo studio sessions` and as *different* (and `held`) in `verify`.
 
 To empty the script on purpose, write at least one non-blank line, delete the file, or run `verify --fix --include-held`. When the script's class changed on disk too while it was held, `--include-held` cannot empty it, since the class change replaces the instance; it is reported as skipped, and writing code to its file or deleting the file ends the hold as usual. A plain `--fix` leaves held scripts alone.
 
@@ -49,6 +49,8 @@ The guard checks each change from disk when it arrives. Studio writes a script's
 The guard is the plugin setting **Guard Against Script Wipes**, on by default. Agent control can turn it on but not off unless **Agent Can Skip Confirmation** is on.
 
 ## Undoing a Rojo change
+
+`verify` compares the scripts Rojo tracks. A script that is in Studio only because Undo brought it back after its file was deleted is no longer tracked, so `verify` does not list it; reconnect to remove it.
 
 Each change Rojo applies is normally its own undo step, named `Rojo: Patch <time>`. When another plugin or tool is recording a change at that moment, Rojo's change becomes part of that recording instead, and undoing it is not detected; `verify` still finds the difference. Undoing one puts back what Studio had before, so Studio no longer matches the files, and with two-way sync the undone values may be written back to disk. The plugin now warns in Studio's output when that happens and counts it in `undoneRojoPatches`, until the step is redone. Run `verify --fix`, or reconnect, to sync the files again.
 

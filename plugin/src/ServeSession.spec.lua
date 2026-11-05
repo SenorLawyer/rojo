@@ -770,6 +770,21 @@ return function()
 			again:stop()
 		end)
 
+		it("keeps a held script that could not be paired out of the catch-up removals", function()
+			session:__holdScriptWipes(sourceUpdate("UI", ""))
+			session:stop()
+			local again = ServeSession.new({ apiContext = api, twoWaySync = false })
+			local catchUp = { removed = { container }, added = {}, updated = {} }
+			again:__keepUnpairedHolds(catchUp)
+			expect(#catchUp.removed).to.equal(0)
+			local other = Instance.new("Folder")
+			local unrelated = { removed = { other }, added = {}, updated = {} }
+			again:__keepUnpairedHolds(unrelated)
+			expect(#unrelated.removed).to.equal(1)
+			other:Destroy()
+			again:stop()
+		end)
+
 		it("keeps a hold when the same Studio reconnects", function()
 			session:__holdScriptWipes(sourceUpdate("UI", ""))
 			local hold = session.__heldWipes.UI
