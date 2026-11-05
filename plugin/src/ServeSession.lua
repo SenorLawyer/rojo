@@ -222,45 +222,23 @@ function ServeSession.new(options)
 end
 
 function ServeSession:__releaseAllHolds()
-	local sourceOnly, replace = {}, {}
+	-- Holds just end. Studio keeps the code it has until the next change from
+	-- disk, and `rojo studio verify --fix` brings the scripts in line now,
+	-- with its checks against newer changes. Writing anything here would race
+	-- the ordinary sync of a file that gets its code back meanwhile.
+	local count = 0
 	for id, entry in table.clone(self.__heldWipes) do
-		table.insert(if entry.deferredClass then replace else sourceOnly, id)
-		-- Cleared here without queueing a refresh; the class changes are
-		-- handled below.
 		entry.deferredClass = nil
 		self:__clearHold(id)
+		count += 1
 	end
 	table.clear(heldByInstance)
-	if self.__status ~= Status.Connected or (#sourceOnly == 0 and #replace == 0) then
-		return
+	if count > 0 then
+		Log.warn(
+			"Turned off the wipe guard, which was holding back {} empty files. Studio keeps their code until they change; run `rojo studio verify --fix` to sync them now.",
+			count
+		)
 	end
-	-- The changes the guard held back were never applied. A held source
-	-- becomes the file's current source on the same instance, as ordinary
-	-- sync would write it, so nothing else about the script changes; only a
-	-- class change held back with it needs the server's whole copy.
-	task.spawn(function()
-		if #sourceOnly > 0 then
-			local ok, body = self.__apiContext:read(sourceOnly):await()
-			for _, id in sourceOnly do
-				local instance = self.__instanceMap.fromIds[id]
-				local server = ok and body.instances and body.instances[id]
-				local encoded = server and server.Properties and server.Properties.Source
-				local ty, value
-				if type(encoded) == "table" then
-					ty, value = next(encoded)
-				end
-				if instance and ty == "String" and type(value) == "string" then
-					self:__writeSource({ id = id, instance = instance, target = value })
-				end
-			end
-			if not ok then
-				Log.warn("Could not read {} scripts the wipe guard was holding; reconnect to sync them.", #sourceOnly)
-			end
-		end
-		if #replace > 0 and not self:__replaceInstances(replace) then
-			Log.warn("Could not sync {} scripts the wipe guard was holding; reconnect to sync them.", #replace)
-		end
-	end)
 end
 
 --[=[

@@ -4,7 +4,7 @@ Rojo keeps Studio in step with the files on disk, but some things leave them apa
 
 ## Is each Studio still syncing?
 
-`rojo studio sessions` lists every connected Studio. With this plugin, each session also carries a `sync` summary that the plugin sends with every bridge poll, so it is at most a few seconds old (`syncAgeMs`):
+`rojo studio sessions` lists every connected Studio. With this plugin, each session also carries a `sync` summary that the plugin sends with every bridge poll, so it is usually a few seconds old, longer while Studio is busy with a command or in Run mode (`syncAgeMs` says how old):
 
 | Field | Meaning |
 | --- | --- |
@@ -59,9 +59,9 @@ These are why the guard is experimental. Each needs a specific sequence of chang
 * After a reconnect, a held script that could not be paired with its file (renamed or moved in Studio) is kept, with a warning, but is not counted in `rojo studio sessions`.
 * Studio writes sources a moment after a change arrives, and the guard checks each change when it arrives, so several changes to the same script within a fraction of a second can still end with it empty.
 * A script whose class changes on disk (for example from LocalScript to Script, inside a model file) in the same save that empties it is replaced by an empty script, unless it was already held.
-* When several sibling scripts share one name and are replaced by new ones, a held script's code is only carried over by name, so the replacements can all get one of them's code.
+* When several sibling scripts share one name and are replaced by new ones, a held script's code is not carried over, since it is not clear which replacement is which.
 
-Turning the guard off ends every hold, and anything held back then syncs from disk.
+Turning the guard off ends every hold. Studio keeps the code it has until each file changes again; run `verify --fix` to sync them right away.
 
 ## Undoing a Rojo change
 

@@ -859,19 +859,22 @@ return function()
 			expect(summary.heldWipeCount).to.equal(0)
 		end)
 
-		it("syncs a held script's source in place when the guard is turned off", function()
+		it("leaves held scripts as they are when the guard is turned off", function()
 			session.__status = ServeSession.Status.Connected
 			session:__holdScriptWipes(sourceUpdate("UI", ""))
-			module:SetAttribute("StudioOnly", true)
+			local kept = module.Source
+			local reads = 0
 			api.read = function()
-				return Promise.resolve({ instances = { UI = { Properties = { Source = { String = "" } } } } })
+				reads += 1
+				return Promise.resolve({ instances = {} })
 			end
 			Settings:set("guardScriptWipes", false)
-			task.wait(0.3)
+			task.wait(0.2)
 			Settings:set("guardScriptWipes", true)
 			expect(session.__instanceMap.fromIds.UI).to.equal(module)
-			expect(module.Source).to.equal("")
-			expect(module:GetAttribute("StudioOnly")).to.equal(true)
+			expect(module.Source).to.equal(kept)
+			expect(reads).to.equal(0)
+			expect(session.__heldWipes.UI).to.equal(nil)
 		end)
 
 		it("does nothing when the setting is off", function()
