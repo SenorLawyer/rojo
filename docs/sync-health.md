@@ -38,7 +38,9 @@ Scripts are read as the reconciler reads them: from the script editor when a scr
 
 `verify` runs from the server, not the CLI, so it compares against what `rojo serve` has loaded. The plugin hashes about 200 scripts per frame, and the command has the bridge's usual 15-second deadline. Each `--fix` batch sends at most 2 MiB of source.
 
-## The wipe guard
+## The wipe guard (experimental)
+
+The wipe guard is experimental and **off by default**. Turn it on with **Guard Against Script Wipes** in Rojo's settings. It covers the common case below, but some rarer sequences can still empty a held script or hide a hold; they are listed under [Known gaps](#known-gaps). `verify` works the same either way.
 
 When a script with 5 or more non-blank lines would become empty because its file on disk became empty, the plugin keeps the old source in Studio and prints a warning instead. An editor or agent that saves an empty file by mistake then cannot wipe the script in Studio, which used to reach the place before anyone noticed. The hold ends as soon as the file has code again, or the file (or a folder containing it) is deleted. The sync fallback, which replaces an instance with the server's copy when a change cannot be applied, leaves held scripts alone. Holds last while Studio stays open, also across reconnects: a reconnecting session pairs each held script with its file by name and place in the tree. A held script that cannot be paired that way, for example because it was renamed or moved in Studio, is kept in Studio rather than removed, with a warning, but is no longer synced until it is put back or its file has code again. While it lasts, the script shows up in `rojo studio sessions` and as *different* (and `held`) in `verify`.
 
@@ -46,7 +48,16 @@ To empty the script on purpose, write at least one non-blank line, delete the fi
 
 The guard checks each change from disk when it arrives. Studio writes a script's new source a moment later, so a change that emptied a small script and is still being written when a later change makes the script long and a hold starts can still finish; this needs several changes to the same script within a fraction of a second.
 
-The guard is the plugin setting **Guard Against Script Wipes**, on by default. Agent control can turn it on but not off unless **Agent Can Skip Confirmation** is on.
+The guard is the plugin setting **Guard Against Script Wipes**, off by default. Agent control can turn it on but not off unless **Agent Can Skip Confirmation** is on.
+
+### Known gaps
+
+These are why the guard is experimental. Each needs a specific sequence of changes; `verify` still shows the result.
+
+* A folder (or other container) whose class changes on disk, such as a Folder becoming a Model, is replaced with its contents. Held scripts inside it are not carried over, so the replacement has their empty source.
+* A class change from disk that arrives while `verify --fix --include-held` is writing a held script can still let that write empty it.
+* After a reconnect, a held script that could not be paired with its file (renamed or moved in Studio) is kept, with a warning, but is not counted in `rojo studio sessions`.
+* Studio writes sources a moment after a change arrives, and the guard checks each change when it arrives, so several changes to the same script within a fraction of a second can still end with it empty.
 
 ## Undoing a Rojo change
 

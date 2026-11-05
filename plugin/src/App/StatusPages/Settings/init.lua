@@ -244,6 +244,7 @@ function SettingsPage:render()
 				id = "guardScriptWipes",
 				name = "Guard Against Script Wipes",
 				description = "Hold back a change that would empty a script with 5 or more lines of code, such as a broken save of its file, until the file has code again, is deleted, or an agent resyncs it",
+				tag = "unstable",
 				transparency = self.props.transparency,
 				layoutOrder = layoutIncrement(),
 			}),
