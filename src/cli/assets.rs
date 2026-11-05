@@ -2289,7 +2289,12 @@ fn remap_files(roots: &[PathBuf], skipped: &[PathBuf]) -> anyhow::Result<BTreeSe
     // Lockfiles of every config are skipped, not only this one's: their ids
     // are records of past uploads, and with --bare they would be rewritten.
     files.retain(|path| {
-        !skipped.contains(path)
+        // Compared by physical identity, not spelling: on Windows a path in
+        // another case, or through `sub/..` or a link, is the same file, and
+        // `--bare --write` must never rewrite the config or the module.
+        !skipped
+            .iter()
+            .any(|skipped| is_same_file_path(path, skipped))
             && !path
                 .file_name()
                 .and_then(|name| name.to_str())
@@ -4145,6 +4150,67 @@ mod tests {
         for url in kept {
             assert!(expected.contains(url));
         }
+    }
+
+    #[test]
+    fn remap_skips_protected_files_under_any_spelling() {
+        let fixture = Fixture::new();
+        fixture.write_replaced(&[(123456789, 987654321)]);
+        let dir = fixture.dir.path();
+        let mut config = fixture.read_project("assets.toml");
+        config.push_str("# old id 123456789\n");
+        fs::write(fixture.config(), &config).unwrap();
+        let module = "return { Coin = \"rbxassetid://123456789\", Id = 123456789 }\n";
+        fixture.write_project("src/Assets.luau", module.as_bytes());
+        fixture.write_project("src/Shop.luau", b"local id = 123456789\n");
+        let map_out = dir.join("ids.json");
+        fs::write(&map_out, b"{\"123456789\": 1}\n").unwrap();
+
+        let mut paths = vec![
+            dir.join("src/../assets.toml"),
+            dir.join("src/../src/Assets.luau"),
+            dir.join("src/../ids.json"),
+            dir.join("src/Shop.luau"),
+        ];
+        if cfg!(windows) {
+            paths.push(dir.join("ASSETS.TOML"));
+            paths.push(dir.join("SRC/assets.LUAU"));
+            paths.push(dir.join("IDS.JSON"));
+        }
+        let (report, out) = fixture.remap(RemapOptions {
+            paths,
+            write: true,
+            bare: true,
+            map_out: Some(map_out.clone()),
+        });
+
+        assert_eq!(report.files_scanned, 1, "{out}");
+        assert_eq!(report.references[0].path, "src/Shop.luau");
+        assert_eq!(fixture.read_project("assets.toml"), config);
+        assert_eq!(fixture.read_project("src/Assets.luau"), module);
+        assert_eq!(
+            fs::read_to_string(&map_out).unwrap(),
+            "{\n  \"123456789\": 987654321\n}\n"
+        );
+
+        // A walked folder spelled another way skips them too.
+        let root = if cfg!(windows) {
+            dir.join("SRC").join("..")
+        } else {
+            dir.join("src").join("..")
+        };
+        let (report, _) = fixture.remap(RemapOptions {
+            paths: vec![root],
+            write: true,
+            bare: true,
+            ..RemapOptions::default()
+        });
+        assert!(report
+            .references
+            .iter()
+            .all(|reference| !reference.path.to_ascii_lowercase().contains("assets.")));
+        assert_eq!(fixture.read_project("assets.toml"), config);
+        assert_eq!(fixture.read_project("src/Assets.luau"), module);
     }
 
     #[test]
