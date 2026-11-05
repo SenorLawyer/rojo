@@ -849,6 +849,16 @@ function ServeSession:__holdScriptWipes(patch)
 	-- LocalScript and Script. If the old one is held and the new one would
 	-- be empty, the new one gets the old code and the hold instead.
 	local guard = Settings:get("guardScriptWipes")
+	if not guard then
+		-- Turning the guard off ends every hold, so nothing it held back keeps
+		-- affecting sync, fixes or health. Class changes it held back are
+		-- fetched again by `__clearHold`.
+		for id in table.clone(self.__heldWipes) do
+			self:__clearHold(id)
+		end
+		table.clear(heldByInstance)
+		return
+	end
 	local removedHeld = {}
 	for _, removed in patch.removed do
 		local entry = self.__heldWipes[removed]
@@ -1568,7 +1578,7 @@ function ServeSession:__applyPatchInRecording(patch)
 	local heldUpdates = {}
 	local index = 1
 	while index <= #unappliedPatch.updated do
-		if self.__heldWipes[unappliedPatch.updated[index].id] then
+		if Settings:get("guardScriptWipes") and self.__heldWipes[unappliedPatch.updated[index].id] then
 			table.insert(heldUpdates, table.remove(unappliedPatch.updated, index))
 		else
 			index += 1

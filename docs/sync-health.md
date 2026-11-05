@@ -58,6 +58,10 @@ These are why the guard is experimental. Each needs a specific sequence of chang
 * A class change from disk that arrives while `verify --fix --include-held` is writing a held script can still let that write empty it.
 * After a reconnect, a held script that could not be paired with its file (renamed or moved in Studio) is kept, with a warning, but is not counted in `rojo studio sessions`.
 * Studio writes sources a moment after a change arrives, and the guard checks each change when it arrives, so several changes to the same script within a fraction of a second can still end with it empty.
+* A script whose class changes on disk (for example from LocalScript to Script, inside a model file) in the same save that empties it is replaced by an empty script, unless it was already held.
+* When several sibling scripts share one name and are replaced by new ones, a held script's code is only carried over by name, so the replacements can all get one of them's code.
+
+Turning the guard off ends every hold, and anything held back then syncs from disk.
 
 ## Undoing a Rojo change
 
