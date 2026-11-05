@@ -2139,6 +2139,44 @@ fn is_url_delimiter(byte: u8) -> bool {
         )
 }
 
+/// How XML writes `&`. Only used to read URLs; the file keeps its bytes.
+const XML_AMPERSANDS: &[&str] = &["&amp;", "&#38;", "&#x26;"];
+
+/// `bytes` lowercased, with XML-escaped ampersands read as `&`.
+fn unescape_ampersands(bytes: &[u8]) -> String {
+    let mut text = String::from_utf8_lossy(bytes).to_ascii_lowercase();
+    for entity in XML_AMPERSANDS {
+        text = text.replace(entity, "&");
+    }
+    text
+}
+
+/// Whether `a` and `b` name the same file, comparing their canonical
+/// folders and file names, since the file itself may not exist yet. Windows
+/// file names are case-insensitive, so they are compared that way there.
+fn is_same_file_path(a: &Path, b: &Path) -> bool {
+    if let (Ok(a), Ok(b)) = (fs::canonicalize(a), fs::canonicalize(b)) {
+        if a == b {
+            return true;
+        }
+    }
+    let key = |path: &Path| -> Option<(String, String)> {
+        let name = path.file_name()?.to_string_lossy().into_owned();
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        let parent = fs::canonicalize(parent).unwrap_or_else(|_| normalize(parent));
+        let parent = parent.to_string_lossy().into_owned();
+        Some(if cfg!(windows) {
+            (parent.to_lowercase(), name.to_lowercase())
+        } else {
+            (parent, name)
+        })
+    };
+    matches!((key(a), key(b)), (Some(a), Some(b)) if a == b)
+}
+
 /// Whether the digits at `start..end` are the `id=` query parameter of a
 /// Roblox asset URL, such as `https://www.roblox.com/asset/?id=` or
 /// `https://assetdelivery.roblox.com/v1/asset/?id=`, or of an
@@ -2151,8 +2189,14 @@ fn is_asset_url(text: &[u8], start: usize, end: usize) -> bool {
     }
     let rest = &before[..before.len() - 3];
     // `rbxthumb://` URIs have no `?`, so their first parameter follows the
-    // scheme directly.
-    if !matches!(rest.last(), Some(b'?' | b'&')) && !ends_with_ignore_case(rest, b"rbxthumb://") {
+    // scheme directly. XML files, such as .rbxmx models, write `&` as an
+    // entity.
+    if !matches!(rest.last(), Some(b'?' | b'&'))
+        && !XML_AMPERSANDS
+            .iter()
+            .any(|entity| ends_with_ignore_case(rest, entity.as_bytes()))
+        && !ends_with_ignore_case(rest, b"rbxthumb://")
+    {
         return false;
     }
     let window = &rest[rest.len().saturating_sub(MAX_URL_BYTES)..];
@@ -2161,7 +2205,7 @@ fn is_asset_url(text: &[u8], start: usize, end: usize) -> bool {
         .iter()
         .rposition(|byte| is_url_delimiter(*byte))
         .map_or(0, |position| position + 1);
-    let url = String::from_utf8_lossy(&window[url_start..]).to_ascii_lowercase();
+    let url = unescape_ampersands(&window[url_start..]);
 
     if let Some(params) = url.strip_prefix("rbxthumb://") {
         // `type` may come after the id, so the rest of the URI is read too.
@@ -2170,7 +2214,7 @@ fn is_asset_url(text: &[u8], start: usize, end: usize) -> bool {
             .iter()
             .position(|byte| is_url_delimiter(*byte))
             .unwrap_or(after.len());
-        let after = String::from_utf8_lossy(&after[..after_end]).to_ascii_lowercase();
+        let after = unescape_ampersands(&after[..after_end]);
         return params
             .split('&')
             .chain(after.split('&'))
@@ -2285,6 +2329,24 @@ fn walk_text(dir: &Path, files: &mut BTreeSet<PathBuf>) -> anyhow::Result<()> {
 fn remap(config_path: &Path, options: &RemapOptions) -> anyhow::Result<RemapReport> {
     let config = load_config(config_path)?;
     let lock_path = normalize(&config.lock);
+    // `--map-out` is written even without `--write`, so a mistyped path must
+    // not replace a file that sync depends on.
+    if let Some(map_out) = &options.map_out {
+        let protected = [
+            (&config.config, "the assets config"),
+            (&lock_path, "the assets lockfile"),
+            (&config.output, "the module sync generates"),
+        ];
+        for (path, what) in protected {
+            if is_same_file_path(map_out, path) {
+                return Err(UsageError(anyhow::anyhow!(
+                    "--map-out {} is {what}; choose another file. Nothing was written.",
+                    map_out.display()
+                ))
+                .into());
+            }
+        }
+    }
     let lock = load_lock(&lock_path)?;
     let map = resolve_replacements(&lock, &lock_path)?;
     let mut report = RemapReport {
@@ -4004,6 +4066,87 @@ mod tests {
             let is_kept = kept.iter().any(|url| original.contains(url));
             assert_eq!(line == original, is_kept, "{line}");
         }
+    }
+
+    #[test]
+    fn remap_reads_xml_escaped_query_separators() {
+        let fixture = Fixture::new();
+        fixture.write_replaced(&[(123456789, 987654321)]);
+        let rewritten = [
+            "rbxthumb://type=Asset&amp;id=123456789&amp;w=150&amp;h=150",
+            "rbxthumb://id=123456789&amp;type=Asset&amp;w=150&amp;h=150",
+            "https://www.roblox.com/asset/?foo=1&amp;id=123456789",
+            "https://www.roblox.com/asset/?foo=1&#38;id=123456789",
+            "https://assetdelivery.roblox.com/v1/asset/?foo=1&#x26;id=123456789",
+        ];
+        let kept = [
+            "https://notroblox.com/asset/?foo=1&amp;id=123456789",
+            "https://www.roblox.com.evil/asset/?foo=1&amp;id=123456789",
+            "rbxthumb://type=Avatar&amp;id=123456789&amp;w=150&amp;h=150",
+        ];
+        let mut text = String::from("<roblox version=\"4\">\r\n");
+        for url in rewritten.iter().chain(&kept) {
+            text.push_str(&format!(
+                "\t<Content name=\"Texture\"><url>{url}</url></Content>\r\n"
+            ));
+        }
+        text.push_str("</roblox>\r\n");
+        fixture.write_project("src/Coin.rbxmx", text.as_bytes());
+
+        let (report, _) = fixture.remap(RemapOptions {
+            write: true,
+            ..RemapOptions::default()
+        });
+
+        assert_eq!(report.references_rewritten, rewritten.len());
+        let mut expected = text.clone();
+        for url in rewritten {
+            expected = expected.replace(url, &url.replace("123456789", "987654321"));
+        }
+        assert_eq!(fixture.read_project("src/Coin.rbxmx"), expected);
+        for url in kept {
+            assert!(expected.contains(url));
+        }
+    }
+
+    #[test]
+    fn remap_refuses_a_map_out_path_that_sync_depends_on() {
+        let fixture = Fixture::new();
+        fixture.write_replaced(&[(123456789, 987654321)]);
+        fixture.write_project("src/Assets.luau", b"return {}\n");
+        fixture.write_project("src/Shop.luau", SHOP.as_bytes());
+        let lock_before = fixture.read_project("assets.lock.json");
+        let config_before = fixture.read_project("assets.toml");
+        let dir = fixture.dir.path();
+        let mut targets = vec![
+            (dir.join("assets.toml"), "the assets config"),
+            (dir.join("assets.lock.json"), "the assets lockfile"),
+            (dir.join("src/../assets.lock.json"), "the assets lockfile"),
+            (dir.join("src/Assets.luau"), "the module sync generates"),
+        ];
+        if cfg!(windows) {
+            targets.push((dir.join("SRC/assets.LUAU"), "the module sync generates"));
+        }
+
+        for (map_out, what) in targets {
+            let error = super::remap(
+                &fixture.config(),
+                &RemapOptions {
+                    write: true,
+                    map_out: Some(map_out.clone()),
+                    ..RemapOptions::default()
+                },
+            )
+            .unwrap_err();
+            let error = format!("{error:#}");
+            assert!(error.contains(&format!("is {what}")), "{error}");
+            assert!(error.contains("Nothing was written"), "{error}");
+        }
+
+        assert_eq!(fixture.read_project("assets.lock.json"), lock_before);
+        assert_eq!(fixture.read_project("assets.toml"), config_before);
+        assert_eq!(fixture.read_project("src/Assets.luau"), "return {}\n");
+        assert_eq!(fixture.read_project("src/Shop.luau"), SHOP);
     }
 
     #[test]
