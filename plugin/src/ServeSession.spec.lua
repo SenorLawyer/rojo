@@ -1107,6 +1107,24 @@ return function()
 			expect(session.__heldWipes.UI).to.be.ok()
 		end)
 
+		it("starts no hold when the guard is turned off while a resync waits", function()
+			session.__status = ServeSession.Status.Connected
+			local kept = module.Source
+			local isActive = function()
+				-- The server check yields, and the user turns the guard off meanwhile.
+				Settings:set("guardScriptWipes", false)
+				task.wait()
+				return true
+			end
+			local result =
+				session:applyResync(sourceUpdate("UI", ""), expectFrom(kept, ""), false, nil, isActive, "VERIFY")
+			Settings:set("guardScriptWipes", true)
+			expect(result.updated).to.equal(1)
+			expect(module.Source).to.equal("")
+			expect(session.__heldWipes.UI).to.equal(nil)
+			expect(session:getSyncSummary().heldWipeCount).to.equal(0)
+		end)
+
 		it("skips a script that changed since verify checked it", function()
 			session.__status = ServeSession.Status.Connected
 			local result = resyncAs(

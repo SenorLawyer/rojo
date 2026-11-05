@@ -744,7 +744,11 @@ function ServeSession:applyResync(patch, expect, includeHeld, expiresAt, isActiv
 	-- includeHeld such a write is held back like a normal sync's would be.
 	-- Only the callback below, which sees the source being replaced, decides
 	-- that; a write that is cancelled must never touch an existing hold.
-	local guardWipes = not includeHeld and Settings:get("guardScriptWipes")
+	-- The setting is read when it is used, since the guard can be turned off
+	-- while this yields, and then no new hold may start.
+	local function guardWipes()
+		return not includeHeld and Settings:get("guardScriptWipes")
+	end
 
 	-- Without its own undo step, a resync would land in whatever another
 	-- recording holds, and could not be undone on its own.
@@ -833,7 +837,7 @@ function ServeSession:applyResync(patch, expect, includeHeld, expiresAt, isActiv
 							held = self.__heldWipes[write.id] and self.__heldWipes[write.id].lines or 0
 							return nil
 						end
-						if guardWipes and not string.find(write.target, "%S") then
+						if guardWipes() and not string.find(write.target, "%S") then
 							local lines = countNonBlankLines(current)
 							if lines >= WIPE_GUARD_MIN_LINES then
 								held = lines
@@ -858,7 +862,7 @@ function ServeSession:applyResync(patch, expect, includeHeld, expiresAt, isActiv
 			end
 			if held then
 				skipped += 1
-				if not self.__heldWipes[write.id] then
+				if not self.__heldWipes[write.id] and guardWipes() then
 					self:__setHold(
 						write.id,
 						write.instance,
