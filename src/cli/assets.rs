@@ -2281,14 +2281,19 @@ fn is_asset_url(text: &[u8], start: usize, end: usize) -> bool {
 }
 /// Whether the digits at `start..end` are a complete integer token rather
 /// than part of a word (`id123`, `x123_`), a hexadecimal or exponent
-/// (`0x123`, `123e3`, `1e123`) or a decimal or version (`.5`, `1.5`, `123.`,
-/// `1.2.3`). A `.` on either side rules it out, even at the end of a
-/// sentence, since rewriting part of a number would silently change it.
+/// (`0x123`, `123e3`, `1e123`, `1e-123`, `1E+123`), a decimal or version
+/// (`.5`, `1.5`, `123.`, `1.2.3`) or a signed number (`-123`, `+123`). A `.`
+/// on either side rules it out, even at the end of a sentence, and so does a
+/// sign directly before the digits, since asset ids are positive and never
+/// written with one: rewriting part of a number would silently change it.
+/// A sign separated by a space, as in `x - 123`, is an operator, so that
+/// number still counts.
 fn is_bare_number(text: &[u8], start: usize, end: usize) -> bool {
     let joins = |byte: u8| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'.';
     let before = start.checked_sub(1).map(|index| text[index]);
     let after = text.get(end).copied();
-    !before.is_some_and(joins) && !after.is_some_and(joins)
+    !before.is_some_and(|byte| joins(byte) || byte == b'-' || byte == b'+')
+        && !after.is_some_and(joins)
 }
 /// Lists the files `remap` reads under `roots`, in a stable order.
 fn remap_files(roots: &[PathBuf], skipped: &[PathBuf]) -> anyhow::Result<BTreeSet<PathBuf>> {
@@ -4496,8 +4501,18 @@ mod tests {
             "local f = 1e123456789",
             "local g = a123456789",
             "local h = 123456789_",
+            "local k = 1e-123456789",
+            "local l = 1E+123456789",
+            "local m = -123456789",
+            "local n = x -123456789",
+            "local o = +123456789",
         ];
-        let rewritten = ["local i = 123456789,", "local j = {123456789}"];
+        let rewritten = [
+            "local i = 123456789,",
+            "local j = {123456789}",
+            "local p = x - 123456789",
+            "local q = f(123456789)",
+        ];
         let text = kept
             .iter()
             .chain(&rewritten)
@@ -4513,16 +4528,19 @@ mod tests {
             ..RemapOptions::default()
         });
 
-        assert_eq!(report.references_rewritten, 2);
+        assert_eq!(report.references_rewritten, rewritten.len());
         let lines: Vec<usize> = report
             .references
             .iter()
             .map(|reference| reference.line)
             .collect();
-        assert_eq!(lines, [9, 10]);
+        let expected_lines: Vec<usize> = (kept.len() + 1..=kept.len() + rewritten.len()).collect();
+        assert_eq!(lines, expected_lines);
         let expected = text
             .replace("= 123456789,", "= 987654321,")
-            .replace("{123456789}", "{987654321}");
+            .replace("{123456789}", "{987654321}")
+            .replace("x - 123456789", "x - 987654321")
+            .replace("f(123456789)", "f(987654321)");
         assert_eq!(fixture.read_project("src/Numbers.luau"), expected);
     }
 
