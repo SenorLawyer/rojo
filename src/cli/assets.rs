@@ -437,6 +437,15 @@ struct PendingUpload {
     operation: String,
     /// RFC 3339 time the file was sent.
     started: String,
+    /// The entry of another creator at `path` when the file was sent, which
+    /// this upload replaces. Kept here because that entry can be overwritten
+    /// before the upload finishes, such as when the file is renamed and new
+    /// contents are uploaded at its old path, and the old id must still map
+    /// to this upload's id. While a pending upload claims an entry, no other
+    /// upload records it as replaced. Left out when there is none, and in
+    /// pending uploads from builds that did not record it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    replaces: Option<LockEntry>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -516,7 +525,14 @@ fn rekey_pending(mut lock: LockFile) -> LockFile {
 }
 
 fn render_lock(lock: &LockFile) -> String {
-    let version = if lock.replaced.is_empty() && lock.displaced.is_empty() {
+    // Rojo 8.0.0 would drop `replaces` from pending uploads too.
+    let version = if lock.replaced.is_empty()
+        && lock.displaced.is_empty()
+        && lock
+            .pending
+            .values()
+            .all(|pending| pending.replaces.is_none())
+    {
         LOCK_VERSION
     } else {
         LOCK_VERSION_REPLACED
@@ -1510,9 +1526,10 @@ fn sync(
         .iter()
         .map(|source| source.hash.as_str())
         .collect();
-    let set_entry = |lock: &mut LockFile, source: &Source, entry: LockEntry, from: Option<&str>| {
-        replace_entry(lock, &old_lock, &current_hashes, source, entry, from)
-    };
+    let set_entry =
+        |lock: &mut LockFile, source: &Source, entry: LockEntry, from: Option<&LockEntry>| {
+            replace_entry(lock, &old_lock, &current_hashes, source, entry, from)
+        };
     // Recording reused ids first keeps them when an upload below replaces the
     // entry they were copied from and the run is then interrupted.
     for (source, action) in &plan.items {
@@ -1585,17 +1602,26 @@ fn sync(
             report.uploaded.push((source.rel.clone(), entry.asset_id));
             // Contents retried with --retry-rejected that passed this time.
             lock.rejected.remove(&source.hash);
-            // A resumed upload was sent from the path its pending record
-            // names, which may have been renamed since; the entry it was
-            // replacing is the one at that path.
-            let sent_from = resume
+            // A resumed upload replaces what its pending record says it was
+            // replacing when it was sent: the file may have been renamed and
+            // its old path overwritten since. Pending uploads from builds
+            // that did not record it fall back to the entry at the path they
+            // were sent from.
+            let predecessor = resume
                 .as_ref()
                 .and_then(|resume| old_lock.pending.get(&resume.key))
-                .map(|pending| pending.path.as_str())
-                .filter(|path| !path.is_empty());
+                .and_then(|pending| {
+                    pending.replaces.clone().or_else(|| {
+                        old_lock
+                            .assets
+                            .get(&pending.path)
+                            .filter(|_| !pending.path.is_empty())
+                            .cloned()
+                    })
+                });
             // Recorded in the same write as the entry that overwrites the
             // old id, so an interrupted run never loses the old id.
-            set_entry(&mut lock, source, entry, sent_from);
+            set_entry(&mut lock, source, entry, predecessor.as_ref());
             write_atomic(&config.lock, render_lock(&lock))?;
         }
     }
@@ -1681,9 +1707,9 @@ fn replace_entry(
     current_hashes: &HashSet<&str>,
     source: &Source,
     entry: LockEntry,
-    sent_from: Option<&str>,
+    predecessor: Option<&LockEntry>,
 ) {
-    record_replacements(lock, old_lock, current_hashes, source, &entry, sent_from);
+    record_replacements(lock, old_lock, current_hashes, source, &entry, predecessor);
     // A held id that is in use again is no longer held.
     lock.displaced.remove(&entry.asset_id.to_string());
     if let Some(previous) = lock.assets.get(&source.rel) {
@@ -1707,36 +1733,49 @@ fn replace_entry(
 /// are never recorded, since a changed file for the same creator is a new
 /// asset, not a move, and code using its old id may mean the old contents.
 ///
-/// `sent_from` is the path a resumed upload was sent from, when the file has
-/// been renamed since: the entry at that path is a predecessor too.
+/// `predecessor` is the entry a resumed upload's pending record says it
+/// replaces, which counts like the entry at the upload's own path. Entries
+/// that another pending upload claims are left to that upload, so a fresh
+/// upload at a path never takes an id that an unfinished upload replaces.
 fn record_replacements(
     lock: &mut LockFile,
     old_lock: &LockFile,
     current_hashes: &HashSet<&str>,
     source: &Source,
     entry: &LockEntry,
-    sent_from: Option<&str>,
+    predecessor: Option<&LockEntry>,
 ) {
+    // An upload's own pending record is removed once it finishes, so these
+    // are only other uploads' claims.
+    let claimed: BTreeSet<u64> = lock
+        .pending
+        .values()
+        .filter_map(|pending| pending.replaces.as_ref())
+        .map(|replaces| replaces.asset_id)
+        .collect();
     // Displaced entries from an earlier, interrupted run have no path any
-    // more, so they are only found by contents.
+    // more, so they are only found by contents. The predecessor matches as if
+    // it were at this path.
+    let source_rel = &source.rel;
     let candidates = || {
         old_lock
             .assets
             .iter()
             .map(|(rel, old)| (Some(rel), old))
             .chain(old_lock.displaced.values().map(|old| (None, old)))
+            .chain(predecessor.map(|old| (Some(source_rel), old)))
     };
     let old_ids: BTreeSet<u64> = candidates()
         .filter(|(rel, old)| {
             old.creator != entry.creator
                 && old.asset_type == entry.asset_type
                 && old.asset_id != entry.asset_id
+                && !claimed.contains(&old.asset_id)
                 && (old.hash == source.hash
                     // When the old contents still exist at another path,
                     // their id moves with them rather than to whatever
                     // now sits at this path.
-                    || ((*rel == Some(&source.rel)
-                        || rel.is_some_and(|rel| Some(rel.as_str()) == sent_from))
+                    || (*rel == Some(&source.rel)
                         && !current_hashes.contains(old.hash.as_str())))
         })
         .map(|(_, old)| old.asset_id)
@@ -1812,6 +1851,21 @@ fn upload(
             // `plan` resumes a pending upload of these contents rather than
             // sending them again, so this never replaces another operation.
             debug_assert!(!lock.pending.contains_key(&key));
+            // What this upload replaces, unless another unfinished upload
+            // already claims it.
+            let replaces = lock
+                .assets
+                .get(&source.rel)
+                .filter(|previous| {
+                    previous.creator != creator
+                        && !lock.pending.values().any(|pending| {
+                            pending
+                                .replaces
+                                .as_ref()
+                                .is_some_and(|replaces| replaces.asset_id == previous.asset_id)
+                        })
+                })
+                .cloned();
             lock.pending.insert(
                 key.clone(),
                 PendingUpload {
@@ -1821,6 +1875,7 @@ fn upload(
                     creator: creator.to_owned(),
                     operation: operation.clone(),
                     started: humantime::format_rfc3339_seconds(SystemTime::now()).to_string(),
+                    replaces,
                 },
             );
             write_atomic(&config.lock, render_lock(lock)).with_context(|| {
@@ -3944,6 +3999,65 @@ mod tests {
         assert_eq!(replaced.from_creator, "user:42");
         assert_eq!(replaced.to_creator, "group:7");
         assert!(fixture.lock().pending.is_empty());
+    }
+
+    #[test]
+    fn interrupted_moves_map_old_ids_like_uninterrupted_ones() {
+        // Under the user, A.png = X is 1001. Under the group, A.png becomes Y,
+        // then Y moves to B.png and a new A.png = Z appears.
+        let uninterrupted = Fixture::new();
+        let cloud = FakeCloud::start(None);
+        uninterrupted.write("A.png", &png(8, 8, "x"));
+        uninterrupted.sync(&cloud).unwrap();
+        uninterrupted.set_creator("group_id = 7");
+        uninterrupted.write("A.png", &png(8, 8, "y"));
+        uninterrupted.sync(&cloud).unwrap();
+        uninterrupted.rename("A.png", "B.png");
+        uninterrupted.write("A.png", &png(8, 8, "z"));
+        uninterrupted.sync(&cloud).unwrap();
+        assert_eq!(
+            uninterrupted.ids(),
+            ids(&[("A.png", 1003), ("B.png", 1002)])
+        );
+        assert_eq!(uninterrupted.replaced(), ids(&[("1001", 1002)]));
+
+        let fixture = Fixture::new();
+        let cloud = FakeCloud::start(None);
+        fixture.write("A.png", &png(8, 8, "x"));
+        fixture.sync(&cloud).unwrap();
+        // Y is accepted as operations/op2, but following it fails.
+        fixture.set_creator("group_id = 7");
+        fixture.write("A.png", &png(8, 8, "y"));
+        cloud.defer.store(true, Ordering::SeqCst);
+        cloud.refuse_polls.store(true, Ordering::SeqCst);
+        fixture.sync(&cloud).unwrap_err();
+        let pending = fixture.lock().pending.values().next().unwrap().clone();
+        assert_eq!(pending.replaces.as_ref().unwrap().asset_id, 1001);
+        assert!(fixture
+            .read_project("assets.lock.json")
+            .starts_with("{\n  \"version\": 2,"));
+
+        // Z at the old path is uploaded (and finishes at once), then
+        // checking on Y fails again.
+        fixture.rename("A.png", "B.png");
+        fixture.write("A.png", &png(8, 8, "z"));
+        cloud.defer.store(false, Ordering::SeqCst);
+        let error = format!("{:#}", fixture.sync(&cloud).unwrap_err());
+        assert!(
+            error.contains("Could not finish uploading B.png"),
+            "{error}"
+        );
+        assert_eq!(fixture.lock().assets["A.png"].asset_id, 1003);
+        // Z does not take the id that Y's unfinished upload replaces.
+        assert!(fixture.lock().replaced.is_empty());
+
+        cloud.refuse_polls.store(false, Ordering::SeqCst);
+        fixture.sync(&cloud).unwrap();
+
+        assert_eq!(fixture.ids(), uninterrupted.ids());
+        assert_eq!(fixture.replaced(), uninterrupted.replaced());
+        assert!(fixture.lock().pending.is_empty());
+        assert_eq!(cloud.uploads(), ["test-A", "test-A", "test-A"]);
     }
 
     #[test]
