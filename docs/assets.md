@@ -180,10 +180,32 @@ local function swap(prefix: string, id: string): string
 	return prefix .. (if new then string.format("%.0f", new) else id)
 end
 
+-- The same URLs `rojo assets remap` rewrites: Roblox's own asset hosts and
+-- paths, and thumbnails of assets. Other ids, such as the user id in an
+-- avatar thumbnail, are left alone.
+local ASSET_HOSTS = { ["roblox.com"] = true, ["www.roblox.com"] = true, ["assetdelivery.roblox.com"] = true }
+local ASSET_PATHS = { ["/asset"] = true, ["/asset/"] = true, ["/v1/asset"] = true, ["/v1/asset/"] = true }
+
+local function swapQueryId(query: string): string
+	return (query:gsub("^([iI][dD]=)(%d+)", swap):gsub("(&[iI][dD]=)(%d+)", swap))
+end
+
 local function remapUri(uri: string): string
-	local result = uri:gsub("([rR][bB][xX][aA][sS][sS][eE][tT][iI][dD]://)(%d+)", swap)
-	result = result:gsub("([?&][iI][dD]=)(%d+)", swap)
-	return result
+	if uri:lower():sub(1, 13) == "rbxassetid://" then
+		return (uri:gsub("^(%a+://)(%d+)", swap))
+	end
+	local scheme, host, path, query = uri:match("^(%a+)://([^/?#]+)([^?#]*)%?([^#]*)$")
+	if scheme then
+		scheme = scheme:lower()
+		if (scheme == "http" or scheme == "https") and ASSET_HOSTS[host:lower()] and ASSET_PATHS[path:lower()] then
+			return uri:sub(1, #uri - #query) .. swapQueryId(query)
+		end
+	end
+	local thumb = uri:match("^[rR][bB][xX][tT][hH][uU][mM][bB]://(.*)$")
+	if thumb and ("&" .. thumb .. "&"):lower():find("&type=asset&", 1, true) then
+		return uri:sub(1, #uri - #thumb) .. swapQueryId(thumb)
+	end
+	return uri
 end
 
 -- The new value for a property, or nil to leave it alone.

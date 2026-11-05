@@ -855,7 +855,17 @@ function StudioBridge:execute(command)
 		return self.sync.getSourceHashes()
 	elseif command.action == "resync" then
 		assert(self.sync, "This bridge is not attached to a sync session")
-		return self.sync.applyResync(args.patch, args.expect, args.includeHeld == true, command.expiresAt)
+		-- Cancelling a verify removes its batch on the server, and the server
+		-- then answers `validate` for it with 410. Asking before each write
+		-- stops a batch that was already delivered.
+		local function isActive()
+			if self.stopped then
+				return false
+			end
+			local ok = self:request("validate", { requestId = command.requestId }):await()
+			return ok and not self.stopped
+		end
+		return self.sync.applyResync(args.patch, args.expect, args.includeHeld == true, command.expiresAt, isActive)
 	elseif command.action == "selection" then
 		local result = {}
 		for index, instance in Selection:Get() do

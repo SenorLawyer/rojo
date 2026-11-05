@@ -19,7 +19,12 @@ mod test;
 mod typecheck;
 mod upload;
 
-use std::{borrow::Cow, env, path::Path, str::FromStr};
+use std::{
+    borrow::Cow,
+    env,
+    path::{Path, PathBuf},
+    str::FromStr,
+};
 
 use anyhow::Context;
 use clap::Parser;
@@ -191,6 +196,26 @@ pub fn exit_status(error: &anyhow::Error) -> (i32, bool) {
     } else {
         (1, true)
     }
+}
+
+/// A per-user directory for state about the project in `workdir`, for when
+/// it is not in a Git repository: `%LOCALAPPDATA%\Rojo\projects\<id>` on
+/// Windows, `$XDG_STATE_HOME/rojo/projects/<id>` (or `~/.local/state/...`)
+/// elsewhere. It must not be inside the project, because `rojo serve` would
+/// sync any JSON or model file placed in a mapped folder into the place.
+pub(crate) fn project_state_dir(workdir: &Path) -> anyhow::Result<PathBuf> {
+    let base = if cfg!(windows) {
+        env::var_os("LOCALAPPDATA").map(|dir| PathBuf::from(dir).join("Rojo"))
+    } else {
+        env::var_os("XDG_STATE_HOME")
+            .map(PathBuf::from)
+            .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/state")))
+            .map(|dir| dir.join("rojo"))
+    }
+    .context("Could not find a per-user directory for Rojo's state (LOCALAPPDATA, XDG_STATE_HOME or HOME)")?;
+    let canonical = dunce::canonicalize(workdir).unwrap_or_else(|_| workdir.to_owned());
+    let id = blake3::hash(canonical.to_string_lossy().as_bytes()).to_hex();
+    Ok(base.join("projects").join(&id[..16]))
 }
 
 pub(super) fn resolve_path(path: &Path) -> anyhow::Result<Cow<'_, Path>> {

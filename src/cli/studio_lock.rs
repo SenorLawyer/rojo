@@ -261,7 +261,8 @@ impl LockStore {
 
     /// The default store for `start`: `rojo-state/studio-locks` in the Git
     /// common directory, so every worktree of a repository shares its locks,
-    /// or `.rojo/studio-locks` in `start` outside a Git repository.
+    /// or a per-user directory for `start` outside a Git repository (see
+    /// [`super::project_state_dir`]), never inside the project.
     pub(crate) fn discover(start: &Path) -> anyhow::Result<Self> {
         // Only "not a repository" (or no Git at all) falls back. A repository
         // whose common directory cannot be found is an error, since silently
@@ -274,7 +275,9 @@ impl LockStore {
             let common: PathBuf = common.components().collect();
             Ok(Self::new(common.join("rojo-state").join("studio-locks")))
         } else {
-            Ok(Self::new(start.join(".rojo").join("studio-locks")))
+            Ok(Self::new(
+                super::project_state_dir(start)?.join("studio-locks"),
+            ))
         }
     }
 
@@ -951,8 +954,8 @@ impl StateMutex {
 #[derive(Debug, Parser)]
 pub struct LockCommand {
     /// Directory holding the lock files. Defaults to rojo-state/studio-locks in
-    /// the Git common directory, shared by all worktrees, or .rojo/studio-locks
-    /// in the current directory outside Git.
+    /// the Git common directory, shared by all worktrees, or a per-user folder
+    /// for the current directory outside Git, never inside the project.
     #[clap(long, global = true)]
     pub dir: Option<PathBuf>,
     #[clap(subcommand)]

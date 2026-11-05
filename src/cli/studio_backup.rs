@@ -113,24 +113,32 @@ fn timestamp(millis: u64) -> String {
 
 impl Store {
     /// The store for the repository the current directory is in, shared by
-    /// all of its worktrees, or `.rojo/backups` outside a repository.
+    /// all of its worktrees, or a per-user directory outside a repository.
     pub fn open() -> anyhow::Result<Store> {
         let cwd = std::env::current_dir().context("Could not read the current directory")?;
-        Ok(Self::at_workdir(&cwd))
+        Self::at_workdir(&cwd)
     }
 
-    pub fn at_workdir(workdir: &Path) -> Store {
+    pub fn at_workdir(workdir: &Path) -> anyhow::Result<Store> {
         let dir = match git(
             workdir,
             &["rev-parse", "--path-format=absolute", "--git-common-dir"],
         ) {
-            Some(common) => PathBuf::from(common).join("rojo-state").join("backups"),
-            None => workdir.join(".rojo").join("backups"),
+            // Git prints forward slashes on Windows; rebuilding the path from
+            // its components gives one separator style in printed paths.
+            Some(common) => PathBuf::from(common)
+                .components()
+                .collect::<PathBuf>()
+                .join("rojo-state")
+                .join("backups"),
+            // Never inside the project: a folder that `rojo serve` maps would
+            // sync the backups into the place.
+            None => super::super::project_state_dir(workdir)?.join("backups"),
         };
-        Store {
+        Ok(Store {
             dir,
             workdir: workdir.to_owned(),
-        }
+        })
     }
 
     #[cfg(test)]

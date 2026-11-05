@@ -59,6 +59,7 @@ end
 local WIPE_GUARD_MIN_LINES = 5
 -- Bounds what the sync summary sends with every bridge poll.
 local MAX_SUMMARY_HELD = 20
+local MAX_SUMMARY_PATH_BYTES = 4096
 -- Undo history names of Rojo's own changes, which `OnUndo` reports.
 local PATCH_WAYPOINT_PREFIX = "Rojo: Patch "
 local RESYNC_WAYPOINT_PREFIX = "Rojo: Resync "
@@ -289,8 +290,8 @@ function ServeSession:restartStudioBridge()
 		getSourceHashes = function()
 			return self:getSourceHashes()
 		end,
-		applyResync = function(patch, expect, includeHeld, expiresAt)
-			return self:applyResync(patch, expect, includeHeld, expiresAt)
+		applyResync = function(patch, expect, includeHeld, expiresAt, isActive)
+			return self:applyResync(patch, expect, includeHeld, expiresAt, isActive)
 		end,
 	})
 	self.__studioBridge = bridge
@@ -334,9 +335,22 @@ function ServeSession:getSyncSummary()
 	table.sort(held, function(a, b)
 		return a.path < b.path
 	end)
-	while #held > MAX_SUMMARY_HELD do
-		table.remove(held)
+	-- The server ignores a summary over 16 KiB, so the listed paths share a
+	-- byte budget. The count still covers every hold.
+	local listed = {}
+	local budget = MAX_SUMMARY_PATH_BYTES
+	for _, entry in held do
+		if #listed >= MAX_SUMMARY_HELD then
+			break
+		end
+		entry.path = StudioBridge.truncateUtf8(entry.path, 256)
+		budget -= #entry.path + 64
+		if budget < 0 then
+			break
+		end
+		table.insert(listed, entry)
 	end
+	held = listed
 	return {
 		status = self.__status,
 		projectName = self.__projectName,
@@ -405,7 +419,7 @@ end
 	inside one undo step, so a script counts as updated only once its source
 	was written and the whole resync undoes together.
 ]=]
-function ServeSession:applyResync(patch, expect, includeHeld, expiresAt)
+function ServeSession:applyResync(patch, expect, includeHeld, expiresAt, isActive)
 	assert(self.__status == Status.Connected, "Rojo is not syncing this place. Connect it first.")
 	-- The server stops waiting at `expiresAt` and reports the batch as failed,
 	-- so nothing may change after it.
@@ -461,9 +475,19 @@ function ServeSession:applyResync(patch, expect, includeHeld, expiresAt)
 
 	local updated, failed = 0, 0
 	local ok, err = pcall(function()
+		local cancelled = false
 		for _, write in writes do
-			if expired() then
+			-- `isActive` asks the server, so it yields; it cannot run inside
+			-- the update callback, which must not.
+			if cancelled or expired() or (isActive and not isActive()) then
+				cancelled = true
 				failed += 1
+				continue
+			end
+			-- The script may have been removed, or replaced by another
+			-- instance, since the batch was built.
+			if self.__instanceMap.fromIds[write.id] ~= write.instance or not write.instance:IsDescendantOf(game) then
+				skipped += 1
 				continue
 			end
 			-- Only the hold that existed before this write may end with it. A
@@ -485,7 +509,7 @@ function ServeSession:applyResync(patch, expect, includeHeld, expiresAt)
 					end
 					if guardWipes and not string.find(write.target, "%S") then
 						local lines = countNonBlankLines(current)
-						if lines >= WIPE_GUARD_MIN_LINES then
+						if lines >= WIPE_GUARD_MIN_LINES or self.__heldWipes[write.id] then
 							held = lines
 							return nil
 						end
@@ -570,11 +594,13 @@ function ServeSession:__holdScriptWipes(patch)
 				lines = countNonBlankLines(source)
 			end
 		end
-		if lines < WIPE_GUARD_MIN_LINES then
+		-- A script that is already held stays held, even if its source was
+		-- shortened in Studio since. Only the ways out of a hold end it.
+		if lines < WIPE_GUARD_MIN_LINES and not self.__heldWipes[update.id] then
 			index += 1
 			continue
 		end
-		local path = instance:GetFullName()
+		local path = if instance then instance:GetFullName() else self.__heldWipes[update.id].path
 		if not self.__heldWipes[update.id] then
 			Log.warn(
 				"Rojo held back emptying {} ({} lines of code) because its file on disk is now empty."
@@ -584,7 +610,9 @@ function ServeSession:__holdScriptWipes(patch)
 				lines
 			)
 		end
-		self.__heldWipes[update.id] = { path = path, lines = lines, heldAt = nowMillis() }
+		if not self.__heldWipes[update.id] then
+			self.__heldWipes[update.id] = { path = path, lines = lines, heldAt = nowMillis() }
+		end
 		update.changedProperties.Source = nil
 		local empty = next(update.changedProperties) == nil
 			and update.changedName == nil

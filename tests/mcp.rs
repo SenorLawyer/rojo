@@ -30,9 +30,14 @@ fn initialized() -> Value {
 }
 
 fn exchange(directory: &std::path::Path, input: &[u8]) -> Vec<Value> {
+    // Lock and backup state outside Git goes to a per-user folder, which a
+    // test must not touch.
+    let state = directory.join(".test-state");
     let mut child = Command::new(env!("CARGO_BIN_EXE_rojo"))
         .args(["mcp", "--project"])
         .arg(directory)
+        .env("LOCALAPPDATA", &state)
+        .env("XDG_STATE_HOME", &state)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

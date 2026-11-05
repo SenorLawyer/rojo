@@ -89,7 +89,24 @@ fn is_script_file(path: &Path) -> bool {
     ) && path.is_file()
 }
 
+/// The file a script's source comes from. A script inside a model file
+/// (`.model.json`, `.rbxm`, `.rbxmx`) has no file of its own, so the model
+/// file of its nearest ancestor that has one is reported instead.
 fn source_file(tree: &RojoTree, id: rbx_dom_weak::types::Ref, root_dir: &Path) -> Option<String> {
+    let root = tree.get_root_id();
+    let mut current = id;
+    loop {
+        if let Some(file) = own_file(tree, current, root_dir) {
+            return Some(file);
+        }
+        if current == root {
+            return None;
+        }
+        current = tree.get_instance(current)?.parent();
+    }
+}
+
+fn own_file(tree: &RojoTree, id: rbx_dom_weak::types::Ref, root_dir: &Path) -> Option<String> {
     let metadata = tree.get_metadata(id)?;
     let instigating = match &metadata.instigating_source {
         Some(InstigatingSource::Path(path)) => Some(path.as_path()),
@@ -108,8 +125,14 @@ fn source_file(tree: &RojoTree, id: rbx_dom_weak::types::Ref, root_dir: &Path) -
                 .map(PathBuf::as_path)
                 .find(|path| is_script_file(path))
         })
-        .or(instigating)
-        .or_else(|| metadata.relevant_paths.first().map(PathBuf::as_path))?;
+        .or_else(|| instigating.filter(|path| path.is_file()))
+        .or_else(|| {
+            metadata
+                .relevant_paths
+                .iter()
+                .map(PathBuf::as_path)
+                .find(|path| path.is_file())
+        })?;
     let relative = path.strip_prefix(root_dir).unwrap_or(path);
     Some(relative.to_string_lossy().replace('\\', "/"))
 }
@@ -376,6 +399,11 @@ mod test {
         .unwrap();
         std::fs::write(root.join("src/Map/init.luau"), "return 1").unwrap();
         std::fs::write(root.join("src/Plain.luau"), "return 2").unwrap();
+        std::fs::write(
+            root.join("src/Widget.model.json"),
+            r#"{"className":"Folder","children":[{"name":"Inner","className":"ModuleScript","properties":{"Source":"return 3"}}]}"#,
+        )
+        .unwrap();
         let session =
             crate::serve_session::ServeSession::new(memofs::Vfs::new_default().unwrap(), root)
                 .unwrap();
@@ -389,6 +417,7 @@ mod test {
         };
         assert_eq!(file("/Map").as_deref(), Some("src/Map/init.luau"));
         assert_eq!(file("/Plain").as_deref(), Some("src/Plain.luau"));
+        assert_eq!(file("/Inner").as_deref(), Some("src/Widget.model.json"));
     }
 
     #[test]

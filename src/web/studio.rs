@@ -1168,10 +1168,15 @@ impl StudioBridge {
         let id = id.as_str();
         // Older plugins send no summary. A summary is a few hundred bytes, so
         // anything much larger is not one and is ignored.
-        let sync = value
-            .get("sync")
-            .filter(|sync| sync.is_object() && sync.to_string().len() <= MAX_SYNC_SUMMARY_BYTES)
-            .cloned();
+        // A summary that is too large replaces the last one with a marker,
+        // so `sessions` does not keep showing health that is out of date.
+        let sync = value.get("sync").filter(|sync| sync.is_object()).map(|sync| {
+            if sync.to_string().len() <= MAX_SYNC_SUMMARY_BYTES {
+                sync.clone()
+            } else {
+                json!({"status":"unknown","error":"The plugin sent a sync summary over 16 KiB, which was ignored"})
+            }
+        });
         // Leave room for Studio's HTTP queue and background UI scheduling before
         // the plugin's request deadline, even when no agent is issuing commands.
         let deadline = Instant::now() + Duration::from_secs(2);

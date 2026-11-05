@@ -473,6 +473,31 @@ return function()
 			expect(session.__heldWipes.UI).to.be.ok()
 		end)
 
+		it("keeps holding a held script that was shortened in Studio", function()
+			session:__holdScriptWipes(sourceUpdate("UI", ""))
+			local hold = session.__heldWipes.UI
+			module.Source = "return 1"
+			local again = sourceUpdate("UI", " ")
+			session:__holdScriptWipes(again)
+			expect(#again.updated).to.equal(0)
+			expect(session.__heldWipes.UI).to.equal(hold)
+		end)
+
+		it("lists held scripts within a byte budget", function()
+			for index = 1, 40 do
+				session.__heldWipes["ID" .. index] = { path = string.rep("x", 900) .. index, lines = 9, heldAt = 0 }
+			end
+			local summary = session:getSyncSummary()
+			expect(summary.heldWipeCount).to.equal(40)
+			local bytes = 0
+			for _, entry in summary.heldWipes do
+				expect(#entry.path <= 256).to.equal(true)
+				bytes += #entry.path
+			end
+			expect(bytes <= 4096).to.equal(true)
+			expect(#summary.heldWipes > 0).to.equal(true)
+		end)
+
 		it("lets small scripts be emptied", function()
 			module.Source = "return 1"
 			local patch = sourceUpdate("UI", "")
@@ -530,6 +555,34 @@ return function()
 			)
 			expect(result.skipped).to.equal(1)
 			expect(session.__heldWipes.UI).to.equal(hold)
+		end)
+
+		it("stops writing once the server says the batch was cancelled", function()
+			session.__status = ServeSession.Status.Connected
+			local kept = module.Source
+			local asked = 0
+			local result = session:applyResync(
+				sourceUpdate("UI", "return 'cancelled'"),
+				expectFrom(kept, "return 'cancelled'"),
+				false,
+				nil,
+				function()
+					asked += 1
+					return false
+				end
+			)
+			expect(asked).to.equal(1)
+			expect(result.failed).to.equal(1)
+			expect(module.Source).to.equal(kept)
+		end)
+
+		it("skips a script removed from the place since the batch was built", function()
+			session.__status = ServeSession.Status.Connected
+			local kept = module.Source
+			module.Parent = nil
+			local result = session:applyResync(sourceUpdate("UI", "return 'x'"), expectFrom(kept, "return 'x'"), false)
+			expect(result.skipped).to.equal(1)
+			expect(module.Source).to.equal(kept)
 		end)
 
 		it("writes nothing once the command expired", function()
