@@ -687,7 +687,10 @@ fn describe_sessions(result: &Value) -> String {
         if let Some(plugin) = sync["pluginVersion"].as_str() {
             let minor = |version: &str| {
                 let mut parts = version.split('.');
-                (parts.next().map(str::to_owned), parts.next().map(str::to_owned))
+                (
+                    parts.next().map(str::to_owned),
+                    parts.next().map(str::to_owned),
+                )
             };
             if minor(plugin) != minor(server) {
                 warnings.push(format!(

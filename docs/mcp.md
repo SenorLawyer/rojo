@@ -42,6 +42,12 @@ Use the host's own configuration format when it differs. Rojo writes only JSON-R
 | `studio_properties` | `studio properties --json` | `session`, `instance`, `properties` |
 | `studio_logs` | `studio logs --json` | `session`, optional `limit`, `after` |
 | `studio_export` | `studio export --json` | `session`, `instance`, `output` |
+| `studio_verify` | `studio verify --json` | `session`, optional `fix`, `includeHeld` |
+| `studio_backup` | `studio backup create --json` | `session`, `instance`, optional `name`, `note` |
+| `studio_backup_list` | `studio backup list --json` | None |
+| `studio_lock_acquire` | `studio lock acquire --json` | `lock`, `owner`, optional `exclusive`, `limit`, `ttl`, `wait` (at most 60), `note` |
+| `studio_lock_release` | `studio lock release --json` | `lock`, `owner` |
+| `studio_lock_status` | `studio lock status --json` | optional `lock` |
 | `checkpoint_list` | `checkpoint list --json` | None |
 | `workspace_list` | `workspace list --json` | None |
 | `packages_doctor` | `packages doctor --json` | None |
@@ -49,6 +55,8 @@ Use the host's own configuration format when it differs. Rojo writes only JSON-R
 List Studio sessions first and choose the exact UUID for every targeted operation. The adapter never chooses the first available session; `run_tests` without a `session` lets `rojo test` use the only connected session and fails when there are several. It forwards the configured address and token file to each Studio command. Package, workspace and checkpoint tools use the project fixed at server startup; a tool call cannot override it.
 
 `studio_export` creates a native `.rbxm` file at a relative path inside that project. Its parent directory must already exist. Absolute paths, parent traversal and escaping through a parent symlink are rejected. Paths inside a directory mapped by the project's `$path` entries are also rejected, since `rojo serve` would sync the exported model back into Studio. The native export command refuses to overwrite an existing file. This tool exports a model; it does not save or publish the place. Imports remain explicit CLI operations outside this MCP catalog.
+
+`studio_verify` compares the session's scripts with their files, as described in [Verify Studio against the files](sync-health.md#verify-studio-against-the-files). A place that does not match is a successful call with `inSync: false`; `fix` changes scripts in Studio, so the tool is not read-only. `studio_lock_acquire` answers a busy lock with `granted: false` and the current holders rather than a tool error. Lock tools need no Studio connection. See [Studio locks](studio-locks.md).
 
 `studio_logs` returns the newest entries as a list. To tail the log, pass `after: 0` on the first call and the result's `nextAfter` on each later call. Each result then holds only the entries captured since the previous call, oldest first, with `more: true` when more are waiting than `limit` allowed and a `dropped` count for entries lost from the plugin's 200-entry buffer in between. See [Following logs](studio-bridge.md#following-logs) for every field. The MCP tool reads once per call; it does not run `--follow`.
 

@@ -498,7 +498,8 @@ fn command(
             let action = name.strip_prefix("studio_").context("Unknown tool")?;
             // Verify reports a place that does not match its files with exit
             // status 1 and a full report, which is a result, not a failure.
-            reports_failure = action == "verify";
+            // A busy lock exits with 3, which is an answer too.
+            reports_failure = matches!(action, "verify" | "lock_acquire");
             let session = canonical_session(arguments);
             if let (true, Some(session)) = (action != "sessions", &session) {
                 let request = uuid::Uuid::new_v4().to_string();
@@ -515,6 +516,12 @@ fn command(
                 "backup_list" => {
                     command.args(["backup", "list"]);
                 }
+                "lock_acquire" | "lock_release" | "lock_status" => {
+                    command.args(["lock", &action["lock_".len()..]]);
+                    if let Some(lock) = arguments.get("lock").and_then(Value::as_str) {
+                        command.arg(lock);
+                    }
+                }
                 action => {
                     command.arg(action);
                 }
@@ -522,7 +529,10 @@ fn command(
             if let Some(session) = &session {
                 command.arg(format!("--session={session}"));
             }
-            for key in ["instance", "depth", "limit", "seconds", "after", "name", "note"] {
+            for key in [
+                "instance", "depth", "limit", "seconds", "after", "name", "note", "owner", "ttl",
+                "wait",
+            ] {
                 if let Some(value) = arguments.get(key) {
                     command.arg(format!(
                         "--{key}={}",
@@ -537,6 +547,9 @@ fn command(
                 for property in properties {
                     command.arg(format!("--property={}", property.as_str().unwrap()));
                 }
+            }
+            if arguments.get("exclusive") == Some(&json!(true)) {
+                command.arg("--exclusive");
             }
             if arguments.get("fix") == Some(&json!(true)) {
                 command.arg("--fix");
@@ -637,6 +650,8 @@ const MAX_SAFE_INTEGER: u64 = (1 << 53) - 1;
 fn catalog() -> Vec<Value> {
     let session = json!({"type":"string","format":"uuid","maxLength":128});
     let instance = json!({"type":"string","minLength":1,"maxLength":1024});
+    let lock = json!({"type":"string","pattern":"^[A-Za-z0-9_.-]{1,64}$"});
+    let owner = json!({"type":"string","minLength":1,"maxLength":128});
     let mut tools = Vec::new();
     for (name, description, properties, required) in [
         ("studio_sessions", "List connected Studio sessions and identities.", json!({}), vec![]),
@@ -650,11 +665,14 @@ fn catalog() -> Vec<Value> {
         ("studio_verify", "Check that every script Rojo syncs has the same source in the selected Studio as in its file, after a crash, a reconnect, an undo or whenever Studio may be out of date. Lists scripts that differ, are missing from Studio or were removed there, each with its file. With fix, sets differing scripts back to their files' contents (held wipes stay unless includeHeld). A place that does not match is a result (inSync false), not a tool error.", json!({"session":session,"fix":{"type":"boolean"},"includeHeld":{"type":"boolean"}}), vec!["session"]),
         ("studio_backup", "Save a copy of an instance (such as game/Workspace/Map) outside the place, in the repository's backup folder, before rebuilding or replacing it. Use this instead of copying it into ServerStorage. Restore with `rojo studio backup restore`.", json!({"session":session,"instance":instance,"name":{"type":"string","minLength":1,"maxLength":64},"note":{"type":"string","minLength":1,"maxLength":512}}), vec!["session","instance"]),
         ("studio_backup_list", "List saved Studio backups, newest first.", json!({}), vec![]),
+        ("studio_lock_acquire", "Take or renew a named advisory lease on a shared Studio window before using it, such as `main` for Edit work (shared) or `build` for a play test (exclusive). Locks are shared by every worktree of the project and need no Studio connection. Returns granted false with the holders when the lock is busy; retry later or pass wait (seconds). Release it when done. Studio tools such as execute_luau do not check locks, so take one first.", json!({"lock":lock,"owner":owner,"exclusive":{"type":"boolean"},"limit":{"type":"integer","minimum":1,"maximum":64},"ttl":{"type":"integer","minimum":1,"maximum":3600},"wait":{"type":"integer","minimum":0,"maximum":60},"note":{"type":"string","minLength":1,"maxLength":512}}), vec!["lock","owner"]),
+        ("studio_lock_release", "Give up a lease or place in line taken with studio_lock_acquire.", json!({"lock":lock,"owner":owner}), vec!["lock","owner"]),
+        ("studio_lock_status", "Show who holds and waits for a Studio lock, or every lock when lock is omitted.", json!({"lock":lock}), vec![]),
         ("checkpoint_list", "List archived checkpoints for the fixed project.", json!({}), vec![]),
         ("workspace_list", "List Git worktrees and saved-place identities for the fixed project.", json!({}), vec![]),
         ("packages_doctor", "Inspect Wally/pesde manifests, lockfiles and declared Rojo package mappings without running a package manager.", json!({}), vec![]),
     ] {
-        tools.push(json!({"name":name,"description":description,"inputSchema":{"type":"object","properties":properties,"required":required,"additionalProperties":false},"annotations":{"readOnlyHint":!matches!(name, "studio_export" | "studio_test" | "run_tests" | "studio_verify" | "studio_backup"),"destructiveHint":matches!(name, "studio_test" | "run_tests" | "studio_verify"),"openWorldHint":matches!(name, "studio_test" | "run_tests")}}));
+        tools.push(json!({"name":name,"description":description,"inputSchema":{"type":"object","properties":properties,"required":required,"additionalProperties":false},"annotations":{"readOnlyHint":!matches!(name, "studio_export" | "studio_test" | "run_tests" | "studio_verify" | "studio_backup" | "studio_lock_acquire" | "studio_lock_release"),"destructiveHint":matches!(name, "studio_test" | "run_tests" | "studio_verify"),"openWorldHint":matches!(name, "studio_test" | "run_tests")}}));
     }
     tools
 }
@@ -692,7 +710,24 @@ fn validate_arguments<'a>(name: &str, value: &'a Value) -> Result<&'a Map<String
                 uuid::Uuid::parse_str(value.as_str().ok_or("session must be a UUID string")?)
                     .map_err(|_| "session must be an exact UUID from studio_sessions")?;
             }
-            "fix" | "includeHeld" => {
+            "lock" => {
+                let text = value.as_str().ok_or("lock must be a string")?;
+                if text.is_empty()
+                    || text.len() > 64
+                    || !text
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'))
+                {
+                    return Err("lock must be 1-64 letters, digits, '_', '.' or '-'".into());
+                }
+            }
+            "owner" => {
+                let text = value.as_str().ok_or("owner must be a string")?;
+                if text.is_empty() || text.len() > 128 || text.chars().any(char::is_control) {
+                    return Err("Invalid owner".into());
+                }
+            }
+            "exclusive" | "fix" | "includeHeld" => {
                 value.as_bool().ok_or("Expected true or false")?;
             }
             "name" | "note" => {
@@ -708,7 +743,7 @@ fn validate_arguments<'a>(name: &str, value: &'a Value) -> Result<&'a Map<String
                     return Err("Invalid string argument".into());
                 }
             }
-            "depth" | "limit" | "seconds" | "timeout" | "after" => {
+            "depth" | "limit" | "seconds" | "timeout" | "after" | "ttl" | "wait" => {
                 let number = value.as_u64().ok_or("Expected a non-negative integer")?;
                 // Bounds come from the advertised schema so they cannot drift
                 // apart, such as the log limit that the plugin caps lower than
@@ -852,8 +887,10 @@ fn run_command_for(
         "Native tool output exceeded 256 KiB per stream; request fewer instances or log entries"
     );
     let output = String::from_utf8(stdout).context("Native tool returned invalid UTF-8")?;
+    // Exit status 1 is a failed test or a place that does not match its
+    // files, and 3 a busy lock. Both still print a complete JSON answer.
     let reported_failure = reports_failure
-        && status.code() == Some(1)
+        && matches!(status.code(), Some(1 | 3))
         && serde_json::from_str::<Value>(&output).is_ok_and(|value| value.is_object());
     if !status.success() && !reported_failure {
         bail!(

@@ -410,4 +410,166 @@ return function()
 			expect(refPatchCalls).to.equal(0)
 		end)
 	end)
+
+	describe("script wipe guard", function()
+		local Settings = require(script.Parent.Settings)
+		local container
+		local module
+
+		local function sourceUpdate(id, source, extra)
+			local update = { id = id, changedProperties = { Source = { String = source } } }
+			for key, value in extra or {} do
+				update.changedProperties[key] = value
+			end
+			return { removed = {}, added = {}, updated = { update } }
+		end
+
+		beforeEach(function()
+			container = Instance.new("Folder")
+			module = Instance.new("ModuleScript")
+			module.Name = "UIController"
+			module.Source = "local a = 1\nlocal b = 2\nlocal c = 3\nlocal d = 4\nreturn a + b + c + d\n"
+			module.Parent = container
+			container.Parent = workspace
+			session.__instanceMap:insert("UI", module)
+			Settings:set("guardScriptWipes", true)
+		end)
+
+		afterEach(function()
+			container:Destroy()
+		end)
+
+		it("holds back emptying a script with several lines", function()
+			local patch = sourceUpdate("UI", "")
+			session:__holdScriptWipes(patch)
+			expect(#patch.updated).to.equal(0)
+			expect(session.__heldWipes.UI).to.be.ok()
+			expect(session.__heldWipes.UI.lines).to.equal(5)
+			expect(session:getSyncSummary().heldWipeCount).to.equal(1)
+		end)
+
+		it("keeps the rest of an update whose source it holds back", function()
+			local patch = sourceUpdate("UI", "  \n", { Disabled = { Bool = true } })
+			session:__holdScriptWipes(patch)
+			expect(#patch.updated).to.equal(1)
+			expect(patch.updated[1].changedProperties.Source).to.equal(nil)
+			expect(patch.updated[1].changedProperties.Disabled).to.be.ok()
+		end)
+
+		it("lets small scripts be emptied", function()
+			module.Source = "return 1"
+			local patch = sourceUpdate("UI", "")
+			session:__holdScriptWipes(patch)
+			expect(#patch.updated).to.equal(1)
+			expect(session.__heldWipes.UI).to.equal(nil)
+		end)
+
+		it("ends the hold when the file has code again or is removed", function()
+			session:__holdScriptWipes(sourceUpdate("UI", ""))
+			expect(session.__heldWipes.UI).to.be.ok()
+			local fixed = sourceUpdate("UI", "return 'fixed'")
+			session:__holdScriptWipes(fixed)
+			expect(session.__heldWipes.UI).to.equal(nil)
+			expect(#fixed.updated).to.equal(1)
+
+			session:__holdScriptWipes(sourceUpdate("UI", ""))
+			session:__holdScriptWipes({ removed = { "UI" }, added = {}, updated = {} })
+			expect(session.__heldWipes.UI).to.equal(nil)
+		end)
+
+		it("does nothing when the setting is off", function()
+			Settings:set("guardScriptWipes", false)
+			local patch = sourceUpdate("UI", "")
+			session:__holdScriptWipes(patch)
+			Settings:set("guardScriptWipes", true)
+			expect(#patch.updated).to.equal(1)
+		end)
+
+		it("applies a held wipe when resynced on purpose", function()
+			session.__status = ServeSession.Status.Connected
+			session:__applyPatch(sourceUpdate("UI", ""))
+			expect(string.find(module.Source, "return a") ~= nil).to.equal(true)
+			local result = session:applyResync(sourceUpdate("UI", ""))
+			expect(result.updated).to.equal(1)
+			expect(module.Source).to.equal("")
+			expect(session.__heldWipes.UI).to.equal(nil)
+		end)
+
+		it("refuses a resync that adds or removes instances", function()
+			session.__status = ServeSession.Status.Connected
+			local ok = pcall(session.applyResync, session, { removed = { "UI" }, added = {}, updated = {} })
+			expect(ok).to.equal(false)
+		end)
+	end)
+
+	describe("verify support", function()
+		local hashSource = require(script.Parent.hashSource)
+
+		it("hashes tracked scripts and lists ones removed from the place", function()
+			local container = Instance.new("Folder")
+			local inPlace = Instance.new("ModuleScript")
+			inPlace.Source = "return 1\n"
+			inPlace.Parent = container
+			container.Parent = workspace
+			local removed = Instance.new("ModuleScript")
+			session.__instanceMap:insert("IN", inPlace)
+			session.__instanceMap:insert("OUT", removed)
+			session.__instanceMap:insert("FOLDER", container)
+			session.__status = ServeSession.Status.Connected
+
+			local report = session:getSourceHashes()
+			container:Destroy()
+			expect(#report.scripts).to.equal(1)
+			local hash, length = hashSource("return 1\n")
+			expect(report.scripts[1].id).to.equal("IN")
+			expect(report.scripts[1].hash).to.equal(hash)
+			expect(report.scripts[1].length).to.equal(length)
+			expect(#report.detached).to.equal(1)
+			expect(report.detached[1]).to.equal("OUT")
+		end)
+
+		it("refuses to hash before syncing starts", function()
+			expect(pcall(session.getSourceHashes, session)).to.equal(false)
+		end)
+
+		it("counts undone Rojo changes, but not other undo steps", function()
+			session.__status = ServeSession.Status.Connected
+			session:__onRojoHistoryChanged("Rojo: Patch 10:00:00 AM", 1)
+			session:__onRojoHistoryChanged("Move Part", 1)
+			expect(session:getSyncSummary().undoneRojoPatches).to.equal(1)
+			session:__onRojoHistoryChanged("Rojo: Patch 10:00:00 AM", -1)
+			expect(session:getSyncSummary().undoneRojoPatches).to.equal(0)
+		end)
+
+		it("records patch counts in the sync summary", function()
+			session.__status = ServeSession.Status.Connected
+			session:__applyPatch(PatchSet.newEmpty())
+			local summary = session:getSyncSummary()
+			expect(summary.patchesApplied).to.equal(1)
+			expect(summary.lastPatchUnapplied).to.equal(0)
+			expect(type(summary.lastPatchAt)).to.equal("number")
+		end)
+	end)
+
+	describe("versionMismatchWarning", function()
+		local Config = require(script.Parent.Config)
+		local Version = require(script.Parent.Version)
+
+		it("stays quiet for the same major and minor version", function()
+			local same = string.format("%d.%d.99", Config.version[1], Config.version[2])
+			expect(ServeSession.versionMismatchWarning(same)).to.equal(nil)
+			expect(ServeSession.versionMismatchWarning(nil)).to.equal(nil)
+			expect(ServeSession.versionMismatchWarning("garbage")).to.equal(nil)
+		end)
+
+		it("says which side to update", function()
+			local newer = string.format("%d.%d.0", Config.version[1], Config.version[2] + 1)
+			local older = string.format("%d.%d.0", Config.version[1] - 1, 0)
+			local newerWarning = ServeSession.versionMismatchWarning(newer)
+			local olderWarning = ServeSession.versionMismatchWarning(older)
+			expect(newerWarning:find("rojo plugin install", 1, true) ~= nil).to.equal(true)
+			expect(olderWarning:find("rokit.toml", 1, true) ~= nil).to.equal(true)
+			expect(newerWarning:find(Version.display(Config.version), 1, true) ~= nil).to.equal(true)
+		end)
+	end)
 end

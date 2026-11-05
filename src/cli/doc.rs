@@ -66,6 +66,11 @@ pub const AGENT_TOPICS: &[(&str, &str, &str)] = &[
         include_str!("../../docs/studio-bridge.md"),
     ),
     (
+        "sync-health",
+        "rojo studio verify, sync status, the wipe guard and backups",
+        include_str!("../../docs/sync-health.md"),
+    ),
+    (
         "studio-locks",
         "rojo studio lock: advisory leases for agents sharing Studio windows",
         include_str!("../../docs/studio-locks.md"),

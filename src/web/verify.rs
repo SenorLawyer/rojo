@@ -389,7 +389,10 @@ mod test {
         let tree = tree();
         let scripts = tree_scripts(&tree, Path::new("/"));
         let mut answer = studio_answer(&scripts);
-        let changed = scripts.iter().find(|s| s.path.ends_with("/Changed")).unwrap();
+        let changed = scripts
+            .iter()
+            .find(|s| s.path.ends_with("/Changed"))
+            .unwrap();
         answer["held"] = json!([changed.id]);
         let comparison = compare(scripts, &answer).unwrap();
         assert!(comparison.fixable(false).is_empty());
@@ -417,7 +420,11 @@ mod test {
             InstanceSnapshot::new()
                 .name("game")
                 .class_name("DataModel")
-                .children(vec![script("A", &big), script("B", &big), script("C", "return 1")]),
+                .children(vec![
+                    script("A", &big),
+                    script("B", &big),
+                    script("C", "return 1"),
+                ]),
         );
         let ids: Vec<_> = tree_scripts(&tree, Path::new("/"))
             .into_iter()

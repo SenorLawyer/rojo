@@ -158,9 +158,16 @@ impl Store {
         fs::create_dir_all(&self.dir)
             .with_context(|| format!("Could not create {}", self.dir.display()))?;
         record.git_head = git(&self.workdir, &["rev-parse", "HEAD"]);
-        record.git_branch = git(&self.workdir, &["symbolic-ref", "--quiet", "--short", "HEAD"]);
+        record.git_branch = git(
+            &self.workdir,
+            &["symbolic-ref", "--quiet", "--short", "HEAD"],
+        );
         record.bytes = model.len() as u64;
-        let base = format!("{}-{}", timestamp(record.created_at), sanitize(&record.name));
+        let base = format!(
+            "{}-{}",
+            timestamp(record.created_at),
+            sanitize(&record.name)
+        );
         // Two backups with the same name in the same second get a suffix.
         let mut id = base.clone();
         let mut attempt = 1;
@@ -178,7 +185,10 @@ impl Store {
         // The record is written last, so a backup that `list` shows always
         // has its model.
         let mut record_file = tempfile::NamedTempFile::new_in(&self.dir)?;
-        std::io::Write::write_all(&mut record_file, serde_json::to_string_pretty(&record)?.as_bytes())?;
+        std::io::Write::write_all(
+            &mut record_file,
+            serde_json::to_string_pretty(&record)?.as_bytes(),
+        )?;
         record_file
             .persist_noclobber(self.record_path(&id))
             .map_err(|error| error.error)
@@ -258,10 +268,9 @@ pub fn print_list(store: &Store, records: &[Record]) {
             format!("{:.1} KB", record.bytes as f64 / 1024.0)
         };
         let place = record.place_name.as_deref().unwrap_or("unknown place");
-        let commit = record
-            .git_head
-            .as_deref()
-            .map_or_else(String::new, |head| format!(" @ {}", &head[..head.len().min(8)]));
+        let commit = record.git_head.as_deref().map_or_else(String::new, |head| {
+            format!(" @ {}", &head[..head.len().min(8)])
+        });
         println!(
             "{}  {} ({}, {size}) from {place}{commit}",
             record.id, record.instance, record.class_name

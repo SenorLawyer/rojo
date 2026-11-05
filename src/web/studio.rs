@@ -18,9 +18,7 @@ use serde_json::{json, Value};
 use tokio::sync::{oneshot, Notify, Semaphore};
 use uuid::Uuid;
 
-use super::{
-    model_check, origin::canonical, untrusted_model, util::json as json_response, verify,
-};
+use super::{model_check, origin::canonical, untrusted_model, util::json as json_response, verify};
 use crate::serve_session::ServeSession;
 
 pub(super) const MAX_BODY: usize = 8 * 1024 * 1024;

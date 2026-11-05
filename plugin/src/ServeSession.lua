@@ -64,8 +64,7 @@ local RESYNC_WAYPOINT_PREFIX = "Rojo: Resync "
 
 local function countNonBlankLines(source: string): number
 	local count = 0
-	for line in string.gmatch(source, "[^
-]+") do
+	for line in string.gmatch(source, "[^\n]+") do
 		if string.find(line, "%S") then
 			count += 1
 		end
