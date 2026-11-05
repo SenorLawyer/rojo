@@ -1616,6 +1616,21 @@ fn sync(
     for key in &plan.stale_pending {
         lock.pending.remove(key);
     }
+    // An id in use by this creator is current, whatever an earlier creator
+    // change recorded for it: switching back after an interrupted move can
+    // leave a file `Unchanged` with an id that is also recorded as replaced,
+    // and `remap` would then rewrite valid references to the other
+    // creator's id. Reconciled against every entry, since unchanged ones
+    // never pass through `replace_entry`.
+    let creator = config.creator_key();
+    let current_ids: BTreeSet<String> = lock
+        .assets
+        .values()
+        .filter(|entry| entry.creator == creator)
+        .map(|entry| entry.asset_id.to_string())
+        .collect();
+    lock.replaced.retain(|old, _| !current_ids.contains(old));
+    lock.displaced.retain(|old, _| !current_ids.contains(old));
     write_if_changed(&config.lock, &render_lock(&lock))?;
     let newly_replaced = lock
         .replaced
@@ -2001,6 +2016,10 @@ struct RemapReport {
     /// being rewritten, such as an editor saving them. They are left as they
     /// are, so the other edit is kept; running remap again picks them up.
     changed_during_remap: Vec<String>,
+    /// Old ids recorded under `replaced` that an entry under `assets` still
+    /// uses, so they are current and are not rewritten. `sync` drops such
+    /// records; these come from a lockfile edited or merged by hand.
+    live_ids_skipped: Vec<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     map_out: Option<String>,
 }
@@ -2369,12 +2388,27 @@ fn remap_with(
             }
         }
     }
-    let lock = load_lock(&lock_path)?;
+    let mut lock = load_lock(&lock_path)?;
+    // Records for ids still in use are left out before chains are followed,
+    // so that a chain ends at a live id instead of passing through it.
+    let live_ids: BTreeSet<String> = lock
+        .assets
+        .values()
+        .map(|entry| entry.asset_id.to_string())
+        .collect();
+    let live_ids_skipped: Vec<u64> = lock
+        .replaced
+        .keys()
+        .filter(|old| live_ids.contains(*old))
+        .filter_map(|old| old.parse().ok())
+        .collect();
+    lock.replaced.retain(|old, _| !live_ids.contains(old));
     let map = resolve_replacements(&lock, &lock_path)?;
     let mut report = RemapReport {
         write: options.write,
         lockfile: display_path(&config, &lock_path),
         replacements: map.len(),
+        live_ids_skipped,
         ..RemapReport::default()
     };
 
@@ -2464,6 +2498,18 @@ fn describe_remap(report: &RemapReport, out: &mut dyn Write) -> io::Result<()> {
             } else {
                 ""
             }
+        )?;
+    }
+    if !report.live_ids_skipped.is_empty() {
+        let ids: Vec<String> = report.live_ids_skipped.iter().map(u64::to_string).collect();
+        writeln!(
+            out,
+            "warning: {} under \"replaced\" in {} {} still used under \"assets\", so {} not \
+             rewritten. Run `rojo assets sync` to drop such records, or remove them by hand.",
+            ids.join(", "),
+            report.lockfile,
+            if ids.len() == 1 { "is" } else { "are" },
+            if ids.len() == 1 { "it is" } else { "they are" },
         )?;
     }
     if report.replacements == 0 {
@@ -4182,6 +4228,106 @@ mod tests {
         for url in kept {
             assert!(expected.contains(url));
         }
+    }
+
+    #[test]
+    fn switching_back_drops_records_for_ids_that_are_current_again() {
+        let fixture = Fixture::new();
+        // A and B share contents and so id 1001; C is the upload that fails
+        // during the move, before B's copy of A's new id is saved.
+        fixture.write("A.png", &png(8, 8, "same"));
+        fixture.write("B.png", &png(8, 8, "same"));
+        fixture.write("C.png", &png(8, 8, "c"));
+        let cloud = FakeCloud::start(Some(4));
+        fixture.sync(&cloud).unwrap();
+        assert_eq!(
+            fixture.ids(),
+            ids(&[("A.png", 1001), ("B.png", 1001), ("C.png", 1002)])
+        );
+        fixture.set_creator("group_id = 7");
+        fixture.sync(&cloud).unwrap_err();
+        assert_eq!(fixture.replaced(), ids(&[("1001", 1003)]));
+        assert_eq!(fixture.lock().assets["B.png"].creator, "user:42");
+
+        fs::remove_file(fixture.dir.path().join("assets/A.png")).unwrap();
+        fs::remove_file(fixture.dir.path().join("assets/C.png")).unwrap();
+        fixture.set_creator("user_id = 42");
+        let (report, _) = fixture.sync(&cloud).unwrap();
+
+        // B.png is unchanged and still uses 1001, so 1001 is current.
+        assert!(report.uploaded.is_empty());
+        assert_eq!(fixture.ids(), ids(&[("B.png", 1001)]));
+        assert!(fixture.lock().replaced.is_empty());
+        assert!(fixture
+            .read_project("assets.lock.json")
+            .starts_with("{\n  \"version\": 1,"));
+        assert!(!fixture.status().contains("remap"));
+
+        fixture.write_project("src/Shop.luau", b"local B = \"rbxassetid://1001\"\n");
+        let (report, _) = fixture.remap(RemapOptions {
+            write: true,
+            ..RemapOptions::default()
+        });
+        assert!(report.references.is_empty());
+        assert_eq!(
+            fixture.read_project("src/Shop.luau"),
+            "local B = \"rbxassetid://1001\"\n"
+        );
+    }
+
+    #[test]
+    fn remap_does_not_rewrite_ids_that_are_still_in_use() {
+        let fixture = Fixture::new();
+        // As a hand-merged lockfile might have it: 123456789 is recorded as
+        // replaced but still used, and 555 was replaced by it.
+        fixture.write_replaced(&[(123456789, 987654321), (555, 123456789)]);
+        let mut lock = fixture.lock();
+        lock.assets.insert(
+            "Coin.png".to_owned(),
+            LockEntry {
+                hash: "abc".to_owned(),
+                asset_id: 123456789,
+                asset_type: "Image".to_owned(),
+                creator: "user:42".to_owned(),
+                moderation_state: None,
+                uploaded: "2026-01-01T00:00:00Z".to_owned(),
+            },
+        );
+        fs::write(
+            fixture.dir.path().join("assets.lock.json"),
+            render_lock(&lock),
+        )
+        .unwrap();
+        let text = "a = \"rbxassetid://123456789\"\nb = \"rbxassetid://555\"\n";
+        fixture.write_project("src/Shop.luau", text.as_bytes());
+        let map_out = fixture.dir.path().join("ids.json");
+
+        let (report, out) = fixture.remap(RemapOptions {
+            write: true,
+            map_out: Some(map_out.clone()),
+            ..RemapOptions::default()
+        });
+
+        assert_eq!(report.live_ids_skipped, [123456789]);
+        assert_eq!(report.replacements, 1);
+        // The chain from 555 ends at the live id.
+        assert_eq!(
+            fixture.read_project("src/Shop.luau"),
+            "a = \"rbxassetid://123456789\"\nb = \"rbxassetid://123456789\"\n"
+        );
+        assert_eq!(
+            fs::read_to_string(map_out).unwrap(),
+            "{\n  \"555\": 123456789\n}\n"
+        );
+        assert!(
+            out.contains(
+                "warning: 123456789 under \"replaced\" in assets.lock.json is still used under \
+                 \"assets\", so it is not rewritten."
+            ),
+            "{out}"
+        );
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["liveIdsSkipped"][0], 123456789);
     }
 
     #[test]
