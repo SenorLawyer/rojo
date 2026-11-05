@@ -4,14 +4,18 @@ on:
   push:
     branches:
     - master
+    # Releases of earlier lines are tagged on these branches, and the release
+    # workflow requires a passing push run on the tagged commit.
+    - release/**
 
   pull_request:
-    branches:
-    - master
 
 concurrency:
   group: ci-${{ github.ref }}
-  # Superseded PR runs are wasted work, but every push to master must finish.
+  # Superseded PR runs are wasted work, so they are cancelled. Runs for pushed
+  # branches are not cancelled once started, but GitHub still drops a pending
+  # run when a newer one queues behind it, so a release may need CI re-run on
+  # its commit.
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
@@ -38,7 +42,9 @@ jobs:
     - name: Install Rust
       uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
       with:
-        toolchain: stable
+        # Pinned so lints and release builds match. Keep in sync with
+        # release.yml.
+        toolchain: 1.99.1
 
     - name: Restore Rust Cache
       uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
@@ -48,6 +54,7 @@ jobs:
           ~/.cargo/git
           target
         key: ${{ matrix.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: ${{ matrix.os }}-cargo-
 
     - name: Build and test
       run: cargo test --workspace --locked --verbose ${{ matrix.os == 'windows-latest' && '--release' || '' }}
@@ -105,6 +112,7 @@ jobs:
           ~/.cargo/git
           target
         key: ${{ runner.os }}-${{ github.job }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: ${{ runner.os }}-${{ github.job }}-cargo-
 
     - name: Build
       run: cargo build --locked --verbose
@@ -131,7 +139,9 @@ jobs:
     - name: Install Rust
       uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
       with:
-        toolchain: stable
+        # Pinned so lints and release builds match. Keep in sync with
+        # release.yml.
+        toolchain: 1.99.1
         components: rustfmt, clippy
 
     - name: Restore Rust Cache
@@ -142,6 +152,7 @@ jobs:
           ~/.cargo/git
           target
         key: ${{ runner.os }}-${{ github.job }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: ${{ runner.os }}-${{ github.job }}-cargo-
 
     - name: Setup Rokit
       uses: CompeyDev/setup-rokit@d49be92bd9502180218c3f43e7988faa945217b0 # v0.1.2
@@ -149,10 +160,10 @@ jobs:
         version: 'v1.1.0'
 
     - name: Stylua
-      run: stylua --check plugin/src
+      run: stylua --check plugin/src plugin/http plugin/log plugin/fmt plugin/run-tests.server.lua
 
     - name: Selene
-      run: selene plugin/src
+      run: selene plugin/src plugin/http plugin/log plugin/fmt plugin/run-tests.server.lua
 
     - name: Rustfmt
       run: cargo fmt -- --check

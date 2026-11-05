@@ -47,6 +47,8 @@ return function()
 		}
 		local context = ApiContext.new("http://localhost:34872")
 		context.__sessionId = "test-session"
+		-- Specs leave sockets open, which must not use up Studio's budget.
+		context.__streamBudget = Http.StreamBudget.new()
 		context.__createWebSocket = function()
 			return socket
 		end
@@ -212,6 +214,67 @@ return function()
 			expect(string.find(tostring(err), "Timed out connecting", 1, true) ~= nil).to.equal(true)
 			expect(pending:getStatus()).to.equal(Promise.Status.Cancelled)
 			expect(next(context.__activeRequests)).to.equal(nil)
+		end)
+
+		it("starts a stream request's timeout once it is sent, not while it waits for the slot", function()
+			local pending = Promise.new(function() end)
+			local seenOptions
+			Http.get = function(_, options)
+				seenOptions = options
+				return pending
+			end
+			local baseUrl = "http://127.0.0.1:34991"
+			Http._forgetPlainOrigin(baseUrl)
+			Http._recordPermissionAnswer(baseUrl, false)
+			local context = ApiContext.new(baseUrl)
+			context.__handshakeTimeout = 0.05
+			local request = context:connect()
+			request:catch(function() end)
+			-- Still queued behind other sync requests.
+			task.wait(0.15)
+			expect(request:getStatus()).to.equal(Promise.Status.Started)
+			seenOptions.onStarted()
+			task.wait(0.15)
+			expect(request:getStatus()).to.equal(Promise.Status.Rejected)
+			expect(pending:getStatus()).to.equal(Promise.Status.Cancelled)
+		end)
+
+		it("sends background probes with RequestAsync instead of the sync stream", function()
+			local requestAsync = {}
+			Http.get = function(_, options)
+				table.insert(requestAsync, options.requestAsync == true)
+				return Promise.new(function() end)
+			end
+			local context = ApiContext.new("http://localhost:34992")
+			context:probe():catch(function() end)
+			context:connect():catch(function() end)
+			context:disconnect()
+			expect(requestAsync[1]).to.equal(true)
+			expect(requestAsync[2]).to.equal(false)
+		end)
+
+		it("passes each request's own timeout to the HTTP transport", function()
+			local originalPost = Http.post
+			local seen = {}
+			Http.get = function(url, options)
+				seen[if string.find(url, "/api/read/", 1, true) then "read" else "handshake"] = options.timeout
+				return Promise.new(function() end)
+			end
+			Http.post = function(_, _, options)
+				seen.write = options.timeout
+				return Promise.new(function() end)
+			end
+			local context = ApiContext.new("http://transport-timeout.test:34872")
+			local requests =
+				{ context:connect(), context:read({ "A" }), context:write({ removed = {}, updated = {}, added = {} }) }
+			Http.post = originalPost
+			context:disconnect()
+			for _, request in requests do
+				request:catch(function() end)
+			end
+			expect(seen.handshake).to.equal(context.__handshakeTimeout)
+			expect(seen.read).to.equal(context.__initialReadTimeout)
+			expect(seen.write).to.equal(context.__transferTimeout)
 		end)
 
 		it("bounds stalled fallback serialization requests", function()
@@ -398,6 +461,113 @@ return function()
 			expect(applied[2]).to.equal(2)
 			context:disconnect()
 			gate:Destroy()
+		end)
+
+		describe("stream budget", function()
+			local function slots(context)
+				return context.__streamBudget:liveCount()
+			end
+
+			it("gives the socket's slot back however the socket ends", function()
+				local endings = {
+					serverClose = function(_, socket)
+						-- The server closes the socket with 1008 when the checkout changes.
+						socket.Closed:Fire(1008, "Checkout changed")
+					end,
+					error = function(_, socket)
+						socket.Error:Fire(500, "boom")
+					end,
+					badPacket = function(_, socket)
+						socket.MessageReceived:Fire("invalid messagepack")
+					end,
+					disconnect = function(context)
+						context:disconnect()
+					end,
+				}
+				for name, finish in endings do
+					local context, socket = socketContext()
+					local request = context:connectWebSocket({})
+					request:catch(function() end)
+					expect(slots(context)).to.equal(1)
+					finish(context, socket)
+					expect(socket.closeCount).to.equal(1)
+					expect(slots(context)).to.equal(0)
+					-- Later events from a closed socket release nothing more.
+					socket.Closed:Fire(1000, name)
+					expect(slots(context)).to.equal(0)
+				end
+
+				local context, socket = socketContext()
+				context.__handshakeTimeout = 0.01
+				socket.ConnectionState = Enum.WebStreamClientState.Connecting
+				expect(context:connectWebSocket({}):await()).to.equal(false)
+				expect(slots(context)).to.equal(0)
+			end)
+
+			it("gives the slot back when creating the socket fails", function()
+				local context = socketContext()
+				context.__createWebSocket = function()
+					error("could not connect")
+				end
+				local ok, err = context:connectWebSocket({}):await()
+				expect(ok).to.equal(false)
+				expect(string.find(tostring(err), "could not connect", 1, true) ~= nil).to.equal(true)
+				expect(slots(context)).to.equal(0)
+			end)
+
+			it("closes a socket that was created after its request was cancelled", function()
+				local context, socket = socketContext()
+				local gate = Instance.new("BindableEvent")
+				context.__createWebSocket = function()
+					gate.Event:Wait()
+					return socket
+				end
+				local request = context:connectWebSocket({})
+				context:disconnect()
+				expect(request:getStatus()).to.equal(Promise.Status.Cancelled)
+				-- The socket may still arrive, so its slot stays taken.
+				expect(slots(context)).to.equal(1)
+				gate:Fire()
+				task.wait()
+				expect(socket.closeCount).to.equal(1)
+				expect(socket.Opened.isConnected()).to.equal(false)
+				expect(context.__wsClient).to.equal(nil)
+				expect(slots(context)).to.equal(0)
+				gate:Destroy()
+			end)
+
+			it("opens the socket while a request holds the other slot", function()
+				local context = socketContext()
+				local releaseRequest = context.__streamBudget:tryAcquire(Http.StreamBudget.Priority.Request)
+				expect(releaseRequest).to.be.ok()
+				local request = context:connectWebSocket({})
+				expect(request:getStatus()).to.equal(Promise.Status.Started)
+				expect(slots(context)).to.equal(2)
+				context:disconnect()
+				releaseRequest()
+				expect(slots(context)).to.equal(0)
+			end)
+
+			it("refuses a socket instead of creating one past the budget", function()
+				local context = socketContext()
+				local created = 0
+				context.__createWebSocket = function()
+					created += 1
+					error("no socket should be created")
+				end
+				local releaseFirst = context.__streamBudget:tryAcquire(Http.StreamBudget.Priority.Socket)
+				local releaseSecond = context.__streamBudget:tryAcquire(Http.StreamBudget.Priority.Socket)
+				local ok = context:connectWebSocket({}):await()
+				expect(ok).to.equal(false)
+				expect(created).to.equal(0)
+				releaseFirst()
+				releaseSecond()
+			end)
+
+			it("uses the budget shared by the whole plugin by default", function()
+				local context = ApiContext.new("http://localhost:34872")
+				expect(context.__streamBudget).to.equal(Http.StreamBudget.shared)
+			end)
 		end)
 	end)
 end

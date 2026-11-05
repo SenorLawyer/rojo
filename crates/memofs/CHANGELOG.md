@@ -8,6 +8,7 @@
 * Unwatching an unregistered path no longer restarts the macOS event stream and loses unrelated changes.
 * Watcher errors preserve their underlying OS error details.
 * A removal and recreation that `notify` merges into one write is reported as `VfsEvent::Remove` followed by `VfsEvent::Create`, so watches on the deleted directory are replaced.
+* The same applies when `notify` reports a replaced directory only as a creation, and to replacements whose merged event arrives up to 60 seconds after the removal. A directory whose recursive watch fails keeps its parent watch.
 * Watch roots lost because an ancestor was removed are registered again when they reappear, and reported with `VfsEvent::Create`.
 * Added `VfsEvent::Rescan`, emitted when the watcher may have dropped events. Watcher errors are logged instead of ignored.
 * `read_dir` registers its watch before listing, so entries created during the listing are reported.

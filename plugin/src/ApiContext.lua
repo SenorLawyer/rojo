@@ -111,6 +111,8 @@ function ApiContext.new(baseUrl)
 		__connected = true,
 		__activeRequests = {},
 		__handshakeTimeout = 15,
+		-- Replaced by tests so their sockets do not count against Studio's.
+		__streamBudget = Http.StreamBudget.shared,
 		-- Background probes run without the user watching, so they get a hard
 		-- bound that ignores Studio's permission prompt entirely.
 		__probeTimeout = 30,
@@ -165,17 +167,40 @@ function ApiContext:__request(
 		onWaitingForPermission: (() -> ())?,
 		permissionTimeoutMessage: string?,
 		limit: number?,
+		requestAsync: boolean?,
 	}?
 )
 	if not self.__connected then
 		return Promise.reject("Cannot send a request after disconnecting")
 	end
 
-	local request = Http[method](url, body)
+	local requestOptions
+	local sent
+	if options then
+		local markSent
+		if Http.usesEncodedStreams(url) and not options.requestAsync then
+			-- Stream requests share one sync slot, so a write can wait behind
+			-- a slow serialize. The timeout starts once the request is sent, so
+			-- that wait is not blamed on the server; the transport bounds the
+			-- wait itself. RequestAsync is never queued, so it starts at once.
+			sent = Promise.new(function(resolve)
+				markSent = resolve
+			end)
+		end
+		-- The transport needs the deadline too, or its own shorter limits would
+		-- end slow requests such as the initial read before this timeout does.
+		requestOptions = {
+			timeout = options.timeout,
+			onStarted = markSent,
+			requestAsync = options.requestAsync,
+		}
+	end
+	local request = if method == "get" then Http.get(url, requestOptions) else Http.post(url, body, requestOptions)
 	if options then
 		request = Http.timeout(request, url, options.timeout, options.timeoutMessage, options.onWaitingForPermission, {
 			permissionRejectionValue = options.permissionTimeoutMessage,
 			limit = options.limit,
+			started = sent,
 		})
 	end
 	self.__activeRequests[request] = true
@@ -188,10 +213,11 @@ function ApiContext:setMessageCursor(index)
 	self.__messageCursor = index
 end
 
-function ApiContext:__handshake(onWaitingForPermission: (() -> ())?, limit: number?)
+function ApiContext:__handshake(onWaitingForPermission: (() -> ())?, limit: number?, requestAsync: boolean?)
 	local url = ("%s/api/rojo"):format(self.__baseUrl)
 
 	return self:__request("get", url, nil, {
+		requestAsync = requestAsync,
 		timeout = self.__handshakeTimeout,
 		timeoutMessage = "Timed out connecting to the Rojo server. Check `rojo serve` and retry.",
 		onWaitingForPermission = onWaitingForPermission,
@@ -226,8 +252,11 @@ end
 
 -- Checks for a server in the background. Unlike connect, this never waits on
 -- a possible permission prompt past a fixed bound, so callers can't hang.
+-- Probes use RequestAsync so a stalled probe never holds the sync stream slot
+-- that Connect's handshake would queue behind, and they take no stream client
+-- from Studio's per-plugin budget.
 function ApiContext:probe()
-	return self:__handshake(nil, self.__probeTimeout)
+	return self:__handshake(nil, self.__probeTimeout, true)
 end
 
 function ApiContext:read(ids)
@@ -316,145 +345,175 @@ function ApiContext:connectWebSocket(packetHandlers, onOpened)
 	-- Convert HTTP/HTTPS URL to WS/WSS
 	url = url:gsub("^http://", "ws://"):gsub("^https://", "wss://")
 
+	local streamBudget = self.__streamBudget
 	local request = Promise.new(function(resolve, reject, onCancel)
-		local success, wsClient = pcall(self.__createWebSocket, self, url)
-		if not success then
-			reject("Failed to create WebSocket client: " .. tostring(wsClient))
+		-- Studio caps how many stream clients a plugin can have open, and what
+		-- happens past that cap is undocumented, so the socket takes a slot from
+		-- the plugin's budget first to stay under it. One slot is reserved for
+		-- it, so this only fails when another Rojo socket is still open.
+		local releaseSlot = streamBudget:tryAcquire(Http.StreamBudget.Priority.Socket)
+		if not releaseSlot then
+			reject("Rojo already has its sync connection open in Studio. Disconnect the other session and reconnect.")
 			return
 		end
-		self.__wsClient = wsClient
-
-		local connections = {}
-		local pendingMessages = {}
-		local processingMessages = false
-		local openingTimeout
-		local opened = false
-		local settled = false
-		local function cleanup()
-			if settled then
-				return
+		local cancelled = false
+		local cleanupSocket
+		onCancel(function()
+			cancelled = true
+			if cleanupSocket then
+				cleanupSocket()
 			end
-			settled = true
-			if openingTimeout then
-				task.cancel(openingTimeout)
-				openingTimeout = nil
-			end
-			table.clear(pendingMessages)
-			for _, connection in connections do
-				connection:Disconnect()
-			end
-			if self.__wsClient == wsClient then
-				self.__wsClient = nil
-			end
-			-- Closing an already-failed socket can throw, and callers reject
-			-- after cleanup, so this must not prevent the promise from settling.
-			local closed, closeError = pcall(wsClient.Close, wsClient)
-			if not closed then
-				Log.debug("Ignoring error while closing the Rojo WebSocket: {}", closeError)
-			end
-		end
-
-		onCancel(cleanup)
-		if not self.__connected then
-			cleanup()
-			resolve()
-			return
-		end
-
-		local function markOpened()
-			if settled or opened then
-				return
-			end
-			opened = true
-			if openingTimeout then
-				task.cancel(openingTimeout)
-				openingTimeout = nil
-			end
-			if onOpened then
-				local ok, err = pcall(onOpened)
-				if not ok then
-					cleanup()
-					reject(err)
-				end
-			end
-		end
-		table.insert(connections, wsClient.Opened:Connect(markOpened))
-		openingTimeout = task.delay(self.__handshakeTimeout, function()
-			openingTimeout = nil
-			cleanup()
-			reject("Timed out opening the Rojo sync connection. Check `rojo serve` and reconnect.")
 		end)
-
-		local function handleMessage(msg)
-			local data = Http.msgpackDecode(msg)
-			if data.sessionId ~= self.__sessionId then
-				error("Server changed ID; reconnect to sync with the restarted server")
+		-- Cancelling a promise closes its executor thread. Creating the client
+		-- on a thread of its own means a client that arrives after the request
+		-- was cancelled is still closed and gives its slot back.
+		task.spawn(function()
+			local success, wsClient = pcall(self.__createWebSocket, self, url)
+			if not success then
+				releaseSlot()
+				reject("Failed to create WebSocket client: " .. tostring(wsClient))
+				return
 			end
-
-			assert(validateApiSocketPacket(data))
-
-			Log.trace("Received websocket packet: {:#?}", data)
-
-			local handler = packetHandlers[data.packetType]
-			if handler then
-				handler(data.body)
-			else
-				Log.warn("No handler for WebSocket packet type '%s'", data.packetType)
+			if cancelled then
+				pcall(wsClient.Close, wsClient)
+				releaseSlot()
+				return
 			end
-		end
+			self.__wsClient = wsClient
 
-		table.insert(
-			connections,
-			wsClient.MessageReceived:Connect(function(msg)
-				table.insert(pendingMessages, msg)
-				if processingMessages then
+			local connections = {}
+			local pendingMessages = {}
+			local processingMessages = false
+			local openingTimeout
+			local opened = false
+			local settled = false
+			local function cleanup()
+				if settled then
 					return
 				end
-				-- Applying a patch can yield for fallback requests. Preserve wire order
-				-- rather than applying a later patch while the previous one is suspended.
-				processingMessages = true
-				while not settled and #pendingMessages > 0 do
-					local trace
-					local ok, err = xpcall(handleMessage, function(message)
-						trace = debug.traceback(tostring(message), 2)
-						return message
-					end, table.remove(pendingMessages, 1))
+				settled = true
+				if openingTimeout then
+					task.cancel(openingTimeout)
+					openingTimeout = nil
+				end
+				table.clear(pendingMessages)
+				for _, connection in connections do
+					connection:Disconnect()
+				end
+				if self.__wsClient == wsClient then
+					self.__wsClient = nil
+				end
+				-- Closing an already-failed socket can throw, and callers reject
+				-- after cleanup, so this must not prevent the promise from settling.
+				local closed, closeError = pcall(wsClient.Close, wsClient)
+				if not closed then
+					Log.debug("Ignoring error while closing the Rojo WebSocket: {}", closeError)
+				end
+				releaseSlot()
+			end
+
+			cleanupSocket = cleanup
+			if not self.__connected then
+				cleanup()
+				resolve()
+				return
+			end
+
+			local function markOpened()
+				if settled or opened then
+					return
+				end
+				opened = true
+				if openingTimeout then
+					task.cancel(openingTimeout)
+					openingTimeout = nil
+				end
+				if onOpened then
+					local ok, err = pcall(onOpened)
 					if not ok then
-						-- Applying later messages on top of a partially applied one
-						-- would leave Studio silently out of sync, so the session
-						-- ends and the user reconnects to resync from scratch.
-						Log.warn("Stopped syncing because a Rojo server message could not be applied:\n{}", trace)
 						cleanup()
-						reject("Failed to process a Rojo server message: " .. tostring(err))
+						reject(err)
 					end
 				end
-				processingMessages = false
-			end)
-		)
-
-		table.insert(
-			connections,
-			wsClient.Closed:Connect(function(_code, reason)
+			end
+			table.insert(connections, wsClient.Opened:Connect(markOpened))
+			openingTimeout = task.delay(self.__handshakeTimeout, function()
+				openingTimeout = nil
 				cleanup()
-				if self.__connected then
-					local detail = if type(reason) == "string" and #reason > 0 then " " .. reason else ""
-					reject("Connection to the Rojo server closed. Reconnect to resync." .. detail)
-				else
-					resolve()
+				reject("Timed out opening the Rojo sync connection. Check `rojo serve` and reconnect.")
+			end)
+
+			local function handleMessage(msg)
+				local data = Http.msgpackDecode(msg)
+				if data.sessionId ~= self.__sessionId then
+					error("Server changed ID; reconnect to sync with the restarted server")
 				end
-			end)
-		)
 
-		table.insert(
-			connections,
-			wsClient.Error:Connect(function(code, msg)
-				cleanup()
-				reject(formatWebSocketError(code, msg))
-			end)
-		)
-		if wsClient.ConnectionState == Enum.WebStreamClientState.Open then
-			markOpened()
-		end
+				assert(validateApiSocketPacket(data))
+
+				Log.trace("Received websocket packet: {:#?}", data)
+
+				local handler = packetHandlers[data.packetType]
+				if handler then
+					handler(data.body)
+				else
+					Log.warn("No handler for WebSocket packet type '%s'", data.packetType)
+				end
+			end
+
+			table.insert(
+				connections,
+				wsClient.MessageReceived:Connect(function(msg)
+					table.insert(pendingMessages, msg)
+					if processingMessages then
+						return
+					end
+					-- Applying a patch can yield for fallback requests. Preserve wire order
+					-- rather than applying a later patch while the previous one is suspended.
+					processingMessages = true
+					while not settled and #pendingMessages > 0 do
+						local trace
+						local ok, err = xpcall(handleMessage, function(message)
+							trace = debug.traceback(tostring(message), 2)
+							return message
+						end, table.remove(pendingMessages, 1))
+						if not ok then
+							-- Applying later messages on top of a partially applied one
+							-- would leave Studio silently out of sync, so the session
+							-- ends and the user reconnects to resync from scratch.
+							Log.warn("Stopped syncing because a Rojo server message could not be applied:\n{}", trace)
+							cleanup()
+							reject("Failed to process a Rojo server message: " .. tostring(err))
+						end
+					end
+					processingMessages = false
+				end)
+			)
+
+			table.insert(
+				connections,
+				wsClient.Closed:Connect(function(_code, reason)
+					cleanup()
+					if self.__connected then
+						local detail = if type(reason) == "string" and #reason > 0 then " " .. reason else ""
+						reject("Connection to the Rojo server closed. Reconnect to resync." .. detail)
+					else
+						resolve()
+					end
+				end)
+			)
+
+			table.insert(
+				connections,
+				wsClient.Error:Connect(function(code, msg)
+					cleanup()
+					reject(formatWebSocketError(code, msg))
+				end)
+			)
+			if wsClient.ConnectionState == Enum.WebStreamClientState.Open then
+				markOpened()
+			end
+		end)
 	end)
 	self.__activeRequests[request] = true
 	return request:finally(function()

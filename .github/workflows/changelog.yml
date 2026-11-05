@@ -3,8 +3,6 @@ name: Changelog Check
 on:
   pull_request:
     types: [assigned, opened, synchronize, reopened, labeled, unlabeled]
-    branches:
-      - master
 
 # With checkNotification set to Simple, the action only lists the pull
 # request's files and fails the job. It does not comment or create checks.

@@ -74,12 +74,32 @@ Making a new release? Simply add the new header with the version and date undern
 * Syncback now writes metadata keys in sorted order. ([fork#1])
 * `rojo plugin install` now installs the plugin atomically. On Unix, a reinstall keeps the existing file's permissions and a new install is readable by other users. ([fork#1])
 * Added a `--plugins-dir` option to `rojo plugin install` and `rojo plugin uninstall`. ([fork#1])
+* Local HTTP requests use cancellable streams that share one queue. ([fork#2])
+* Encoded HTTP streams preserve binary responses in Studio. When a local server, such as upstream `rojo serve`, answers without encoding, the plugin sends that request again with RequestAsync and keeps using RequestAsync for that server until the plugin reloads. Package-install event batches retain their original instance contents and avoid repeatedly snapshotting nested paths. ([fork#2])
+* Local HTTP streams time out stalled requests and queue waits, report non-2xx statuses delivered through stream errors, and show the original connection and HTTP-permission messages. ([fork#2])
+* Responses to base64-encoded API requests are base64 encoded too, errors included, so Studio can decode them. ([fork#2])
+* `rojo serve` keeps at most 1024 recent changes (and at most about 64 MiB of them) for reconnecting clients, so repeated package reinstalls no longer grow its memory without bound. A Studio plugin that falls further behind is asked to reconnect and resync. ([fork#2])
+* `rojo serve` no longer trims changes that a connected sync socket still needs while it is sending earlier changes to Studio. Changes after an `/api/read` cursor are also kept for five minutes while the initial sync waits for confirmation. The 64 MiB budget remains the hard limit. ([fork#2])
+* Folders that change while they are being extracted are reconciled again at most 2 seconds after the first change, even while other files keep changing. Ordinary file saves are no longer snapshotted a second time. ([fork#2])
+* A folder replaced during a package reinstall is watched again when the watcher reports the replacement only as a creation, or reports it up to 60 seconds after the removal. A folder whose recursive watch fails keeps its parent watch. ([fork#2])
+* Local HTTP streams no longer end the initial project load, sync fallback requests or two-way sync writes after 30 seconds without data. Each request now waits for its own timeout. A stream whose client fails to close no longer stops all later requests, and a request that ends while Studio's HTTP permission prompt is open still records a denied permission. Error responses reported without headers are decoded, and responses that fail to decode show a connection error. ([fork#2])
+* Sync request timeouts start when the request is sent, not while it waits behind other requests for the plugin's HTTP stream, so a write queued behind a slow serialize no longer times out and ends the session. A request waits at most two minutes for the stream. Background server checks use RequestAsync and no longer hold up Connect. ([fork#2])
+* A cancelled request whose HTTP stream was still opening keeps its slot until Studio finishes opening it, so the plugin never has two sync streams open at once. Sync responses are limited to 128 MiB. ([fork#2])
+* Studio's HTTP permission prompt counts as answered only once the server responds or Studio reports a denied permission or disabled HTTP requests, so other connection failures no longer cut the wait for the prompt short. ([fork#2])
+* The plugin loads on Studio builds without `EncodingService`. It then uses RequestAsync for local requests. ([fork#2])
+* A valid file change no longer waits for its next save when a half-written sibling in the same batch keeps the parent folder from syncing. ([fork#2])
+* A sync socket whose client stops reading is closed after 30 seconds. ([fork#2])
+* The released `Rojo.rbxm` is built with the release's own CLI instead of the upstream Rojo pinned in rokit.toml. 7.7 releases require the tagged commit to be on `release/7.7` with a passing CI run from a push to `release/7.7`, and include a `SHA256SUMS` file. CI and releases build with the same pinned Rust toolchain. CI lint now also checks `plugin/http`, `plugin/log`, `plugin/fmt` and `plugin/run-tests.server.lua`. ([fork#2])
+* The plugin keeps at most two HTTP streams open at once, under Studio's limit of four per plugin, and saves one for the sync connection. Requests that find no free stream use RequestAsync instead. ([fork#2])
+* Local reads too large for an HTTP stream, or queued behind a stream that never opens, are sent with RequestAsync instead of failing. ([fork#2])
+* Studio now shows the Rojo server's error reason instead of the raw MessagePack bytes of the error response. ([fork#2])
 * LocalizationTables no longer report as changed when nothing changes. ([#1333])
 * Sounds now preloaded correctly. The warning "*ContentId: rbxassetid://203785492 failed due to: Asset type does not match requested type*" is fixed. ([#1351])
 
 [#1333]: https://github.com/rojo-rbx/rojo/pull/1333
 [#1351]: https://github.com/rojo-rbx/rojo/pull/1351
 [fork#1]: https://github.com/SenorLawyer/rojo/pull/1
+[fork#2]: https://github.com/SenorLawyer/rojo/pull/2
 
 ## [7.7.1] (October 1st, 2026)
 
