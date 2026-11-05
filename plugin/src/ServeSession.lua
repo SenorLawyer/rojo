@@ -519,7 +519,7 @@ function ServeSession:getSourceHashes(verifyId, expiresAt, isActive)
 	end
 	-- Kept per verify, so two verifies at once cannot replace each other's
 	-- record, and only for the last few, so memory stays bounded.
-	self:__rememberVerified(verifyId, seen)
+	self:__rememberVerified(verifyId, seen, table.clone(self.__sourceGenerations))
 	return { scripts = scripts, detached = detached, held = held }
 end
 
@@ -537,24 +537,29 @@ end
 	inside one undo step, so a script counts as updated only once its source
 	was written and the whole resync undoes together.
 ]=]
-function ServeSession:__rememberVerified(verifyId, seen)
+function ServeSession:__rememberVerified(verifyId, seen, generations)
 	if type(verifyId) ~= "string" then
 		return
 	end
 	local records = self.__verifiedRecords
-	table.insert(records, { id = verifyId, sources = seen })
+	table.insert(records, { id = verifyId, sources = seen, generations = generations or {} })
 	while #records > MAX_VERIFY_RECORDS do
 		table.remove(records, 1)
 	end
 end
 
-function ServeSession:__verifiedSourcesFor(verifyId)
+function ServeSession:__verifiedRecordFor(verifyId)
 	for _, record in self.__verifiedRecords do
 		if record.id == verifyId then
-			return record.sources
+			return record
 		end
 	end
 	return nil
+end
+
+function ServeSession:__verifiedSourcesFor(verifyId)
+	local record = self:__verifiedRecordFor(verifyId)
+	return record and record.sources
 end
 
 function ServeSession:applyResync(patch, expect, includeHeld, expiresAt, isActive, verifyId)
@@ -613,7 +618,8 @@ function ServeSession:applyResync(patch, expect, includeHeld, expiresAt, isActiv
 
 	-- Without the sources its own verify saw, a write could undo a newer edit
 	-- whose hashes match, so every write is skipped.
-	local verified = self:__verifiedSourcesFor(verifyId)
+	local record = self:__verifiedRecordFor(verifyId)
+	local verified = record and record.sources
 	local updated, failed = 0, 0
 	local ok, err = pcall(function()
 		local cancelled = false
@@ -637,8 +643,27 @@ function ServeSession:applyResync(patch, expect, includeHeld, expiresAt, isActiv
 			local seenSource = verified and verified[write.id]
 			local changed, held, late = false, nil, false
 			self.__instanceMap:pauseInstance(write.instance)
+			-- A sync write started after verify looked carries a newer change
+			-- from disk than this fix, so the fix gives way to it.
+			local seenGeneration = record and record.generations and record.generations[write.id] or 0
+			if (self.__sourceGenerations[write.id] or 0) ~= seenGeneration then
+				skipped += 1
+				continue
+			end
+			-- A held script whose class change was held back too is fixed by
+			-- reconnecting, which applies the class with its source.
+			local holdNow = self.__heldWipes[write.id]
+			if includeHeld and holdNow and holdNow.deferredClass then
+				failed += 1
+				Log.warn(
+					"{} also has a class change from disk that was held back; reconnect Studio to apply both.",
+					holdNow.path
+				)
+				continue
+			end
 			-- Shared with ordinary sync writes: whichever write was started
-			-- last for a script is the only one that may still commit.
+			-- last for a script is the only one that may still commit. Older
+			-- pending writes started before verify looked are cancelled.
 			local generation = (self.__sourceGenerations[write.id] or 0) + 1
 			self.__sourceGenerations[write.id] = generation
 			local done, wrote, abandoned = false, false, false
@@ -711,19 +736,6 @@ function ServeSession:applyResync(patch, expect, includeHeld, expiresAt, isActiv
 				failed += 1
 			end
 		end
-		-- A hold this fix ended may have held back a class change, which is
-		-- applied now, in the same undo step, rather than waiting for the next
-		-- change from disk.
-		local refresh = {}
-		for id in self.__refreshAfterHold do
-			table.insert(refresh, id)
-		end
-		if #refresh > 0 and not expired() then
-			table.clear(self.__refreshAfterHold)
-			if not self:__replaceInstances(refresh) then
-				Log.warn("Could not apply a class change Rojo held back with a script's wipe. Reconnect to sync it.")
-			end
-		end
 	end)
 	if recording then
 		ChangeHistoryService:FinishRecording(recording, Enum.FinishRecordingOperation.Commit)
@@ -759,6 +771,18 @@ function ServeSession:__holdScriptWipes(patch)
 			-- Changing the class recreates the instance from the update's other
 			-- properties, without the source the hold keeps, so it waits until
 			-- the hold ends.
+			-- A script class becoming a non-script, such as an init file's
+			-- directory turning back into a Folder when the file is deleted, is
+			-- the script's file going away, which ends the hold.
+			if
+				self.__heldWipes[update.id]
+				and update.changedClassName ~= nil
+				and not SCRIPT_CLASSES[update.changedClassName]
+			then
+				self:__clearHold(update.id)
+				index += 1
+				continue
+			end
 			if self.__heldWipes[update.id] and update.changedClassName ~= nil then
 				Log.warn(
 					"Rojo held back changing the class of {} because its file on disk is empty.",
@@ -1260,37 +1284,63 @@ end
 	patch for the reconciler and the writes. The patch itself is left as it
 	is, since hooks show its changes to the user.
 ]=]
+local function stringSource(encoded)
+	local ty, value
+	if type(encoded) == "table" then
+		ty, value = next(encoded)
+	end
+	if ty == "String" and type(value) == "string" then
+		return value
+	end
+	return nil
+end
+
 function ServeSession:__splitSourceWrites(patch)
+	-- Every script source goes through `__writeSource`, including those of
+	-- new scripts and of scripts recreated by a class change: the reconciler's
+	-- own writer finishes later without checking holds or newer writes. The
+	-- reconciler gets the patch without those sources, and the writes are
+	-- made once it has created the instances. Instances are looked up then.
 	local writes = {}
 	local updated = {}
 	for _, update in patch.updated do
-		local encoded = update.changedProperties and update.changedProperties.Source
-		local ty, target
-		if type(encoded) == "table" then
-			ty, target = next(encoded)
-		end
+		local target = stringSource(update.changedProperties and update.changedProperties.Source)
 		local instance = self.__instanceMap.fromIds[update.id]
-		-- A class change recreates the instance, so the reconciler sets its
-		-- source along with everything else.
-		if
-			ty ~= "String"
-			or type(target) ~= "string"
-			or update.changedClassName ~= nil
-			or not (instance and instance:IsA("LuaSourceContainer"))
-		then
+		local isScript = if update.changedClassName ~= nil
+			then SCRIPT_CLASSES[update.changedClassName] == true
+			else instance ~= nil and instance:IsA("LuaSourceContainer")
+		if target == nil or not isScript then
 			table.insert(updated, update)
 			continue
 		end
-		table.insert(writes, { id = update.id, instance = instance, target = target })
+		table.insert(writes, { id = update.id, target = target })
 		local rest = table.clone(update)
 		rest.changedProperties = table.clone(update.changedProperties)
 		rest.changedProperties.Source = nil
-		local empty = next(rest.changedProperties) == nil and rest.changedName == nil and rest.changedMetadata == nil
+		local empty = next(rest.changedProperties) == nil
+			and rest.changedName == nil
+			and rest.changedMetadata == nil
+			and rest.changedClassName == nil
 		if not empty then
 			table.insert(updated, rest)
 		end
 	end
-	return { removed = patch.removed, added = patch.added, updated = updated }, writes
+	local added = {}
+	for id, virtual in patch.added do
+		local target = SCRIPT_CLASSES[virtual.ClassName]
+			and virtual.Properties
+			and stringSource(virtual.Properties.Source)
+		if target then
+			local copy = table.clone(virtual)
+			copy.Properties = table.clone(virtual.Properties)
+			copy.Properties.Source = nil
+			added[id] = copy
+			table.insert(writes, { id = id, target = target })
+		else
+			added[id] = virtual
+		end
+	end
+	return { removed = patch.removed, added = added, updated = updated }, writes
 end
 
 --[=[
@@ -1356,7 +1406,10 @@ function ServeSession:__applyPatchInRecording(patch)
 	local reconcilerPatch, sourceWrites = self:__splitSourceWrites(patch)
 	local unappliedPatch = self.__reconciler:applyPatch(reconcilerPatch)
 	for _, write in sourceWrites do
-		self:__writeSource(write)
+		write.instance = self.__instanceMap.fromIds[write.id]
+		if write.instance and write.instance:IsA("LuaSourceContainer") then
+			self:__writeSource(write)
+		end
 	end
 
 	-- The fallback replaces an instance with the server's whole copy, which

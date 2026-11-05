@@ -586,14 +586,62 @@ return function()
 			session:__clearHold("UI")
 		end)
 
+		it("gives way to a sync write started after verify looked", function()
+			session.__status = ServeSession.Status.Connected
+			local kept = module.Source
+			session.__verifiedRecords = {
+				{ id = "VERIFY", sources = { UI = kept }, generations = { UI = 0 } },
+			}
+			local expected = { UI = { from = hashSource(kept), to = hashSource("return 'stale fix'") } }
+			-- A newer change from disk started writing after verify.
+			session.__sourceGenerations.UI = 1
+			local result = resyncAs(sourceUpdate("UI", "return 'stale fix'"), expected, false)
+			expect(result.skipped).to.equal(1)
+			expect(module.Source).to.equal(kept)
+		end)
+
+		it("ends a hold when the held script's file is deleted and its folder stays", function()
+			session:__holdScriptWipes(sourceUpdate("UI", ""))
+			local deleted = {
+				removed = {},
+				added = {},
+				updated = { { id = "UI", changedClassName = "Folder", changedProperties = {} } },
+			}
+			session:__holdScriptWipes(deleted)
+			expect(#deleted.updated).to.equal(1)
+			expect(session.__heldWipes.UI).to.equal(nil)
+		end)
+
+		it("writes the sources of new scripts through the guarded writer", function()
+			local reconcilerPatch, writes = session:__splitSourceWrites({
+				removed = {},
+				added = {
+					NEW = {
+						Id = "NEW",
+						ClassName = "ModuleScript",
+						Name = "New",
+						Parent = "FOLDER",
+						Properties = { Source = { String = "return 'new'" } },
+						Children = {},
+					},
+				},
+				updated = {},
+			})
+			expect(reconcilerPatch.added.NEW.Properties.Source).to.equal(nil)
+			expect(#writes).to.equal(1)
+			expect(writes[1].target).to.equal("return 'new'")
+		end)
+
 		it("lets a fix cancel an older pending sync write", function()
 			session.__status = ServeSession.Status.Connected
 			local kept = module.Source
-			session.__verifiedRecords = { { id = "VERIFY", sources = { UI = kept } } }
-			local expected = { UI = { from = hashSource(kept), to = hashSource("return 'fixed'") } }
-			-- An ordinary write started earlier, then the fix took over.
+			-- An ordinary write started before verify looked, then the fix took over.
 			local generation = (session.__sourceGenerations.UI or 0) + 1
 			session.__sourceGenerations.UI = generation
+			session.__verifiedRecords = {
+				{ id = "VERIFY", sources = { UI = kept }, generations = { UI = generation } },
+			}
+			local expected = { UI = { from = hashSource(kept), to = hashSource("return 'fixed'") } }
 			local result = resyncAs(sourceUpdate("UI", "return 'fixed'"), expected, false)
 			expect(result.updated).to.equal(1)
 			expect(session.__sourceGenerations.UI > generation).to.equal(true)
