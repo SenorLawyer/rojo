@@ -10,7 +10,7 @@
 use std::{
     borrow::Cow,
     collections::{HashMap, HashSet},
-    path::Path,
+    path::{Path, PathBuf},
 };
 
 use rbx_dom_weak::{types::Variant, ustr, UstrMap};
@@ -79,14 +79,34 @@ fn instance_path(tree: &RojoTree, id: rbx_dom_weak::types::Ref) -> String {
     names.join("/")
 }
 
+fn is_script_file(path: &Path) -> bool {
+    matches!(
+        path.extension().and_then(|extension| extension.to_str()),
+        Some("lua" | "luau")
+    ) && path.is_file()
+}
+
 fn source_file(tree: &RojoTree, id: rbx_dom_weak::types::Ref, root_dir: &Path) -> Option<String> {
     let metadata = tree.get_metadata(id)?;
-    let path = match &metadata.instigating_source {
-        Some(InstigatingSource::Path(path)) => path.as_path(),
-        // A script declared in a project file gets its source from `$path`,
-        // which is listed among the relevant paths.
-        _ => metadata.relevant_paths.first()?.as_path(),
+    let instigating = match &metadata.instigating_source {
+        Some(InstigatingSource::Path(path)) => Some(path.as_path()),
+        _ => None,
     };
+    // A script made from a directory's init file has the directory as its
+    // instigating source, and a script declared in a project file gets its
+    // source from `$path`. Either way the file itself is among the relevant
+    // paths, next to candidates such as `init.lua` that do not exist.
+    let path = instigating
+        .filter(|path| is_script_file(path))
+        .or_else(|| {
+            metadata
+                .relevant_paths
+                .iter()
+                .map(PathBuf::as_path)
+                .find(|path| is_script_file(path))
+        })
+        .or(instigating)
+        .or_else(|| metadata.relevant_paths.first().map(PathBuf::as_path))?;
     let relative = path.strip_prefix(root_dir).unwrap_or(path);
     Some(relative.to_string_lossy().replace('\\', "/"))
 }
@@ -125,13 +145,21 @@ pub(crate) fn tree_scripts(tree: &RojoTree, root_dir: &Path) -> Vec<TreeScript> 
     scripts
 }
 
+/// A script whose source in Studio differs from the server's.
+#[derive(Debug, Clone)]
+pub(crate) struct Different {
+    pub script: TreeScript,
+    /// Studio's hash and length when it was checked. A fix only applies while
+    /// Studio still has this source, so it cannot undo a newer change.
+    pub studio_hash: u32,
+    pub studio_length: usize,
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct Comparison {
     pub checked: usize,
     pub matching: usize,
-    /// Scripts whose source in Studio differs from the server's, with
-    /// Studio's length.
-    pub different: Vec<(TreeScript, usize)>,
+    pub different: Vec<Different>,
     pub missing: Vec<TreeScript>,
     pub detached: Vec<TreeScript>,
     pub held: HashSet<String>,
@@ -180,7 +208,11 @@ pub(crate) fn compare(scripts: Vec<TreeScript>, studio: &Value) -> anyhow::Resul
             Some(&(hash, length)) if hash == script.hash && length == script.length => {
                 comparison.matching += 1;
             }
-            Some(&(_, length)) => comparison.different.push((script, length)),
+            Some(&(hash, length)) => comparison.different.push(Different {
+                script,
+                studio_hash: hash,
+                studio_length: length,
+            }),
             None if detached.contains(&script.id) => comparison.detached.push(script),
             None => comparison.missing.push(script),
         }
@@ -203,10 +235,10 @@ impl Comparison {
     }
 
     pub(crate) fn report(&self) -> Value {
-        let (different, different_count) = listed(self.different.iter().map(|(script, studio)| {
-            let mut value = describe(script);
-            value["studioLength"] = json!(studio);
-            value["held"] = json!(self.held.contains(&script.id));
+        let (different, different_count) = listed(self.different.iter().map(|different| {
+            let mut value = describe(&different.script);
+            value["studioLength"] = json!(different.studio_length);
+            value["held"] = json!(self.held.contains(&different.script.id));
             value
         }));
         let (missing, missing_count) = listed(self.missing.iter().map(describe));
@@ -228,23 +260,41 @@ impl Comparison {
 
     /// The scripts `--fix` sets back to their files' contents. Held wipes stay
     /// out unless asked for, because fixing them empties the script in Studio.
-    pub(crate) fn fixable(&self, include_held: bool) -> Vec<rbx_dom_weak::types::Ref> {
+    pub(crate) fn fixable(&self, include_held: bool) -> Vec<&Different> {
         self.different
             .iter()
-            .filter(|(script, _)| include_held || !self.held.contains(&script.id))
-            .map(|(script, _)| script.ref_id)
+            .filter(|different| include_held || !self.held.contains(&different.script.id))
             .collect()
+    }
+
+    pub(crate) fn held_count(&self) -> usize {
+        self.different
+            .iter()
+            .filter(|different| self.held.contains(&different.script.id))
+            .count()
     }
 }
 
-/// Builds sync messages that set each script's `Source` to the server's,
-/// split so that each carries at most [`MAX_RESYNC_BYTES`] of source. A
-/// script larger than that gets a message of its own.
-pub(crate) fn resync_messages(tree: &RojoTree, ids: &[rbx_dom_weak::types::Ref]) -> Vec<Value> {
-    let mut messages = Vec::new();
+/// One batch of `resync`: a sync message that sets each script's `Source` to
+/// the server's, and for each script the hash Studio must still have for the
+/// update to apply (`from`) and the hash it must have afterwards (`to`).
+pub(crate) struct ResyncBatch {
+    pub patch: Value,
+    pub expect: Value,
+    pub count: usize,
+}
+
+/// Builds resync batches for `fixes`, split so that each carries at most
+/// [`MAX_RESYNC_BYTES`] of source. A script larger than that gets a batch of
+/// its own. The sources are read from the tree now, which may be newer than
+/// the comparison that chose the scripts.
+pub(crate) fn resync_batches(tree: &RojoTree, fixes: &[&Different]) -> Vec<ResyncBatch> {
+    let mut batches = Vec::new();
     let mut updated = Vec::new();
+    let mut expect = serde_json::Map::new();
     let mut bytes = 0;
-    for &id in ids {
+    for fix in fixes {
+        let id = fix.script.ref_id;
         let Some(instance) = tree.get_instance(id) else {
             continue;
         };
@@ -253,10 +303,15 @@ pub(crate) fn resync_messages(tree: &RojoTree, ids: &[rbx_dom_weak::types::Ref])
             continue;
         };
         if !updated.is_empty() && bytes + text.len() > MAX_RESYNC_BYTES {
-            messages.push(std::mem::take(&mut updated));
+            batches.push((std::mem::take(&mut updated), std::mem::take(&mut expect)));
             bytes = 0;
         }
         bytes += text.len();
+        let (target, _) = hash_source(text);
+        expect.insert(
+            fix.script.id.clone(),
+            json!({"from": fix.studio_hash, "to": target}),
+        );
         let mut changed_properties = UstrMap::default();
         changed_properties.insert(ustr("Source"), Some(source.clone()));
         updated.push(InstanceUpdate {
@@ -268,17 +323,19 @@ pub(crate) fn resync_messages(tree: &RojoTree, ids: &[rbx_dom_weak::types::Ref])
         });
     }
     if !updated.is_empty() {
-        messages.push(updated);
+        batches.push((updated, expect));
     }
-    messages
+    batches
         .into_iter()
-        .map(|updated| {
-            serde_json::to_value(SubscribeMessage {
+        .map(|(updated, expect)| ResyncBatch {
+            count: updated.len(),
+            patch: serde_json::to_value(SubscribeMessage {
                 removed: Vec::new(),
                 added: HashMap::new(),
                 updated,
             })
-            .expect("sync messages always serialize")
+            .expect("sync messages always serialize"),
+            expect: Value::Object(expect),
         })
         .collect()
 }
@@ -295,6 +352,33 @@ mod test {
         assert_eq!(hash_source("a"), (0xe40c_292c, 1));
         assert_eq!(hash_source("foobar"), (0xbf9c_f968, 6));
         assert_eq!(hash_source("print(\"Hello, Rojo!\")\n"), (0x8d5c_0b3a, 22));
+    }
+
+    #[test]
+    fn init_scripts_report_their_init_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("src/Map")).unwrap();
+        std::fs::write(
+            root.join("default.project.json"),
+            r#"{"name":"t","tree":{"$className":"DataModel","ReplicatedStorage":{"Shared":{"$path":"src"}}}}"#,
+        )
+        .unwrap();
+        std::fs::write(root.join("src/Map/init.luau"), "return 1").unwrap();
+        std::fs::write(root.join("src/Plain.luau"), "return 2").unwrap();
+        let session =
+            crate::serve_session::ServeSession::new(memofs::Vfs::new_default().unwrap(), root)
+                .unwrap();
+        let root_dir = dunce::canonicalize(session.root_dir()).unwrap();
+        let scripts = tree_scripts(&session.tree(), &root_dir);
+        let file = |name: &str| {
+            scripts
+                .iter()
+                .find(|s| s.path.ends_with(name))
+                .and_then(|s| s.file.clone())
+        };
+        assert_eq!(file("/Map").as_deref(), Some("src/Map/init.luau"));
+        assert_eq!(file("/Plain").as_deref(), Some("src/Plain.luau"));
     }
 
     #[test]
@@ -397,6 +481,7 @@ mod test {
         let comparison = compare(scripts, &answer).unwrap();
         assert!(comparison.fixable(false).is_empty());
         assert_eq!(comparison.fixable(true).len(), 1);
+        assert_eq!(comparison.held_count(), 1);
         assert_eq!(comparison.report()["different"][0]["held"], true);
     }
 
@@ -426,15 +511,28 @@ mod test {
                     script("C", "return 1"),
                 ]),
         );
-        let ids: Vec<_> = tree_scripts(&tree, Path::new("/"))
+        let fixes: Vec<Different> = tree_scripts(&tree, Path::new("/"))
             .into_iter()
-            .map(|s| s.ref_id)
+            .map(|script| Different {
+                script,
+                studio_hash: 7,
+                studio_length: 1,
+            })
             .collect();
-        let messages = resync_messages(&tree, &ids);
-        assert_eq!(messages.len(), 2);
-        let first = &messages[0]["updated"][0];
+        let refs: Vec<&Different> = fixes.iter().collect();
+        let batches = resync_batches(&tree, &refs);
+        assert_eq!(batches.len(), 2);
+        assert_eq!(batches[0].count + batches[1].count, 3);
+        let first = &batches[0].patch["updated"][0];
         assert!(first["changedProperties"]["Source"]["String"].is_string());
-        assert_eq!(messages[0]["added"], json!({}));
-        assert_eq!(messages[0]["removed"], json!([]));
+        assert_eq!(batches[0].patch["added"], json!({}));
+        assert_eq!(batches[0].patch["removed"], json!([]));
+        let id = first["id"].as_str().unwrap();
+        assert_eq!(batches[0].expect[id]["from"], 7);
+        assert_eq!(
+            batches[0].expect[id]["to"],
+            json!(hash_source(&big).0),
+            "the target is the hash of the source being sent"
+        );
     }
 }

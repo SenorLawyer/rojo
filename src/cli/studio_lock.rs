@@ -33,9 +33,6 @@ const POLL_INTERVAL: Duration = Duration::from_secs(1);
 /// How long one update waits for another process's update to finish. Updates
 /// take milliseconds, so this only runs out when something is stuck.
 const MUTEX_WAIT: Duration = Duration::from_secs(5);
-/// A guard file older than this was left by a process that died while
-/// updating, since no update takes nearly this long.
-const MUTEX_STALE: Duration = Duration::from_secs(10);
 /// The event log is rotated into `<name>.log.jsonl.1` past this size, so it
 /// stays bounded at about twice this.
 const LOG_LIMIT: u64 = 256 * 1024;
@@ -896,13 +893,15 @@ fn write_state(path: &Path, state: &State) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Held for one read-modify-write of a state file, like `rojo assets sync`'s
-/// lock: `<name>.json.lock` is created with `create_new`, so only one process
-/// at a time holds it, and removed on drop. Unlike that lock, a leftover file
-/// is removed after [`MUTEX_STALE`], because these are held for milliseconds
-/// and agents should not need a person to clean up after a killed process.
+/// Held for one read-modify-write of a state file. It is an operating system
+/// lock on `<name>.json.lock`, which the system releases when the process
+/// exits, even when it is killed mid-update. A lock file that is left behind
+/// therefore never blocks anyone, and no process ever has to decide that
+/// another one died and remove its lock, which two processes could otherwise
+/// both do at once and end up updating the state together.
 struct StateMutex {
-    path: PathBuf,
+    // Dropping the file releases the lock. The file itself stays.
+    _file: fs::File,
 }
 
 impl StateMutex {
@@ -910,63 +909,33 @@ impl StateMutex {
         let mut path = state_path.as_os_str().to_owned();
         path.push(".lock");
         let path = PathBuf::from(path);
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .with_context(|| format!("Cannot create {}", path.display()))?;
         let start = Instant::now();
         loop {
-            match OpenOptions::new().write(true).create_new(true).open(&path) {
-                Ok(mut file) => {
-                    // The contents only help someone looking at a stuck file.
-                    let _ = write!(
-                        file,
-                        "pid {}\nstarted {}\n",
-                        std::process::id(),
-                        format_time(system_now_ms())
-                    );
-                    return Ok(Self { path });
-                }
-                Err(error)
-                    if error.kind() == io::ErrorKind::AlreadyExists
-                        // Windows reports a file that is still being deleted
-                        // as access denied, briefly, after its holder drops it.
-                        || (cfg!(windows) && error.kind() == io::ErrorKind::PermissionDenied) =>
-                {
-                    let stale = fs::metadata(&path)
-                        .and_then(|m| m.modified())
-                        .ok()
-                        .and_then(|modified| modified.elapsed().ok())
-                        .is_some_and(|age| age > MUTEX_STALE);
-                    if stale {
-                        // Two processes that both find it stale could each
-                        // remove it, the second removing the first's fresh
-                        // file. That needs a process to die mid-update and
-                        // two others to notice in the same instant, and only
-                        // risks one overlapping update.
-                        let _ = fs::remove_file(&path);
-                        continue;
-                    }
+            match file.try_lock() {
+                Ok(()) => return Ok(Self { _file: file }),
+                Err(fs::TryLockError::WouldBlock) => {
                     if start.elapsed() > MUTEX_WAIT {
-                        let holder = fs::read_to_string(&path).unwrap_or_default();
-                        let holder = holder.split_whitespace().collect::<Vec<_>>().join(" ");
                         bail!(
-                            "{} has been held by another update for over {} seconds ({holder}). \
-                             It is removed automatically once it is {} seconds old.",
+                            "{} has been locked by another update for over {} seconds. \
+                             The lock is released when that process exits.",
                             path.display(),
                             MUTEX_WAIT.as_secs(),
-                            MUTEX_STALE.as_secs()
                         );
                     }
                     thread::sleep(Duration::from_millis(10));
                 }
-                Err(error) => {
-                    return Err(error).with_context(|| format!("Cannot create {}", path.display()))
+                Err(fs::TryLockError::Error(error)) => {
+                    return Err(error).with_context(|| format!("Cannot lock {}", path.display()))
                 }
             }
         }
-    }
-}
-
-impl Drop for StateMutex {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
     }
 }
 
@@ -1669,16 +1638,33 @@ mod tests {
     }
 
     #[test]
-    fn a_stale_guard_file_is_removed() {
+    fn a_leftover_guard_file_does_not_block() {
         let f = Fixture::new();
         fs::create_dir_all(f.store.dir()).unwrap();
-        let guard = f.store.dir().join("main.json.lock");
-        let file = fs::File::create(&guard).unwrap();
-        file.set_modified(SystemTime::now() - MUTEX_STALE - Duration::from_secs(1))
-            .unwrap();
-        drop(file);
+        // A process that was killed mid-update leaves the file, but not the
+        // lock, behind.
+        fs::write(f.store.dir().join("main.json.lock"), "pid 1\n").unwrap();
         assert!(f.try_lock("a", Shared, None).granted);
-        assert!(!guard.exists());
+    }
+
+    #[test]
+    fn a_held_guard_blocks_other_updates_until_released() {
+        let f = Fixture::new();
+        fs::create_dir_all(f.store.dir()).unwrap();
+        let state = f.store.dir().join("main.json");
+        let held = StateMutex::acquire(&state).unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let waiter = thread::spawn(move || {
+            let started = Instant::now();
+            let _second = StateMutex::acquire(&state).unwrap();
+            sender.send(started.elapsed()).unwrap();
+        });
+        thread::sleep(Duration::from_millis(200));
+        assert!(receiver.try_recv().is_err(), "the second update must wait");
+        drop(held);
+        let waited = receiver.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(waited >= Duration::from_millis(150));
+        waiter.join().unwrap();
     }
 
     #[test]

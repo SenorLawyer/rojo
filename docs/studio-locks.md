@@ -59,7 +59,7 @@ Inside a Git repository, locks live in `<git common dir>/rojo-state/studio-locks
 Each lock has three files:
 
 * `<name>.json` is its state. It is written to a temporary file and renamed into place, so a killed process never leaves half a file.
-* `<name>.json.lock` exists only while one command updates the state. Commands wait up to 5 seconds for it, and remove one older than 10 seconds, which a killed process left behind.
+* `<name>.json.lock` is locked by the operating system while one command updates the state, and commands wait up to 5 seconds for it. The system releases the lock when that process exits, even if it is killed, so a leftover file never blocks anyone and nothing ever removes another process's lock.
 * `<name>.log.jsonl` is the event log, one JSON object per line. Past 256 KiB it is renamed to `<name>.log.jsonl.1`, replacing the older one, so the log stays bounded.
 
 A state file that cannot be read is an error for every command except `reset`, rather than being treated as an empty lock that could be handed to a second holder. Look at it, then run `rojo studio lock reset <name>` to delete it. Reset drops every hold and place in line on that lock, and keeps the old contents in the event log.

@@ -84,6 +84,9 @@ const MAX_COMMAND_BYTES: usize = MAX_BODY - 64 * 1024;
 const MAX_SESSION_PENDING_BYTES: usize = 64 * 1024 * 1024;
 pub(crate) const MAX_MODEL_BYTES: usize = 5 * 1024 * 1024;
 const MAX_MODEL_INSTANCES: usize = 10_000;
+/// How long `verify --fix` keeps sending batches, so it ends before the CLI,
+/// which waits [`MAX_COMMAND_REQUEST`] plus 5 seconds, gives up on it.
+const VERIFY_FIX_BUDGET: Duration = Duration::from_secs(40);
 /// Bound on the sync summary a plugin sends with each poll.
 const MAX_SYNC_SUMMARY_BYTES: usize = 16 * 1024;
 
@@ -1268,6 +1271,7 @@ impl StudioBridge {
     /// `fix`, sets those that differ back to their files' contents. See
     /// [`super::verify`].
     async fn verify(&self, session_id: &str, id: String, args: &Value) -> Response<Body> {
+        let started = Instant::now();
         let fix = args.get("fix").and_then(Value::as_bool).unwrap_or(false);
         let include_held = args
             .get("includeHeld")
@@ -1295,21 +1299,37 @@ impl StudioBridge {
         };
         let mut report = comparison.report();
         if fix {
-            let ids = comparison.fixable(include_held);
-            let messages = {
+            let fixes = comparison.fixable(include_held);
+            let batches = {
                 let tree = self.serve.tree();
-                verify::resync_messages(&tree, &ids)
+                verify::resync_batches(&tree, &fixes)
             };
-            let (mut updated, mut failed) = (0, 0);
+            let (mut updated, mut failed, mut skipped) = (0, 0, 0);
             let mut errors = Vec::new();
-            for message in messages {
-                let count = message["updated"].as_array().map_or(0, Vec::len) as u64;
+            let mut remaining: u64 = batches.iter().map(|batch| batch.count as u64).sum();
+            for batch in batches {
+                // The caller's request ID only covered `sources`, which has
+                // finished, so a cancel for it lands in `cancelled`. Checking it
+                // before each batch keeps the whole fix cancellable.
+                if self.take_cancelled(&id, session_id) {
+                    errors.push("Cancelled before every script was fixed".to_owned());
+                    break;
+                }
+                // The caller stops waiting after its own timeout, and a fix it
+                // no longer hears about must not keep changing Studio.
+                if started.elapsed() > VERIFY_FIX_BUDGET {
+                    errors.push(format!(
+                        "Stopped after {} seconds; run verify --fix again for the rest",
+                        VERIFY_FIX_BUDGET.as_secs()
+                    ));
+                    break;
+                }
                 let response = self
                     .dispatch(
                         session_id,
                         Uuid::new_v4().to_string(),
                         "resync",
-                        json!({"patch": message}),
+                        json!({"patch": batch.patch, "expect": batch.expect, "includeHeld": include_held}),
                     )
                     .await;
                 let (status, value) = response_value(response).await;
@@ -1317,10 +1337,11 @@ impl StudioBridge {
                 if status == StatusCode::OK && result["ok"] == json!(true) {
                     updated += result["value"]["updated"].as_u64().unwrap_or(0);
                     failed += result["value"]["failed"].as_u64().unwrap_or(0);
+                    skipped += result["value"]["skipped"].as_u64().unwrap_or(0);
+                    remaining -= batch.count as u64;
                 } else {
                     // Later batches would most likely fail the same way, and
                     // the report must say what is still out of date.
-                    failed += count;
                     errors.push(
                         result["error"]
                             .as_str()
@@ -1332,12 +1353,11 @@ impl StudioBridge {
                 }
             }
             report["fixed"] = json!({
-                "attempted": ids.len(),
+                "attempted": fixes.len(),
                 "updated": updated,
-                "failed": failed,
-                "skippedHeld": if include_held { 0 } else {
-                    comparison.different.iter().filter(|(script, _)| comparison.held.contains(&script.id)).count()
-                },
+                "failed": failed + remaining,
+                "skippedChanged": skipped,
+                "skippedHeld": if include_held { 0 } else { comparison.held_count() },
                 "errors": errors,
             });
         }
@@ -1345,6 +1365,22 @@ impl StudioBridge {
             StatusCode::OK,
             json!({"sessionId":session_id,"requestId":id,"result":{"ok":true,"value":report}}),
         )
+    }
+
+    /// Removes a cancellation of `id` that arrived after it finished, telling
+    /// whether there was one.
+    fn take_cancelled(&self, id: &str, session_id: &str) -> bool {
+        let mut state = self.state();
+        Self::prune(&mut state);
+        if state
+            .cancelled
+            .get(id)
+            .is_some_and(|(session, _)| session == session_id)
+        {
+            state.cancelled.remove(id);
+            return true;
+        }
+        false
     }
 
     /// Queues one command for the session and waits for Studio's result.
