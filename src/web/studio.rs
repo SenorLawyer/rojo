@@ -18,7 +18,9 @@ use serde_json::{json, Value};
 use tokio::sync::{oneshot, Notify, Semaphore};
 use uuid::Uuid;
 
-use super::{model_check, origin::canonical, untrusted_model, util::json as json_response};
+use super::{
+    model_check, origin::canonical, untrusted_model, util::json as json_response, verify,
+};
 use crate::serve_session::ServeSession;
 
 pub(super) const MAX_BODY: usize = 8 * 1024 * 1024;
@@ -84,6 +86,8 @@ const MAX_COMMAND_BYTES: usize = MAX_BODY - 64 * 1024;
 const MAX_SESSION_PENDING_BYTES: usize = 64 * 1024 * 1024;
 pub(crate) const MAX_MODEL_BYTES: usize = 5 * 1024 * 1024;
 const MAX_MODEL_INSTANCES: usize = 10_000;
+/// Bound on the sync summary a plugin sends with each poll.
+const MAX_SYNC_SUMMARY_BYTES: usize = 16 * 1024;
 
 /// Why requests and sync stop after the checkout changes. Returning to the
 /// accepted branch and commit lets the same server continue. It also fits in a
@@ -377,6 +381,9 @@ struct Session {
     description: Value,
     last_seen: Instant,
     queue: VecDeque<String>,
+    /// The plugin's latest sync health summary, sent with each poll, and
+    /// when it arrived.
+    sync: Option<(Value, Instant)>,
 }
 
 enum Outcome {
@@ -685,6 +692,8 @@ pub struct StudioBridge {
     /// unauthenticated responses do not reveal local paths.
     plugin_identity: Value,
     git: Option<Arc<GitWatch>>,
+    /// The tree `verify` compares Studio with.
+    serve: Arc<ServeSession>,
     state: Mutex<State>,
     changed: Notify,
     decodes: Arc<Semaphore>,
@@ -695,6 +704,17 @@ fn reply(status: StatusCode, value: Value) -> Response<Body> {
 }
 fn failure(status: StatusCode, message: impl Into<String>) -> Response<Body> {
     reply(status, json!({"error": message.into()}))
+}
+
+/// Reads back a response built by [`reply`], for actions made of several
+/// Studio commands.
+async fn response_value(response: Response<Body>) -> (StatusCode, Value) {
+    let status = response.status();
+    let value = match hyper::body::to_bytes(response.into_body()).await {
+        Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+        Err(_) => Value::Null,
+    };
+    (status, value)
 }
 
 /// Whether the Host header names the loopback interface literally. A DNS
@@ -726,12 +746,12 @@ fn loopback_host(request: &Request<Body>) -> bool {
 }
 
 impl StudioBridge {
-    pub fn new(session: &ServeSession, token_file: &Path) -> anyhow::Result<Arc<Self>> {
+    pub fn new(session: &Arc<ServeSession>, token_file: &Path) -> anyhow::Result<Arc<Self>> {
         Self::with_lock_wait(session, token_file, GIT_LOCK_WAIT)
     }
 
     fn with_lock_wait(
-        session: &ServeSession,
+        session: &Arc<ServeSession>,
         token_file: &Path,
         lock_wait: Duration,
     ) -> anyhow::Result<Arc<Self>> {
@@ -802,6 +822,7 @@ impl StudioBridge {
             identity_json,
             plugin_identity,
             git,
+            serve: Arc::clone(session),
             state: Mutex::new(State::default()),
             changed: Notify::new(),
             decodes: Arc::new(Semaphore::new(MAX_CONCURRENT_DECODES)),
@@ -953,6 +974,10 @@ impl StudioBridge {
                     let mut description = session.description.clone();
                     description["lastSeenMs"] =
                         json!(session.last_seen.elapsed().as_millis() as u64);
+                    if let Some((sync, at)) = &session.sync {
+                        description["sync"] = sync.clone();
+                        description["syncAgeMs"] = json!(at.elapsed().as_millis() as u64);
+                    }
                     description
                 })
                 .collect();
@@ -1105,6 +1130,7 @@ impl StudioBridge {
                 description: stored,
                 last_seen: Instant::now(),
                 queue: VecDeque::new(),
+                sync: None,
             },
         );
         reply(StatusCode::OK, json!({"registered":true,"sessionId":id}))
@@ -1115,6 +1141,12 @@ impl StudioBridge {
             return failure(StatusCode::BAD_REQUEST, "A UUID sessionId is required");
         };
         let id = id.as_str();
+        // Older plugins send no summary. A summary is a few hundred bytes, so
+        // anything much larger is not one and is ignored.
+        let sync = value
+            .get("sync")
+            .filter(|sync| sync.is_object() && sync.to_string().len() <= MAX_SYNC_SUMMARY_BYTES)
+            .cloned();
         // Leave room for Studio's HTTP queue and background UI scheduling before
         // the plugin's request deadline, even when no agent is issuing commands.
         let deadline = Instant::now() + Duration::from_secs(2);
@@ -1135,6 +1167,9 @@ impl StudioBridge {
                     );
                 };
                 session.last_seen = Instant::now();
+                if let Some(sync) = &sync {
+                    session.sync = Some((sync.clone(), Instant::now()));
+                }
                 // Commands are delivered at most once: a delivered command is
                 // never resent, so a lost poll response surfaces as a timeout
                 // instead of a duplicated import. Larger batches stay queued for
@@ -1202,6 +1237,8 @@ impl StudioBridge {
         let Some(action) = value.get("action").and_then(Value::as_str) else {
             return failure(StatusCode::BAD_REQUEST, "action is required");
         };
+        // `sources` and `resync` are only sent by `verify`, so callers cannot
+        // set script sources to anything but the server's own files.
         if !matches!(
             action,
             "status"
@@ -1213,6 +1250,7 @@ impl StudioBridge {
                 | "import"
                 | "test"
                 | "spec"
+                | "verify"
         ) {
             return failure(StatusCode::BAD_REQUEST, "Unsupported action. Arbitrary Luau execution, whole-place save, publish and play control are unavailable through this bridge.");
         }
@@ -1222,6 +1260,103 @@ impl StudioBridge {
             _ => return failure(StatusCode::BAD_REQUEST, "requestId must be a UUID"),
         };
         let args = value.get("args").cloned().unwrap_or(json!({}));
+        if action == "verify" {
+            return self.verify(session_id, id, &args).await;
+        }
+        self.dispatch(session_id, id, action, args).await
+    }
+
+    /// Compares the session's scripts with the server's tree and, with
+    /// `fix`, sets those that differ back to their files' contents. See
+    /// [`super::verify`].
+    async fn verify(&self, session_id: &str, id: String, args: &Value) -> Response<Body> {
+        let fix = args.get("fix").and_then(Value::as_bool).unwrap_or(false);
+        let include_held = args
+            .get("includeHeld")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let response = self
+            .dispatch(session_id, id.clone(), "sources", json!({}))
+            .await;
+        let (status, value) = response_value(response).await;
+        if status != StatusCode::OK || value["result"]["ok"] != json!(true) {
+            return reply(status, value);
+        }
+        let scripts = {
+            let tree = self.serve.tree();
+            verify::tree_scripts(&tree, self.serve.root_dir())
+        };
+        let comparison = match verify::compare(scripts, &value["result"]["value"]) {
+            Ok(comparison) => comparison,
+            Err(error) => {
+                return failure(
+                    StatusCode::BAD_GATEWAY,
+                    format!("Could not compare Studio's scripts: {error}"),
+                )
+            }
+        };
+        let mut report = comparison.report();
+        if fix {
+            let ids = comparison.fixable(include_held);
+            let messages = {
+                let tree = self.serve.tree();
+                verify::resync_messages(&tree, &ids)
+            };
+            let (mut updated, mut failed) = (0, 0);
+            let mut errors = Vec::new();
+            for message in messages {
+                let count = message["updated"].as_array().map_or(0, Vec::len) as u64;
+                let response = self
+                    .dispatch(
+                        session_id,
+                        Uuid::new_v4().to_string(),
+                        "resync",
+                        json!({"patch": message}),
+                    )
+                    .await;
+                let (status, value) = response_value(response).await;
+                let result = &value["result"];
+                if status == StatusCode::OK && result["ok"] == json!(true) {
+                    updated += result["value"]["updated"].as_u64().unwrap_or(0);
+                    failed += result["value"]["failed"].as_u64().unwrap_or(0);
+                } else {
+                    // Later batches would most likely fail the same way, and
+                    // the report must say what is still out of date.
+                    failed += count;
+                    errors.push(
+                        result["error"]
+                            .as_str()
+                            .or(value["error"].as_str())
+                            .unwrap_or("Studio did not apply the resync")
+                            .to_owned(),
+                    );
+                    break;
+                }
+            }
+            report["fixed"] = json!({
+                "attempted": ids.len(),
+                "updated": updated,
+                "failed": failed,
+                "skippedHeld": if include_held { 0 } else {
+                    comparison.different.iter().filter(|(script, _)| comparison.held.contains(&script.id)).count()
+                },
+                "errors": errors,
+            });
+        }
+        reply(
+            StatusCode::OK,
+            json!({"sessionId":session_id,"requestId":id,"result":{"ok":true,"value":report}}),
+        )
+    }
+
+    /// Queues one command for the session and waits for Studio's result.
+    async fn dispatch(
+        &self,
+        session_id: &str,
+        id: String,
+        action: &str,
+        args: Value,
+    ) -> Response<Body> {
         let deadline = match studio_deadline(action, &args) {
             Ok(deadline) => deadline,
             Err(message) => return failure(StatusCode::BAD_REQUEST, message),
@@ -1463,7 +1598,7 @@ mod tests {
     }
 
     fn bridge_for(dir: &Path, lock_wait: Duration) -> Arc<StudioBridge> {
-        let session = ServeSession::new(Vfs::new_default().unwrap(), dir).unwrap();
+        let session = Arc::new(ServeSession::new(Vfs::new_default().unwrap(), dir).unwrap());
         StudioBridge::with_lock_wait(&session, &dir.join("token"), lock_wait).unwrap()
     }
 

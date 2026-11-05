@@ -20,6 +20,9 @@ local strict = require(script.Parent.strict)
 local Settings = require(script.Parent.Settings)
 local orderSwaps = require(script.Parent.orderSwaps)
 local StudioBridge = require(script.Parent.StudioBridge)
+local hashSource = require(script.Parent.hashSource)
+local Config = require(script.Parent.Config)
+local Version = require(script.Parent.Version)
 
 local Status = strict("Session.Status", {
 	NotStarted = "NotStarted",
@@ -48,6 +51,30 @@ local function debugPatch(object)
 		output:unindent()
 		output:write("}")
 	end)
+end
+
+-- A script that loses this many non-blank lines in one change is held back
+-- instead of being emptied. Smaller scripts are often emptied on purpose.
+local WIPE_GUARD_MIN_LINES = 5
+-- Bounds what the sync summary sends with every bridge poll.
+local MAX_SUMMARY_HELD = 20
+-- Undo history names of Rojo's own changes, which `OnUndo` reports.
+local PATCH_WAYPOINT_PREFIX = "Rojo: Patch "
+local RESYNC_WAYPOINT_PREFIX = "Rojo: Resync "
+
+local function countNonBlankLines(source: string): number
+	local count = 0
+	for line in string.gmatch(source, "[^
+]+") do
+		if string.find(line, "%S") then
+			count += 1
+		end
+	end
+	return count
+end
+
+local function nowMillis()
+	return DateTime.now().UnixTimestampMillis
 end
 
 local function attemptReparent(instance, parent)
@@ -103,6 +130,20 @@ function ServeSession.new(options)
 			self:__onPlaceIdChanged()
 		end)
 	)
+	-- Undoing a Rojo change puts back what Studio had before it, so Studio no
+	-- longer matches the files on disk, and nothing would say so.
+	table.insert(
+		connections,
+		ChangeHistoryService.OnUndo:Connect(function(waypoint)
+			self:__onRojoHistoryChanged(waypoint, 1)
+		end)
+	)
+	table.insert(
+		connections,
+		ChangeHistoryService.OnRedo:Connect(function(waypoint)
+			self:__onRojoHistoryChanged(waypoint, -1)
+		end)
+	)
 
 	self = {
 		__status = Status.NotStarted,
@@ -117,11 +158,49 @@ function ServeSession.new(options)
 		__precommitCallbacks = {},
 		__postcommitCallbacks = {},
 		__updateLoadingText = function() end,
+		-- Scripts whose emptying was held back, by ID. See `__holdScriptWipes`.
+		__heldWipes = {},
+		__syncStats = {
+			connectedAt = nil,
+			lastPatchAt = nil,
+			patchesApplied = 0,
+			lastPatchUnapplied = 0,
+			undoneRojoPatches = 0,
+		},
 	}
 
 	setmetatable(self, ServeSession)
 
 	return self
+end
+
+--[=[
+	Plugins and servers with the same protocol work together, but a plugin from
+	another release may lack features the server's docs describe, which is easy
+	to miss when both say "Rojo". Returns a warning when the major or minor
+	versions differ.
+]=]
+function ServeSession.versionMismatchWarning(serverVersion)
+	if type(serverVersion) ~= "string" then
+		return nil
+	end
+	local server = Version.parse(serverVersion)
+	if type(server[1]) ~= "number" or type(server[2]) ~= "number" then
+		return nil
+	end
+	local plugin = Config.version
+	if server[1] == plugin[1] and server[2] == plugin[2] then
+		return nil
+	end
+	local fix = if Version.compare(server, plugin) > 0
+		then "Run `rojo plugin install` with the Rojo that runs `rojo serve`, then restart Studio, to update the plugin."
+		else "Update Rojo in the project's rokit.toml (then `rokit install`) to match the plugin."
+	return string.format(
+		"The Rojo plugin is version %s but the server is version %s. Syncing works, but features differ between them. %s",
+		Version.display(plugin),
+		serverVersion,
+		fix
+	)
 end
 
 function ServeSession:__fmtDebug(output)
@@ -185,9 +264,207 @@ function ServeSession:restartStudioBridge()
 			return
 		end
 		Log.warn("{} Normal syncing remains connected. Retry the bridge through agent control.", err)
-	end)
+	end, {
+		getSummary = function()
+			return self:getSyncSummary()
+		end,
+		getSourceHashes = function()
+			return self:getSourceHashes()
+		end,
+		applyResync = function(patch)
+			return self:applyResync(patch)
+		end,
+	})
 	self.__studioBridge = bridge
 	bridge:start()
+end
+
+function ServeSession:__onRojoHistoryChanged(waypoint, delta)
+	if self.__status ~= Status.Connected or type(waypoint) ~= "string" then
+		return
+	end
+	local isRojo = string.sub(waypoint, 1, #PATCH_WAYPOINT_PREFIX) == PATCH_WAYPOINT_PREFIX
+		or string.sub(waypoint, 1, #RESYNC_WAYPOINT_PREFIX) == RESYNC_WAYPOINT_PREFIX
+	if not isRojo then
+		return
+	end
+	local stats = self.__syncStats
+	stats.undoneRojoPatches = math.max(0, stats.undoneRojoPatches + delta)
+	if delta > 0 then
+		Log.warn(
+			"Undid '{}', a change Rojo synced from disk. Studio no longer matches the project's files for the instances it changed{}."
+				.. " Redo it, or run `rojo studio verify --fix` (or reconnect) to sync them again.",
+			waypoint,
+			if self.__twoWaySync then ", and two-way sync may write the undone values back to disk" else ""
+		)
+	end
+end
+
+--[=[
+	Returns a small summary of this session's sync health. The Studio bridge
+	sends it with every poll, so `rojo studio sessions` can show it without
+	asking each Studio.
+]=]
+function ServeSession:getSyncSummary()
+	local stats = self.__syncStats
+	local held = {}
+	local heldCount = 0
+	for id, entry in self.__heldWipes do
+		heldCount += 1
+		table.insert(held, { id = id, path = entry.path, lines = entry.lines, heldAt = entry.heldAt })
+	end
+	table.sort(held, function(a, b)
+		return a.path < b.path
+	end)
+	while #held > MAX_SUMMARY_HELD do
+		table.remove(held)
+	end
+	return {
+		status = self.__status,
+		projectName = self.__projectName,
+		serverVersion = self.__serverVersion,
+		pluginVersion = Version.display(Config.version),
+		placeId = game.PlaceId,
+		twoWaySync = self.__twoWaySync,
+		connectedAt = stats.connectedAt,
+		lastPatchAt = stats.lastPatchAt,
+		patchesApplied = stats.patchesApplied,
+		lastPatchUnapplied = stats.lastPatchUnapplied,
+		undoneRojoPatches = stats.undoneRojoPatches,
+		heldWipeCount = heldCount,
+		heldWipes = held,
+	}
+end
+
+--[=[
+	Hashes the source of every script Rojo tracks, for `rojo studio verify`.
+	Yields between batches so a large place does not freeze Studio.
+]=]
+function ServeSession:getSourceHashes()
+	assert(self.__status == Status.Connected, "Rojo is not syncing this place. Connect it first.")
+	local scripts = {}
+	local detached = {}
+	-- Patches may add or remove IDs while this yields, which would break
+	-- iterating the live table.
+	local tracked = table.clone(self.__instanceMap.fromIds)
+	local hashed = 0
+	for id, instance in tracked do
+		if not instance:IsA("LuaSourceContainer") then
+			continue
+		end
+		if not instance:IsDescendantOf(game) then
+			table.insert(detached, id)
+			continue
+		end
+		local ok, source = pcall(function()
+			return (instance :: any).Source
+		end)
+		if ok and type(source) == "string" then
+			local hash, length = hashSource(source)
+			table.insert(scripts, { id = id, hash = hash, length = length })
+		end
+		hashed += 1
+		if hashed % 200 == 0 then
+			task.wait()
+		end
+	end
+	local held = {}
+	for id in self.__heldWipes do
+		table.insert(held, id)
+	end
+	return { scripts = scripts, detached = detached, held = held }
+end
+
+--[=[
+	Applies the script updates that `rojo studio verify --fix` built from the
+	server's tree. They skip the wipe guard, since the agent asked for exactly
+	these files' contents.
+]=]
+function ServeSession:applyResync(patch)
+	assert(self.__status == Status.Connected, "Rojo is not syncing this place. Connect it first.")
+	assert(
+		type(patch) == "table"
+			and type(patch.updated) == "table"
+			and (patch.removed == nil or next(patch.removed) == nil)
+			and (patch.added == nil or next(patch.added) == nil),
+		"A resync may only update existing instances"
+	)
+	local resync = {
+		removed = {},
+		added = {},
+		updated = patch.updated,
+	}
+	local unapplied = self:__applyPatch(resync, { force = true, waypoint = RESYNC_WAYPOINT_PREFIX })
+	local failed = PatchSet.countInstances(unapplied)
+	return { updated = #patch.updated - failed, failed = failed }
+end
+
+--[=[
+	Takes changes out of `patch` that would empty a script with several lines
+	of code, and remembers them, so a broken write on disk (an editor or agent
+	saving an empty file) cannot wipe the script in Studio. A later change that
+	gives the script source again, or removes it, ends the hold.
+]=]
+function ServeSession:__holdScriptWipes(patch)
+	for _, removed in patch.removed do
+		self.__heldWipes[removed] = nil
+	end
+	if not Settings:get("guardScriptWipes") then
+		return
+	end
+	local index = 1
+	while index <= #patch.updated do
+		local update = patch.updated[index]
+		local encoded = update.changedProperties and update.changedProperties.Source
+		local ty, value
+		if type(encoded) == "table" then
+			ty, value = next(encoded)
+		end
+		if ty ~= "String" or type(value) ~= "string" then
+			index += 1
+			continue
+		end
+		if string.find(value, "%S") then
+			self.__heldWipes[update.id] = nil
+			index += 1
+			continue
+		end
+		local instance = self.__instanceMap.fromIds[update.id]
+		local lines = 0
+		if instance and instance:IsA("LuaSourceContainer") then
+			local ok, source = pcall(function()
+				return (instance :: any).Source
+			end)
+			if ok and type(source) == "string" then
+				lines = countNonBlankLines(source)
+			end
+		end
+		if lines < WIPE_GUARD_MIN_LINES then
+			index += 1
+			continue
+		end
+		local path = instance:GetFullName()
+		if not self.__heldWipes[update.id] then
+			Log.warn(
+				"Rojo held back emptying {} ({} lines of code) because its file on disk is now empty."
+					.. " If that was a broken save, write the file again. If it is intended, delete the file,"
+					.. " or run `rojo studio verify --fix --include-held`.",
+				path,
+				lines
+			)
+		end
+		self.__heldWipes[update.id] = { path = path, lines = lines, heldAt = nowMillis() }
+		update.changedProperties.Source = nil
+		local empty = next(update.changedProperties) == nil
+			and update.changedName == nil
+			and update.changedClassName == nil
+			and update.changedMetadata == nil
+		if empty then
+			table.remove(patch.updated, index)
+		else
+			index += 1
+		end
+	end
 end
 
 --[=[
@@ -257,6 +534,11 @@ function ServeSession:start()
 			end
 
 			self.__serverVersion = serverInfo.serverVersion
+			self.__projectName = serverInfo.projectName
+			local mismatch = ServeSession.versionMismatchWarning(serverInfo.serverVersion)
+			if mismatch then
+				Log.warn("{}", mismatch)
+			end
 			self:setLoadingText("Loading initial data from server...")
 			return self:__initialSync(serverInfo):andThen(function()
 				if self.__status == Status.Disconnected then
@@ -290,6 +572,7 @@ function ServeSession:start()
 					end,
 				}, function()
 					if self.__status ~= Status.Disconnected then
+						self.__syncStats.connectedAt = nowMillis()
 						self:__setStatus(Status.Connected, serverInfo.projectName)
 						if serverInfo.studioBridge and self.__status ~= Status.Disconnected then
 							self.__bridgePairing = serverInfo.studioBridge
@@ -551,9 +834,14 @@ function ServeSession:__replaceInstances(idList)
 	return true, unappliedPatch
 end
 
-function ServeSession:__applyPatch(patch)
+function ServeSession:__applyPatch(patch, options)
+	options = options or {}
+	if not options.force then
+		self:__holdScriptWipes(patch)
+	end
 	local patchTimestamp = DateTime.now():FormatLocalTime("LTS", "en-us")
-	local historyRecording = ChangeHistoryService:TryBeginRecording("Rojo: Patch " .. patchTimestamp)
+	local historyRecording =
+		ChangeHistoryService:TryBeginRecording((options.waypoint or PATCH_WAYPOINT_PREFIX) .. patchTimestamp)
 	if not historyRecording then
 		-- There can only be one recording at a time
 		Log.debug("Failed to begin history recording for " .. patchTimestamp .. ". Another recording is in progress.")
@@ -562,13 +850,23 @@ function ServeSession:__applyPatch(patch)
 	-- A recording left open blocks every later recording in this Studio
 	-- session, so it must be finished however patch application exits. Partial
 	-- changes are committed so the user can still undo them.
-	local success, err = pcall(self.__applyPatchInRecording, self, patch)
+	local success, result = pcall(self.__applyPatchInRecording, self, patch)
 	if historyRecording then
 		ChangeHistoryService:FinishRecording(historyRecording, Enum.FinishRecordingOperation.Commit)
 	end
 	if not success then
-		error(err, 0)
+		error(result, 0)
 	end
+	if options.force then
+		for _, update in patch.updated do
+			self.__heldWipes[update.id] = nil
+		end
+	end
+	local stats = self.__syncStats
+	stats.patchesApplied += 1
+	stats.lastPatchAt = nowMillis()
+	stats.lastPatchUnapplied = PatchSet.countInstances(result)
+	return result
 end
 
 function ServeSession:__applyPatchInRecording(patch)
@@ -630,6 +928,8 @@ function ServeSession:__applyPatchInRecording(patch)
 		end)
 	end
 	Timer.stop()
+
+	return unappliedPatch
 end
 
 function ServeSession:__initialSync(serverInfo)

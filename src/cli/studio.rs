@@ -12,6 +12,11 @@ use data_encoding::BASE64;
 use reqwest::{blocking::Client, Url};
 use serde_json::{json, Value};
 
+#[path = "studio_backup.rs"]
+mod backup;
+
+use std::io::IsTerminal;
+
 use crate::web::{
     model_check,
     studio::{read_token_file, IMPORT_CHECK_LIMIT, MAX_COMMAND_REQUEST, MAX_MODEL_BYTES},
@@ -126,6 +131,24 @@ pub enum StudioSubcommand {
         #[clap(long, short)]
         output: PathBuf,
     },
+    /// Check that every script Rojo syncs has the same source in Studio as in
+    /// its file. Exits with 1 when something differs.
+    Verify {
+        #[clap(flatten)]
+        target: Target,
+        /// Set scripts that differ back to their files' contents.
+        #[clap(long)]
+        fix: bool,
+        /// With --fix, also empty scripts whose emptying the plugin held back
+        /// because their file became empty.
+        #[clap(long, requires = "fix")]
+        include_held: bool,
+    },
+    /// Save copies of Studio instances outside the place, and put them back.
+    Backup {
+        #[clap(subcommand)]
+        command: BackupCommand,
+    },
     /// Insert a validated model into Studio. This does not save or publish a place.
     Import {
         #[clap(flatten)]
@@ -140,8 +163,67 @@ pub enum StudioSubcommand {
     },
 }
 
+#[derive(Debug, Parser)]
+pub enum BackupCommand {
+    /// Export an instance to the project's backup folder.
+    Create {
+        #[clap(flatten)]
+        target: Target,
+        /// Instance ID or game/... path, such as game/Workspace/Map.
+        #[clap(long)]
+        instance: String,
+        /// Short name for the backup. Defaults to the instance's name.
+        #[clap(long)]
+        name: Option<String>,
+        /// What the backup is for, shown by `backup list`.
+        #[clap(long)]
+        note: Option<String>,
+    },
+    /// List backups, newest first.
+    List,
+    /// Insert a backup into Studio under a parent instance.
+    Restore {
+        #[clap(flatten)]
+        target: Target,
+        /// Backup ID from `backup list`.
+        backup: String,
+        /// Instance ID or game/... path to insert the backup under.
+        #[clap(long)]
+        parent: String,
+        /// Permit script content. Restored Script/LocalScript instances remain disabled.
+        #[clap(long)]
+        allow_scripts: bool,
+    },
+    /// Delete a backup.
+    Remove {
+        /// Backup ID from `backup list`.
+        backup: String,
+    },
+}
+
 impl StudioCommand {
     pub fn run(self) -> anyhow::Result<()> {
+        // Listing and removing backups only reads local files, so they work
+        // without a running server.
+        if let StudioSubcommand::Backup { command } = &self.command {
+            match command {
+                BackupCommand::List => {
+                    let store = backup::Store::open()?;
+                    let backups = store.list()?;
+                    if self.json {
+                        return print_json(&json!({ "backups": backups }), true);
+                    }
+                    backup::print_list(&store, &backups);
+                    return Ok(());
+                }
+                BackupCommand::Remove { backup } => {
+                    let store = backup::Store::open()?;
+                    store.remove(backup)?;
+                    return print_json(&json!({"removed": backup}), self.json);
+                }
+                _ => {}
+            }
+        }
         if let StudioSubcommand::Token { output } = &self.command {
             create_token(output)?;
             return print_json(&json!({"tokenFile":output,"created":true}), self.json);
@@ -160,7 +242,135 @@ impl StudioCommand {
             .build()?;
         if matches!(self.command, StudioSubcommand::Sessions) {
             let result = request(&client, &address, token.trim(), None)?;
+            // Scripts parse stdout, which stays JSON. The summary is for
+            // people reading a terminal.
+            if !self.json && std::io::stderr().is_terminal() {
+                eprint!("{}", describe_sessions(&result));
+            }
             return print_json(&result, self.json);
+        }
+        if let StudioSubcommand::Verify {
+            target,
+            fix,
+            include_held,
+        } = &self.command
+        {
+            let result = request(
+                &client,
+                &address,
+                token.trim(),
+                Some(json!({
+                    "sessionId": target.session,
+                    "action": "verify",
+                    "args": {"fix": fix, "includeHeld": include_held},
+                    "requestId": self.request_id.clone().unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+                })),
+            )?;
+            let response = &result["result"];
+            if response.get("ok") != Some(&json!(true)) {
+                bail!(
+                    "Studio command failed: {}",
+                    response
+                        .get("error")
+                        .and_then(Value::as_str)
+                        .unwrap_or("Invalid plugin response")
+                );
+            }
+            let report = &response["value"];
+            if !self.json {
+                eprint!("{}", describe_verify(report));
+            }
+            print_json(&result, self.json)?;
+            return if verify_passed(report) {
+                Ok(())
+            } else {
+                Err(super::ExitStatus(1).into())
+            };
+        }
+        if let StudioSubcommand::Backup { command } = &self.command {
+            let store = backup::Store::open()?;
+            match command {
+                BackupCommand::Create {
+                    target,
+                    instance,
+                    name,
+                    note,
+                } => {
+                    let bridge = Bridge {
+                        client: &client,
+                        address: &address,
+                        token: token.trim(),
+                        session: &target.session,
+                    };
+                    let exported = bridge.command("export", json!({"instance": instance}))?;
+                    let model = BASE64.decode(
+                        exported["model"]
+                            .as_str()
+                            .context("Studio did not return native model bytes")?
+                            .as_bytes(),
+                    )?;
+                    anyhow::ensure!(
+                        model.len() <= MAX_MODEL_BYTES,
+                        "Export exceeds the 5MiB model limit"
+                    );
+                    let status = bridge.command("status", json!({}))?;
+                    let described = &exported["instance"];
+                    let record = store.save(
+                        backup::Record {
+                            id: String::new(),
+                            name: name.clone().unwrap_or_else(|| {
+                                described["name"].as_str().unwrap_or("backup").to_owned()
+                            }),
+                            instance: described["path"].as_str().unwrap_or(instance).to_owned(),
+                            class_name: described["className"]
+                                .as_str()
+                                .unwrap_or("Instance")
+                                .to_owned(),
+                            place_id: status["placeId"].as_u64(),
+                            place_name: status["placeName"].as_str().map(str::to_owned),
+                            git_head: None,
+                            git_branch: None,
+                            created_at: backup::now_millis(),
+                            bytes: 0,
+                            note: note.clone(),
+                        },
+                        &model,
+                    )?;
+                    if !self.json {
+                        eprintln!(
+                            "Saved backup {} of {} in {}",
+                            record.id,
+                            record.instance,
+                            store.dir().display()
+                        );
+                    }
+                    return print_json(&json!({ "backup": record }), self.json);
+                }
+                BackupCommand::Restore {
+                    target,
+                    backup,
+                    parent,
+                    allow_scripts,
+                } => {
+                    let (record, path) = store.get(backup)?;
+                    let bytes = read_model(&path, *allow_scripts)?;
+                    let bridge = Bridge {
+                        client: &client,
+                        address: &address,
+                        token: token.trim(),
+                        session: &target.session,
+                    };
+                    let imported = bridge.command(
+                        "import",
+                        json!({"parent": parent, "model": BASE64.encode(&bytes), "allowScripts": allow_scripts}),
+                    )?;
+                    return print_json(
+                        &json!({"restored": record.id, "result": imported}),
+                        self.json,
+                    );
+                }
+                BackupCommand::List | BackupCommand::Remove { .. } => unreachable!(),
+            }
         }
         if let StudioSubcommand::Cancel { target, request } = &self.command {
             let response = client
@@ -311,6 +521,182 @@ impl StudioCommand {
         }
         print_json(&result, self.json)
     }
+}
+
+/// Whether `verify` found Studio matching the files, or, with `--fix`,
+/// managed to make it match. Held wipes that were left alone still count as
+/// differences, because Studio keeps code the files no longer have.
+fn verify_passed(report: &Value) -> bool {
+    if report["inSync"] == json!(true) {
+        return true;
+    }
+    let count = |key: &str| report[key].as_u64().unwrap_or(0);
+    let fixed = &report["fixed"];
+    fixed.is_object()
+        && count("missingCount") == 0
+        && count("detachedCount") == 0
+        && fixed["failed"].as_u64() == Some(0)
+        && fixed["skippedHeld"].as_u64() == Some(0)
+        && fixed["updated"].as_u64() == Some(count("differentCount"))
+}
+
+fn describe_verify(report: &Value) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    let count = |key: &str| report[key].as_u64().unwrap_or(0);
+    let _ = writeln!(
+        out,
+        "Checked {} scripts: {} match their files.",
+        count("checked"),
+        count("matching")
+    );
+    let line = |item: &Value| {
+        let file = item["file"].as_str().unwrap_or("?");
+        format!("{} ({file})", item["path"].as_str().unwrap_or("?"))
+    };
+    if count("differentCount") > 0 {
+        let _ = writeln!(out, "{} differ from their files:", count("differentCount"));
+        for item in report["different"].as_array().into_iter().flatten() {
+            let held = if item["held"] == json!(true) {
+                " [held: its file is empty]"
+            } else {
+                ""
+            };
+            let _ = writeln!(out, "  {}{held}", line(item));
+        }
+    }
+    if count("missingCount") > 0 {
+        let _ = writeln!(out, "{} are not in Studio:", count("missingCount"));
+        for item in report["missing"].as_array().into_iter().flatten() {
+            let _ = writeln!(out, "  {}", line(item));
+        }
+    }
+    if count("detachedCount") > 0 {
+        let _ = writeln!(
+            out,
+            "{} were removed from the place in Studio:",
+            count("detachedCount")
+        );
+        for item in report["detached"].as_array().into_iter().flatten() {
+            let _ = writeln!(out, "  {}", line(item));
+        }
+    }
+    if report["truncated"] == json!(true) {
+        let _ = writeln!(out, "(Lists are cut short; --json has the counts.)");
+    }
+    let fixed = &report["fixed"];
+    if fixed.is_object() {
+        let _ = writeln!(
+            out,
+            "Fixed {} of {} scripts.",
+            fixed["updated"].as_u64().unwrap_or(0),
+            fixed["attempted"].as_u64().unwrap_or(0)
+        );
+        if fixed["skippedHeld"].as_u64().unwrap_or(0) > 0 {
+            let _ = writeln!(
+                out,
+                "Left {} held scripts alone; pass --include-held to empty them as their files are.",
+                fixed["skippedHeld"]
+            );
+        }
+        for error in fixed["errors"].as_array().into_iter().flatten() {
+            let _ = writeln!(out, "Error: {}", error.as_str().unwrap_or("?"));
+        }
+    } else if count("differentCount") > 0 {
+        let _ = writeln!(
+            out,
+            "Run again with --fix to set them back to their files' contents."
+        );
+    }
+    if count("missingCount") > 0 || count("detachedCount") > 0 {
+        let _ = writeln!(
+            out,
+            "Scripts that are missing or removed in Studio come back when Studio reconnects to Rojo."
+        );
+    }
+    out
+}
+
+fn ago(millis: Option<u64>) -> String {
+    let Some(then) = millis else {
+        return "never".to_owned();
+    };
+    let secs = backup::now_millis().saturating_sub(then) / 1000;
+    match secs {
+        0..=59 => format!("{secs}s ago"),
+        60..=3599 => format!("{}m ago", secs / 60),
+        _ => format!("{}h ago", secs / 3600),
+    }
+}
+
+fn describe_sessions(result: &Value) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    let sessions = result["sessions"].as_array().cloned().unwrap_or_default();
+    if sessions.is_empty() {
+        let _ = writeln!(out, "No Studio is connected to this server's bridge.");
+        return out;
+    }
+    let server = crate::web::interface::SERVER_VERSION;
+    for session in &sessions {
+        let _ = writeln!(
+            out,
+            "{} \"{}\" (place {}) session {}",
+            session["mode"].as_str().unwrap_or("?"),
+            session["placeName"].as_str().unwrap_or("?"),
+            session["placeId"],
+            session["sessionId"].as_str().unwrap_or("?"),
+        );
+        let sync = &session["sync"];
+        if !sync.is_object() {
+            let _ = writeln!(out, "  sync: unknown (plugin too old to report it)");
+            continue;
+        }
+        let _ = writeln!(
+            out,
+            "  sync: {}, last change {}, {} patches applied",
+            sync["status"].as_str().unwrap_or("?"),
+            ago(sync["lastPatchAt"].as_u64()),
+            sync["patchesApplied"].as_u64().unwrap_or(0),
+        );
+        let mut warnings = Vec::new();
+        let unapplied = sync["lastPatchUnapplied"].as_u64().unwrap_or(0);
+        if unapplied > 0 {
+            warnings.push(format!(
+                "{unapplied} instances in the last change could not be applied"
+            ));
+        }
+        let undone = sync["undoneRojoPatches"].as_u64().unwrap_or(0);
+        if undone > 0 {
+            warnings.push(format!("{undone} Rojo changes were undone in Studio"));
+        }
+        let held = sync["heldWipeCount"].as_u64().unwrap_or(0);
+        if held > 0 {
+            warnings.push(format!("{held} scripts held back from being emptied"));
+        }
+        if let Some(plugin) = sync["pluginVersion"].as_str() {
+            let minor = |version: &str| {
+                let mut parts = version.split('.');
+                (parts.next().map(str::to_owned), parts.next().map(str::to_owned))
+            };
+            if minor(plugin) != minor(server) {
+                warnings.push(format!(
+                    "plugin {plugin} differs from server {server}; run `rojo plugin install`"
+                ));
+            }
+        }
+        for warning in &warnings {
+            let _ = writeln!(out, "  warning: {warning}");
+        }
+        if unapplied > 0 || undone > 0 || held > 0 {
+            let _ = writeln!(
+                out,
+                "  run `rojo studio verify --session {}` to compare its scripts with the files",
+                session["sessionId"].as_str().unwrap_or("?")
+            );
+        }
+    }
+    out
 }
 
 /// The most entries one `logs` command returns; the plugin's buffer size.

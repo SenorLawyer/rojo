@@ -8,6 +8,7 @@ pub mod interface;
 pub(crate) mod model_check;
 mod origin;
 pub(crate) mod studio;
+mod verify;
 mod ui;
 mod untrusted_model;
 mod util;

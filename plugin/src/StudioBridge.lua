@@ -17,6 +17,8 @@ local Log = require(Packages.Log)
 local RbxDom = require(Packages.RbxDom)
 local ReflectionDatabase = require(Packages.RbxDom.database)
 local Settings = require(script.Parent.Settings)
+local Config = require(script.Parent.Config)
+local Version = require(script.Parent.Version)
 local SpecRunner = require(script.Parent.SpecRunner)
 local StreamRequest = require(Packages.Http.StreamRequest)
 local StreamBudget = require(Packages.Http.StreamBudget)
@@ -265,7 +267,11 @@ function StudioBridge.pathOf(instance)
 	return table.concat(escaped, "/"), segments
 end
 
-function StudioBridge.new(apiContext, pairing, onFailure)
+-- `sync`, when given, connects the bridge to the sync session it runs beside:
+-- `getSummary()` for the health summary sent with every poll,
+-- `getSourceHashes()` for `rojo studio verify` and `applyResync(patch)` for
+-- `rojo studio verify --fix`.
+function StudioBridge.new(apiContext, pairing, onFailure, sync)
 	assert(
 		pairing.protocolVersion == 1 and type(pairing.pluginToken) == "string" and type(pairing.identity) == "table",
 		"Unsupported Studio bridge pairing"
@@ -280,6 +286,7 @@ function StudioBridge.new(apiContext, pairing, onFailure)
 		apiContext = apiContext,
 		pairing = pairing,
 		onFailure = onFailure,
+		sync = sync,
 		sessionId = HttpService:GenerateGUID(false),
 		stopped = false,
 		transports = {},
@@ -437,17 +444,41 @@ function StudioBridge:capabilities()
 			maxFailures = SpecRunner.MAX_FAILURES,
 			reason = "Runs the place's *.spec modules in Run mode with a fixed runner and returns a bounded report",
 		},
+		sources = {
+			available = self.sync ~= nil,
+			reason = "Hashes of the scripts Rojo syncs, compared with the server's files by rojo studio verify",
+		},
+		resync = {
+			available = self.sync ~= nil,
+			reason = "Sets the source of scripts that rojo studio verify --fix found different from their files",
+		},
 	}
 end
 
+-- Registered once and compared on a retried registration, so it holds only
+-- what cannot change during the bridge session. Sync health changes all the
+-- time and goes with each poll instead (see `syncSummary`).
 function StudioBridge:status()
 	return {
 		sessionId = self.sessionId,
 		placeId = game.PlaceId,
 		placeName = game.Name,
+		pluginVersion = Version.display(Config.version),
 		mode = if RunService:IsEdit() then "Edit" else "Play",
 		capabilities = self:capabilities(),
 	}
+end
+
+function StudioBridge:syncSummary()
+	if not self.sync then
+		return nil
+	end
+	local ok, summary = pcall(self.sync.getSummary)
+	if ok then
+		return summary
+	end
+	Log.debug("Could not read the sync summary for the Studio bridge: {}", summary)
+	return nil
 end
 
 local function encodeBody(value)
@@ -816,7 +847,15 @@ function StudioBridge:execute(command)
 	self:ensureActive(command)
 	local args = command.args or {}
 	if command.action == "status" then
-		return self:status()
+		local status = self:status()
+		status.sync = self:syncSummary()
+		return status
+	elseif command.action == "sources" then
+		assert(self.sync, "This bridge is not attached to a sync session")
+		return self.sync.getSourceHashes()
+	elseif command.action == "resync" then
+		assert(self.sync, "This bridge is not attached to a sync session")
+		return self.sync.applyResync(args.patch)
 	elseif command.action == "selection" then
 		local result = {}
 		for index, instance in Selection:Get() do
@@ -1054,7 +1093,10 @@ function StudioBridge:start()
 			local afterRunMode = false
 			while not self.stopped do
 				local failure = {}
-				local polled, response = pcall(self.__requestWithRetry, self, "poll", {}, failure)
+				-- Each poll carries the sync session's current health, so agents
+				-- can list every Studio's sync state without a command per session.
+				local polled, response =
+					pcall(self.__requestWithRetry, self, "poll", { sync = self:syncSummary() }, failure)
 				if not polled then
 					-- Studio cannot poll in Run mode, and if its heartbeats did not
 					-- reach the server for long enough the session expired, which

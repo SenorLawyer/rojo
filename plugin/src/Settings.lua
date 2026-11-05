@@ -29,6 +29,7 @@ local defaultSettings = {
 	agentControlEnabled = true,
 	agentControlCanChangeConfirmation = true,
 	studioBridgeAutoEnable = true,
+	guardScriptWipes = true,
 	priorEndpoints = {},
 }
 

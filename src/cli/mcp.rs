@@ -496,6 +496,9 @@ fn command(
                 .arg(format!("--token-file={}", token.display()))
                 .arg("--json");
             let action = name.strip_prefix("studio_").context("Unknown tool")?;
+            // Verify reports a place that does not match its files with exit
+            // status 1 and a full report, which is a result, not a failure.
+            reports_failure = action == "verify";
             let session = canonical_session(arguments);
             if let (true, Some(session)) = (action != "sessions", &session) {
                 let request = uuid::Uuid::new_v4().to_string();
@@ -505,11 +508,21 @@ fn command(
                     request,
                 });
             }
-            command.arg(action);
+            match action {
+                "backup" => {
+                    command.args(["backup", "create"]);
+                }
+                "backup_list" => {
+                    command.args(["backup", "list"]);
+                }
+                action => {
+                    command.arg(action);
+                }
+            }
             if let Some(session) = &session {
                 command.arg(format!("--session={session}"));
             }
-            for key in ["instance", "depth", "limit", "seconds", "after"] {
+            for key in ["instance", "depth", "limit", "seconds", "after", "name", "note"] {
                 if let Some(value) = arguments.get(key) {
                     command.arg(format!(
                         "--{key}={}",
@@ -524,6 +537,12 @@ fn command(
                 for property in properties {
                     command.arg(format!("--property={}", property.as_str().unwrap()));
                 }
+            }
+            if arguments.get("fix") == Some(&json!(true)) {
+                command.arg("--fix");
+            }
+            if arguments.get("includeHeld") == Some(&json!(true)) {
+                command.arg("--include-held");
             }
             if name == "studio_export" {
                 let path = checked_output(
@@ -628,11 +647,14 @@ fn catalog() -> Vec<Value> {
         ("studio_logs", "Read a bounded number of captured Studio log entries. Pass `after` (0 to start) to read only entries newer than that sequence number; the result then has `entries`, `nextAfter` to pass on the next call, `more` when entries are still waiting, and `dropped` for entries lost from the 200-entry buffer.", json!({"session":session,"limit":{"type":"integer","minimum":1,"maximum":200},"after":{"type":"integer","minimum":0,"maximum":MAX_SAFE_INTEGER}}), vec!["session"]),
         ("run_tests", "Run the place's *.spec modules (TestEZ, or Jest-Lua) in Studio's Run mode and return a report: status (passed, failed, error or timedOut), counts, and each failure's test path and messages. A failing test is a result, not a tool error. This executes the place's existing and synced scripts in game context, like studio_test. The session may be omitted when exactly one is connected, but only a call with an explicit session can be cancelled.", json!({"session":session,"roots":{"type":"array","minItems":1,"maxItems":32,"items":instance},"filter":{"type":"string","maxLength":256,"description":"At most 256 bytes of UTF-8, without control characters"},"framework":{"type":"string","enum":["auto","testez","jest"]},"module":instance,"timeout":{"type":"integer","minimum":1,"maximum":300}}), vec![]),
         ("studio_export", "Export an instance to a new relative .rbxm file inside the fixed project. Does not save or publish the place.", json!({"session":session,"instance":instance,"output":{"type":"string","minLength":1,"maxLength":1024}}), vec!["session","instance","output"]),
+        ("studio_verify", "Check that every script Rojo syncs has the same source in the selected Studio as in its file, after a crash, a reconnect, an undo or whenever Studio may be out of date. Lists scripts that differ, are missing from Studio or were removed there, each with its file. With fix, sets differing scripts back to their files' contents (held wipes stay unless includeHeld). A place that does not match is a result (inSync false), not a tool error.", json!({"session":session,"fix":{"type":"boolean"},"includeHeld":{"type":"boolean"}}), vec!["session"]),
+        ("studio_backup", "Save a copy of an instance (such as game/Workspace/Map) outside the place, in the repository's backup folder, before rebuilding or replacing it. Use this instead of copying it into ServerStorage. Restore with `rojo studio backup restore`.", json!({"session":session,"instance":instance,"name":{"type":"string","minLength":1,"maxLength":64},"note":{"type":"string","minLength":1,"maxLength":512}}), vec!["session","instance"]),
+        ("studio_backup_list", "List saved Studio backups, newest first.", json!({}), vec![]),
         ("checkpoint_list", "List archived checkpoints for the fixed project.", json!({}), vec![]),
         ("workspace_list", "List Git worktrees and saved-place identities for the fixed project.", json!({}), vec![]),
         ("packages_doctor", "Inspect Wally/pesde manifests, lockfiles and declared Rojo package mappings without running a package manager.", json!({}), vec![]),
     ] {
-        tools.push(json!({"name":name,"description":description,"inputSchema":{"type":"object","properties":properties,"required":required,"additionalProperties":false},"annotations":{"readOnlyHint":!matches!(name, "studio_export" | "studio_test" | "run_tests"),"destructiveHint":matches!(name, "studio_test" | "run_tests"),"openWorldHint":matches!(name, "studio_test" | "run_tests")}}));
+        tools.push(json!({"name":name,"description":description,"inputSchema":{"type":"object","properties":properties,"required":required,"additionalProperties":false},"annotations":{"readOnlyHint":!matches!(name, "studio_export" | "studio_test" | "run_tests" | "studio_verify" | "studio_backup"),"destructiveHint":matches!(name, "studio_test" | "run_tests" | "studio_verify"),"openWorldHint":matches!(name, "studio_test" | "run_tests")}}));
     }
     tools
 }
@@ -669,6 +691,16 @@ fn validate_arguments<'a>(name: &str, value: &'a Value) -> Result<&'a Map<String
             "session" => {
                 uuid::Uuid::parse_str(value.as_str().ok_or("session must be a UUID string")?)
                     .map_err(|_| "session must be an exact UUID from studio_sessions")?;
+            }
+            "fix" | "includeHeld" => {
+                value.as_bool().ok_or("Expected true or false")?;
+            }
+            "name" | "note" => {
+                let text = value.as_str().ok_or("Expected a string")?;
+                let bound = properties[key.as_str()]["maxLength"].as_u64().unwrap() as usize;
+                if text.is_empty() || text.len() > bound || text.chars().any(char::is_control) {
+                    return Err(format!("Invalid {key}"));
+                }
             }
             "instance" | "output" => {
                 let text = value.as_str().ok_or("Expected a string")?;
