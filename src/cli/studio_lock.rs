@@ -36,7 +36,11 @@ const MUTEX_WAIT: Duration = Duration::from_secs(5);
 /// The event log is rotated into `<name>.log.jsonl.1` past this size, so it
 /// stays bounded at about twice this.
 const LOG_LIMIT: u64 = 256 * 1024;
+#[cfg(not(test))]
 const MAX_STATE_BYTES: u64 = 1024 * 1024;
+// Small in tests, so reaching the limit takes a few hundred acquires.
+#[cfg(test)]
+const MAX_STATE_BYTES: u64 = 64 * 1024;
 const STATE_VERSION: u32 = 1;
 const MAX_OWNER_LEN: usize = 128;
 const MAX_TEXT_LEN: usize = 500;
@@ -845,7 +849,12 @@ fn format_time(ms: u64) -> String {
 /// A state file that cannot be read is an error rather than an empty lock:
 /// treating it as empty would hand out a lock someone may hold.
 fn read_state(path: &Path) -> anyhow::Result<State> {
-    let bytes = match fs::read(path) {
+    // Bounded before reading, so a huge file is refused without loading it.
+    let bytes = match fs::File::open(path).and_then(|file| {
+        let mut bytes = Vec::new();
+        io::Read::read_to_end(&mut io::Read::take(file, MAX_STATE_BYTES + 1), &mut bytes)?;
+        Ok(bytes)
+    }) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             return Ok(State {
@@ -892,10 +901,22 @@ fn read_state(path: &Path) -> anyhow::Result<State> {
 /// Writes through a temporary file and a rename, so a process killed while
 /// writing leaves the previous state, never half a file.
 fn write_state(path: &Path, state: &State) -> anyhow::Result<()> {
+    // State over the limit would be refused by every later command, before it
+    // could prune expired holders, so it is never written.
+    let serialized = serde_json::to_vec_pretty(state)?;
+    if serialized.len() as u64 > MAX_STATE_BYTES {
+        bail!(
+            "{} would grow past {} KiB with this many holders and waiters ({} and {});              wait for some to release or expire",
+            path.display(),
+            MAX_STATE_BYTES / 1024,
+            state.holders.len(),
+            state.waiters.len()
+        );
+    }
     let parent = path.parent().context("Missing parent directory")?;
     let mut file = tempfile::NamedTempFile::new_in(parent)
         .with_context(|| format!("Cannot write to {}", parent.display()))?;
-    serde_json::to_writer_pretty(&mut file, state)?;
+    file.write_all(&serialized)?;
     file.flush()?;
     file.persist(path)
         .map_err(|error| error.error)
@@ -1419,6 +1440,40 @@ mod tests {
             .unwrap()
             .contains("shared has been waiting longer"));
         assert!(f.wait_lock("shared", Shared).granted);
+    }
+
+    #[test]
+    fn state_that_would_outgrow_the_limit_is_never_written() {
+        let f = Fixture::new();
+        assert!(f.try_lock("a", Shared, None).granted);
+        let path = f.store.dir().join("main.json");
+        let before = fs::read(&path).unwrap();
+        let note = "x".repeat(MAX_TEXT_LEN);
+        let mut refused = false;
+        for index in 0..4000 {
+            let outcome = f.store.acquire(
+                &AcquireRequest {
+                    name: "main".to_owned(),
+                    owner: format!("agent-{index}"),
+                    mode: Shared,
+                    limit: None,
+                    ttl: DEFAULT_TTL,
+                    note: Some(note.clone()),
+                },
+                Duration::ZERO,
+                |_| {},
+            );
+            if outcome.is_err() {
+                refused = true;
+                break;
+            }
+        }
+        assert!(refused, "the state limit must refuse new holders");
+        assert!(fs::metadata(&path).unwrap().len() <= MAX_STATE_BYTES);
+        // The lock still works for everyone already holding it.
+        assert!(f.store.status("main").is_ok());
+        assert!(f.store.release("main", "a").unwrap().released);
+        assert_ne!(fs::read(&path).unwrap(), before);
     }
 
     #[test]

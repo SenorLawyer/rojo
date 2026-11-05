@@ -60,6 +60,8 @@ local WIPE_GUARD_MIN_LINES = 5
 -- Bounds what the sync summary sends with every bridge poll.
 local MAX_SUMMARY_HELD = 20
 local MAX_SUMMARY_PATH_BYTES = 4096
+-- How many verifies' sources are kept for their fixes.
+local MAX_VERIFY_RECORDS = 4
 -- Undo history names of Rojo's own changes, which `OnUndo` reports.
 local PATCH_WAYPOINT_PREFIX = "Rojo: Patch "
 local RESYNC_WAYPOINT_PREFIX = "Rojo: Resync "
@@ -184,6 +186,8 @@ function ServeSession.new(options)
 		__updateLoadingText = function() end,
 		-- Scripts whose emptying was held back, by ID. See `__holdScriptWipes`.
 		__heldWipes = {},
+		-- The sources recent verifies saw, by verify request ID.
+		__verifiedRecords = {},
 		-- Scripts whose hold ended with a class change still to apply.
 		__refreshAfterHold = {},
 		__syncStats = {
@@ -294,11 +298,11 @@ function ServeSession:restartStudioBridge()
 		getSummary = function()
 			return self:getSyncSummary()
 		end,
-		getSourceHashes = function()
-			return self:getSourceHashes()
+		getSourceHashes = function(verifyId)
+			return self:getSourceHashes(verifyId)
 		end,
-		applyResync = function(patch, expect, includeHeld, expiresAt, isActive)
-			return self:applyResync(patch, expect, includeHeld, expiresAt, isActive)
+		applyResync = function(patch, expect, includeHeld, expiresAt, isActive, verifyId)
+			return self:applyResync(patch, expect, includeHeld, expiresAt, isActive, verifyId)
 		end,
 	})
 	self.__studioBridge = bridge
@@ -445,7 +449,7 @@ end
 	Hashes the source of every script Rojo tracks, for `rojo studio verify`.
 	Yields between batches so a large place does not freeze Studio.
 ]=]
-function ServeSession:getSourceHashes()
+function ServeSession:getSourceHashes(verifyId)
 	assert(self.__status == Status.Connected, "Rojo is not syncing this place. Connect it first.")
 	local scripts = {}
 	local detached = {}
@@ -480,7 +484,9 @@ function ServeSession:getSourceHashes()
 	for id in self.__heldWipes do
 		table.insert(held, id)
 	end
-	self.__verifiedSources = seen
+	-- Kept per verify, so two verifies at once cannot replace each other's
+	-- record, and only for the last few, so memory stays bounded.
+	self:__rememberVerified(verifyId, seen)
 	return { scripts = scripts, detached = detached, held = held }
 end
 
@@ -498,7 +504,27 @@ end
 	inside one undo step, so a script counts as updated only once its source
 	was written and the whole resync undoes together.
 ]=]
-function ServeSession:applyResync(patch, expect, includeHeld, expiresAt, isActive)
+function ServeSession:__rememberVerified(verifyId, seen)
+	if type(verifyId) ~= "string" then
+		return
+	end
+	local records = self.__verifiedRecords
+	table.insert(records, { id = verifyId, sources = seen })
+	while #records > MAX_VERIFY_RECORDS do
+		table.remove(records, 1)
+	end
+end
+
+function ServeSession:__verifiedSourcesFor(verifyId)
+	for _, record in self.__verifiedRecords do
+		if record.id == verifyId then
+			return record.sources
+		end
+	end
+	return nil
+end
+
+function ServeSession:applyResync(patch, expect, includeHeld, expiresAt, isActive, verifyId)
 	assert(self.__status == Status.Connected, "Rojo is not syncing this place. Connect it first.")
 	-- The server stops waiting at `expiresAt` and reports the batch as failed,
 	-- so nothing may change after it.
@@ -552,6 +578,9 @@ function ServeSession:applyResync(patch, expect, includeHeld, expiresAt, isActiv
 		"Studio is recording another change, so the resync could not get its own undo step. Run verify --fix again."
 	)
 
+	-- Without the sources its own verify saw, a write could undo a newer edit
+	-- whose hashes match, so every write is skipped.
+	local verified = self:__verifiedSourcesFor(verifyId)
 	local updated, failed = 0, 0
 	local ok, err = pcall(function()
 		local cancelled = false
@@ -572,7 +601,7 @@ function ServeSession:applyResync(patch, expect, includeHeld, expiresAt, isActiv
 			-- Only the hold that existed before this write may end with it. A
 			-- hold made while the write yielded is for a newer empty file.
 			local holdBefore = self.__heldWipes[write.id]
-			local seenSource = self.__verifiedSources and self.__verifiedSources[write.id]
+			local seenSource = verified and verified[write.id]
 			local changed, held, late = false, nil, false
 			self.__instanceMap:pauseInstance(write.instance)
 			local wrote = pcall(function()

@@ -417,6 +417,11 @@ return function()
 		local container
 		local module
 
+		-- A resync as the verify that `expectFrom` recorded sends it.
+		local function resyncAs(patch, expected, includeHeld, expiresAt, isActive)
+			return session:applyResync(patch, expected, includeHeld, expiresAt, isActive, "VERIFY")
+		end
+
 		local function sourceUpdate(id, source, extra)
 			local update = { id = id, changedProperties = { Source = { String = source } } }
 			for key, value in extra or {} do
@@ -566,8 +571,8 @@ return function()
 			local kept = module.Source
 			local expected = { UI = { from = hashSource(kept), to = hashSource("return 'x'") } }
 			-- verify saw different text that happens to hash the same.
-			session.__verifiedSources = { UI = "something else" }
-			local result = session:applyResync(sourceUpdate("UI", "return 'x'"), expected, false)
+			session.__verifiedRecords = { { id = "VERIFY", sources = { UI = "something else" } } }
+			local result = resyncAs(sourceUpdate("UI", "return 'x'"), expected, false)
 			expect(result.skipped).to.equal(1)
 			expect(module.Source).to.equal(kept)
 		end)
@@ -619,7 +624,7 @@ return function()
 
 		-- Also records `source` as what verify saw, as `getSourceHashes` does.
 		local function expectFrom(source, target)
-			session.__verifiedSources = { UI = source }
+			session.__verifiedRecords = { { id = "VERIFY", sources = { UI = source } } }
 			return { UI = { from = hashSource(source), to = hashSource(target) } }
 		end
 
@@ -628,7 +633,7 @@ return function()
 			session:__applyPatch(sourceUpdate("UI", ""))
 			local kept = module.Source
 			expect(string.find(kept, "return a") ~= nil).to.equal(true)
-			local result = session:applyResync(sourceUpdate("UI", ""), expectFrom(kept, ""), true)
+			local result = resyncAs(sourceUpdate("UI", ""), expectFrom(kept, ""), true)
 			expect(result.updated).to.equal(1)
 			expect(result.failed).to.equal(0)
 			expect(module.Source).to.equal("")
@@ -640,7 +645,7 @@ return function()
 			session:__holdScriptWipes(sourceUpdate("UI", ""))
 			local hold = session.__heldWipes.UI
 			expect(hold).to.be.ok()
-			local result = session:applyResync(
+			local result = resyncAs(
 				sourceUpdate("UI", "return 'from disk'"),
 				expectFrom("return 'what verify saw'", "return 'from disk'"),
 				false
@@ -653,7 +658,7 @@ return function()
 			session.__status = ServeSession.Status.Connected
 			local kept = module.Source
 			local asked = 0
-			local result = session:applyResync(
+			local result = resyncAs(
 				sourceUpdate("UI", "return 'cancelled'"),
 				expectFrom(kept, "return 'cancelled'"),
 				false,
@@ -672,7 +677,7 @@ return function()
 			session.__status = ServeSession.Status.Connected
 			local kept = module.Source
 			module.Parent = nil
-			local result = session:applyResync(sourceUpdate("UI", "return 'x'"), expectFrom(kept, "return 'x'"), false)
+			local result = resyncAs(sourceUpdate("UI", "return 'x'"), expectFrom(kept, "return 'x'"), false)
 			expect(result.skipped).to.equal(1)
 			expect(module.Source).to.equal(kept)
 		end)
@@ -680,7 +685,7 @@ return function()
 		it("writes nothing once the command expired", function()
 			session.__status = ServeSession.Status.Connected
 			local kept = module.Source
-			local result = session:applyResync(
+			local result = resyncAs(
 				sourceUpdate("UI", "return 'late'"),
 				expectFrom(kept, "return 'late'"),
 				false,
@@ -714,7 +719,7 @@ return function()
 			session.__status = ServeSession.Status.Connected
 			local ChangeHistoryService = game:GetService("ChangeHistoryService")
 			local kept = module.Source
-			session:applyResync(sourceUpdate("UI", "return 'resynced'"), expectFrom(kept, "return 'resynced'"), false)
+			resyncAs(sourceUpdate("UI", "return 'resynced'"), expectFrom(kept, "return 'resynced'"), false)
 			expect(module.Source).to.equal("return 'resynced'")
 			local canUndo, waypoint = ChangeHistoryService:GetCanUndo()
 			expect(canUndo).to.equal(true)
@@ -724,7 +729,7 @@ return function()
 		it("still guards against wipes in a resync without includeHeld", function()
 			session.__status = ServeSession.Status.Connected
 			local kept = module.Source
-			local result = session:applyResync(sourceUpdate("UI", ""), expectFrom(kept, ""), false)
+			local result = resyncAs(sourceUpdate("UI", ""), expectFrom(kept, ""), false)
 			expect(module.Source).to.equal(kept)
 			expect(result.updated).to.equal(0)
 			expect(result.skipped).to.equal(1)
@@ -733,7 +738,7 @@ return function()
 
 		it("skips a script that changed since verify checked it", function()
 			session.__status = ServeSession.Status.Connected
-			local result = session:applyResync(
+			local result = resyncAs(
 				sourceUpdate("UI", "return 'from disk'"),
 				expectFrom("return 'what verify saw'", "return 'from disk'"),
 				false
@@ -811,6 +816,18 @@ return function()
 			expect(report.scripts[1].length).to.equal(length)
 			expect(#report.detached).to.equal(1)
 			expect(report.detached[1]).to.equal("OUT")
+		end)
+
+		it("keeps each verify's sources apart and only the last few", function()
+			session:__rememberVerified("A", { UI = "first" })
+			session:__rememberVerified("B", { UI = "second" })
+			expect(session:__verifiedSourcesFor("A").UI).to.equal("first")
+			expect(session:__verifiedSourcesFor("B").UI).to.equal("second")
+			for index = 1, 10 do
+				session:__rememberVerified("X" .. index, {})
+			end
+			expect(session:__verifiedSourcesFor("A")).to.equal(nil)
+			expect(#session.__verifiedRecords <= 4).to.equal(true)
 		end)
 
 		it("refuses to hash before syncing starts", function()

@@ -1319,7 +1319,9 @@ impl StudioBridge {
             },
         };
         let response = self
-            .dispatch(session_id, id.clone(), "sources", json!({}))
+            // The plugin keeps the sources it hashes under this verify's ID,
+            // so its fix compares with exactly what this verify saw.
+            .dispatch(session_id, id.clone(), "sources", json!({"verifyId": id}))
             .await;
         let (status, value) = response_value(response).await;
         if status != StatusCode::OK || value["result"]["ok"] != json!(true) {
@@ -1395,7 +1397,7 @@ impl StudioBridge {
                         session_id,
                         child,
                         "resync",
-                        json!({"patch": batch.patch, "expect": batch.expect, "includeHeld": include_held}),
+                        json!({"patch": batch.patch, "expect": batch.expect, "includeHeld": include_held, "verifyId": id}),
                     )
                     .await;
                 let (status, value) = response_value(response).await;

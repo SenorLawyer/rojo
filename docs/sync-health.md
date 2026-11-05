@@ -43,6 +43,8 @@ When a script with 5 or more non-blank lines would become empty because its file
 
 To empty the script on purpose, write at least one non-blank line, delete the file, or run `verify --fix --include-held`. A plain `--fix` leaves held scripts alone.
 
+The guard checks each change from disk when it arrives. Studio writes a script's new source a moment later, so a change that emptied a small script and is still being written when a later change makes the script long and a hold starts can still finish; this needs several changes to the same script within a fraction of a second.
+
 The guard is the plugin setting **Guard Against Script Wipes**, on by default. Agent control can turn it on but not off unless **Agent Can Skip Confirmation** is on.
 
 ## Undoing a Rojo change
