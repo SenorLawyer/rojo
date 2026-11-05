@@ -502,6 +502,53 @@ return function()
 			expect(session.__heldWipes.UI).to.equal(nil)
 		end)
 
+		it("keeps an existing hold when a stale resync is skipped", function()
+			session.__status = ServeSession.Status.Connected
+			session:__holdScriptWipes(sourceUpdate("UI", ""))
+			local hold = session.__heldWipes.UI
+			expect(hold).to.be.ok()
+			local result = session:applyResync(
+				sourceUpdate("UI", "return 'from disk'"),
+				expectFrom("return 'what verify saw'", "return 'from disk'"),
+				false
+			)
+			expect(result.skipped).to.equal(1)
+			expect(session.__heldWipes.UI).to.equal(hold)
+		end)
+
+		it("writes nothing once the command expired", function()
+			session.__status = ServeSession.Status.Connected
+			local kept = module.Source
+			local result = session:applyResync(
+				sourceUpdate("UI", "return 'late'"),
+				expectFrom(kept, "return 'late'"),
+				false,
+				DateTime.now().UnixTimestampMillis - 1
+			)
+			expect(result.failed).to.equal(1)
+			expect(module.Source).to.equal(kept)
+		end)
+
+		it("refuses to write without its own undo step", function()
+			session.__status = ServeSession.Status.Connected
+			local ChangeHistoryService = game:GetService("ChangeHistoryService")
+			local other = ChangeHistoryService:TryBeginRecording("Another change")
+			local kept = module.Source
+			local ok = pcall(
+				session.applyResync,
+				session,
+				sourceUpdate("UI", "return 'x'"),
+				expectFrom(kept, "return 'x'"),
+				false
+			)
+			if other then
+				ChangeHistoryService:FinishRecording(other, Enum.FinishRecordingOperation.Cancel)
+			end
+			expect(other ~= nil).to.equal(true)
+			expect(ok).to.equal(false)
+			expect(module.Source).to.equal(kept)
+		end)
+
 		it("writes the resync inside one undo step", function()
 			session.__status = ServeSession.Status.Connected
 			local ChangeHistoryService = game:GetService("ChangeHistoryService")

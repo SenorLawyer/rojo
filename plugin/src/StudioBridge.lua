@@ -855,7 +855,7 @@ function StudioBridge:execute(command)
 		return self.sync.getSourceHashes()
 	elseif command.action == "resync" then
 		assert(self.sync, "This bridge is not attached to a sync session")
-		return self.sync.applyResync(args.patch, args.expect, args.includeHeld == true)
+		return self.sync.applyResync(args.patch, args.expect, args.includeHeld == true, command.expiresAt)
 	elseif command.action == "selection" then
 		local result = {}
 		for index, instance in Selection:Get() do

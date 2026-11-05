@@ -289,8 +289,8 @@ function ServeSession:restartStudioBridge()
 		getSourceHashes = function()
 			return self:getSourceHashes()
 		end,
-		applyResync = function(patch, expect, includeHeld)
-			return self:applyResync(patch, expect, includeHeld)
+		applyResync = function(patch, expect, includeHeld, expiresAt)
+			return self:applyResync(patch, expect, includeHeld, expiresAt)
 		end,
 	})
 	self.__studioBridge = bridge
@@ -405,8 +405,13 @@ end
 	inside one undo step, so a script counts as updated only once its source
 	was written and the whole resync undoes together.
 ]=]
-function ServeSession:applyResync(patch, expect, includeHeld)
+function ServeSession:applyResync(patch, expect, includeHeld, expiresAt)
 	assert(self.__status == Status.Connected, "Rojo is not syncing this place. Connect it first.")
+	-- The server stops waiting at `expiresAt` and reports the batch as failed,
+	-- so nothing may change after it.
+	local function expired()
+		return type(expiresAt) == "number" and DateTime.now().UnixTimestampMillis >= expiresAt
+	end
 	assert(
 		type(patch) == "table"
 			and type(patch.updated) == "table"
@@ -437,60 +442,70 @@ function ServeSession:applyResync(patch, expect, includeHeld)
 		end
 		table.insert(writes, { id = update.id, instance = instance, target = target, from = expected.from })
 	end
-	if not includeHeld then
-		-- A file may have become empty after verify checked it. The guard
-		-- holds such a write back exactly as it would hold a normal sync.
-		local guarded = { removed = {}, added = {}, updated = {} }
-		for _, write in writes do
-			table.insert(guarded.updated, {
-				id = write.id,
-				changedProperties = { Source = { String = write.target } },
-			})
-		end
-		self:__holdScriptWipes(guarded)
-		local allowed = {}
-		for _, update in guarded.updated do
-			allowed[update.id] = true
-		end
-		local kept = {}
-		for _, write in writes do
-			if allowed[write.id] then
-				table.insert(kept, write)
-			else
-				skipped += 1
-			end
-		end
-		writes = kept
-	end
+	-- A file may have become empty after verify checked it. Without
+	-- includeHeld such a write is held back like a normal sync's would be.
+	-- Only the callback below, which sees the source being replaced, decides
+	-- that; a write that is cancelled must never touch an existing hold.
+	local guardWipes = not includeHeld and Settings:get("guardScriptWipes")
 
-	local updated, failed = 0, 0
+	-- Without its own undo step, a resync would land in whatever another
+	-- recording holds, and could not be undone on its own.
 	local recording =
 		ChangeHistoryService:TryBeginRecording(RESYNC_WAYPOINT_PREFIX .. DateTime.now():FormatLocalTime("LTS", "en-us"))
+	assert(
+		recording or #writes == 0,
+		"Studio is recording another change, so the resync could not get its own undo step. Run verify --fix again."
+	)
+
+	local updated, failed = 0, 0
 	local ok, err = pcall(function()
 		for _, write in writes do
+			if expired() then
+				failed += 1
+				continue
+			end
 			-- Only the hold that existed before this write may end with it. A
 			-- hold made while the write yielded is for a newer empty file.
 			local holdBefore = self.__heldWipes[write.id]
-			local changed = false
+			local changed, held, late = false, nil, false
 			self.__instanceMap:pauseInstance(write.instance)
 			local wrote = pcall(function()
 				ScriptEditorService:UpdateSourceAsync(write.instance, function(current)
+					-- Returning nil cancels the update. The callback can run
+					-- again when Studio retries, so each check is repeated.
+					if expired() then
+						late = true
+						return nil
+					end
 					if hashSource(current) ~= write.from then
 						changed = true
-						-- Returning nil cancels the update.
 						return nil
+					end
+					if guardWipes and not string.find(write.target, "%S") then
+						local lines = countNonBlankLines(current)
+						if lines >= WIPE_GUARD_MIN_LINES then
+							held = lines
+							return nil
+						end
 					end
 					return write.target
 				end)
 			end)
-			if changed then
+			if held then
 				skipped += 1
-			elseif wrote then
+				if not self.__heldWipes[write.id] then
+					self.__heldWipes[write.id] =
+						{ path = write.instance:GetFullName(), lines = held, heldAt = nowMillis() }
+				end
+			elseif changed then
+				skipped += 1
+			elseif wrote and not late then
 				updated += 1
 				if holdBefore and self.__heldWipes[write.id] == holdBefore then
 					self.__heldWipes[write.id] = nil
 				end
 			else
+				-- The write failed, or was cancelled because the command expired.
 				failed += 1
 			end
 		end
