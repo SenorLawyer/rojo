@@ -3891,23 +3891,13 @@ mod tests {
                 .len(),
             groups
         );
-        // The verify is over, so its pins are gone and the next prune brings
-        // the folder back under the cap.
-        assert!(store
-            .list()
-            .unwrap()
+        // The verify is over, so its pins are gone, and releasing them
+        // brought the folder back within the cap without another save.
+        let listed = store.list().unwrap();
+        assert!(listed
             .iter()
             .all(|record| !backups.join(format!("{}.pin", record.id)).exists()));
-        let mut record = backup::automatic_record(
-            "auto-sync",
-            "auto: later",
-            &[("game/Later".to_owned(), "Folder".to_owned())],
-            None,
-            None,
-        );
-        record.created_at = backup::now_millis();
-        store.save_automatic(record, b"<roblox!later").unwrap();
-        assert_eq!(store.list().unwrap().len(), backup::MAX_AUTOMATIC);
+        assert_eq!(listed.len(), backup::MAX_AUTOMATIC);
     }
 
     #[tokio::test]

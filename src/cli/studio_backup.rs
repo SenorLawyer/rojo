@@ -506,15 +506,25 @@ impl Store {
                 return Err(error.context("Could not pin the backup"));
             }
         }
-        if let Err(error) = self.prune_locked(limits, now) {
+        if let Err(error) = self.prune_locked(limits, now, Some(&record.id)) {
             log::warn!("Could not remove old automatic backups: {error:#}");
         }
         Ok(record)
     }
 
-    /// Removes the pins of `ids`. Backups whose pins are gone are pruned like
-    /// any other.
+    /// Removes the pins of `ids`, then prunes, so an operation that went over
+    /// the limits with its own pins does not leave the folder over them.
+    /// Other operations' unexpired pins still protect theirs.
     pub fn unpin(&self, ids: &[String]) -> anyhow::Result<()> {
+        self.unpin_with(ids, PruneLimits::DEFAULT, now_millis())
+    }
+
+    pub(crate) fn unpin_with(
+        &self,
+        ids: &[String],
+        limits: PruneLimits,
+        now: u64,
+    ) -> anyhow::Result<()> {
         let _lock = self.lock()?;
         for id in ids {
             if valid_id(id) {
@@ -525,6 +535,7 @@ impl Store {
                 }
             }
         }
+        self.prune_locked(limits, now, None)?;
         Ok(())
     }
 
@@ -553,28 +564,43 @@ impl Store {
         now: u64,
     ) -> anyhow::Result<Vec<String>> {
         let _lock = self.lock()?;
-        self.prune_locked(limits, now)
+        self.prune_locked(limits, now, None)
     }
 
-    fn prune_locked(&self, limits: PruneLimits, now: u64) -> anyhow::Result<Vec<String>> {
-        let mut bytes: u64 = 0;
-        let removed: Vec<String> = self
+    /// Prunes, never removing a pinned backup nor `saved`, the one just
+    /// saved. Those are kept first and count towards every limit; the rest,
+    /// newest first by `created_at` then ID, fill what is left. So a backup
+    /// just saved stays even when others are dated in the future, as after
+    /// the clock was set back.
+    fn prune_locked(
+        &self,
+        limits: PruneLimits,
+        now: u64,
+        saved: Option<&str>,
+    ) -> anyhow::Result<Vec<String>> {
+        let (kept, others): (Vec<Record>, Vec<Record>) = self
             .list()?
             .into_iter()
             .filter(|record| record.automatic)
-            .enumerate()
-            .filter(|(index, record)| {
-                // Newest first, so the running total is of those kept so far
-                // and the ones newer than them.
-                bytes = bytes.saturating_add(record.bytes);
-                if self.pinned(&record.id, now) {
-                    return false;
-                }
+            .partition(|record| Some(record.id.as_str()) == saved || self.pinned(&record.id, now));
+        let mut count = kept.len();
+        let mut bytes = kept
+            .iter()
+            .fold(0u64, |total, record| total.saturating_add(record.bytes));
+        let removed: Vec<String> = others
+            .into_iter()
+            .filter(|record| {
                 let old = record.created_at.saturating_add(limits.grace_millis) <= now;
-                let over_cap = *index >= limits.max_count || bytes > limits.max_bytes;
-                over_cap || (*index >= limits.keep && old)
+                let fits = count < limits.max_count
+                    && bytes.saturating_add(record.bytes) <= limits.max_bytes
+                    && (count < limits.keep || !old);
+                if fits {
+                    count += 1;
+                    bytes = bytes.saturating_add(record.bytes);
+                }
+                !fits
             })
-            .map(|(_, record)| record.id)
+            .map(|record| record.id)
             .collect();
         for id in &removed {
             self.remove_locked(id)?;
@@ -1022,6 +1048,91 @@ mod tests {
         store.unpin(&pinned).unwrap();
         store.prune_automatic_with(limits, now).unwrap();
         assert!(automatic_ids(&store).iter().all(|id| !pinned.contains(id)));
+    }
+
+    #[test]
+    fn a_backup_just_saved_survives_others_dated_in_the_future() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::in_dir(dir.path());
+        let now = now_millis();
+        let limits = PruneLimits {
+            keep: 2,
+            grace_millis: AUTOMATIC_GRACE_MILLIS,
+            max_count: 5,
+            max_bytes: u64::MAX,
+        };
+        // Saved before the clock was set back a day.
+        let future: Vec<String> = (0..5)
+            .map(|index| fill(&store, "future", now + 86_400_000 + index))
+            .collect();
+        let saved = store
+            .save_automatic_with(record("now", now), b"new", None, &[], limits, now)
+            .unwrap();
+        let left = automatic_ids(&store);
+        assert!(
+            left.contains(&saved.id),
+            "the backup reported as saved is kept"
+        );
+        assert_eq!(left.len(), 5, "the cap still holds");
+        assert!(!left.contains(&future[0]), "the oldest other one made room");
+        // The real cap too.
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::in_dir(dir.path());
+        for index in 0..MAX_AUTOMATIC as u64 {
+            fill(&store, "future", now + 86_400_000 + index);
+        }
+        let saved = store.save_automatic(record("now", now), b"new").unwrap();
+        assert!(store.exists(&saved.id));
+        assert_eq!(automatic_ids(&store).len(), MAX_AUTOMATIC);
+    }
+
+    #[test]
+    fn releasing_pins_brings_the_folder_back_within_the_limits() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::in_dir(dir.path());
+        let now = now_millis();
+        let limits = PruneLimits {
+            keep: 1,
+            grace_millis: AUTOMATIC_GRACE_MILLIS,
+            max_count: 3,
+            max_bytes: u64::MAX,
+        };
+        // Another operation's pin, which still protects its backup.
+        let theirs = store
+            .save_automatic_with(
+                record("theirs", now - 1_000),
+                b"theirs",
+                Some(now + 60_000),
+                &[],
+                limits,
+                now,
+            )
+            .unwrap()
+            .id;
+        let mut own = Vec::new();
+        for index in 0..5 {
+            let saved = store
+                .save_automatic_with(
+                    record("own", now - 100 + index),
+                    b"own",
+                    Some(now + 60_000),
+                    &own,
+                    limits,
+                    now,
+                )
+                .unwrap();
+            own.push(saved.id);
+        }
+        assert_eq!(
+            automatic_ids(&store).len(),
+            6,
+            "pins keep all of them for now"
+        );
+        store.unpin_with(&own, limits, now).unwrap();
+        let left = automatic_ids(&store);
+        assert_eq!(left.len(), 3);
+        assert!(left.contains(&theirs));
+        assert!(left.contains(&own[4]) && left.contains(&own[3]));
     }
 
     #[test]
