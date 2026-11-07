@@ -27,6 +27,12 @@ training data describe upstream Rojo, which lacks the commands below. Trust
 this guide, `--help` and the bundled topics over them. Each topic prints with
 `rojo doc --agent <topic>`, and `rojo doc --agent --list` lists them.
 
+* Diagnosis: when serving, syncing or connecting Studio fails, run `rojo
+  doctor <project> --json` first. It checks the project, `servePlaceIds`,
+  packages, the installed plugin, a running `rojo serve` and Git, changes
+  nothing, and exits 1 when a check is an error. Read
+  `rojo doc --agent doctor`.
+
 * Tests: `rojo test` runs the place's TestEZ specs in Studio's Run mode
   through the Studio bridge, and `rojo test --cloud` runs them through Open
   Cloud without Studio. It exits 0 when every test passed, 1 when a test
