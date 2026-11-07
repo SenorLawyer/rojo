@@ -856,8 +856,11 @@ impl OpenCloud {
         let body = self.send(Method::GET, &path, None, REQUEST_TIMEOUT)?;
         let page: RawGameServerPage = self.parse(&body, "a page of game servers")?;
         Ok(GameServerPage {
+            incomplete: page.active_servers_fetch_error == Some(true)
+                || page.shutdown_servers_fetch_error == Some(true),
             servers: page
                 .game_servers
+                .unwrap_or_default()
                 .iter()
                 .filter_map(GameServer::from_value)
                 .collect(),
@@ -887,6 +890,7 @@ impl OpenCloud {
         Ok(GameServerLogPage {
             logs: page
                 .game_server_logs
+                .unwrap_or_default()
                 .iter()
                 .map(GameServerLog::from_value)
                 .collect(),
@@ -1134,6 +1138,10 @@ impl GameServer {
 pub struct GameServerPage {
     pub servers: Vec<GameServer>,
     pub next_page_token: Option<String>,
+    /// Roblox could not fetch its active or its shut-down servers, so the
+    /// page may be missing some (`activeServersFetchError` or
+    /// `shutdownServersFetchError`).
+    pub incomplete: bool,
 }
 
 /// A log entry's severity. Roblox documents `LogSeverity` as the numbers
@@ -1247,16 +1255,21 @@ pub struct GameServerLogPage {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RawGameServerPage {
+    // Option, so the explicit `null` the schema allows reads as empty.
     #[serde(default)]
-    game_servers: Vec<Value>,
+    game_servers: Option<Vec<Value>>,
     next_page_token: Option<String>,
+    #[serde(default)]
+    active_servers_fetch_error: Option<bool>,
+    #[serde(default)]
+    shutdown_servers_fetch_error: Option<bool>,
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RawGameServerLogPage {
     #[serde(default)]
-    game_server_logs: Vec<Value>,
+    game_server_logs: Option<Vec<Value>>,
     next_page_token: Option<String>,
 }
 
@@ -2364,6 +2377,40 @@ mod tests {
         assert_eq!(
             requests[1].target,
             "/server-management/v1/universes/1/places/2/versions/45/game-servers?MaxPageSize=100&PageToken=t"
+        );
+    }
+
+    #[test]
+    fn null_lists_read_as_empty_and_fetch_errors_mark_pages_incomplete() {
+        let (base, _) = serve(vec![
+            reply("200 OK", r#"{"gameServers":null,"nextPageToken":null}"#),
+            reply("200 OK", r#"{"gameServerLogs":null,"nextPageToken":null}"#),
+            reply(
+                "200 OK",
+                r#"{"gameServers":[{"jobId":"a"}],"activeServersFetchError":false,"shutdownServersFetchError":true}"#,
+            ),
+            reply(
+                "200 OK",
+                r#"{"gameServers":[],"activeServersFetchError":true,"shutdownServersFetchError":null}"#,
+            ),
+        ]);
+        let client = client(&base);
+        let page = client.list_game_servers(1, 2, "3", None).unwrap();
+        assert!(page.servers.is_empty());
+        assert!(!page.incomplete);
+        assert_eq!(page.next_page_token, None);
+        let logs = client
+            .list_game_server_logs(1, 2, "3", "job", "", None)
+            .unwrap();
+        assert!(logs.logs.is_empty());
+        let page = client.list_game_servers(1, 2, "3", None).unwrap();
+        assert_eq!(page.servers.len(), 1);
+        assert!(page.incomplete);
+        assert!(
+            client
+                .list_game_servers(1, 2, "3", None)
+                .unwrap()
+                .incomplete
         );
     }
 

@@ -54,9 +54,11 @@ const MAX_REQUESTS_PER_MINUTE: u32 = 100;
 /// logs come newest first when asked for `message_timestamp desc`, so reading
 /// a server stops at the first page that reaches --since; and an entry
 /// becomes readable about three minutes after it was logged. --follow
-/// therefore reads each server again from 5 minutes before the newest entry
-/// it showed, and keeps reading a server for 5 minutes after it shut down.
-/// An entry that turns up later than that is missed.
+/// therefore keeps the --since boundary of its first read for the whole run,
+/// reads each server again from 5 minutes before the newest entry it showed,
+/// and keeps reading a server for 5 minutes after it shut down. An entry that
+/// turns up later than that is missed. When Roblox says it could not list
+/// every server, a warning says so and --json reports `"incomplete": true`.
 #[derive(Debug, Parser)]
 pub struct LogsCommand {
     /// The universe (experience) to read logs of.
@@ -97,8 +99,8 @@ pub struct LogsCommand {
     /// With --follow: seconds between the starts of two rounds.
     #[clap(long, default_value = "30")]
     pub interval: u64,
-    /// The most servers read per round. Active servers come first, then the
-    /// most recently shut down.
+    /// The most servers read per round, including those named with
+    /// --job-id. Active servers come first, then the most recently shut down.
     #[clap(long, default_value = "20")]
     pub max_servers: usize,
     /// Open Cloud requests this command may send per minute, at most 100,
@@ -156,6 +158,7 @@ impl LogsCommand {
                 "entries": entries.iter().map(entry_json).collect::<Vec<_>>(),
                 "serversRead": batch.servers_read,
                 "truncated": batch.truncated,
+                "incomplete": batch.incomplete,
             });
             if let Some(error) = &batch.error {
                 value["error"] = json!(error.to_string());
@@ -343,6 +346,9 @@ struct Batch {
     servers_read: usize,
     /// Whether some servers or entries were left out by the caps.
     truncated: bool,
+    /// Whether Roblox said it could not list every server, so servers may
+    /// have been missed.
+    incomplete: bool,
     /// Why the round stopped early. `entries` still holds what the servers
     /// read before it returned, and the reader counts those as shown.
     error: Option<OpenCloudError>,
@@ -385,6 +391,9 @@ struct Reader<'a, S> {
     /// Shut-down servers read after their last entries became readable,
     /// with when they shut down, so later rounds skip them.
     finished: HashMap<String, u64>,
+    /// `now - --since` at the first round: how far back servers are read
+    /// that have shown nothing yet.
+    history_ms: Option<u64>,
 }
 
 impl<'a, S: LogSource> Reader<'a, S> {
@@ -401,6 +410,7 @@ impl<'a, S: LogSource> Reader<'a, S> {
             max_servers: command.max_servers,
             servers: HashMap::new(),
             finished: HashMap::new(),
+            history_ms: None,
         }
     }
 
@@ -409,7 +419,11 @@ impl<'a, S: LogSource> Reader<'a, S> {
     /// pages were read, together with adding its entries to the batch, so a
     /// failure leaves the servers after it to be read in full next time.
     fn round(&mut self, now_ms: u64) -> Batch {
-        let since_ms = now_ms.saturating_sub(self.since.as_millis() as u64);
+        // Fixed at the first round: a moving bound would pass entries by
+        // before Roblox makes them readable, minutes after they were logged.
+        let since_ms = *self
+            .history_ms
+            .get_or_insert(now_ms.saturating_sub(self.since.as_millis() as u64));
         let overlap_ms = OVERLAP.as_millis() as u64;
         let mut batch = Batch::default();
         let targets = match self.targets(since_ms, now_ms, &mut batch) {
@@ -482,13 +496,15 @@ impl<'a, S: LogSource> Reader<'a, S> {
             }
         }
 
-        // Servers that left the listing are not coming back, and finished
-        // servers that shut down before --since are no longer listed as
-        // worth reading, so neither needs remembering.
-        self.servers
-            .retain(|_, state| state.last_listed_ms.saturating_add(overlap_ms) >= now_ms);
-        self.finished
-            .retain(|_, terminated| *terminated >= since_ms);
+        // Servers that left the listing are not coming back. A listing that
+        // Roblox says is partial does not show that, and servers named with
+        // --job-id are always read again.
+        if !batch.incomplete {
+            let jobs = &self.jobs;
+            self.servers.retain(|job, state| {
+                jobs.contains(job) || state.last_listed_ms.saturating_add(overlap_ms) >= now_ms
+            });
+        }
         batch
             .entries
             .sort_by_key(|entry| entry.timestamp_ms.unwrap_or(now_ms));
@@ -502,20 +518,50 @@ impl<'a, S: LogSource> Reader<'a, S> {
         now_ms: u64,
         batch: &mut Batch,
     ) -> Result<Vec<Target>, OpenCloudError> {
-        // A server named together with its one version can be read directly.
-        if !self.jobs.is_empty() && self.versions.len() == 1 {
-            return Ok(self
-                .jobs
+        // A server named together with its one version can be read without
+        // listing servers; the cap below applies all the same.
+        let mut targets = if !self.jobs.is_empty() && self.versions.len() == 1 {
+            let mut seen = HashSet::new();
+            self.jobs
                 .iter()
+                .filter(|job| seen.insert(job.as_str()))
                 .map(|job| Target {
                     version: self.versions[0].clone(),
                     job: job.clone(),
                     terminated_ms: None,
                     shut_down: false,
                 })
-                .collect());
-        }
+                .collect()
+        } else {
+            self.listed_targets(since_ms, batch)?
+        };
 
+        // Servers left out by the cap below are still listed, so what was
+        // shown from them is kept.
+        for target in &targets {
+            if let Some(state) = self.servers.get_mut(&target.job) {
+                state.last_listed_ms = now_ms;
+            }
+        }
+        if targets.len() > self.max_servers {
+            batch.truncated = true;
+            batch.notices.push(format!(
+                "{} servers to read; reading the first {}. Pass --job-id or --max-servers to choose.",
+                targets.len(),
+                self.max_servers
+            ));
+            targets.truncate(self.max_servers);
+        }
+        Ok(targets)
+    }
+
+    /// The servers worth reading among those Roblox lists for the place
+    /// versions.
+    fn listed_targets(
+        &mut self,
+        since_ms: u64,
+        batch: &mut Batch,
+    ) -> Result<Vec<Target>, OpenCloudError> {
         let versions = if self.versions.is_empty() {
             let all = self.source.place_versions(self.universe, self.place)?;
             let chosen = newest_versions(&all, DEFAULT_VERSIONS);
@@ -550,6 +596,12 @@ impl<'a, S: LogSource> Reader<'a, S> {
                     version,
                     token.as_deref(),
                 )?;
+                if result.incomplete && !batch.incomplete {
+                    batch.incomplete = true;
+                    batch.notices.push(format!(
+                        "Warning: Roblox could not list all servers of place version {version}, so some servers may not have been read."
+                    ));
+                }
                 servers.extend(
                     result
                         .servers
@@ -563,33 +615,22 @@ impl<'a, S: LogSource> Reader<'a, S> {
             }
         }
 
-        let mut targets = select_servers(servers, since_ms, &self.jobs, &self.finished);
-        // Servers left out by the cap below are still listed, so what was
-        // shown from them is kept.
-        for target in &targets {
-            if let Some(state) = self.servers.get_mut(&target.job) {
-                state.last_listed_ms = now_ms;
-            }
+        // A finished server stays skipped while Roblox lists it; one it no
+        // longer lists in a complete listing can be forgotten.
+        if !batch.incomplete {
+            let listed: HashSet<&str> = servers.iter().map(|(_, s)| s.job_id.as_str()).collect();
+            self.finished.retain(|job, _| listed.contains(job.as_str()));
         }
+        let targets = select_servers(servers, since_ms, &self.jobs, &self.finished);
         if !self.jobs.is_empty() {
             let found: HashSet<&str> = targets.iter().map(|t| t.job.as_str()).collect();
             for job in self.jobs.iter().filter(|job| !found.contains(job.as_str())) {
                 batch.notices.push(format!(
-                    "Server {job} is not among the servers of place versions {} that ran in the last {}.",
+                    "Server {job} is not among the servers of place versions {} that ran since {}.",
                     versions.join(", "),
-                    humantime::format_duration(self.since)
+                    timestamp(Some(since_ms))
                 ));
             }
-        }
-        if targets.len() > self.max_servers {
-            batch.truncated = true;
-            batch.notices.push(format!(
-                "{} servers ran in the last {}; reading the first {}. Pass --job-id or --max-servers to choose.",
-                targets.len(),
-                humantime::format_duration(self.since),
-                self.max_servers
-            ));
-            targets.truncate(self.max_servers);
         }
         Ok(targets)
     }
@@ -627,8 +668,9 @@ impl<'a, S: LogSource> Reader<'a, S> {
     }
 }
 
-/// How far back a server is read: to --since, or to the overlap before its
-/// newest entry, whichever is later.
+/// How far back a server is read: to the overlap before its newest entry,
+/// but never before the boundary --since set at the first round, which
+/// stays fixed while following.
 fn read_cutoff(state: &ServerState, since_ms: u64) -> u64 {
     state.newest.map_or(since_ms, |newest| {
         newest
@@ -924,6 +966,15 @@ mod tests {
             self.servers.borrow_mut().push_back(Ok(GameServerPage {
                 servers,
                 next_page_token: next.map(str::to_owned),
+                incomplete: false,
+            }));
+        }
+
+        fn partial_servers(&self, servers: Vec<GameServer>) {
+            self.servers.borrow_mut().push_back(Ok(GameServerPage {
+                servers,
+                next_page_token: None,
+                incomplete: true,
             }));
         }
 
@@ -969,6 +1020,7 @@ mod tests {
                 .unwrap_or(Ok(GameServerPage {
                     servers: Vec::new(),
                     next_page_token: None,
+                    incomplete: false,
                 }))
         }
 
@@ -1097,8 +1149,10 @@ mod tests {
             if round < 20 {
                 servers.push(server("quiet", false, None));
             }
-            // "ended" shut down at the first round.
-            servers.push(server("ended", true, Some("2026-11-07T12:00:00Z")));
+            // "ended" shut down at the first round and is listed until 40.
+            if round < 40 {
+                servers.push(server("ended", true, Some("2026-11-07T12:00:00Z")));
+            }
             fake.servers(servers, None);
             fake.logs(
                 "busy",
@@ -1126,11 +1180,117 @@ mod tests {
             if let Some(quiet) = reader.servers.get("quiet") {
                 assert!(quiet.seen.len() <= 1);
             }
+            // "ended" is skipped once finished, for as long as it is listed.
+            let skipped = (6..40).contains(&round);
+            assert_eq!(
+                reader.finished.contains_key("ended"),
+                skipped,
+                "round {round}"
+            );
         }
-        // The quiet server left the listing long ago, and the ended server
-        // shut down before --since.
+        // The quiet and ended servers left the listing long ago.
         assert_eq!(reader.servers.keys().collect::<Vec<_>>(), ["busy"]);
         assert!(reader.finished.is_empty());
+    }
+
+    #[test]
+    fn following_shows_entries_that_become_readable_after_since_passed() {
+        let fake = Fake::default();
+        let command = parse(&["--place-version", "45", "--job-id", "a", "--since", "1m"]);
+        let mut reader = reader(&fake, &command);
+        assert!(reader.round(NOW).entries.is_empty());
+        // Logged 30 seconds in, readable three minutes later: by then
+        // `now - 1m` is past it.
+        fake.logs(
+            "a",
+            vec![log("a", NOW + 30_000, LogSeverity::Error, "late")],
+            None,
+        );
+        assert_eq!(messages(&reader.round(NOW + 3 * MINUTE + 30_000)), ["late"]);
+        // Later ones are read back from the newest entry, not from --since.
+        fake.logs(
+            "a",
+            vec![
+                log("a", NOW + 2 * MINUTE, LogSeverity::Error, "later"),
+                log("a", NOW + 30_000, LogSeverity::Error, "late"),
+            ],
+            None,
+        );
+        assert_eq!(messages(&reader.round(NOW + 6 * MINUTE)), ["later"]);
+    }
+
+    #[test]
+    fn named_jobs_are_remembered_through_failures() {
+        let fake = Fake::default();
+        let command = parse(&["--place-version", "45", "--job-id", "a"]);
+        let mut reader = reader(&fake, &command);
+        let old = || vec![log("a", NOW - MINUTE, LogSeverity::Error, "old")];
+        fake.logs("a", old(), None);
+        assert_eq!(messages(&reader.round(NOW)), ["old"]);
+        // Ten minutes of failed reads, then the same entry again.
+        for minute in 1..=10 {
+            fake.failing_logs("a");
+            assert!(reader.round(NOW + minute * MINUTE).error.is_some());
+        }
+        fake.logs("a", old(), None);
+        let batch = reader.round(NOW + 11 * MINUTE);
+        assert!(batch.error.is_none());
+        assert!(batch.entries.is_empty(), "{:?}", messages(&batch));
+    }
+
+    #[test]
+    fn named_jobs_are_capped_too() {
+        let fake = Fake::default();
+        let command = parse(&[
+            "--place-version",
+            "45",
+            "--job-id",
+            "a",
+            "--job-id",
+            "b",
+            "--job-id",
+            "c",
+            "--max-servers",
+            "2",
+        ]);
+        let mut reader = reader(&fake, &command);
+        let batch = reader.round(NOW);
+        assert!(batch.truncated);
+        assert_eq!(batch.servers_read, 2);
+        assert!(
+            batch.notices[0].contains("3 servers to read"),
+            "{:?}",
+            batch.notices
+        );
+    }
+
+    #[test]
+    fn partial_listings_are_reported_and_do_not_forget_servers() {
+        let fake = Fake::default();
+        let command = parse(&["--place-version", "45"]);
+        let mut reader = reader(&fake, &command);
+        let old = || vec![log("a", NOW - MINUTE, LogSeverity::Error, "old")];
+        fake.servers(vec![server("a", false, None)], None);
+        fake.logs("a", old(), None);
+        assert_eq!(messages(&reader.round(NOW)), ["old"]);
+
+        // Ten minutes of listings that Roblox says are partial and lack a.
+        for minute in 1..=10 {
+            fake.partial_servers(Vec::new());
+            let batch = reader.round(NOW + minute * MINUTE);
+            assert!(batch.incomplete);
+            assert!(
+                batch.notices[0].starts_with("Warning:"),
+                "{:?}",
+                batch.notices
+            );
+        }
+        assert!(reader.servers.contains_key("a"));
+        fake.servers(vec![server("a", false, None)], None);
+        fake.logs("a", old(), None);
+        let batch = reader.round(NOW + 11 * MINUTE);
+        assert!(!batch.incomplete);
+        assert!(batch.entries.is_empty(), "{:?}", messages(&batch));
     }
 
     #[test]
@@ -1321,7 +1481,7 @@ mod tests {
         // Active servers come first.
         assert!(matches!(&fake.calls.borrow()[1], Call::Logs(_, job, _, _) if job == "live"));
         assert!(
-            batch.notices[0].contains("2 servers ran"),
+            batch.notices[0].contains("2 servers to read"),
             "{:?}",
             batch.notices
         );
