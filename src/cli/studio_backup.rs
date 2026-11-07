@@ -56,19 +56,19 @@ pub struct Root {
 }
 
 /// How many automatic backups are kept. Each is at most 5 MiB, and every
-/// reconnect that changes Studio takes one, so without a bound they would
-/// fill the disk.
+/// `verify --fix` that changes Studio takes at least one, so without a bound
+/// they would fill the disk.
 pub const KEEP_AUTOMATIC: usize = 20;
 
 /// An automatic backup younger than this is never pruned, whoever prunes.
 /// The store is shared by every worktree and server of the repository, so
 /// another process may prune while an operation that saved several backups,
 /// such as a `verify --fix`, still relies on them. This is far longer than
-/// any such operation runs (20 seconds for a fix, 30 for a sync's request).
+/// any such operation runs (a fix stops starting batches after 20 seconds).
 pub const AUTOMATIC_GRACE_MILLIS: u64 = 60 * 60 * 1000;
 
 /// The most automatic backups kept, however young, so a burst of them (many
-/// reconnects within the grace period) cannot fill the disk. The oldest go
+/// fixes within the grace period) cannot fill the disk. The oldest go
 /// first.
 pub const MAX_AUTOMATIC: usize = 100;
 /// The most model bytes all automatic backups may use together, however
@@ -1604,7 +1604,7 @@ mod tests {
                     .id
             })
             .collect();
-        // Meanwhile the other server saves a reconnect backup, which prunes.
+        // Meanwhile the other server saves a backup of its own, which prunes.
         let theirs = other
             .save_automatic(record("theirs", now_millis()), b"theirs")
             .unwrap();

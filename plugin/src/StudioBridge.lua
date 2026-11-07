@@ -267,16 +267,6 @@ function StudioBridge.pathOf(instance)
 	return table.concat(escaped, "/"), segments
 end
 
--- The bridge's plugin token is only ever sent to a server on this computer.
-function StudioBridge.isLoopbackUrl(url)
-	return type(url) == "string"
-		and (
-			url:match("^http://localhost:%d+$") ~= nil
-			or url:match("^http://127%.0%.0%.1:%d+$") ~= nil
-			or url:match("^http://%[::1%]:%d+$") ~= nil
-		)
-end
-
 -- Native model bytes as base64, which JSON can carry.
 function StudioBridge.encodeModel(model)
 	assert(EncodingService, "This Studio has no EncodingService, so it cannot send models")
@@ -285,15 +275,20 @@ end
 
 -- `sync`, when given, connects the bridge to the sync session it runs beside:
 -- `getSummary()` for the health summary sent with every poll,
--- `getSourceHashes()` for `rojo studio verify`, `exportForBackup(ids, hashes)` for
--- the backup `rojo studio verify --fix` takes first and `applyResync(patch)`
--- for the fix itself.
+-- `getSourceHashes()` for `rojo studio verify`, `exportForBackup(ids,
+-- hashes, verifyId)` for the backup `rojo studio verify --fix` takes first
+-- and `applyResync(patch)` for the fix itself.
 function StudioBridge.new(apiContext, pairing, onFailure, sync)
 	assert(
 		pairing.protocolVersion == 1 and type(pairing.pluginToken) == "string" and type(pairing.identity) == "table",
 		"Unsupported Studio bridge pairing"
 	)
-	assert(StudioBridge.isLoopbackUrl(apiContext.__baseUrl), "Studio control requires a loopback Rojo address")
+	assert(
+		apiContext.__baseUrl:match("^http://localhost:%d+$")
+			or apiContext.__baseUrl:match("^http://127%.0%.0%.1:%d+$")
+			or apiContext.__baseUrl:match("^http://%[::1%]:%d+$"),
+		"Studio control requires a loopback Rojo address"
+	)
 	local self = setmetatable({
 		apiContext = apiContext,
 		pairing = pairing,

@@ -391,27 +391,6 @@ return function()
 			container:Destroy()
 		end)
 
-		it("swaps nothing when the session stops while the fallback waits for the server", function()
-			local container = Instance.new("Folder")
-			local present = Instance.new("Folder")
-			present.Parent = container
-			session.__instanceMap:insert("PRESENT", present)
-			api.serialize = function()
-				session:stop()
-				return Promise.resolve({ modelContents = buffer.create(0), missingIds = {} })
-			end
-			api.refPatch = function()
-				return Promise.resolve({ patch = PatchSet.newEmpty() })
-			end
-			session.__deserializeInstances = function()
-				return model({ "PRESENT" })
-			end
-			local ok = session:__replaceInstances({ "PRESENT" })
-			expect(ok).to.equal(false)
-			expect(present.Parent).to.equal(container)
-			container:Destroy()
-		end)
-
 		it("succeeds without further requests when every id is missing", function()
 			local refPatchCalls = 0
 			api.serialize = function()
@@ -1263,798 +1242,104 @@ return function()
 		end)
 	end)
 
-	describe("backups before the first sync", function()
-		local Settings = require(script.Parent.Settings)
-		local HttpService = game:GetService("HttpService")
-		local nativeBridgeRequest = StudioBridge.requestAsync
-		local pairing = { protocolVersion = 1, pluginToken = "plugin-token", identity = { digest = "d" } }
+	describe("backups for verify --fix", function()
+		local hashSource = require(script.Parent.hashSource)
 		local fixture
-		local previousSetting
 
 		beforeEach(function()
-			previousSetting = Settings:get("autoBackupBeforeSync")
 			fixture = Instance.new("Folder")
-			fixture.Name = "__RojoSyncBackupSpec"
+			fixture.Name = "__RojoVerifyBackupSpec"
 			fixture.Parent = game:GetService("ReplicatedStorage")
-			api.__baseUrl = "http://127.0.0.1:34872"
+			session.__status = ServeSession.Status.Connected
 		end)
 
 		afterEach(function()
-			Settings:set("autoBackupBeforeSync", previousSetting)
-			StudioBridge.requestAsync = nativeBridgeRequest
 			fixture:Destroy()
 		end)
 
-		-- Runs the first sync with a catch-up patch that removes `removed`,
-		-- and records the order in which the backup and the patch happen.
-		local function syncRemoving(removed, serverInfo, events)
-			events = events or {}
-			local patch = PatchSet.newEmpty()
-			table.insert(patch.removed, removed)
-			session.__reconciler = {
-				hydrate = function() end,
-				diff = function()
-					return true, patch
-				end,
-			}
-			session.__applyPatch = function(_, applied)
-				expect(applied).to.equal(patch)
-				table.insert(events, "patch")
-			end
-			local pending = session:__initialSync(serverInfo)
-			readResolve({ messageCursor = 0, instances = {} })
-			pending:await()
-			return events
-		end
-
-		it("saves what the catch-up patch removes before applying it", function()
-			Settings:set("autoBackupBeforeSync", true)
-			local removed = Instance.new("ModuleScript")
-			removed.Name = "OnlyInStudio"
-			removed.Parent = fixture
-			local body
-			local events
-			StudioBridge.requestAsync = function(options)
-				table.insert(events, "backup")
-				body = HttpService:JSONDecode(options.Body)
-				return {
-					Success = true,
-					StatusCode = 200,
-					Body = HttpService:JSONEncode({ backup = { id = "20261107-000000-auto-sync" } }),
-				}
-			end
-			events = {}
-			syncRemoving(removed, { rootInstanceId = "ROOT", studioBridge = pairing }, events)
-			expect(#events).to.equal(2)
-			expect(events[1]).to.equal("backup")
-			expect(events[2]).to.equal("patch")
-			expect(body.instances[1].path).to.equal("game/ReplicatedStorage/__RojoSyncBackupSpec/OnlyInStudio")
-			expect(body.instances[1].className).to.equal("ModuleScript")
-			expect(type(body.model)).to.equal("string")
-			expect(body.identity.digest).to.equal("d")
-		end)
-
-		it("still syncs when the backup cannot be saved", function()
-			Settings:set("autoBackupBeforeSync", true)
-			local removed = Instance.new("Folder")
-			removed.Parent = fixture
-			local calls = 0
-			StudioBridge.requestAsync = function()
-				calls += 1
-				error("simulated server failure")
-			end
-			local refused = syncRemoving(removed, { rootInstanceId = "ROOT", studioBridge = pairing })
-			expect(calls).to.equal(1)
-			expect(refused[1]).to.equal("patch")
-			-- A server without a Studio bridge cannot save one at all.
-			local unpaired = syncRemoving(removed, { rootInstanceId = "ROOT" })
-			expect(calls).to.equal(1)
-			expect(unpaired[1]).to.equal("patch")
-		end)
-
-		it("warns about changed services it cannot back up and syncs anyway", function()
-			Settings:set("autoBackupBeforeSync", true)
-			local Log = require(script.Parent.Parent.Packages.Log)
-			local nativeWarn = Log.warn
-			local warnings = {}
-			Log.warn = function(template, ...)
-				table.insert(warnings, { template = template, args = { ... } })
-			end
-			local calls = 0
-			StudioBridge.requestAsync = function()
-				calls += 1
-				error("no request expected")
-			end
-			local patch = PatchSet.newEmpty()
-			table.insert(patch.updated, { id = "LIGHTING", changedProperties = { Brightness = { Float32 = 1 } } })
-			session.__instanceMap.fromIds.LIGHTING = game:GetService("Lighting")
-			local applied = false
-			session.__reconciler = {
-				hydrate = function() end,
-				diff = function()
-					return true, patch
-				end,
-			}
-			session.__applyPatch = function()
-				applied = true
-			end
-			local pending = session:__initialSync({ rootInstanceId = "ROOT", studioBridge = pairing })
-			readResolve({ messageCursor = 0, instances = {} })
-			pending:await()
-			Log.warn = nativeWarn
-			session.__instanceMap.fromIds.LIGHTING = nil
-			expect(applied).to.equal(true)
-			expect(calls).to.equal(0)
-			expect(#warnings).to.equal(1)
-			expect(warnings[1].template:find("cannot back up", 1, true)).to.be.ok()
-			expect(warnings[1].args[2]).to.equal("game/Lighting")
-		end)
-
-		it("syncs anyway when collecting what to back up fails", function()
-			Settings:set("autoBackupBeforeSync", true)
-			local Log = require(script.Parent.Parent.Packages.Log)
-			local StudioBackup = require(script.Parent.StudioBackup)
-			local nativeWarn = Log.warn
-			local warnings = {}
-			Log.warn = function(template, ...)
-				table.insert(warnings, { template = template, args = { ... } })
-			end
-			-- The wipe guard reads removed instances too; the stand-in below is
-			-- not an Instance, which only this test's failure injection needs.
-			local previousGuard = Settings:get("guardScriptWipes")
-			Settings:set("guardScriptWipes", false)
-			-- An affected instance that cannot be read, and no bridge at all.
-			local inaccessible = setmetatable({}, {
-				__index = function(_, key)
-					error("The current thread cannot access '" .. tostring(key) .. "'")
-				end,
-			})
-			session.__instanceMap.fromIds.LOCKED = inaccessible
-			local unpaired = syncRemoving("LOCKED", { rootInstanceId = "ROOT" })
-			session.__instanceMap.fromIds.LOCKED = nil
-			-- And collecting itself failing.
-			local nativeCollect = StudioBackup.collect
-			StudioBackup.collect = function()
-				error("simulated failure while collecting")
-			end
-			local failed = syncRemoving(Instance.new("Folder"), { rootInstanceId = "ROOT", studioBridge = pairing })
-			StudioBackup.collect = nativeCollect
-			Log.warn = nativeWarn
-			Settings:set("guardScriptWipes", previousGuard)
-			expect(unpaired[1]).to.equal("patch")
-			expect(failed[1]).to.equal("patch")
-			expect(#warnings).to.equal(2)
-			expect(warnings[1].template:find("cannot back up", 1, true)).to.be.ok()
-			expect(warnings[1].args[2]).to.equal(StudioBackup.INACCESSIBLE)
-			expect(tostring(warnings[2].args[1]):find("simulated failure while collecting", 1, true)).to.be.ok()
-		end)
-
-		it("skips a catch-up source write that lands after its backup's protection ran out", function()
-			local Log = require(script.Parent.Parent.Packages.Log)
-			local nativeWarn = Log.warn
-			local nativeClock = ServeSession.clock
-			local warnings = {}
-			Log.warn = function(template, ...)
-				table.insert(warnings, { template = template, args = { ... } })
-			end
-			local now = 1000
-			ServeSession.clock = function()
-				return now
-			end
+		local function trackedModule(id, source)
 			local module = Instance.new("ModuleScript")
-			module.Name = "Late"
-			module.Source = "return 'studio'"
-			module.Parent = fixture
-			session.__instanceMap:insert("LATE", module)
-			session.__status = ServeSession.Status.Connected
-			-- Queued while the deadline was set, written after it passed.
-			session.__catchUpWriteDeadline = now + 300
-			now += 301
-			session:__writeSource({ id = "LATE", instance = module, target = "return 'disk'" })
-			session.__catchUpWriteDeadline = nil
-			task.wait(0.3)
-			local late = module.Source
-			-- In time, the same write goes through.
-			session.__catchUpWriteDeadline = now + 300
-			session:__writeSource({ id = "LATE", instance = module, target = "return 'disk'" })
-			session.__catchUpWriteDeadline = nil
-			task.wait(0.3)
-			Log.warn = nativeWarn
-			ServeSession.clock = nativeClock
-			expect(late).to.equal("return 'studio'")
-			expect(module.Source).to.equal("return 'disk'")
-			expect(#warnings).to.equal(1)
-			expect(warnings[1].template:find("came too late", 1, true)).to.be.ok()
-		end)
-
-		it("gives the catch-up patch's writes a deadline from when the backup was saved", function()
-			Settings:set("autoBackupBeforeSync", true)
-			local nativeClock = ServeSession.clock
-			ServeSession.clock = function()
-				return 5000
-			end
-			StudioBridge.requestAsync = function()
-				return {
-					Success = true,
-					StatusCode = 200,
-					Body = HttpService:JSONEncode({ backup = { id = "20261107-000000-auto-sync" } }),
-				}
-			end
-			local removed = Instance.new("Folder")
-			removed.Parent = fixture
-			local deadline
-			local patch = PatchSet.newEmpty()
-			table.insert(patch.removed, removed)
-			session.__reconciler = {
-				hydrate = function() end,
-				diff = function()
-					return true, patch
-				end,
-			}
-			session.__applyPatch = function()
-				deadline = session.__catchUpWriteDeadline
-			end
-			local pending = session:__initialSync({ rootInstanceId = "ROOT", studioBridge = pairing })
-			readResolve({ messageCursor = 0, instances = {} })
-			pending:await()
-			ServeSession.clock = nativeClock
-			expect(deadline).to.equal(5000 + 300)
-			expect(session.__catchUpWriteDeadline).to.equal(nil)
-		end)
-
-		-- Runs `body` with Log.warn recorded, and returns the warnings.
-		local function recordingWarnings(body)
-			local Log = require(script.Parent.Parent.Packages.Log)
-			local nativeWarn = Log.warn
-			local warnings = {}
-			Log.warn = function(template, ...)
-				table.insert(warnings, { template = template, args = { ... } })
-			end
-			local ok, err = pcall(body)
-			Log.warn = nativeWarn
-			assert(ok, err)
-			return warnings
-		end
-
-		local function backedUpModule(name, source)
-			local module = Instance.new("ModuleScript")
-			module.Name = name
+			module.Name = id
 			module.Source = source
 			module.Parent = fixture
-			session.__instanceMap:insert(name, module)
-			session.__status = ServeSession.Status.Connected
+			session.__instanceMap:insert(id, module)
 			return module
 		end
 
-		it("writes over a user's edit made after the backup and says so", function()
-			local hashSource = require(script.Parent.hashSource)
-			local module = backedUpModule("Captured", "return 'captured'")
-			local warnings = recordingWarnings(function()
-				session.__catchUpGuarded = { [module] = (hashSource("return 'captured'")) }
-				-- The user types after the backup, before the write lands.
-				module.Source = "return 'typed after the backup'"
-				session:__writeSource({ id = "Captured", instance = module, target = "return 'disk'" })
-				session.__catchUpGuarded = nil
-				task.wait(0.8)
-			end)
-			expect(module.Source).to.equal("return 'disk'")
-			expect(#warnings).to.equal(1)
-			expect(warnings[1].template:find("does not hold as they are now", 1, true)).to.be.ok()
-			expect(warnings[1].args[1]:find("Captured", 1, true)).to.be.ok()
+		it("exports the scripts verify --fix overwrites, leaving out those not in the place", function()
+			trackedModule("FIXED", "return 1")
+			session:__rememberVerified("VERIFY", { FIXED = "return 1" })
+			local exported = session:exportForBackup(
+				{ "FIXED", "GONE" },
+				{ FIXED = (hashSource("return 1")) },
+				"VERIFY"
+			)
+			expect(exported.missing).to.equal(1)
+			expect(#exported.ids).to.equal(1)
+			expect(exported.ids[1]).to.equal("FIXED")
+			expect(#exported.instances).to.equal(1)
+			expect(exported.instances[1].path).to.equal("game/ReplicatedStorage/__RojoVerifyBackupSpec/FIXED")
+			expect(type(exported.model)).to.equal("string")
+			expect(exported.bytes > 0).to.equal(true)
+			local none = session:exportForBackup({ "GONE" }, {}, "VERIFY")
+			expect(none.model).to.equal(nil)
+			expect(#none.ids).to.equal(0)
+			expect(#none.instances).to.equal(0)
 		end)
 
-		it("still writes a script whose editor text the backup could not read", function()
-			local module = backedUpModule("Unread", "return 'studio'")
-			local warnings = recordingWarnings(function()
-				session.__catchUpGuarded = { [module] = false }
-				session:__writeSource({ id = "Unread", instance = module, target = "return 'disk'" })
-				session.__catchUpGuarded = nil
-				task.wait(0.8)
-			end)
-			expect(module.Source).to.equal("return 'disk'")
-			expect(#warnings).to.equal(0)
-		end)
-
-		it("does not mistake Rojo's own write for an edit, and replaces through the fallback after it", function()
-			local hashSource = require(script.Parent.hashSource)
-			local module = backedUpModule("Swapped", "return 'captured'")
-			local warnings = recordingWarnings(function()
-				session.__catchUpGuarded = { [module] = (hashSource("return 'captured'")) }
-				session:__writeSource({ id = "Swapped", instance = module, target = "return 'disk'" })
-				task.wait(0.3)
-				-- A second write lands on the text Rojo just wrote.
-				session:__writeSource({ id = "Swapped", instance = module, target = "return 'disk again'" })
-				task.wait(0.3)
-				-- Then the fallback replaces the script.
-				api.serialize = function()
-					return Promise.resolve({ modelContents = buffer.create(0), missingIds = {} })
-				end
-				api.refPatch = function()
-					return Promise.resolve({ patch = PatchSet.newEmpty() })
-				end
-				session.__deserializeInstances = function()
-					local container = Instance.new("Folder")
-					local pointer = Instance.new("ObjectValue")
-					pointer.Name = "Swapped"
-					local replacement = Instance.new("ModuleScript")
-					replacement.Name = "Swapped"
-					replacement.Source = "return 'replacement'"
-					pointer.Value = replacement
-					pointer.Parent = container
-					return { container }
-				end
-				local ok, unapplied = session:__replaceInstances({ "Swapped" })
-				session.__catchUpGuarded = nil
-				expect(ok).to.equal(true)
-				expect(PatchSet.isEmpty(unapplied)).to.equal(true)
-				task.wait(0.8)
-			end)
-			local current = session.__instanceMap.fromIds.Swapped
-			expect(current).never.to.equal(module)
-			expect(current.Source).to.equal("return 'replacement'")
-			expect(module.Source).to.equal("return 'disk again'")
-			expect(#warnings).to.equal(0)
-		end)
-
-		it("swaps a script edited while the fallback waited, and says so", function()
-			local hashSource = require(script.Parent.hashSource)
-			local module = backedUpModule("EditedDuringFallback", "return 'captured'")
+		it("leaves out a script whose editor text cannot be read rather than export its saved source", function()
+			trackedModule("UNREADABLE", "return 1")
+			session:__rememberVerified("VERIFY", { UNREADABLE = "return 1" })
 			local nativeRead = ServeSession.readEditorText
-			local warnings = recordingWarnings(function()
-				ServeSession.readEditorText = function(instance)
-					return instance.Source
-				end
-				session.__catchUpGuarded = { [module] = (hashSource("return 'captured'")) }
-				api.serialize = function()
-					return Promise.resolve({ modelContents = buffer.create(0), missingIds = {} })
-				end
-				api.refPatch = function()
-					-- The user types while the fallback waits for the server.
-					module.Source = "return 'typed during the fallback'"
-					return Promise.resolve({ patch = PatchSet.newEmpty() })
-				end
-				session.__deserializeInstances = function()
-					local container = Instance.new("Folder")
-					local pointer = Instance.new("ObjectValue")
-					pointer.Name = "EditedDuringFallback"
-					local replacement = Instance.new("ModuleScript")
-					replacement.Source = "return 'replacement'"
-					pointer.Value = replacement
-					pointer.Parent = container
-					return { container }
-				end
-				local ok = session:__replaceInstances({ "EditedDuringFallback" })
-				session.__catchUpGuarded = nil
-				ServeSession.readEditorText = nativeRead
-				expect(ok).to.equal(true)
-				task.wait(0.8)
-			end)
-			expect(session.__instanceMap.fromIds.EditedDuringFallback).never.to.equal(module)
-			expect(#warnings).to.equal(1)
-			expect(warnings[1].args[1]:find("EditedDuringFallback", 1, true)).to.be.ok()
-		end)
-
-		it("keeps no written hashes for ordinary syncing", function()
-			local module = backedUpModule("Ordinary", "return 0")
-			for index = 1, 1000 do
-				session:__writeSource({ id = "Ordinary", instance = module, target = "return " .. index })
+			ServeSession.readEditorText = function()
+				return nil
 			end
-			local waited = 0
-			while session.__syncStats.pendingSourceWrites > 0 and waited < 10 do
-				waited += task.wait()
-			end
-			expect(session.__syncStats.pendingSourceWrites).to.equal(0)
-			expect(next(session.__rojoWrittenHashes)).to.equal(nil)
-			expect(session.__catchUpPendingWrites).to.equal(0)
+			local exported = session:exportForBackup(
+				{ "UNREADABLE" },
+				{ UNREADABLE = (hashSource("return 1")) },
+				"VERIFY"
+			)
+			ServeSession.readEditorText = nativeRead
+			expect(exported.missing).to.equal(1)
+			expect(#exported.ids).to.equal(0)
+			expect(exported.model).to.equal(nil)
 		end)
 
-		it("keeps only the latest written hash per script, and forgets them when the sync's writes end", function()
-			local hashSource = require(script.Parent.hashSource)
-			local module = backedUpModule("Latest", "return 'captured'")
-			session.__catchUpGuarded = { [module] = (hashSource("return 'captured'")) }
-			session:__writeSource({ id = "Latest", instance = module, target = "return 'first'" })
-			task.wait(0.3)
-			session:__writeSource({ id = "Latest", instance = module, target = "return 'second'" })
-			task.wait(0.3)
-			local count = 0
-			for _ in session.__rojoWrittenHashes do
-				count += 1
-			end
-			expect(count).to.equal(1)
-			expect(session.__rojoWrittenHashes[module]).to.equal((hashSource("return 'second'")))
-			-- The sync is over, as `__initialSync` ends it.
-			session.__catchUpGuarded = nil
-			session.__catchUpPendingWrites += 1
-			session:__finishCatchUpWrite()
-			expect(next(session.__rojoWrittenHashes)).to.equal(nil)
+		it("leaves out a script whose source differs from what verify saw though the hashes match", function()
+			-- Two sources known to share a hash and length.
+			local checked, current = "return '07ilh49'", "return '0v3kbm8'"
+			expect((hashSource(checked))).to.equal((hashSource(current)))
+			local collided = trackedModule("COLLIDED", current)
+			session:__rememberVerified("VERIFY", { COLLIDED = checked })
+			local exported = session:exportForBackup({ "COLLIDED" }, { COLLIDED = (hashSource(checked)) }, "VERIFY")
+			expect(exported.missing).to.equal(1)
+			expect(#exported.ids).to.equal(0)
+			-- Without a record of what the verify saw, nothing is exported.
+			collided.Source = checked
+			local unknown = session:exportForBackup({ "COLLIDED" }, { COLLIDED = (hashSource(checked)) }, "OTHER")
+			expect(#unknown.ids).to.equal(0)
+			local known = session:exportForBackup({ "COLLIDED" }, { COLLIDED = (hashSource(checked)) }, "VERIFY")
+			expect(#known.ids).to.equal(1)
 		end)
 
-		it("keeps a fallback replacement that came too late as unapplied", function()
-			local module = backedUpModule("Late", "return 'studio'")
-			local nativeClock = ServeSession.clock
-			local warnings = recordingWarnings(function()
-				ServeSession.clock = function()
-					return 1000
-				end
-				session.__catchUpWriteDeadline = 500
-				api.serialize = function()
-					return Promise.resolve({ modelContents = buffer.create(0), missingIds = {} })
-				end
-				api.refPatch = function()
-					return Promise.resolve({ patch = PatchSet.newEmpty() })
-				end
-				session.__deserializeInstances = function()
-					local container = Instance.new("Folder")
-					local pointer = Instance.new("ObjectValue")
-					pointer.Name = "Late"
-					pointer.Value = Instance.new("ModuleScript")
-					pointer.Parent = container
-					return { container }
-				end
-				local ok, _, skipped = session:__replaceInstances({ "Late" })
-				session.__catchUpWriteDeadline = nil
-				ServeSession.clock = nativeClock
-				expect(ok).to.equal(true)
-				expect(skipped.Late).to.equal(true)
-			end)
-			expect(session.__instanceMap.fromIds.Late).to.equal(module)
-			expect(#warnings).to.equal(1)
-		end)
-
-		-- A module the reconnect backup holds, edited in Studio while a
-		-- precommit callback yields, and a patch that removes it.
-		local function removeAfterYieldingCallback(module, duringCallback)
-			local hashSource = require(script.Parent.hashSource)
-			session.__instanceMap:insert("REMOVED", module)
-			session.__status = ServeSession.Status.Connected
-			session.__catchUpGuarded = { [module] = (hashSource(module.Source)) }
-			local unhook = session:hookPrecommit(function()
-				-- The patch visualizer yields like this.
-				task.wait()
-				duringCallback()
-			end)
-			local patch = PatchSet.newEmpty()
-			table.insert(patch.removed, "REMOVED")
-			session:__applyPatch(patch)
-			unhook()
-			session.__catchUpGuarded = nil
-		end
-
-		it("names a script edited while precommit callbacks yield, and still removes it", function()
-			local nativeRead = ServeSession.readEditorText
-			local module = Instance.new("ModuleScript")
-			module.Name = "EditedDuringPrecommit"
-			module.Source = "return 'captured'"
-			module.Parent = fixture
-			local warnings = recordingWarnings(function()
-				ServeSession.readEditorText = function(instance)
-					return instance.Source
-				end
-				removeAfterYieldingCallback(module, function()
-					module.Source = "return 'typed while the visualizer was built'"
-				end)
-				ServeSession.readEditorText = nativeRead
-				task.wait(0.8)
-			end)
-			expect(module.Parent).to.equal(nil)
-			expect(#warnings).to.equal(1)
-			expect(warnings[1].template:find("does not hold as they are now", 1, true)).to.be.ok()
-			expect(warnings[1].args[1]:find("EditedDuringPrecommit", 1, true)).to.be.ok()
-		end)
-
-		it("does not apply a patch when the session stops while precommit callbacks yield", function()
-			local module = Instance.new("ModuleScript")
-			module.Name = "StillHere"
-			module.Parent = fixture
-			removeAfterYieldingCallback(module, function()
-				session:stop()
-			end)
-			expect(module.Parent).to.equal(fixture)
-		end)
-
-		it("names a script added under a backed-up instance after the backup was prepared", function()
-			local hashSource = require(script.Parent.hashSource)
-			local nativeRead = ServeSession.readEditorText
-			local folder = Instance.new("Folder")
-			folder.Name = "Removed"
-			folder.Parent = fixture
-			local captured = Instance.new("ModuleScript")
-			captured.Name = "Captured"
-			captured.Source = "return 1"
-			captured.Parent = folder
-			local warnings = recordingWarnings(function()
-				ServeSession.readEditorText = function(instance)
-					return instance.Source
-				end
-				session.__instanceMap:insert("REMOVED", folder)
-				session.__status = ServeSession.Status.Connected
-				session.__catchUpGuarded = { [captured] = (hashSource("return 1")) }
-				session.__catchUpRoots = { folder }
-				-- Added while the backup was being prepared.
-				local added = Instance.new("ModuleScript")
-				added.Name = "AddedLater"
-				added.Parent = folder
-				local patch = PatchSet.newEmpty()
-				table.insert(patch.removed, "REMOVED")
-				session:__applyPatch(patch)
-				session.__catchUpGuarded = nil
-				session.__catchUpRoots = nil
-				ServeSession.readEditorText = nativeRead
-				task.wait(0.8)
-			end)
-			expect(folder.Parent).to.equal(nil)
-			expect(#warnings).to.equal(1)
-			expect(warnings[1].args[1]:find("AddedLater", 1, true)).to.be.ok()
-			expect(warnings[1].args[1]:find("Captured", 1, true)).to.equal(nil)
-		end)
-
-		it("applies nothing once the backup's protection has run out, and ends the sync", function()
-			local nativeClock = ServeSession.clock
-			local module = Instance.new("ModuleScript")
-			module.Name = "Protected"
-			module.Parent = fixture
-			local warnings = recordingWarnings(function()
-				ServeSession.clock = function()
-					return 1000
-				end
-				session.__instanceMap:insert("PROTECTED", module)
-				session.__status = ServeSession.Status.Connected
-				session.__catchUpWriteDeadline = 500
-				local patch = PatchSet.newEmpty()
-				table.insert(patch.removed, "PROTECTED")
-				session:__applyPatch(patch)
-				session.__catchUpWriteDeadline = nil
-				ServeSession.clock = nativeClock
-			end)
-			expect(module.Parent).to.equal(fixture)
-			expect(session.__catchUpExpired).to.equal(true)
-			expect(#warnings).to.equal(1)
-			expect(warnings[1].args[1]:find("Reconnect to take a fresh backup", 1, true)).to.be.ok()
-
-			-- The initial sync then ends instead of carrying on.
-			session.__catchUpExpired = false
-			session.__status = ServeSession.Status.NotStarted
-			Settings:set("autoBackupBeforeSync", false)
-			session.__reconciler = {
-				hydrate = function() end,
-				diff = function()
-					return true, PatchSet.newEmpty()
-				end,
-			}
-			session.__applyPatch = function()
-				session.__catchUpExpired = true
-			end
-			local pending = session:__initialSync({ rootInstanceId = "ROOT" })
-			readResolve({ messageCursor = 0, instances = {} })
-			local ok, err = pending:await()
-			expect(ok).to.equal(false)
-			expect(tostring(err):find("Reconnect to take a fresh backup", 1, true)).to.be.ok()
-		end)
-
-		-- A folder in the reconnect backup holding a captured script, and
-		-- `body(folder, child)` run with warnings recorded.
-		local function withBackedUpFolder(body)
-			local hashSource = require(script.Parent.hashSource)
-			local nativeRead = ServeSession.readEditorText
-			local folder = Instance.new("Folder")
-			folder.Name = "Parent"
-			folder.Parent = fixture
-			local child = Instance.new("ModuleScript")
-			child.Name = "Child"
-			child.Source = "return 'captured'"
-			child.Parent = folder
-			session.__instanceMap:insert("PARENT", folder)
-			session.__instanceMap:insert("CHILD", child)
-			session.__status = ServeSession.Status.Connected
-			return recordingWarnings(function()
-				ServeSession.readEditorText = function(instance)
-					return instance.Source
-				end
-				session.__catchUpGuarded = { [child] = (hashSource("return 'captured'")) }
-				session.__catchUpRoots = { folder }
-				body(folder, child)
-				session.__catchUpGuarded = nil
-				session.__catchUpRoots = nil
-				ServeSession.readEditorText = nativeRead
-				task.wait(0.8)
-			end)
-		end
-
-		it("names an affected script moved out of a backed-up instance during preparation", function()
-			local warnings = withBackedUpFolder(function(_, child)
-				-- Moved out after the backup captured it, so the serialized
-				-- folder no longer holds it, yet the patch still changes it.
-				child.Parent = fixture
-				local patch = PatchSet.newEmpty()
-				table.insert(patch.updated, { id = "CHILD", changedName = "Renamed" })
-				session:__applyPatch(patch)
-			end)
-			expect(#warnings).to.equal(1)
-			expect(warnings[1].args[1]:find("Child", 1, true)).to.be.ok()
-		end)
-
-		it("does not name a script the patch leaves alone", function()
-			local child
-			local warnings = withBackedUpFolder(function(folder, script)
-				child = script
-				-- Edited, but only its parent changes.
-				script.Source = "return 'edited, but not touched by the sync'"
-				local patch = PatchSet.newEmpty()
-				table.insert(patch.updated, { id = "PARENT", changedName = "Renamed" })
-				session:__applyPatch(patch)
-				expect(folder.Name).to.equal("Renamed")
-			end)
-			expect(child.Source).to.equal("return 'edited, but not touched by the sync'")
-			expect(#warnings).to.equal(0)
-		end)
-
-		it("leaves the fallback's reference repairs unapplied once the backup's protection ran out", function()
-			local module = backedUpModule("LateRefs", "return 'studio'")
-			local nativeClock = ServeSession.clock
-			local unapplied
-			recordingWarnings(function()
-				ServeSession.clock = function()
-					return 1000
-				end
-				session.__catchUpWriteDeadline = 500
-				api.serialize = function()
-					return Promise.resolve({ modelContents = buffer.create(0), missingIds = {} })
-				end
-				local refPatch = PatchSet.newEmpty()
-				table.insert(refPatch.updated, { id = "LateRefs", changedProperties = { Value = { Ref = "OTHER" } } })
-				api.refPatch = function()
-					return Promise.resolve({ patch = refPatch })
-				end
-				session.__deserializeInstances = function()
-					local container = Instance.new("Folder")
-					local pointer = Instance.new("ObjectValue")
-					pointer.Name = "LateRefs"
-					pointer.Value = Instance.new("ModuleScript")
-					pointer.Parent = container
-					return { container }
-				end
-				local ok
-				ok, unapplied = session:__replaceInstances({ "LateRefs" })
-				expect(ok).to.equal(true)
-				session.__catchUpWriteDeadline = nil
-				ServeSession.clock = nativeClock
-			end)
-			expect(session.__instanceMap.fromIds.LateRefs).to.equal(module)
-			expect(#unapplied.updated).to.equal(1)
-			expect(unapplied.updated[1].id).to.equal("LateRefs")
-		end)
-
-		it("checks many affected instances against the backup quickly", function()
-			-- Folders are cheap stand-ins: only the walk up to the roots is
-			-- measured, and everything is removed again afterwards.
-			local folder = Instance.new("Folder")
-			folder.Name = "Siblings"
-			folder.Parent = fixture
-			local roots = {}
-			local patch = PatchSet.newEmpty()
-			for index = 1, 10_000 do
-				local child = Instance.new("Folder")
-				child.Name = "Child" .. index
-				child.Parent = folder
-				table.insert(roots, child)
-				session.__instanceMap.fromIds["F" .. index] = child
-				table.insert(patch.updated, { id = "F" .. index, changedName = "Renamed" .. index })
-			end
-			session.__catchUpGuarded = {}
-			session.__catchUpRoots = roots
-			local started = os.clock()
-			session:__noteEditsBeforeApply(patch)
-			local elapsed = os.clock() - started
-			session.__catchUpGuarded = nil
-			session.__catchUpRoots = nil
-			session.__catchUpRootSet = nil
-			for index = 1, 10_000 do
-				session.__instanceMap.fromIds["F" .. index] = nil
-			end
-			table.clear(roots)
-			folder:Destroy()
-			expect(elapsed < 2).to.equal(true)
-			expect(session.__overwrittenEdits).to.equal(nil)
-		end)
-
-		it("applies the patch when the overwrite check meets an instance it cannot read", function()
-			local hashSource = require(script.Parent.hashSource)
-			local module = Instance.new("ModuleScript")
-			module.Name = "Readable"
-			module.Source = "return 1"
-			module.Parent = fixture
-			local inaccessible = setmetatable({}, {
-				__index = function(_, key)
-					error("The current thread cannot access '" .. tostring(key) .. "'")
-				end,
-			})
-			local warnings = recordingWarnings(function()
-				session.__instanceMap:insert("READABLE", module)
-				session.__instanceMap.fromIds.LOCKED = inaccessible
-				session.__status = ServeSession.Status.Connected
-				session.__catchUpGuarded = { [module] = (hashSource("return 1")) }
-				session.__catchUpRoots = { module }
-				local patch = PatchSet.newEmpty()
-				table.insert(patch.removed, "READABLE")
-				table.insert(patch.removed, "LOCKED")
-				-- The real apply, so a failing check would stop it. The wipe
-				-- guard is off: it reads removed instances too, and the
-				-- stand-in above is not a real Instance.
-				-- Trace logging prints the instance map, which reads every
-				-- instance in it, so it is quieter here too.
-				local previousGuard = Settings:get("guardScriptWipes")
-				local previousLevel = Settings:get("logLevel")
-				Settings:set("guardScriptWipes", false)
-				Settings:set("logLevel", "Info")
-				local applied, err = pcall(session.__applyPatch, session, patch)
-				Settings:set("guardScriptWipes", previousGuard)
-				Settings:set("logLevel", previousLevel)
-				assert(applied, err)
-				session.__instanceMap.fromIds.LOCKED = nil
-				session.__catchUpGuarded = nil
-				session.__catchUpRoots = nil
-				session.__catchUpRootSet = nil
-				task.wait(0.8)
-			end)
-			expect(module.Parent).to.equal(nil)
-			for _, warning in warnings do
-				expect(warning.template:find("Could not finish checking", 1, true)).to.equal(nil)
-			end
-		end)
-
-		it("names a fallback reference repair outside the backup, and still applies it", function()
-			local hashSource = require(script.Parent.hashSource)
-			local inside = backedUpModule("InsideBackup", "return 1")
-			local warnings = recordingWarnings(function()
-				session.__catchUpGuarded = { [inside] = (hashSource("return 1")) }
-				session.__catchUpRoots = { inside }
-				-- An ObjectValue elsewhere that the user pointed somewhere
-				-- else while the fallback waited.
-				local outside = Instance.new("ObjectValue")
-				outside.Name = "Pointer"
-				outside.Parent = fixture
-				session.__instanceMap:insert("POINTER", outside)
-				local applied
-				session.__reconciler = {
-					applyPatch = function(_, refPatch)
-						applied = refPatch
-						return PatchSet.newEmpty()
-					end,
-				}
-				api.serialize = function()
-					return Promise.resolve({ modelContents = buffer.create(0), missingIds = {} })
-				end
-				local refPatch = PatchSet.newEmpty()
-				table.insert(refPatch.updated, { id = "POINTER", changedProperties = { Value = { Ref = "X" } } })
-				api.refPatch = function()
-					return Promise.resolve({ patch = refPatch })
-				end
-				session.__deserializeInstances = function()
-					local container = Instance.new("Folder")
-					local pointer = Instance.new("ObjectValue")
-					pointer.Name = "InsideBackup"
-					local replacement = Instance.new("ModuleScript")
-					replacement.Source = "return 1"
-					pointer.Value = replacement
-					pointer.Parent = container
-					return { container }
-				end
-				local ok = session:__replaceInstances({ "InsideBackup" })
-				session.__catchUpGuarded = nil
-				session.__catchUpRoots = nil
-				session.__catchUpRootSet = nil
-				expect(ok).to.equal(true)
-				expect(#applied.updated).to.equal(1)
-				task.wait(0.8)
-			end)
-			expect(#warnings).to.equal(1)
-			expect(warnings[1].args[1]:find("Pointer (Value)", 1, true)).to.be.ok()
+		it("leaves out a script whose source changed since verify hashed it", function()
+			trackedModule("EDITED", "return 'edited after the check'")
+			session:__rememberVerified("VERIFY", { EDITED = "return 'checked'" })
+			local exported = session:exportForBackup(
+				{ "EDITED" },
+				{ EDITED = (hashSource("return 'checked'")) },
+				"VERIFY"
+			)
+			expect(exported.missing).to.equal(1)
+			expect(#exported.ids).to.equal(0)
+			expect(exported.model).to.equal(nil)
+			-- A script without an expected hash is left out too.
+			expect(#session:exportForBackup({ "EDITED" }, {}, "VERIFY").ids).to.equal(0)
 		end)
 
 		it("does not let a cancelled resync's pending write land", function()
-			local hashSource = require(script.Parent.hashSource)
 			local nativeUpdate = ServeSession.updateSourceAsync
-			local module = backedUpModule("Resynced", "return 'studio'")
+			local module = trackedModule("Resynced", "return 'studio'")
 			session:__rememberVerified("VERIFY", { Resynced = "return 'studio'" }, {})
 			local committed = false
 			ServeSession.updateSourceAsync = function(instance, callback)
@@ -2090,142 +1375,6 @@ return function()
 			expect(committed).to.equal(false)
 			expect(module.Source).to.equal("return 'studio'")
 			expect(result.updated).to.equal(0)
-		end)
-
-		it("takes no backup when it is turned off", function()
-			Settings:set("autoBackupBeforeSync", false)
-			local removed = Instance.new("Folder")
-			removed.Parent = fixture
-			local calls = 0
-			StudioBridge.requestAsync = function()
-				calls += 1
-				error("no request expected")
-			end
-			local events = syncRemoving(removed, { rootInstanceId = "ROOT", studioBridge = pairing })
-			expect(calls).to.equal(0)
-			expect(events[1]).to.equal("patch")
-		end)
-
-		it("exports the scripts verify --fix overwrites, leaving out those not in the place", function()
-			local fixed = Instance.new("ModuleScript")
-			fixed.Name = "Fixed"
-			fixed.Source = "return 1"
-			fixed.Parent = fixture
-			session.__instanceMap:insert("FIXED", fixed)
-			session.__status = ServeSession.Status.Connected
-			local hashSource = require(script.Parent.hashSource)
-			session:__rememberVerified("VERIFY", { FIXED = "return 1" })
-			local exported = session:exportForBackup(
-				{ "FIXED", "GONE" },
-				{ FIXED = (hashSource("return 1")) },
-				"VERIFY"
-			)
-			expect(exported.missing).to.equal(1)
-			expect(#exported.ids).to.equal(1)
-			expect(exported.ids[1]).to.equal("FIXED")
-			expect(#exported.instances).to.equal(1)
-			expect(exported.instances[1].path).to.equal("game/ReplicatedStorage/__RojoSyncBackupSpec/Fixed")
-			expect(type(exported.model)).to.equal("string")
-			expect(exported.bytes > 0).to.equal(true)
-			local none = session:exportForBackup({ "GONE" }, {})
-			expect(none.model).to.equal(nil)
-			expect(#none.ids).to.equal(0)
-			expect(#none.instances).to.equal(0)
-		end)
-
-		it("leaves out a script whose editor text cannot be read rather than export its saved source", function()
-			local unreadable = Instance.new("ModuleScript")
-			unreadable.Name = "Unreadable"
-			unreadable.Source = "return 1"
-			unreadable.Parent = fixture
-			session.__instanceMap:insert("UNREADABLE", unreadable)
-			session.__status = ServeSession.Status.Connected
-			local hashSource = require(script.Parent.hashSource)
-			local nativeRead = ServeSession.readEditorText
-			ServeSession.readEditorText = function()
-				return nil
-			end
-			local exported = session:exportForBackup({ "UNREADABLE" }, { UNREADABLE = (hashSource("return 1")) })
-			ServeSession.readEditorText = nativeRead
-			expect(exported.missing).to.equal(1)
-			expect(#exported.ids).to.equal(0)
-			expect(exported.model).to.equal(nil)
-		end)
-
-		it("warns about scripts whose unsaved editor text it could not back up", function()
-			Settings:set("autoBackupBeforeSync", true)
-			local Log = require(script.Parent.Parent.Packages.Log)
-			local nativeWarn = Log.warn
-			local nativeRead = ServeSession.readEditorText
-			local warnings = {}
-			Log.warn = function(template, ...)
-				table.insert(warnings, { template = template, args = { ... } })
-			end
-			ServeSession.readEditorText = function()
-				return nil
-			end
-			local sent = 0
-			StudioBridge.requestAsync = function()
-				sent += 1
-				return {
-					Success = true,
-					StatusCode = 200,
-					Body = HttpService:JSONEncode({ backup = { id = "20261107-000000-auto-sync" } }),
-				}
-			end
-			local removed = Instance.new("ModuleScript")
-			removed.Name = "OpenInEditor"
-			removed.Parent = fixture
-			local events = syncRemoving(removed, { rootInstanceId = "ROOT", studioBridge = pairing })
-			Log.warn = nativeWarn
-			ServeSession.readEditorText = nativeRead
-			expect(sent).to.equal(1)
-			expect(events[1]).to.equal("patch")
-			expect(#warnings).to.equal(1)
-			expect(warnings[1].template:find("Unsaved editor text could not be backed up", 1, true)).to.be.ok()
-			expect(warnings[1].args[2]).to.equal("game/ReplicatedStorage/__RojoSyncBackupSpec/OpenInEditor")
-		end)
-
-		it("leaves out a script whose source differs from what verify saw though the hashes match", function()
-			local hashSource = require(script.Parent.hashSource)
-			-- Two sources known to share a hash and length.
-			local checked, current = "return '07ilh49'", "return '0v3kbm8'"
-			expect((hashSource(checked))).to.equal((hashSource(current)))
-			local collided = Instance.new("ModuleScript")
-			collided.Name = "Collided"
-			collided.Source = current
-			collided.Parent = fixture
-			session.__instanceMap:insert("COLLIDED", collided)
-			session.__status = ServeSession.Status.Connected
-			session:__rememberVerified("VERIFY", { COLLIDED = checked })
-			local exported = session:exportForBackup({ "COLLIDED" }, { COLLIDED = (hashSource(checked)) }, "VERIFY")
-			expect(exported.missing).to.equal(1)
-			expect(#exported.ids).to.equal(0)
-			-- Without a record of what the verify saw, nothing is exported.
-			collided.Source = checked
-			expect(#session:exportForBackup({ "COLLIDED" }, { COLLIDED = (hashSource(checked)) }, "OTHER").ids).to.equal(
-				0
-			)
-			expect(#session:exportForBackup({ "COLLIDED" }, { COLLIDED = (hashSource(checked)) }, "VERIFY").ids).to.equal(
-				1
-			)
-		end)
-
-		it("leaves out a script whose source changed since verify hashed it", function()
-			local edited = Instance.new("ModuleScript")
-			edited.Name = "Edited"
-			edited.Source = "return 'edited after the check'"
-			edited.Parent = fixture
-			session.__instanceMap:insert("EDITED", edited)
-			session.__status = ServeSession.Status.Connected
-			local hashSource = require(script.Parent.hashSource)
-			-- Verify saw "return 'checked'"; Studio has a newer edit now.
-			local exported = session:exportForBackup({ "EDITED" }, { EDITED = (hashSource("return 'checked'")) })
-			expect(exported.missing).to.equal(1)
-			expect(#exported.ids).to.equal(0)
-			expect(exported.model).to.equal(nil)
-			-- A script without an expected hash is left out too.
-			expect(#session:exportForBackup({ "EDITED" }, {}).ids).to.equal(0)
 		end)
 	end)
 

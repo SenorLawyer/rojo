@@ -972,7 +972,6 @@ impl StudioBridge {
                 | "/api/studio/result"
                 | "/api/studio/disconnect"
                 | "/api/studio/validate"
-                | "/api/studio/backup"
         );
         if !self.authorized(&request, plugin) {
             return failure(StatusCode::UNAUTHORIZED, "Invalid Studio control token");
@@ -1030,7 +1029,6 @@ impl StudioBridge {
             }
             "/api/studio/poll" => self.poll(value).await,
             "/api/studio/result" => self.result(value),
-            "/api/studio/backup" => self.plugin_backup(value).await,
             "/api/studio/validate" => {
                 let mut state = self.state();
                 Self::prune(&mut state);
@@ -1687,56 +1685,6 @@ impl StudioBridge {
         .map_err(|(_, message)| format!("the backup would not be restorable: {message}"))
     }
 
-    /// Saves a backup the plugin took before its first sync after connecting
-    /// changed or removed instances in Studio, such as after the server's
-    /// branch changed. It comes with the plugin token like the plugin's other
-    /// requests, and only ever adds to the backup folder.
-    async fn plugin_backup(&self, value: Value) -> Response<Body> {
-        let model = match backup_model_bytes(&value) {
-            Ok(model) => model,
-            Err(error) => return failure(StatusCode::BAD_REQUEST, format!("{error:#}")),
-        };
-        let contents = match backup_contents(&value) {
-            Ok(contents) if !contents.is_empty() => contents,
-            Ok(_) => {
-                return failure(
-                    StatusCode::BAD_REQUEST,
-                    "A backup must hold at least one instance",
-                )
-            }
-            Err(error) => return failure(StatusCode::BAD_REQUEST, error),
-        };
-        if let Err(error) = self.check_restorable(&model).await {
-            return failure(StatusCode::UNPROCESSABLE_ENTITY, error);
-        }
-        let record = backup::automatic_record(
-            "auto-sync",
-            "auto: before Rojo synced Studio with the files on connecting",
-            &contents,
-            value["placeId"].as_u64(),
-            value["placeName"].as_str(),
-        );
-        if !backup::record_fits(&record) {
-            return failure(StatusCode::PAYLOAD_TOO_LARGE, RECORD_TOO_LARGE);
-        }
-        // Pinned for a while, so another save cannot prune it while Studio
-        // applies the sync it backs up; the pin just expires.
-        let until = backup::now_millis() + BACKUP_PIN.as_millis() as u64;
-        match self
-            .save_backup(record, model, Some((until, Vec::new())))
-            .await
-        {
-            Ok((record, store_dir)) => reply(
-                StatusCode::OK,
-                json!({ "backup": backup_summary(&record, &store_dir) }),
-            ),
-            Err(error) => failure(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Could not save the backup: {error:#}"),
-            ),
-        }
-    }
-
     /// The backup folder of the project's repository, which
     /// `rojo studio backup list` reads from any of its worktrees.
     fn backup_store(dir: Option<PathBuf>, root: &Path) -> anyhow::Result<backup::Store> {
@@ -2064,7 +2012,7 @@ fn import_model_bytes(args: &Value) -> anyhow::Result<Vec<u8>> {
 }
 
 const RECORD_TOO_LARGE: &str =
-    "the backup lists too many or too long instance paths for its record, so it was not saved";
+    "the backup lists too many or too long script paths for its record, so it was not saved";
 
 /// What `verify --fix` saved, with the scripts the backups hold.
 struct FixBackups {
@@ -3574,7 +3522,7 @@ mod tests {
         // Old automatic backups, more than are kept, left by earlier runs.
         for index in 0..backup::KEEP_AUTOMATIC as u64 + 5 {
             let mut record = backup::automatic_record(
-                "auto-sync",
+                "auto-verify-fix",
                 "auto: old",
                 &[("game/Old".to_owned(), "Folder".to_owned())],
                 None,
@@ -3732,26 +3680,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn backups_that_could_not_be_restored_are_not_saved() {
+    async fn verify_fix_does_not_save_a_backup_that_could_not_be_restored() {
         let unrestorable = unrestorable_model();
-        // The sync route refuses it, so the plugin warns and syncs anyway.
-        let (dir, bridge) = fixture();
-        let (status, value) = plugin(
-            &bridge,
-            "/api/studio/backup",
-            json!({"model": unrestorable, "instances": [{"path":"game/Workspace/S","className":"ModuleScript"}]}),
-        )
-        .await;
-        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{value}");
-        assert!(value["error"]
-            .as_str()
-            .unwrap()
-            .contains("not be restorable"));
-        assert!(backup::Store::in_dir(&dir.path().join("backups"))
-            .list()
-            .unwrap()
-            .is_empty());
-
         // verify --fix changes nothing.
         let (dir, bridge, session, script, verify) = fix_past_sources(json!({"fix":true})).await;
         let command = next_command(&bridge, &session).await;
@@ -3823,25 +3753,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn backups_that_restore_would_refuse_after_reencoding_are_not_saved() {
+    async fn verify_fix_does_not_save_a_backup_restore_would_refuse_after_reencoding() {
         let model = too_large_once_reencoded();
-        let (dir, bridge) = fixture();
-        let (status, value) = plugin(
-            &bridge,
-            "/api/studio/backup",
-            json!({"model": model, "instances": [{"path":"game/Workspace/Folder","className":"Folder"}]}),
-        )
-        .await;
-        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{value}");
-        assert!(
-            value["error"].as_str().unwrap().contains("exceeds 5MiB"),
-            "{value}"
-        );
-        assert!(backup::Store::in_dir(&dir.path().join("backups"))
-            .list()
-            .unwrap()
-            .is_empty());
-
         let (dir, bridge, session, script, verify) = fix_past_sources(json!({"fix":true})).await;
         let command = next_command(&bridge, &session).await;
         answer_export(
@@ -3997,7 +3910,7 @@ mod tests {
         // Older automatic backups, which make way for this verify's.
         for index in 0..3 {
             let mut record = backup::automatic_record(
-                "auto-sync",
+                "auto-verify-fix",
                 "auto: old",
                 &[("game/Old".to_owned(), "Folder".to_owned())],
                 None,
@@ -4073,83 +3986,43 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn plugin_backups_are_saved_as_automatic_with_the_plugin_token_only() {
-        let (dir, bridge) = fixture();
-        let body = json!({
-            "model": model(&["Part"]),
-            "instances": [{"path":"game/Workspace/Folder","className":"Folder"}],
-            "placeId": 9,
-            "placeName": "Place",
-        });
-        // The CLI's token is not the plugin's.
-        let (status, _) = cli(&bridge, "/api/studio/backup", body.clone()).await;
-        assert_eq!(status, StatusCode::UNAUTHORIZED);
-        // Nor is a plugin paired with another server.
-        let mut foreign = body.clone();
-        foreign["identity"] = json!({"serverSession":"other","digest":"other"});
-        let request = request(
-            "POST",
-            "/api/studio/backup",
-            &bridge.plugin_token,
-            Some(foreign),
-        );
-        let (status, _) =
-            into_value(bridge.clone().call(PEER.parse().unwrap(), request).await).await;
-        assert_eq!(status, StatusCode::CONFLICT);
-        let store = backup::Store::in_dir(&dir.path().join("backups"));
-        assert!(store.list().unwrap().is_empty());
-
-        // The bridge does not have to be registered: the backup is taken
-        // before the plugin starts it.
-        let (status, value) = plugin(&bridge, "/api/studio/backup", body).await;
-        assert_eq!(status, StatusCode::OK, "{value}");
-        assert_eq!(value["backup"]["automatic"], true);
-        let listed = store.list().unwrap();
-        assert_eq!(listed.len(), 1);
-        assert_eq!(listed[0].instance, "game/Workspace/Folder");
-        assert_eq!(listed[0].place_name.as_deref(), Some("Place"));
-        assert!(listed[0]
-            .note
-            .as_deref()
-            .unwrap()
-            .starts_with("auto: before Rojo synced Studio"));
-    }
-
-    #[tokio::test]
     async fn backups_keep_long_root_paths_whole_and_refuse_records_too_large() {
-        let (dir, bridge) = fixture();
+        let (dir, bridge, session, script, verify) = fix_past_sources(json!({"fix":true})).await;
         let store = backup::Store::in_dir(&dir.path().join("backups"));
         let deep = "Nested/".repeat(200);
         let first = format!("game/Workspace/{deep}A");
         let second = format!("game/Workspace/{deep}B");
         assert!(first.len() > 1024);
-        let (status, value) = plugin(
+        let command = next_command(&bridge, &session).await;
+        answer_export(
             &bridge,
-            "/api/studio/backup",
-            json!({"model": model(&["Part"]), "instances": [
-                {"path": first, "className": "Part"},
-                {"path": second, "className": "Part"},
+            &session,
+            &command,
+            json!({"model": model(&["ModuleScript"]), "ids": [script.id], "instances": [
+                {"path": first, "className": "ModuleScript"},
+                {"path": second, "className": "ModuleScript"},
             ]}),
         )
         .await;
+        let resync = next_command(&bridge, &session).await;
+        plugin(
+            &bridge,
+            "/api/studio/result",
+            json!({"requestId":resync["requestId"],"sessionId":session,"result":{"ok":true,"value":{"updated":1,"failed":0,"skipped":0}}}),
+        )
+        .await;
+        let (status, value) = into_value(verify.await.unwrap()).await;
         assert_eq!(status, StatusCode::OK, "{value}");
-        let (record, _) = store.get(value["backup"]["id"].as_str().unwrap()).unwrap();
-        assert_eq!(record.roots[0].path, first);
-        assert_eq!(record.roots[1].path, second);
+        let saved = store.list().unwrap();
+        assert_eq!(saved.len(), 1);
+        assert_eq!(saved[0].roots[0].path, first);
+        assert_eq!(saved[0].roots[1].path, second);
 
         // 10,000 roots with long paths make a record over the 4 MiB limit.
         let long = "x".repeat(500);
         let instances: Vec<Value> = (0..10_000)
             .map(|index| json!({"path": format!("game/Workspace/{long}{index}"), "className": "Part"}))
             .collect();
-        let (status, value) = plugin(
-            &bridge,
-            "/api/studio/backup",
-            json!({"model": model(&["Part"]), "instances": instances.clone()}),
-        )
-        .await;
-        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{value}");
-        assert_eq!(store.list().unwrap().len(), 1, "nothing more was saved");
 
         // verify --fix changes nothing when its backup's record is too large.
         let (dir, bridge, session, script, verify) = fix_past_sources(json!({"fix":true})).await;
@@ -4171,91 +4044,6 @@ mod tests {
             "{value}"
         );
         assert!(bridge.state().pending.is_empty(), "no resync was sent");
-        assert!(backup::Store::in_dir(&dir.path().join("backups"))
-            .list()
-            .unwrap()
-            .is_empty());
-    }
-
-    #[tokio::test]
-    async fn a_reconnect_backup_is_pinned_until_its_pin_expires() {
-        let (dir, bridge) = fixture();
-        let (status, value) = plugin(
-            &bridge,
-            "/api/studio/backup",
-            json!({"model": model(&["Part"]), "instances": [{"path":"game/Workspace/Folder","className":"Folder"}]}),
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK, "{value}");
-        let id = value["backup"]["id"].as_str().unwrap().to_owned();
-        // Another process fills the folder with backups dated in the future,
-        // as after a clock correction, and saves one more.
-        let other = backup::Store::in_dir(&dir.path().join("backups"));
-        let future = backup::now_millis() + 86_400_000;
-        for index in 0..backup::MAX_AUTOMATIC as u64 {
-            let mut record = backup::automatic_record(
-                "auto-sync",
-                "auto: future",
-                &[("game/Future".to_owned(), "Folder".to_owned())],
-                None,
-                None,
-            );
-            record.created_at = future + index;
-            other.save(record, b"<roblox!future").unwrap();
-        }
-        let mut record = backup::automatic_record(
-            "auto-sync",
-            "auto: later",
-            &[("game/Later".to_owned(), "Folder".to_owned())],
-            None,
-            None,
-        );
-        record.created_at = backup::now_millis();
-        other.save_automatic(record, b"<roblox!later").unwrap();
-        assert!(
-            other.exists(&id),
-            "its pin keeps it while Studio applies the sync"
-        );
-        // Once the pin has expired, the next save prunes it like any other:
-        // it is the oldest of those over the cap.
-        let later = backup::now_millis() + BACKUP_PIN.as_millis() as u64 + 1;
-        let mut record = backup::automatic_record(
-            "auto-sync",
-            "auto: after the pin",
-            &[("game/After".to_owned(), "Folder".to_owned())],
-            None,
-            None,
-        );
-        record.created_at = later;
-        other
-            .save_automatic_with(
-                record,
-                b"<roblox!after",
-                None,
-                &[],
-                backup::PruneLimits::DEFAULT,
-                later,
-            )
-            .unwrap();
-        assert!(!other.exists(&id));
-    }
-
-    #[tokio::test]
-    async fn plugin_backups_outside_the_limits_are_refused() {
-        let (dir, bridge) = fixture();
-        let instances = json!([{"path":"game/Workspace/Folder","className":"Folder"}]);
-        let too_large = "A".repeat(MAX_MODEL_BYTES.div_ceil(3) * 4 + 4);
-        for body in [
-            json!({"instances": instances}),
-            json!({"model": "not base64!", "instances": instances}),
-            json!({"model": data_encoding::BASE64.encode(b"hello"), "instances": instances}),
-            json!({"model": too_large, "instances": instances}),
-            json!({"model": model(&[]), "instances": []}),
-            json!({"model": model(&[]), "instances": [{"path": "game/Workspace"}]}),
-        ] {
-            let (status, value) = plugin(&bridge, "/api/studio/backup", body).await;
-            assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
-        }
         assert!(backup::Store::in_dir(&dir.path().join("backups"))
             .list()
             .unwrap()

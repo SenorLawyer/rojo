@@ -1320,28 +1320,22 @@ return function()
 				getSummary = function()
 					return {}
 				end,
-				exportForBackup = function(ids, hashes)
+				exportForBackup = function(ids, hashes, verifyId)
 					asked = ids
 					expect(hashes.A).to.equal(7)
+					expect(verifyId).to.equal("VERIFY")
 					return { instances = { { path = "game/A", className = "ModuleScript" } }, model = "AAAA" }
 				end,
 			}
 			expect(bridge:capabilities().backup.available).to.equal(true)
-			local result = bridge:execute(command("backup", { ids = { "A", "B" }, hashes = { A = 7, B = 8 } }))
+			local result = bridge:execute(
+				command("backup", { ids = { "A", "B" }, hashes = { A = 7, B = 8 }, verifyId = "VERIFY" })
+			)
 			expect(result.model).to.equal("AAAA")
 			expect(#asked).to.equal(2)
 			bridge.sync = nil
 			expect(bridge:capabilities().backup.available).to.equal(false)
 			expect(pcall(bridge.execute, bridge, command("backup", { ids = {} }))).to.equal(false)
-		end)
-
-		it("only sends its token to a Rojo server on this computer", function()
-			expect(StudioBridge.isLoopbackUrl("http://127.0.0.1:34872")).to.equal(true)
-			expect(StudioBridge.isLoopbackUrl("http://localhost:34872")).to.equal(true)
-			expect(StudioBridge.isLoopbackUrl("http://[::1]:34872")).to.equal(true)
-			expect(StudioBridge.isLoopbackUrl("http://127.0.0.1.example.com:34872")).to.equal(false)
-			expect(StudioBridge.isLoopbackUrl("https://127.0.0.1:34872")).to.equal(false)
-			expect(StudioBridge.isLoopbackUrl(nil)).to.equal(false)
 		end)
 
 		it("sends no summary when the sync session cannot give one", function()
