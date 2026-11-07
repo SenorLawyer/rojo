@@ -298,8 +298,11 @@ fn git_toplevel(path: &Path) -> Option<PathBuf> {
         // GitHub still only reads workflows at its root.
         Err(_) => return find_git_marker(path),
     };
+    // Git also fails inside a checkout it refuses, for example one owned by
+    // another user, so the marker decides whether this really is outside a
+    // repository.
     if !output.status.success() {
-        return None;
+        return find_git_marker(path);
     }
     let toplevel = String::from_utf8(output.stdout).ok()?;
     dunce::canonicalize(toplevel.trim_end_matches(['\r', '\n'])).ok()
@@ -795,6 +798,23 @@ fn init_at_a_repository_root_keeps_the_workflow_unchanged() {
     assert_eq!(body(&at_root), body(&not_in_repo));
     assert!(!at_root.contains("working-directory"));
     assert!(at_root.contains("\nname: Rojo\n"));
+}
+
+#[test]
+fn a_checkout_git_refuses_still_puts_the_workflow_at_its_root() {
+    // A `.git` folder with only HEAD looks like a checkout but makes
+    // `git rev-parse` fail, standing in for a checkout Git refuses to read.
+    let tree = tempfile::tempdir().unwrap();
+    let checkout = tree.path().join("checkout");
+    let project = checkout.join("games").join("racer");
+    fs::create_dir_all(&project).unwrap();
+    fs::create_dir(checkout.join(".git")).unwrap();
+    fs::write(checkout.join(".git").join("HEAD"), "ref: refs/heads/main\n").unwrap();
+
+    assert_eq!(
+        git_toplevel(&project).map(|root| dunce::canonicalize(root).unwrap()),
+        Some(dunce::canonicalize(&checkout).unwrap())
+    );
 }
 
 #[test]
