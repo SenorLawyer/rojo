@@ -34,7 +34,9 @@ static TEMPLATE_BINCODE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/templ
 ///
 /// It also adds a GitHub Actions workflow at .github/workflows/rojo.yml that
 /// runs `rojo packages doctor`, `rojo typecheck` and, for places once its
-/// secrets are set, `rojo test --cloud`. To leave it out, pass `--no-ci`.
+/// secrets are set, `rojo test --cloud`. Inside an existing Git repository it
+/// goes at the repository root, as .github/workflows/rojo-<project path>.yml,
+/// and runs in the project's folder. To leave it out, pass `--no-ci`.
 #[derive(Debug, Parser)]
 pub struct InitCommand {
     /// Path to the place to create the project. Defaults to the current directory.
@@ -49,7 +51,7 @@ pub struct InitCommand {
     #[clap(long)]
     pub skip_git: bool,
 
-    /// Does not add the GitHub Actions workflow, .github/workflows/rojo.yml.
+    /// Does not add the GitHub Actions workflow.
     #[clap(long)]
     pub no_ci: bool,
 }
@@ -84,7 +86,8 @@ impl InitCommand {
             queue.push_back(entry?.path().to_path_buf())
         }
 
-        let mut created_workflow = false;
+        let workflow_target = WorkflowTarget::for_project(&base_path)?;
+        let mut created_workflow = None;
         while let Some(mut path) = queue.pop_front() {
             let metadata = vfs.metadata(&path)?;
             if metadata.is_dir() {
@@ -94,7 +97,6 @@ impl InitCommand {
                 }
             } else {
                 let content = vfs.read_to_string_lf_normalized(&path)?;
-                let mut is_workflow = false;
                 if let Some(file_stem) = path.file_name().and_then(OsStr::to_str) {
                     if file_stem == GIT_IGNORE_PLACEHOLDER {
                         if self.skip_git {
@@ -106,16 +108,20 @@ impl InitCommand {
                         if self.no_ci {
                             continue;
                         }
-                        path = PathBuf::from(CI_WORKFLOW_PATH);
-                        fs::create_dir_all(base_path.join(&path).parent().unwrap())?;
-                        is_workflow = true;
+                        let rendered = project_params.render_template(&content);
+                        let workflow = workflow_target.adapt(&rendered);
+                        let file = workflow_target.file();
+                        fs::create_dir_all(file.parent().unwrap())?;
+                        if write_if_not_exists(&file, &workflow)? {
+                            created_workflow = Some(workflow_target.display_path());
+                        }
+                        continue;
                     }
                 }
-                let created = write_if_not_exists(
+                write_if_not_exists(
                     &base_path.join(&path),
                     &project_params.render_template(&content),
                 )?;
-                created_workflow |= is_workflow && created;
             }
         }
 
@@ -136,15 +142,140 @@ impl InitCommand {
         }
 
         println!("Created project successfully.");
-        if created_workflow {
+        if let Some(path) = created_workflow {
             println!(
-                "Added the GitHub Actions workflow {CI_WORKFLOW_PATH}. The comments at its \
-                 top list the secrets it needs, if any."
+                "Added the GitHub Actions workflow {path}. The comments at its top list the \
+                 secrets it needs, if any."
             );
         }
 
         Ok(())
     }
+}
+
+/// Where the GitHub Actions workflow goes. GitHub only reads workflows from
+/// the repository root's .github/workflows, so a project created inside an
+/// existing repository gets its workflow there, set to run in the project.
+#[derive(Debug)]
+struct WorkflowTarget {
+    /// The repository root, or the project when it is the root or not in a
+    /// repository yet.
+    root: PathBuf,
+    /// The project's path from the repository root, with `/` separators, or
+    /// `None` when the project is the root.
+    project_dir: Option<String>,
+}
+
+impl WorkflowTarget {
+    fn for_project(project: &Path) -> anyhow::Result<Self> {
+        let project = dunce::canonicalize(project)?;
+        let Some(root) = git_toplevel(&project) else {
+            return Ok(Self {
+                root: project,
+                project_dir: None,
+            });
+        };
+        let relative = match project.strip_prefix(&root) {
+            Ok(relative) if !relative.as_os_str().is_empty() => relative,
+            // The project is the root, or Git named a root that does not
+            // contain the project (such as through a symlink Rojo resolved
+            // differently). Keep the workflow in the project as before.
+            _ => {
+                return Ok(Self {
+                    root: project,
+                    project_dir: None,
+                })
+            }
+        };
+        let components = relative
+            .components()
+            .map(|component| {
+                component
+                    .as_os_str()
+                    .to_str()
+                    .map(str::to_owned)
+                    .ok_or_else(|| format_err!("{} is not valid Unicode", relative.display()))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        Ok(Self {
+            root,
+            project_dir: Some(components.join("/")),
+        })
+    }
+
+    /// The workflow's path from the repository root, with `/` separators.
+    fn display_path(&self) -> String {
+        match &self.project_dir {
+            None => CI_WORKFLOW_PATH.to_owned(),
+            // The whole path, not only the folder's name, so that projects
+            // such as games/racer and tools/racer do not share a file.
+            Some(dir) => {
+                let name: String = dir
+                    .chars()
+                    .map(|c| match c {
+                        'a'..='z' | '0'..='9' | '-' | '_' => c,
+                        'A'..='Z' => c.to_ascii_lowercase(),
+                        _ => '-',
+                    })
+                    .collect();
+                format!(".github/workflows/rojo-{name}.yml")
+            }
+        }
+    }
+
+    fn file(&self) -> PathBuf {
+        self.root.join(self.display_path())
+    }
+
+    /// Points a rendered workflow at the project when it is not the root:
+    /// each job runs its commands in the project's folder, and the workflow
+    /// is named after it so several projects' workflows can be told apart.
+    fn adapt(&self, workflow: &str) -> String {
+        let Some(dir) = &self.project_dir else {
+            return workflow.to_owned();
+        };
+        let quoted = single_quoted(dir);
+        let mut output = String::with_capacity(workflow.len() + 256);
+        for line in workflow.lines() {
+            if line == "name: Rojo" {
+                output.push_str(&format!(
+                    "name: {}\n",
+                    single_quoted(&format!("Rojo ({dir})"))
+                ));
+                continue;
+            }
+            output.push_str(&line.replace(CI_WORKFLOW_PATH, &self.display_path()));
+            output.push('\n');
+            // Every job in the templates has one `runs-on` line at job level.
+            if line == "    runs-on: ubuntu-latest" {
+                output.push_str("    defaults:\n      run:\n        working-directory: ");
+                output.push_str(&quoted);
+                output.push('\n');
+            }
+        }
+        output
+    }
+}
+
+/// A YAML single-quoted string, in which only quotes need escaping.
+fn single_quoted(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+/// The top level of the Git repository that contains `path`, or `None` when
+/// it is not in one or Git is not installed, as in `should_git_init`.
+fn git_toplevel(path: &Path) -> Option<PathBuf> {
+    let output = Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .stderr(Stdio::null())
+        .current_dir(path)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let toplevel = String::from_utf8(output.stdout).ok()?;
+    dunce::canonicalize(toplevel.trim_end_matches(['\r', '\n'])).ok()
 }
 
 /// The templates we support for initializing a Rojo project.
@@ -473,4 +604,102 @@ fn init_keeps_an_existing_workflow() {
         fs::read_to_string(workflows.join("other.yml")).unwrap(),
         "name: Other\n"
     );
+}
+
+#[cfg(test)]
+fn git_init_for_test(path: &Path) {
+    let status = Command::new("git")
+        .args(["init", "--quiet"])
+        .current_dir(path)
+        .status()
+        .unwrap();
+    assert!(status.success());
+}
+
+#[test]
+fn init_inside_a_repository_puts_the_workflow_at_its_root() {
+    for kind in [InitKind::Place, InitKind::Model, InitKind::Plugin] {
+        let repo = tempfile::tempdir().unwrap();
+        git_init_for_test(repo.path());
+        let project = repo.path().join("games").join("Racer Game");
+        init_for_test(&project, kind, false);
+
+        // GitHub only reads workflows at the repository root.
+        assert!(!project.join(".github").exists(), "{kind:?}");
+        assert!(!repo.path().join(CI_WORKFLOW_PATH).exists(), "{kind:?}");
+        let workflow = fs::read_to_string(
+            repo.path()
+                .join(".github")
+                .join("workflows")
+                .join("rojo-games-racer-game.yml"),
+        )
+        .unwrap();
+        assert!(
+            workflow.contains("Checks Racer Game on GitHub Actions"),
+            "{kind:?}"
+        );
+        assert!(!workflow.contains(CI_WORKFLOW_PATH), "{kind:?}");
+
+        let yaml: serde_yaml::Value = serde_yaml::from_str(&workflow)
+            .unwrap_or_else(|error| panic!("{kind:?} workflow is not YAML: {error}"));
+        assert_eq!(
+            yaml["name"].as_str(),
+            Some("Rojo (games/Racer Game)"),
+            "{kind:?}"
+        );
+        let jobs = yaml["jobs"].as_mapping().unwrap();
+        let expected_jobs = match kind {
+            InitKind::Place => 2,
+            InitKind::Model | InitKind::Plugin => 1,
+        };
+        assert_eq!(jobs.len(), expected_jobs, "{kind:?}");
+        for (name, job) in jobs {
+            assert_eq!(
+                job["defaults"]["run"]["working-directory"].as_str(),
+                Some("games/Racer Game"),
+                "{kind:?} job {name:?}"
+            );
+        }
+        assert!(
+            step_runs(&yaml["jobs"]["check"])
+                .iter()
+                .any(|run| run == "rojo packages doctor"),
+            "{kind:?}"
+        );
+    }
+}
+
+#[test]
+fn init_inside_a_repository_keeps_an_existing_root_workflow() {
+    let repo = tempfile::tempdir().unwrap();
+    git_init_for_test(repo.path());
+    let workflows = repo.path().join(".github").join("workflows");
+    fs::create_dir_all(&workflows).unwrap();
+    fs::write(workflows.join("rojo-racer.yml"), "name: Mine\n").unwrap();
+
+    init_for_test(&repo.path().join("racer"), InitKind::Place, false);
+
+    assert_eq!(
+        fs::read_to_string(workflows.join("rojo-racer.yml")).unwrap(),
+        "name: Mine\n"
+    );
+    assert!(!repo.path().join("racer").join(".github").exists());
+}
+
+#[test]
+fn init_at_a_repository_root_keeps_the_workflow_unchanged() {
+    let repo = tempfile::tempdir().unwrap();
+    git_init_for_test(repo.path());
+    init_for_test(repo.path(), InitKind::Place, false);
+
+    let outside = tempfile::tempdir().unwrap();
+    init_for_test(outside.path(), InitKind::Place, false);
+
+    let at_root = fs::read_to_string(repo.path().join(CI_WORKFLOW_PATH)).unwrap();
+    let not_in_repo = fs::read_to_string(outside.path().join(CI_WORKFLOW_PATH)).unwrap();
+    // Only the project name in the header comment differs.
+    let body = |workflow: &str| workflow.lines().skip(1).collect::<Vec<_>>().join("\n");
+    assert_eq!(body(&at_root), body(&not_in_repo));
+    assert!(!at_root.contains("working-directory"));
+    assert!(at_root.contains("\nname: Rojo\n"));
 }
