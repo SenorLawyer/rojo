@@ -803,13 +803,14 @@ function ServeSession:__backUpBeforeCatchUp(patch, serverInfo)
 	end
 	local captured = {}
 	local guarded = {}
+	local serializedRoots = {}
 	local ok, result = pcall(function()
 		assert(
 			serverInfo.studioBridge ~= nil,
 			"the server was not started with --studio-token-file, so it cannot save backups"
 		)
 		local model, described, unreadable, unarchivable
-		model, described, unreadable, captured, unarchivable, guarded =
+		model, described, unreadable, captured, unarchivable, guarded, serializedRoots =
 			StudioBackup.serialize(roots, ServeSession.readEditorText)
 		if #unarchivable > 0 then
 			-- Studio does not save instances that are not Archivable, nor
@@ -844,11 +845,7 @@ function ServeSession:__backUpBeforeCatchUp(patch, serverInfo)
 			id,
 			id
 		)
-		local backedUpRoots = {}
-		for _, root in roots do
-			table.insert(backedUpRoots, root.instance)
-		end
-		return captured, guarded, backedUpRoots
+		return captured, guarded, serializedRoots
 	else
 		local paths = {}
 		for _, root in roots do
@@ -1586,8 +1583,10 @@ function ServeSession:__replaceInstances(idList)
 		})
 	end
 
-	-- Replacements left out, which stay unapplied.
+	-- Replacements left out, which stay unapplied, and every swap that did
+	-- not happen, whose reference repairs are not applied either.
 	local skipped = {}
+	local notSwapped = {}
 	for _, swap in orderSwaps(swaps) do
 		local id, replacement, oldInstance = swap.id, swap.replacement, swap.oldInstance
 
@@ -1601,6 +1600,7 @@ function ServeSession:__replaceInstances(idList)
 				oldInstance:GetFullName()
 			)
 			skipped[id] = true
+			notSwapped[id] = true
 			replacement:Destroy()
 			continue
 		end
@@ -1634,6 +1634,7 @@ function ServeSession:__replaceInstances(idList)
 				if replacement.ClassName ~= oldInstance.ClassName then
 					self.__heldWipes[id].deferredClass = replacement.ClassName
 				end
+				notSwapped[id] = true
 				replacement:Destroy()
 				continue
 			end
@@ -1676,6 +1677,7 @@ function ServeSession:__replaceInstances(idList)
 			attemptReparent(oldInstance, oldParent)
 
 			-- Our replacement should never have existed in the first place, so we can just destroy it.
+			notSwapped[id] = true
 			replacement:Destroy()
 			continue
 		end
@@ -1687,12 +1689,35 @@ function ServeSession:__replaceInstances(idList)
 		end
 	end
 
+	-- Past the backup's protection, the reference repairs are left
+	-- unapplied too, like the swaps that came too late.
+	if self:__catchUpTooLate() then
+		Selection:Set(selection)
+		return true, refPatch, skipped
+	end
+	-- Repairs for a swap that did not happen would point the old instance at
+	-- references meant for its replacement, so they stay unapplied.
+	local applicable = PatchSet.newEmpty()
+	applicable.added = refPatch.added
+	applicable.removed = refPatch.removed
+	local excluded = {}
+	for _, update in refPatch.updated do
+		if notSwapped[update.id] then
+			table.insert(excluded, update)
+		else
+			table.insert(applicable.updated, update)
+		end
+	end
+
 	-- Restore the selection even if applying references fails, since the
 	-- swapped instances are already in place.
-	local patchApplySuccess, unappliedPatch = pcall(self.__reconciler.applyPatch, self.__reconciler, refPatch)
+	local patchApplySuccess, unappliedPatch = pcall(self.__reconciler.applyPatch, self.__reconciler, applicable)
 	Selection:Set(selection)
 	if not patchApplySuccess then
 		error(unappliedPatch, 0)
+	end
+	for _, update in excluded do
+		table.insert(unappliedPatch.updated, update)
 	end
 	return true, unappliedPatch, skipped
 end
@@ -1837,27 +1862,63 @@ end
 -- text is now an edit made since, for the warning that such edits were
 -- overwritten. Reading editor text does not yield, so nothing can change
 -- between this and the changes that follow it.
-function ServeSession:__noteEditsBeforeApply()
+function ServeSession:__noteEditsBeforeApply(patch)
 	local guarded = self.__catchUpGuarded
 	if guarded == nil then
 		return
 	end
-	for instance in guarded do
-		if self:__isEditSinceBackup(instance, ServeSession.readEditorText(instance)) then
-			self:__noteOverwrittenEdit(instance:GetFullName())
+	local roots = self.__catchUpRoots or {}
+	local function inBackup(instance)
+		for _, root in roots do
+			if instance == root or instance:IsDescendantOf(root) then
+				return true
+			end
+		end
+		return false
+	end
+	-- What the patch removes, with everything inside it, and what it
+	-- changes or replaces. Only these lose anything; the rest is untouched.
+	local affected = {}
+	for _, removed in patch.removed do
+		local instance = if typeof(removed) == "Instance" then removed else self.__instanceMap.fromIds[removed]
+		if instance then
+			affected[instance] = true
+			local ok, descendants = pcall(instance.GetDescendants, instance)
+			for _, descendant in if ok then descendants else {} do
+				affected[descendant] = true
+			end
 		end
 	end
-	-- Scripts added under the backed-up instances while the backup was
-	-- prepared are not in it at all. Listing them does not yield either.
-	for _, root in self.__catchUpRoots or {} do
-		local ok, descendants = pcall(root.GetDescendants, root)
+	for _, update in patch.updated do
+		local instance = self.__instanceMap.fromIds[update.id]
+		local changes = update.changedName ~= nil
+			or update.changedClassName ~= nil
+			or (update.changedProperties ~= nil and next(update.changedProperties) ~= nil)
+		if instance and changes then
+			affected[instance] = true
+		end
+	end
+	for instance in affected do
+		local ok, path = pcall(instance.GetFullName, instance)
 		if not ok then
 			continue
 		end
-		table.insert(descendants, root)
-		for _, descendant in descendants do
-			if descendant:IsA("LuaSourceContainer") and guarded[descendant] == nil then
-				self:__noteOverwrittenEdit(descendant:GetFullName())
+		if not inBackup(instance) then
+			-- Moved out of what was serialized while the backup was made, so
+			-- the backup does not hold it. Services were never in it, which
+			-- the warning about them already says.
+			local service = instance == game or instance.Parent == game
+			if not service then
+				self:__noteOverwrittenEdit(path)
+			end
+		elseif instance:IsA("LuaSourceContainer") then
+			-- Added under a backed-up instance after the backup captured
+			-- the scripts, or edited since.
+			if
+				guarded[instance] == nil
+				or self:__isEditSinceBackup(instance, ServeSession.readEditorText(instance))
+			then
+				self:__noteOverwrittenEdit(path)
 			end
 		end
 	end
@@ -1901,7 +1962,7 @@ function ServeSession:__noteOverwrittenEdit(path)
 			text ..= string.format(" and %d more", #paths - MAX_OVERWRITTEN_NAMED)
 		end
 		Log.warn(
-			"The sync after connecting overwrote or removed scripts edited or added in Studio after Rojo backed them up, so the backup does not hold their newest text: {}",
+			"The sync after connecting changed or removed these, which the backup Rojo took does not hold as they are now, since they were edited, added or moved in Studio after it: {}",
 			text
 		)
 	end)
@@ -2013,7 +2074,7 @@ function ServeSession:__applyPatchInRecording(patch)
 		self.__catchUpExpired = true
 		return patch
 	end
-	self:__noteEditsBeforeApply()
+	self:__noteEditsBeforeApply(patch)
 
 	local reconcilerPatch, sourceWrites = self:__splitSourceWrites(patch)
 	local unappliedPatch = self.__reconciler:applyPatch(reconcilerPatch)

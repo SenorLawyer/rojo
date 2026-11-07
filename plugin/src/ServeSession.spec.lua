@@ -1539,7 +1539,7 @@ return function()
 			end)
 			expect(module.Source).to.equal("return 'disk'")
 			expect(#warnings).to.equal(1)
-			expect(warnings[1].template:find("edited or added in Studio after Rojo backed them up", 1, true)).to.be.ok()
+			expect(warnings[1].template:find("does not hold as they are now", 1, true)).to.be.ok()
 			expect(warnings[1].args[1]:find("Captured", 1, true)).to.be.ok()
 		end)
 
@@ -1738,7 +1738,7 @@ return function()
 			end)
 			expect(module.Parent).to.equal(nil)
 			expect(#warnings).to.equal(1)
-			expect(warnings[1].template:find("edited or added in Studio after Rojo backed them up", 1, true)).to.be.ok()
+			expect(warnings[1].template:find("does not hold as they are now", 1, true)).to.be.ok()
 			expect(warnings[1].args[1]:find("EditedDuringPrecommit", 1, true)).to.be.ok()
 		end)
 
@@ -1829,6 +1829,99 @@ return function()
 			local ok, err = pending:await()
 			expect(ok).to.equal(false)
 			expect(tostring(err):find("Reconnect to take a fresh backup", 1, true)).to.be.ok()
+		end)
+
+		-- A folder in the reconnect backup holding a captured script, and
+		-- `body(folder, child)` run with warnings recorded.
+		local function withBackedUpFolder(body)
+			local hashSource = require(script.Parent.hashSource)
+			local nativeRead = ServeSession.readEditorText
+			local folder = Instance.new("Folder")
+			folder.Name = "Parent"
+			folder.Parent = fixture
+			local child = Instance.new("ModuleScript")
+			child.Name = "Child"
+			child.Source = "return 'captured'"
+			child.Parent = folder
+			session.__instanceMap:insert("PARENT", folder)
+			session.__instanceMap:insert("CHILD", child)
+			session.__status = ServeSession.Status.Connected
+			return recordingWarnings(function()
+				ServeSession.readEditorText = function(instance)
+					return instance.Source
+				end
+				session.__catchUpGuarded = { [child] = (hashSource("return 'captured'")) }
+				session.__catchUpRoots = { folder }
+				body(folder, child)
+				session.__catchUpGuarded = nil
+				session.__catchUpRoots = nil
+				ServeSession.readEditorText = nativeRead
+				task.wait(0.8)
+			end)
+		end
+
+		it("names an affected script moved out of a backed-up instance during preparation", function()
+			local warnings = withBackedUpFolder(function(_, child)
+				-- Moved out after the backup captured it, so the serialized
+				-- folder no longer holds it, yet the patch still changes it.
+				child.Parent = fixture
+				local patch = PatchSet.newEmpty()
+				table.insert(patch.updated, { id = "CHILD", changedName = "Renamed" })
+				session:__applyPatch(patch)
+			end)
+			expect(#warnings).to.equal(1)
+			expect(warnings[1].args[1]:find("Child", 1, true)).to.be.ok()
+		end)
+
+		it("does not name a script the patch leaves alone", function()
+			local child
+			local warnings = withBackedUpFolder(function(folder, script)
+				child = script
+				-- Edited, but only its parent changes.
+				script.Source = "return 'edited, but not touched by the sync'"
+				local patch = PatchSet.newEmpty()
+				table.insert(patch.updated, { id = "PARENT", changedName = "Renamed" })
+				session:__applyPatch(patch)
+				expect(folder.Name).to.equal("Renamed")
+			end)
+			expect(child.Source).to.equal("return 'edited, but not touched by the sync'")
+			expect(#warnings).to.equal(0)
+		end)
+
+		it("leaves the fallback's reference repairs unapplied once the backup's protection ran out", function()
+			local module = backedUpModule("LateRefs", "return 'studio'")
+			local nativeClock = ServeSession.clock
+			local unapplied
+			recordingWarnings(function()
+				ServeSession.clock = function()
+					return 1000
+				end
+				session.__catchUpWriteDeadline = 500
+				api.serialize = function()
+					return Promise.resolve({ modelContents = buffer.create(0), missingIds = {} })
+				end
+				local refPatch = PatchSet.newEmpty()
+				table.insert(refPatch.updated, { id = "LateRefs", changedProperties = { Value = { Ref = "OTHER" } } })
+				api.refPatch = function()
+					return Promise.resolve({ patch = refPatch })
+				end
+				session.__deserializeInstances = function()
+					local container = Instance.new("Folder")
+					local pointer = Instance.new("ObjectValue")
+					pointer.Name = "LateRefs"
+					pointer.Value = Instance.new("ModuleScript")
+					pointer.Parent = container
+					return { container }
+				end
+				local ok
+				ok, unapplied = session:__replaceInstances({ "LateRefs" })
+				expect(ok).to.equal(true)
+				session.__catchUpWriteDeadline = nil
+				ServeSession.clock = nativeClock
+			end)
+			expect(session.__instanceMap.fromIds.LateRefs).to.equal(module)
+			expect(#unapplied.updated).to.equal(1)
+			expect(unapplied.updated[1].id).to.equal("LateRefs")
 		end)
 
 		it("takes no backup when it is turned off", function()

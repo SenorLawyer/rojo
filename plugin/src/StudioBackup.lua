@@ -356,7 +356,8 @@ end
 	- the paths of instances that are not Archivable and so not in it;
 	- `guarded`, mapping every script in the backup to the hash of the text
 	  it holds, or `false` when that text could not be read, so a later write
-	  can tell whether it would overwrite what the backup does not hold.
+	  can tell whether it would overwrite what the backup does not hold;
+	- the root instances serialized, without those left out.
 ]]
 function StudioBackup.serialize(roots, readEditor)
 	local started = StudioBackup.clock()
@@ -486,7 +487,11 @@ function StudioBackup.serialize(roots, readEditor)
 	if not ok then
 		error(result, 0)
 	end
-	return result, described, unreadable, captured, unarchivable, guarded
+	local serialized = {}
+	for _, root in roots do
+		table.insert(serialized, root.instance)
+	end
+	return result, described, unreadable, captured, unarchivable, guarded, serialized
 end
 
 --[[
