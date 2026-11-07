@@ -1,0 +1,120 @@
+# Checks {project_name} on GitHub Actions. Created by `rojo init` (Rojo
+# {rojo_version}), which never overwrites this file, so edit it freely.
+#
+# The check job runs `rojo packages doctor` and `rojo typecheck` on every push
+# and pull request. It needs no setup.
+#
+# The test job runs the place's *.spec modules with `rojo test --cloud`
+# through Open Cloud Luau Execution. It is skipped until all three of these
+# are set under Settings > Secrets and variables > Actions:
+#
+#   Secret   ROBLOX_API_KEY    An Open Cloud API key for the test experience
+#                              with the universe-places:write and
+#                              universe.place.luau-execution-session:read and
+#                              :write scopes.
+#   Variable TEST_UNIVERSE_ID  The experience (universe) ID.
+#   Variable TEST_PLACE_ID     A place set aside for testing. Every run saves
+#                              the build to it as a new, unpublished version.
+#
+# The place also needs TestEZ or Jest Lua mapped into it and at least one
+# *.spec module, or the test job fails. `rojo doc --agent testing` explains
+# both. The test job runs on pushes, not pull requests, so a branch with an
+# open pull request is not tested twice. Pull requests from forks get no
+# secrets, so their runs skip it.
+#
+# If the project uses Wally or pesde packages, install them before the type
+# check step so their modules are in the sourcemap.
+
+name: Rojo
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  ROJO_VERSION: "{rojo_version}"
+  LUAU_LSP_VERSION: "1.70.1"
+
+jobs:
+  check:
+    name: Packages and types
+    runs-on: ubuntu-latest
+    outputs:
+      cloud-tests: ${{ steps.cloud.outputs.configured }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rojo and luau-lsp
+        run: |
+          mkdir -p "$RUNNER_TEMP/tools/bin"
+          cd "$RUNNER_TEMP/tools"
+          curl -fsSLO "https://github.com/SenorLawyer/rojo/releases/download/v$ROJO_VERSION/rojo-$ROJO_VERSION-linux-x86_64.zip"
+          curl -fsSLO "https://github.com/SenorLawyer/rojo/releases/download/v$ROJO_VERSION/SHA256SUMS"
+          sha256sum --check --ignore-missing SHA256SUMS
+          curl -fsSLO "https://github.com/JohnnyMorganz/luau-lsp/releases/download/$LUAU_LSP_VERSION/luau-lsp-linux-x86_64.zip"
+          unzip -o "rojo-$ROJO_VERSION-linux-x86_64.zip" -d bin
+          unzip -o luau-lsp-linux-x86_64.zip -d bin
+          chmod +x bin/rojo bin/luau-lsp
+          curl -fsSL -o globalTypes.d.luau "https://raw.githubusercontent.com/JohnnyMorganz/luau-lsp/$LUAU_LSP_VERSION/scripts/globalTypes.d.luau"
+          echo "$RUNNER_TEMP/tools/bin" >> "$GITHUB_PATH"
+
+      - name: Check packages
+        run: rojo packages doctor
+
+      - name: Type check
+        run: rojo typecheck --definitions "$RUNNER_TEMP/tools/globalTypes.d.luau" -- "--ignore=**/Packages/**" --formatter=gnu
+
+      # Secrets cannot be read in a job's `if`, so this step tells the test
+      # job whether it can run.
+      - name: Look for cloud test settings
+        id: cloud
+        env:
+          CONFIGURED: ${{ secrets.ROBLOX_API_KEY != '' && vars.TEST_UNIVERSE_ID != '' && vars.TEST_PLACE_ID != '' }}
+        run: |
+          echo "configured=$CONFIGURED" >> "$GITHUB_OUTPUT"
+          if [ "$CONFIGURED" != "true" ]; then
+            echo "::notice::rojo test --cloud is skipped until ROBLOX_API_KEY, TEST_UNIVERSE_ID and TEST_PLACE_ID are set. See the top of .github/workflows/rojo.yml."
+          fi
+
+  test:
+    name: Cloud tests
+    needs: check
+    if: needs.check.outputs.cloud-tests == 'true' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    # Luau Execution limits how many tasks run at once, and each run saves a
+    # version of the same place, so this workflow's test runs do not overlap.
+    # GitHub keeps at most one waiting run per group: a newer push replaces
+    # an older run that has not started yet. The group is named after the
+    # workflow, so other projects' workflows in the repository do not
+    # replace this one's runs.
+    concurrency:
+      group: rojo-cloud-tests-${{ github.workflow }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rojo
+        run: |
+          mkdir -p "$RUNNER_TEMP/tools/bin"
+          cd "$RUNNER_TEMP/tools"
+          curl -fsSLO "https://github.com/SenorLawyer/rojo/releases/download/v$ROJO_VERSION/rojo-$ROJO_VERSION-linux-x86_64.zip"
+          curl -fsSLO "https://github.com/SenorLawyer/rojo/releases/download/v$ROJO_VERSION/SHA256SUMS"
+          sha256sum --check --ignore-missing SHA256SUMS
+          unzip -o "rojo-$ROJO_VERSION-linux-x86_64.zip" -d bin
+          chmod +x bin/rojo
+          echo "$RUNNER_TEMP/tools/bin" >> "$GITHUB_PATH"
+
+      - name: Run specs
+        env:
+          ROBLOX_API_KEY: ${{ secrets.ROBLOX_API_KEY }}
+          TEST_UNIVERSE_ID: ${{ vars.TEST_UNIVERSE_ID }}
+          TEST_PLACE_ID: ${{ vars.TEST_PLACE_ID }}
+        run: rojo test --cloud --universe-id "$TEST_UNIVERSE_ID" --place-id "$TEST_PLACE_ID"

@@ -65,7 +65,9 @@ rojo typecheck default.project.json --definitions globalTypes.d.luau -- "--ignor
 
 ## GitHub Actions
 
-This job checks a game repository whose `rokit.toml` lists this fork's Rojo and luau-lsp:
+`rojo init` creates `.github/workflows/rojo.yml` for new projects (pass `--no-ci` to leave it out), or `.github/workflows/rojo-<project path>-<hash>.yml` at the root of the Git repository the project is created in, set to run in the project's folder. It downloads pinned releases of this fork's Rojo and of luau-lsp, and Roblox's definitions from the same luau-lsp release (the PluginSecurity ones for plugins), then runs `rojo packages doctor` and `rojo typecheck`. It does not use Rokit or the project's `rokit.toml`.
+
+In a repository that uses Rokit, this job checks a game repository whose `rokit.toml` lists this fork's Rojo and luau-lsp:
 
 ```toml
 [tools]
