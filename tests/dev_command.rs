@@ -238,17 +238,16 @@ fn dev_serves_keeps_the_sourcemap_current_and_is_found_by_rojo_studio() {
     let result = studio.output().unwrap();
     let stdout = String::from_utf8_lossy(&result.stdout);
     let stderr = String::from_utf8_lossy(&result.stderr);
+    // It fails closed: no fallback to the default port, which may be another
+    // worktree's server, and nothing from the other project's server.
+    assert_eq!(result.status.code(), Some(2), "{stdout}\n{stderr}");
     assert!(
-        stderr.contains("Ignoring the rojo dev recorded")
-            && stderr.contains("not the one rojo dev recorded"),
+        stderr.contains("could not be confirmed")
+            && stderr.contains("not the one rojo dev recorded")
+            && stderr.contains("--address and --token-file"),
         "{stderr}"
     );
-    // The command falls back to the default address, where nothing or some
-    // unrelated server answers, but never the other project's server.
-    if let Ok(answer) = serde_json::from_str::<serde_json::Value>(&stdout) {
-        let workspace = answer["identity"]["workspacePath"].as_str().unwrap_or("");
-        assert!(!workspace.ends_with("other"), "{stdout}");
-    }
+    assert!(stdout.trim().is_empty(), "{stdout}");
 }
 
 /// Unix gets the Ctrl+C path: SIGINT must stop the server, remove the state

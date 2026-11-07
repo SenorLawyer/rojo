@@ -77,29 +77,44 @@ as before. When either is given, nothing changes: the other keeps its old
 default (`http://127.0.0.1:34872`, or no token). When both are left out, they
 use the `dev.json` of the worktree they run in (`rojo mcp`: the worktree of
 its `--project`, looked up on every tool call, so a restarted `rojo dev` on
-another port is found), then `http://127.0.0.1:34872` and the shared
+another port is found; a cancellation goes to the server its command was sent
+to), and only when there is no record, `http://127.0.0.1:34872` and the shared
 `studio-token` if it exists. Outside Git, `dev.json` is found from the
 project folder or any folder below it.
 
-A record is only used once it is confirmed: the process it names must still
-run, and the server on its address must report, over the token-authenticated
-`/api/studio/sessions` route, the same serve session ID and canonical project
-file that `rojo dev` recorded. The session ID is random for every start, so a
-server that took the port later, even another worktree's `rojo dev` with the
-shared token, does not match. A record that fails is ignored with a warning
-on stderr, and the command uses the defaults.
+A record is only used once it is confirmed: its address must be loopback,
+the process it names must still run, and the server on its address must
+report, over the token-authenticated `/api/studio/sessions` route, the same
+serve session ID and canonical project file that `rojo dev` recorded. The
+session ID is random for every start, so a server that took the port later,
+even another worktree's `rojo dev` with the shared token, does not match. The
+check waits up to 20 seconds, longer than the bridge holds a request while Git
+is busy, and never follows a redirect.
+
+A record that cannot be confirmed is an error (exit status 2), not a reason
+to try the default address: that server is often another worktree's, such as
+the main checkout's, and a command meant for this worktree's Studio must not
+run against it. The error says to restart `rojo dev`, pass `--address` and
+`--token-file`, or delete the record.
 
 `dev.json` is removed when `rojo dev` stops on Ctrl+C, Ctrl+Break, closing the
 console window, SIGTERM or SIGHUP. A `rojo dev` that is killed leaves it
-behind until the next `rojo dev` in that worktree replaces it, and the check
-above ignores it meanwhile. Two `rojo dev` in one worktree share one
+behind, so flagless commands in that worktree fail until `rojo dev` starts
+there again or the file is deleted. Two `rojo dev` in one worktree share one
 `dev.json`, and the last one started wins.
+
+Requests that carry the Studio token, from `rojo studio`, `rojo test` and this
+check, never follow redirects, since the HTTP client would otherwise send the
+token on to wherever a redirect points.
 
 ## Ports and tokens
 
 Before taking a port, `rojo dev` checks that nothing holds it on the listen
 address, on 127.0.0.1 or ::1, or on either wildcard address, since the plugin
-connects to `localhost`, which can resolve to either. Several worktrees can
+connects to `localhost`, which can resolve to either. It then binds the port
+at once and holds it while it sets up. If another launch took an
+automatically chosen port in between, it tries the next one (up to 8 ports);
+a port from `--port` or `servePort` is never swapped. Several worktrees can
 start `rojo dev` for the first time at once: the token is written whole to a
 private temporary file and hard-linked into place, which never replaces an
 existing token, so they all end up with the same one. A token file that is

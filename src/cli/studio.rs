@@ -336,17 +336,14 @@ impl StudioCommand {
             self.address.as_deref(),
             self.token_file.as_deref(),
             &std::env::current_dir().unwrap_or_default(),
-        );
+        )?;
         let address = local_address(&address)?;
         let token_file = token_file.context(super::dev::MISSING_TOKEN)?;
         let token = read_token_file(&token_file)?;
         // Outlast the server's own bound on a command, so a slow command (for
         // example while Git is busy) reports the server's answer, not a
         // timeout that leaves the command running in Studio.
-        let client = Client::builder()
-            .timeout(MAX_COMMAND_REQUEST + Duration::from_secs(5))
-            .no_proxy()
-            .build()?;
+        let client = bridge_client(MAX_COMMAND_REQUEST + Duration::from_secs(5))?;
         if matches!(self.command, StudioSubcommand::Sessions) {
             let result = request(&client, &address, token.trim(), None)?;
             // Scripts parse stdout, which stays JSON. The summary is for
@@ -1177,6 +1174,18 @@ fn json_escape_controls(json: String) -> String {
         }
     }
     escaped
+}
+
+/// A client for requests that carry the Studio token. It ignores proxies and
+/// never follows redirects: reqwest keeps custom headers such as the token
+/// when it follows a redirect to another host, so a local server answering
+/// with a redirect could otherwise send the token anywhere.
+pub(super) fn bridge_client(timeout: Duration) -> reqwest::Result<Client> {
+    Client::builder()
+        .timeout(timeout)
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
 }
 
 pub(super) fn local_address(address: &str) -> anyhow::Result<Url> {

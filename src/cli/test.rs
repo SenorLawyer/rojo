@@ -16,7 +16,6 @@ use std::{
 
 use anyhow::Context;
 use clap::{ArgEnum, Parser};
-use reqwest::blocking::Client;
 use serde::Serialize;
 use serde_json::{json, Value};
 
@@ -865,14 +864,11 @@ impl TestCommand {
             self.address.as_deref(),
             self.token_file.as_deref(),
             &std::env::current_dir().unwrap_or_default(),
-        );
+        )?;
         let address = local_address(&address)?;
         let token_file = token_file.context(super::dev::MISSING_TOKEN)?;
         let token = read_token_file(&token_file)?;
-        let client = Client::builder()
-            .timeout(client_timeout(self.timeout))
-            .no_proxy()
-            .build()?;
+        let client = super::studio::bridge_client(client_timeout(self.timeout))?;
         let unreachable = "Could not reach local Studio bridge. Start rojo serve with --studio-token-file and connect Studio.";
 
         let session = if let Some(session) = &self.session {

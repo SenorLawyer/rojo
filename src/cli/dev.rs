@@ -43,6 +43,10 @@ const SOURCEMAP_FILE: &str = "sourcemap.json";
 /// The address `rojo studio`, `rojo test` and `rojo mcp` use when neither a
 /// flag nor a running `rojo dev` says otherwise.
 pub(super) const DEFAULT_STUDIO_ADDRESS: &str = "http://127.0.0.1:34872";
+/// How long confirming a recorded `rojo dev` may take: longer than the
+/// bridge holds a request while Git is busy.
+const VERIFY_TIMEOUT: Duration =
+    Duration::from_secs(crate::web::studio::GIT_WAIT_LIMIT.as_secs() + 5);
 /// The error for a Studio command that found no token file.
 pub(super) const MISSING_TOKEN: &str = "Pass --token-file with the secret file used by rojo serve --studio-token-file, or start `rojo dev`, which creates one these commands find on their own";
 /// Linked worktrees get ports from this range, starting at a slot chosen by
@@ -124,7 +128,9 @@ impl DevCommand {
             .address
             .or_else(|| session.serve_address())
             .unwrap_or(DEFAULT_BIND_ADDRESS.into());
-        let (port, port_source) = pick_port(
+        // Bound now and held until the server starts, so the setup below
+        // cannot lose the port to another launch.
+        let (listener, port, port_source) = bind_port(
             &PortRequest {
                 flag: self.port,
                 project: session.project_port(),
@@ -132,6 +138,7 @@ impl DevCommand {
                 slot: worktree_slot(&checkout.root),
             },
             |port| port_is_free(ip, port),
+            |port| TcpListener::bind(SocketAddr::new(ip, port)),
         )?;
 
         let token_file = match self.studio_token_file {
@@ -195,8 +202,8 @@ impl DevCommand {
         };
 
         let server = LiveServer::new(Arc::clone(&session)).with_studio_token_file(&token_file)?;
-        let result = server.start_until(
-            (ip, port).into(),
+        let result = server.start_on_until(
+            listener,
             allowed_hosts,
             || {
                 if let Some(state) = &state {
@@ -346,21 +353,24 @@ impl DevState {
 /// When either flag is given, the command behaves as it did before `rojo
 /// dev` existed: the other one keeps its old default (the default address,
 /// or no token), so an explicit invocation never goes somewhere new. With
-/// neither, a `rojo dev` running in the worktree around `start` is used once
-/// it is confirmed to be live (see [`verify`]), then the default address and
-/// the token `rojo dev` creates. Nothing here fails: when discovery does not
-/// work, the command falls back to the defaults and reports a connection or
-/// token error as before.
+/// neither, a `rojo dev` recorded for the worktree around `start` is used
+/// once it is confirmed to be live (see [`verify`]); without a record, the
+/// default address and the token `rojo dev` creates.
+///
+/// A record that cannot be confirmed is an error rather than a reason to try
+/// the default address: that server is often another worktree's, the main
+/// checkout's for example, and a command meant for this worktree's Studio
+/// must not run against it.
 pub(super) fn bridge_target(
     address: Option<&str>,
     token_file: Option<&Path>,
     start: &Path,
-) -> (String, Option<PathBuf>) {
+) -> anyhow::Result<(String, Option<PathBuf>)> {
     if address.is_some() || token_file.is_some() {
-        return (
+        return Ok((
             address.unwrap_or(DEFAULT_STUDIO_ADDRESS).to_owned(),
             token_file.map(Path::to_owned),
-        );
+        ));
     }
     // `rojo mcp --project` may name the project file rather than its folder.
     let start = match start.parent() {
@@ -372,19 +382,28 @@ pub(super) fn bridge_target(
         .as_ref()
         .and_then(|checkout| find_running(checkout, start))
     {
-        match verify(&state) {
-            Ok(()) => return (state.address, Some(state.token_file)),
-            Err(reason) => log::warn!(
-                "Ignoring the rojo dev recorded in {}: {reason}. Using {DEFAULT_STUDIO_ADDRESS} instead.",
-                path.display()
-            ),
-        }
+        return use_record(&path, state);
     }
     let token_file = checkout.and_then(|checkout| {
         let default = checkout.shared_state.join(TOKEN_FILE);
         default.is_file().then_some(default)
     });
-    (DEFAULT_STUDIO_ADDRESS.to_owned(), token_file)
+    Ok((DEFAULT_STUDIO_ADDRESS.to_owned(), token_file))
+}
+
+/// The bridge a confirmed record names, or an error when it cannot be
+/// confirmed (see [`bridge_target`]).
+fn use_record(path: &Path, state: DevState) -> anyhow::Result<(String, Option<PathBuf>)> {
+    match verify(&state) {
+        Ok(()) => Ok((state.address, Some(state.token_file))),
+        Err(reason) => Err(super::UsageError(anyhow::anyhow!(
+            "This worktree's rojo dev, recorded in {}, could not be confirmed: {reason}. \
+             Restart `rojo dev` here, or pass --address and --token-file for the server to use. \
+             Delete that file if no rojo dev should run here.",
+            path.display()
+        ))
+        .into()),
+    }
 }
 
 /// The state a `rojo dev` recorded for this worktree, and where. Outside Git
@@ -415,12 +434,9 @@ fn verify(state: &DevState) -> Result<(), String> {
     let base = studio::local_address(&state.address).map_err(|err| format!("{err:#}"))?;
     let token =
         crate::web::studio::read_token_file(&state.token_file).map_err(|err| format!("{err:#}"))?;
-    let client = reqwest::blocking::Client::builder()
-        .connect_timeout(Duration::from_secs(3))
-        .timeout(Duration::from_secs(5))
-        .no_proxy()
-        .build()
-        .map_err(|err| err.to_string())?;
+    // The bridge may hold a request while Git is busy, so a shorter wait
+    // would reject a live server whose repository is mid-checkout.
+    let client = studio::bridge_client(VERIFY_TIMEOUT).map_err(|err| err.to_string())?;
     let url = base
         .join("api/studio/sessions")
         .map_err(|err| err.to_string())?;
@@ -428,10 +444,24 @@ fn verify(state: &DevState) -> Result<(), String> {
         .get(url)
         .header("x-rojo-studio-token", token)
         .send()
-        .map_err(|_| format!("nothing answered on {}", state.address))?;
+        .map_err(|err| {
+            if err.is_timeout() {
+                format!("the server on {} did not answer in time", state.address)
+            } else {
+                format!("nothing answered on {}", state.address)
+            }
+        })?;
+    // Redirects are not followed (see `bridge_client`), and one is never
+    // the bridge's answer.
+    if !response.status().is_success() {
+        return Err(format!(
+            "the server on {} answered with HTTP {}",
+            state.address,
+            response.status()
+        ));
+    }
     let identity: serde_json::Value = response
-        .error_for_status()
-        .and_then(|response| response.json())
+        .json()
         .map_err(|_| format!("the server on {} is not its Studio bridge", state.address))?;
     let identity = &identity["identity"];
     let same_session = identity["serverSession"].as_str() == Some(state.server_session.as_str());
@@ -509,6 +539,45 @@ fn worktree_slot(root: &Path) -> u16 {
     let hash = blake3::hash(root.to_string_lossy().as_bytes());
     let bytes = hash.as_bytes();
     u16::from_le_bytes([bytes[0], bytes[1]]) % WORKTREE_PORTS
+}
+
+/// How many automatically chosen ports `bind_port` tries before giving up.
+const BIND_ATTEMPTS: usize = 8;
+
+/// Picks a port with [`pick_port`] and binds it with `bind`. Another launch
+/// can take an automatically chosen port between the probe and the bind; that
+/// port is then skipped and the next one tried. A port from `--port` or
+/// `servePort` is never swapped, so its bind failing is an error.
+fn bind_port<L>(
+    request: &PortRequest,
+    is_free: impl Fn(u16) -> bool,
+    mut bind: impl FnMut(u16) -> std::io::Result<L>,
+) -> anyhow::Result<(L, u16, PortSource)> {
+    let mut lost = Vec::new();
+    loop {
+        let (port, source) = pick_port(request, |port| !lost.contains(&port) && is_free(port))?;
+        match bind(port) {
+            Ok(listener) => return Ok((listener, port, source)),
+            Err(err)
+                if matches!(source, PortSource::Default | PortSource::Worktree)
+                    && matches!(
+                        err.kind(),
+                        std::io::ErrorKind::AddrInUse | std::io::ErrorKind::PermissionDenied
+                    )
+                    && lost.len() + 1 < BIND_ATTEMPTS =>
+            {
+                log::debug!("Port {port} was taken before rojo dev could bind it; trying another");
+                lost.push(port);
+            }
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!(
+                        "Could not listen on port {port}. Another rojo serve or rojo dev may have taken it; pass another --port."
+                    )
+                })
+            }
+        }
+    }
 }
 
 /// Picks the port to serve on. A port from `--port` or the project's
@@ -809,17 +878,31 @@ impl SourcemapWriter {
         &self,
         generate: impl FnOnce() -> anyhow::Result<Vec<u8>>,
     ) -> Option<anyhow::Result<bool>> {
+        let mut last = self.lock();
+        // Checked under the lock: a write that just finished may have
+        // cleared it.
         if !self.is_dirty() {
             return None;
         }
-        Some(self.generate_and_write(generate))
+        Some(self.generate_and_write_locked(&mut last, generate))
     }
 
+    /// Generates and writes under one lock, so two writers cannot cross: a
+    /// map generated earlier can never land after, and replace, a newer one.
     fn generate_and_write(
         &self,
         generate: impl FnOnce() -> anyhow::Result<Vec<u8>>,
     ) -> anyhow::Result<bool> {
-        let result = generate().and_then(|bytes| self.write_if_changed(bytes));
+        let mut last = self.lock();
+        self.generate_and_write_locked(&mut last, generate)
+    }
+
+    fn generate_and_write_locked(
+        &self,
+        last: &mut Option<Vec<u8>>,
+        generate: impl FnOnce() -> anyhow::Result<Vec<u8>>,
+    ) -> anyhow::Result<bool> {
+        let result = generate().and_then(|bytes| self.write_locked(last, bytes));
         self.dirty.store(result.is_err(), Ordering::SeqCst);
         result
     }
@@ -836,8 +919,12 @@ impl SourcemapWriter {
         self.generate_and_write(|| generate_sourcemap(session))
     }
 
+    #[cfg(test)]
     fn write_if_changed(&self, bytes: Vec<u8>) -> anyhow::Result<bool> {
-        let mut last = self.lock();
+        self.generate_and_write(|| Ok(bytes))
+    }
+
+    fn write_locked(&self, last: &mut Option<Vec<u8>>, bytes: Vec<u8>) -> anyhow::Result<bool> {
         if last.is_none() {
             // An unchanged file from an earlier run is left alone, so editors
             // watching it do not reload for nothing.
@@ -1230,7 +1317,8 @@ mod test {
             Some("http://127.0.0.1:1"),
             Some(Path::new("token")),
             Path::new("/does/not/exist"),
-        );
+        )
+        .unwrap();
         assert_eq!(address, "http://127.0.0.1:1");
         assert_eq!(token, Some(PathBuf::from("token")));
     }
@@ -1240,10 +1328,10 @@ mod test {
         // The current directory is this repository's worktree, where a
         // `rojo dev` record could exist; neither call may consult it.
         let here = std::env::current_dir().unwrap();
-        let (address, token) = bridge_target(None, Some(Path::new("token")), &here);
+        let (address, token) = bridge_target(None, Some(Path::new("token")), &here).unwrap();
         assert_eq!(address, DEFAULT_STUDIO_ADDRESS);
         assert_eq!(token, Some(PathBuf::from("token")));
-        let (address, token) = bridge_target(Some("http://127.0.0.1:1"), None, &here);
+        let (address, token) = bridge_target(Some("http://127.0.0.1:1"), None, &here).unwrap();
         assert_eq!(address, "http://127.0.0.1:1");
         assert_eq!(token, None);
     }
@@ -1266,6 +1354,19 @@ mod test {
     /// Answers one HTTP request with `body` as JSON, and returns the
     /// address to reach it and the request it got.
     fn answer_once(body: serde_json::Value) -> (String, thread::JoinHandle<String>) {
+        let body = body.to_string();
+        answer_raw(
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            ),
+            Duration::ZERO,
+        )
+    }
+
+    /// Answers one HTTP request with `response` after `delay`, and returns
+    /// the address to reach it and the request it got.
+    fn answer_raw(response: String, delay: Duration) -> (String, thread::JoinHandle<String>) {
         use std::io::{BufRead, BufReader};
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = format!("http://{}", listener.local_addr().unwrap());
@@ -1280,17 +1381,26 @@ mod test {
                 }
                 request.push_str(&line);
             }
-            let body = body.to_string();
+            thread::sleep(delay);
             let mut stream = stream;
-            write!(
-                stream,
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            )
-            .unwrap();
+            stream.write_all(response.as_bytes()).unwrap();
             request
         });
         (address, handle)
+    }
+
+    /// A listener that records whether anything connected to it.
+    fn redirect_target() -> (TcpListener, String) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = format!("http://{}", listener.local_addr().unwrap());
+        (listener, address)
+    }
+
+    fn was_contacted(listener: &TcpListener) -> bool {
+        // Give a followed redirect time to arrive.
+        thread::sleep(Duration::from_millis(200));
+        listener.accept().is_ok()
     }
 
     fn recorded(dir: &Path, address: String, pid: u32) -> DevState {
@@ -1446,5 +1556,209 @@ mod test {
             .generate_and_write(|| anyhow::bail!("tree is busy"))
             .is_err());
         assert!(writer.is_dirty());
+    }
+
+    #[test]
+    fn an_unconfirmed_record_is_an_error_not_a_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut child = std::process::Command::new("git")
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        let state = recorded(dir.path(), "http://127.0.0.1:9".to_owned(), pid);
+        let error = use_record(&dir.path().join(STATE_FILE), state).unwrap_err();
+        let text = format!("{error:#}");
+        assert!(text.contains("could not be confirmed"), "{text}");
+        assert!(text.contains("--address and --token-file"), "{text}");
+        assert!(text.contains("Restart `rojo dev`"), "{text}");
+        // A usage problem, so the command exits with 2.
+        assert_eq!(super::super::exit_status(&error).0, 2);
+    }
+
+    #[test]
+    fn a_confirmed_record_names_its_bridge() {
+        let dir = tempfile::tempdir().unwrap();
+        let (address, _) = answer_once(serde_json::json!({
+            "identity": {
+                "serverSession": "recorded-session",
+                "projectPath": dir.path().join("default.project.json"),
+            },
+        }));
+        let state = recorded(dir.path(), address.clone(), std::process::id());
+        let token = state.token_file.clone();
+        let (found, found_token) = use_record(&dir.path().join(STATE_FILE), state).unwrap();
+        assert_eq!(found, address);
+        assert_eq!(found_token, Some(token));
+    }
+
+    #[test]
+    fn verification_outlasts_the_bridges_git_wait() {
+        assert!(VERIFY_TIMEOUT > crate::web::studio::GIT_WAIT_LIMIT);
+        // An answer slower than the old 5-second limit is still accepted.
+        let dir = tempfile::tempdir().unwrap();
+        let body = serde_json::json!({
+            "identity": {
+                "serverSession": "recorded-session",
+                "projectPath": dir.path().join("default.project.json"),
+            },
+        })
+        .to_string();
+        let (address, _) = answer_raw(
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            ),
+            Duration::from_secs(6),
+        );
+        let state = recorded(dir.path(), address, std::process::id());
+        assert_eq!(verify(&state), Ok(()));
+    }
+
+    #[test]
+    fn verification_never_follows_a_redirect_with_the_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let (target, target_address) = redirect_target();
+        let (address, _) = answer_raw(
+            format!(
+                "HTTP/1.1 302 Found\r\nLocation: {target_address}/steal\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            ),
+            Duration::ZERO,
+        );
+        let state = recorded(dir.path(), address, std::process::id());
+        let reason = verify(&state).unwrap_err();
+        assert!(reason.contains("HTTP 302"), "{reason}");
+        assert!(!was_contacted(&target), "the redirect was followed");
+    }
+
+    #[test]
+    fn bridge_clients_do_not_follow_redirects() {
+        let (target, target_address) = redirect_target();
+        let (address, _) = answer_raw(
+            format!(
+                "HTTP/1.1 307 Temporary Redirect\r\nLocation: {target_address}/steal\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            ),
+            Duration::ZERO,
+        );
+        let client = studio::bridge_client(Duration::from_secs(5)).unwrap();
+        let response = client
+            .get(format!("{address}/api/studio/sessions"))
+            .header("x-rojo-studio-token", "secret")
+            .send()
+            .unwrap();
+        assert_eq!(response.status().as_u16(), 307);
+        assert!(!was_contacted(&target), "the redirect was followed");
+    }
+
+    #[test]
+    fn verification_only_talks_to_loopback() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = recorded(
+            dir.path(),
+            "http://192.168.1.2:34872".to_owned(),
+            std::process::id(),
+        );
+        let reason = verify(&state).unwrap_err();
+        assert!(reason.contains("loopback"), "{reason}");
+    }
+
+    #[test]
+    fn a_newer_sourcemap_is_never_replaced_by_an_older_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(SOURCEMAP_FILE);
+        let writer = Arc::new(SourcemapWriter::new(path.clone()));
+        let (started, wait_started) = std::sync::mpsc::channel();
+        let (release, wait_release) = std::sync::mpsc::channel::<()>();
+
+        // The older update generates first, then stalls before writing.
+        let older = {
+            let writer = Arc::clone(&writer);
+            thread::spawn(move || {
+                writer
+                    .generate_and_write(|| {
+                        started.send(()).unwrap();
+                        wait_release.recv().unwrap();
+                        Ok(b"old".to_vec())
+                    })
+                    .unwrap()
+            })
+        };
+        wait_started.recv().unwrap();
+        // A newer update must wait for the older one instead of writing
+        // first and then being overwritten.
+        let newer = {
+            let writer = Arc::clone(&writer);
+            thread::spawn(move || writer.generate_and_write(|| Ok(b"new".to_vec())).unwrap())
+        };
+        thread::sleep(Duration::from_millis(200));
+        assert!(!newer.is_finished(), "the newer update did not wait");
+        release.send(()).unwrap();
+        older.join().unwrap();
+        newer.join().unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"new");
+        assert!(!writer.is_dirty());
+    }
+
+    #[test]
+    fn an_automatic_port_taken_before_the_bind_is_skipped() {
+        // Something takes the first choice between the probe and the bind.
+        let taken = TcpListener::bind("127.0.0.1:0").unwrap();
+        let taken_port = taken.local_addr().unwrap().port();
+        let first = WORKTREE_PORT_FIRST + 10;
+        let mut tried = Vec::new();
+        let (_listener, port, source) = bind_port(
+            &request(None, None, false),
+            |_| true,
+            |port| {
+                tried.push(port);
+                if port == first {
+                    TcpListener::bind(("127.0.0.1", taken_port))
+                } else {
+                    TcpListener::bind("127.0.0.1:0")
+                }
+            },
+        )
+        .unwrap();
+        assert_eq!((port, source), (first + 1, PortSource::Worktree));
+        assert_eq!(tried, vec![first, first + 1]);
+    }
+
+    #[test]
+    fn an_explicit_port_taken_before_the_bind_is_an_error() {
+        let taken = TcpListener::bind("127.0.0.1:0").unwrap();
+        let taken_port = taken.local_addr().unwrap().port();
+        let mut attempts = 0;
+        let error = bind_port(
+            &request(Some(taken_port), None, true),
+            |_| true,
+            |port| {
+                attempts += 1;
+                TcpListener::bind(("127.0.0.1", port))
+            },
+        )
+        .unwrap_err();
+        assert_eq!(attempts, 1);
+        assert!(
+            error.to_string().contains(&taken_port.to_string()),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn automatic_bind_retries_are_bounded() {
+        let mut attempts = 0;
+        let error = bind_port(
+            &request(None, None, false),
+            |_| true,
+            |_| -> std::io::Result<TcpListener> {
+                attempts += 1;
+                Err(std::io::ErrorKind::AddrInUse.into())
+            },
+        )
+        .unwrap_err();
+        assert_eq!(attempts, BIND_ATTEMPTS);
+        assert!(error.to_string().contains("Could not listen"), "{error}");
     }
 }
