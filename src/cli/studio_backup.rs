@@ -39,6 +39,20 @@ pub struct Record {
     /// purpose stays until they remove it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub automatic: bool,
+    /// Every root of the model, in the order it holds them, with the path
+    /// each had in the place. Backups of many instances, such as hundreds of
+    /// modules with the same name, need this to tell where each came from.
+    /// Records from before it was added have none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub roots: Vec<Root>,
+}
+
+/// One root of a backup's model.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Root {
+    pub path: String,
+    pub class_name: String,
 }
 
 /// How many automatic backups are kept. Each is at most 5 MiB, and every
@@ -52,6 +66,35 @@ pub const KEEP_AUTOMATIC: usize = 20;
 /// such as a `verify --fix`, still relies on them. This is far longer than
 /// any such operation runs (20 seconds for a fix, 30 for a sync's request).
 pub const AUTOMATIC_GRACE_MILLIS: u64 = 60 * 60 * 1000;
+
+/// The most automatic backups kept, however young, so a burst of them (many
+/// reconnects within the grace period) cannot fill the disk. The oldest go
+/// first.
+pub const MAX_AUTOMATIC: usize = 100;
+/// The most model bytes all automatic backups may use together, however
+/// young. The newest [`KEEP_AUTOMATIC`] at 5 MiB each stay well under it.
+pub const MAX_AUTOMATIC_BYTES: u64 = 512 * 1024 * 1024;
+
+/// How [`Store::prune_automatic_with`] decides what to remove.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PruneLimits {
+    /// Kept whatever their age.
+    pub keep: usize,
+    /// Kept beyond `keep` while younger than this.
+    pub grace_millis: u64,
+    /// Never more than this many, nor more than `max_bytes` of models.
+    pub max_count: usize,
+    pub max_bytes: u64,
+}
+
+impl PruneLimits {
+    pub(crate) const DEFAULT: PruneLimits = PruneLimits {
+        keep: KEEP_AUTOMATIC,
+        grace_millis: AUTOMATIC_GRACE_MILLIS,
+        max_count: MAX_AUTOMATIC,
+        max_bytes: MAX_AUTOMATIC_BYTES,
+    };
+}
 
 pub struct Store {
     dir: PathBuf,
@@ -129,6 +172,26 @@ impl Store {
         Self::at_workdir(&cwd)
     }
 
+    /// The store `rojo serve` uses for the project at `project`, a project
+    /// file or the folder holding it, which is where its automatic backups
+    /// go. `backup --project` opens this one.
+    pub fn for_project(project: &Path) -> anyhow::Result<Store> {
+        let folder = if project.is_file() {
+            project
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .unwrap_or(Path::new("."))
+        } else {
+            project
+        };
+        anyhow::ensure!(
+            folder.is_dir(),
+            "{} is not a project file or a folder",
+            project.display()
+        );
+        Self::at_workdir(folder)
+    }
+
     pub fn at_workdir(workdir: &Path) -> anyhow::Result<Store> {
         // Only "not a repository" (or no Git) falls back, like the locks: a
         // repository whose common directory cannot be read is an error.
@@ -199,7 +262,11 @@ impl Store {
         let _lock = self.lock()?;
         // `list` skips records over this size, so a larger one would vanish.
         anyhow::ensure!(
-            record.name.len() <= 64 && record.note.as_ref().is_none_or(|note| note.len() <= 4096),
+            record.name.len() <= 64
+                && record
+                    .note
+                    .as_ref()
+                    .is_none_or(|note| note.len() <= MAX_NOTE_BYTES),
             "A backup name is at most 64 bytes and a note at most 4096"
         );
         fs::create_dir_all(&self.dir)
@@ -347,24 +414,38 @@ impl Store {
         Ok(record)
     }
 
-    /// Removes automatic backups beyond the [`KEEP_AUTOMATIC`] newest that are
-    /// older than [`AUTOMATIC_GRACE_MILLIS`], and returns their IDs. Backups
-    /// made on purpose are never removed.
+    /// Removes automatic backups and returns their IDs: beyond the
+    /// [`KEEP_AUTOMATIC`] newest, those older than [`AUTOMATIC_GRACE_MILLIS`],
+    /// and beyond [`MAX_AUTOMATIC`] backups or [`MAX_AUTOMATIC_BYTES`] of
+    /// models, the oldest whatever their age. Backups made on purpose are
+    /// never removed.
     pub fn prune_automatic(&self) -> anyhow::Result<Vec<String>> {
-        self.prune_automatic_at(KEEP_AUTOMATIC, now_millis())
+        self.prune_automatic_with(PruneLimits::DEFAULT, now_millis())
     }
 
-    /// [`Self::prune_automatic`] keeping `keep` and taking `now` as the
-    /// current time, in Unix milliseconds.
-    pub(crate) fn prune_automatic_at(&self, keep: usize, now: u64) -> anyhow::Result<Vec<String>> {
+    /// [`Self::prune_automatic`] with other limits, taking `now` as the
+    /// current time in Unix milliseconds.
+    pub(crate) fn prune_automatic_with(
+        &self,
+        limits: PruneLimits,
+        now: u64,
+    ) -> anyhow::Result<Vec<String>> {
         let _lock = self.lock()?;
+        let mut bytes: u64 = 0;
         let removed: Vec<String> = self
             .list()?
             .into_iter()
             .filter(|record| record.automatic)
-            .skip(keep)
-            .filter(|record| record.created_at.saturating_add(AUTOMATIC_GRACE_MILLIS) <= now)
-            .map(|record| record.id)
+            .enumerate()
+            .filter(|(index, record)| {
+                // Newest first, so the running total is of those kept so far
+                // and the ones newer than them.
+                bytes = bytes.saturating_add(record.bytes);
+                let old = record.created_at.saturating_add(limits.grace_millis) <= now;
+                let over_cap = *index >= limits.max_count || bytes > limits.max_bytes;
+                over_cap || (*index >= limits.keep && old)
+            })
+            .map(|(_, record)| record.id)
             .collect();
         for id in &removed {
             self.remove_locked(id)?;
@@ -394,8 +475,12 @@ impl Store {
     }
 }
 
-const MAX_RECORD_BYTES: u64 = 64 * 1024;
+/// Records with a root list can be large (up to 10,000 roots); `list`
+/// skips anything larger than this.
+const MAX_RECORD_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_NOTE_BYTES: usize = 4096;
+/// The note of an automatic backup is a short summary; `roots` has them all.
+const AUTOMATIC_NOTE_BYTES: usize = 512;
 
 /// `text` cut to at most `max` bytes on a character boundary.
 pub(crate) fn clip(text: &str, max: usize) -> &str {
@@ -410,8 +495,9 @@ pub(crate) fn clip(text: &str, max: usize) -> &str {
 }
 
 /// The record of an automatic backup holding `contents`, the path and class
-/// of each instance in its model. The note starts with `reason` and lists as
-/// many of the paths as fit, so `backup list` says what is in it.
+/// of each root of its model in order, all of which it keeps in `roots`. The
+/// note starts with `reason` and names the first few, as a summary for
+/// `backup list`.
 pub(crate) fn automatic_record(
     name: &str,
     reason: &str,
@@ -431,7 +517,7 @@ pub(crate) fn automatic_record(
     let mut note = format!("{reason}; {} instances:", contents.len());
     for (index, (path, _)) in contents.iter().enumerate() {
         let more = format!(" (and {} more)", contents.len() - index);
-        if note.len() + 1 + path.len() + more.len() > MAX_NOTE_BYTES {
+        if note.len() + 1 + path.len() + more.len() > AUTOMATIC_NOTE_BYTES {
             note.push_str(&more);
             break;
         }
@@ -449,8 +535,15 @@ pub(crate) fn automatic_record(
         git_branch: None,
         created_at: now_millis(),
         bytes: 0,
-        note: Some(clip(&note, MAX_NOTE_BYTES).to_owned()),
+        note: Some(clip(&note, AUTOMATIC_NOTE_BYTES).to_owned()),
         automatic: true,
+        roots: contents
+            .iter()
+            .map(|(path, class_name)| Root {
+                path: path.clone(),
+                class_name: class_name.clone(),
+            })
+            .collect(),
     }
 }
 
@@ -510,6 +603,7 @@ mod tests {
             bytes: 0,
             note: None,
             automatic: false,
+            roots: Vec::new(),
         }
     }
 
@@ -612,7 +706,15 @@ mod tests {
             .map(|index| fill(&store, "auto", 1_000 + index * 1_000))
             .collect();
         let manual_new = store.save(record("Lobby", 100_000), b"manual").unwrap();
-        let removed = store.prune_automatic_at(2, now_millis()).unwrap();
+        let removed = store
+            .prune_automatic_with(
+                PruneLimits {
+                    keep: 2,
+                    ..PruneLimits::DEFAULT
+                },
+                now_millis(),
+            )
+            .unwrap();
         assert_eq!(
             removed,
             vec![
@@ -671,12 +773,105 @@ mod tests {
         let later = now + AUTOMATIC_GRACE_MILLIS;
         assert_eq!(
             store
-                .prune_automatic_at(KEEP_AUTOMATIC, later)
+                .prune_automatic_with(
+                    PruneLimits {
+                        keep: KEEP_AUTOMATIC,
+                        ..PruneLimits::DEFAULT
+                    },
+                    later
+                )
                 .unwrap()
                 .len(),
             5
         );
         assert_eq!(automatic_ids(&store).len(), KEEP_AUTOMATIC);
+    }
+
+    #[test]
+    fn a_burst_of_young_backups_is_capped_by_count_and_by_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::in_dir(dir.path());
+        let manual = store.save(record("Map", 1), b"manual").unwrap();
+        let now = now_millis();
+        let ids: Vec<String> = (0..12)
+            .map(|index| fill(&store, "young", now - 60_000 + index * 100))
+            .collect();
+        let limits = PruneLimits {
+            keep: 2,
+            grace_millis: AUTOMATIC_GRACE_MILLIS,
+            max_count: 8,
+            max_bytes: u64::MAX,
+        };
+        // All are young, but only 8 may stay: the 4 oldest go.
+        let removed = store.prune_automatic_with(limits, now).unwrap();
+        assert_eq!(removed, ids[..4].iter().rev().cloned().collect::<Vec<_>>());
+        assert_eq!(automatic_ids(&store).len(), 8);
+        // Each model here is 4 bytes, so 20 bytes keep the newest 5.
+        let removed = store
+            .prune_automatic_with(
+                PruneLimits {
+                    max_bytes: 20,
+                    ..limits
+                },
+                now,
+            )
+            .unwrap();
+        assert_eq!(removed.len(), 3);
+        assert_eq!(
+            automatic_ids(&store),
+            ids[7..].iter().rev().cloned().collect::<Vec<_>>()
+        );
+        assert!(
+            store.get(&manual.id).is_ok(),
+            "manual backups are never capped"
+        );
+        // The real limits are a hard cap of 100 by default.
+        for index in 0..MAX_AUTOMATIC as u64 + 3 {
+            fill(&store, "burst", now - 30_000 + index);
+        }
+        store.prune_automatic().unwrap();
+        assert_eq!(automatic_ids(&store).len(), MAX_AUTOMATIC);
+    }
+
+    #[test]
+    fn records_keep_every_root_and_old_records_load_without_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::in_dir(dir.path());
+        let contents: Vec<(String, String)> = (0..300)
+            .map(|index| {
+                (
+                    format!("game/ServerScriptService/Feature{index}/Module"),
+                    "ModuleScript".to_owned(),
+                )
+            })
+            .collect();
+        let record = automatic_record(
+            "auto-verify-fix",
+            "auto: before verify --fix",
+            &contents,
+            None,
+            None,
+        );
+        assert!(
+            record.note.as_ref().unwrap().len() <= 512,
+            "the note stays a summary"
+        );
+        let saved = store.save_automatic(record, b"model").unwrap();
+        let (loaded, _) = store.get(&saved.id).unwrap();
+        assert_eq!(loaded.roots.len(), 300);
+        assert_eq!(
+            loaded.roots[299].path,
+            "game/ServerScriptService/Feature299/Module"
+        );
+        assert_eq!(loaded.roots[0].class_name, "ModuleScript");
+        // A record written before roots existed.
+        let old = r#"{"id":"20200101-000000-Map","name":"Map","instance":"game/Workspace/Map","className":"Model","placeId":1,"placeName":"Place","gitHead":null,"gitBranch":null,"createdAt":1,"bytes":5}"#;
+        fs::write(dir.path().join("20200101-000000-Map.json"), old).unwrap();
+        fs::write(dir.path().join("20200101-000000-Map.rbxm"), b"model").unwrap();
+        let (old, _) = store.get("20200101-000000-Map").unwrap();
+        assert!(old.roots.is_empty() && !old.automatic);
+        let text = fs::read_to_string(store.record_path(&old.id)).unwrap();
+        assert!(!text.contains("roots"));
     }
 
     #[test]
@@ -738,7 +933,15 @@ mod tests {
         );
         assert!(!store.get(&saved.id).unwrap().0.automatic);
         assert_eq!(
-            store.prune_automatic_at(0, now_millis()).unwrap(),
+            store
+                .prune_automatic_with(
+                    PruneLimits {
+                        keep: 0,
+                        ..PruneLimits::DEFAULT
+                    },
+                    now_millis()
+                )
+                .unwrap(),
             Vec::<String>::new()
         );
         let auto = store

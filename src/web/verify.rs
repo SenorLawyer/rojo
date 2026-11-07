@@ -350,7 +350,14 @@ impl Comparison {
     /// The report, listing at most `limit` scripts of each kind, in at most
     /// `max_bytes` of JSON for the lists together. The counts cover every
     /// script either way.
+    #[cfg(test)]
     pub(crate) fn report(&self, limit: usize, max_bytes: usize) -> Value {
+        self.report_with_budget(limit, max_bytes).0
+    }
+
+    /// [`Self::report`], with what is left of `max_bytes` for further lists,
+    /// such as those `--fix` adds.
+    pub(crate) fn report_with_budget(&self, limit: usize, max_bytes: usize) -> (Value, usize) {
         let mut budget = max_bytes;
         let (different, different_count) = listed(
             self.different.iter().map(|different| {
@@ -366,7 +373,7 @@ impl Comparison {
             listed(self.missing.iter().map(describe), limit, &mut budget);
         let (detached, detached_count) =
             listed(self.detached.iter().map(describe), limit, &mut budget);
-        json!({
+        let report = json!({
             "inSync": self.in_sync(),
             "checked": self.checked,
             "matching": self.matching,
@@ -380,7 +387,8 @@ impl Comparison {
             "truncated": different.len() < different_count
                 || missing.len() < missing_count
                 || detached.len() < detached_count,
-        })
+        });
+        (report, budget)
     }
 
     /// The scripts `--fix` sets back to their files' contents. Held wipes stay
@@ -424,6 +432,17 @@ pub(crate) fn backup_groups<'a>(fixes: &[&'a Different]) -> Vec<Vec<&'a Differen
         groups.push(group);
     }
     groups
+}
+
+/// Lists `scripts` like the report's lists: paths shortened, at most
+/// `limit` of them, within what is left of `budget`, which they use up.
+/// Returns them and how many there were in all.
+pub(crate) fn list_scripts<'a>(
+    scripts: impl ExactSizeIterator<Item = &'a TreeScript> + 'a,
+    limit: usize,
+    budget: &mut usize,
+) -> (Vec<Value>, usize) {
+    listed(scripts.map(describe), limit, budget)
 }
 
 /// One batch of `resync`: a sync message that sets each script's `Source` to
@@ -732,6 +751,34 @@ mod test {
             ],
             "every script is in exactly one group, in order, and an oversized one alone"
         );
+    }
+
+    #[test]
+    fn extra_lists_share_the_reports_byte_budget_and_shorten_paths() {
+        let long = "N".repeat(5_000);
+        let scripts: Vec<TreeScript> = (0..200)
+            .map(|index| TreeScript {
+                id: format!("{index}"),
+                ref_id: rbx_dom_weak::types::Ref::none(),
+                path: format!("game/ServerScriptService/{long}{index}"),
+                file: Some(format!("src/{long}{index}.luau")),
+                hash: 1,
+                hash2: 1,
+                length: 1,
+            })
+            .collect();
+        let comparison = compare(scripts.clone(), &json!({"scripts": []})).unwrap();
+        let (report, mut budget) = comparison.report_with_budget(MAX_LISTED, 64 * 1024);
+        assert_eq!(report["truncated"], true);
+        let before = budget;
+        let (listed, total) = list_scripts(scripts.iter(), MAX_LISTED, &mut budget);
+        assert_eq!(total, 200);
+        assert!(listed.len() < 200, "the budget cuts the list short");
+        let used: usize = listed.iter().map(|item| item.to_string().len() + 1).sum();
+        assert!(used <= before);
+        for item in &listed {
+            assert!(item["path"].as_str().unwrap().len() <= MAX_REPORTED_PATH + 3);
+        }
     }
 
     #[test]

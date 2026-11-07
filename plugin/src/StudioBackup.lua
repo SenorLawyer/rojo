@@ -19,6 +19,9 @@ local MAX_BODY_BYTES = 8 * 1024 * 1024
 
 -- The folder in a backup that holds scripts as their open editors show them.
 StudioBackup.DRAFTS_FOLDER = "Rojo editor drafts"
+-- The attribute on each script copy in a `verify --fix` backup naming the
+-- script it copies, by its full path in the place.
+StudioBackup.ORIGIN_ATTRIBUTE = "RojoBackupOf"
 
 -- Services and the DataModel cannot be saved as models.
 local function canCopy(instance)
@@ -213,8 +216,14 @@ function StudioBackup.serializeScripts(entries)
 	local ok, result = pcall(function()
 		for _, entry in entries do
 			local script = entry.instance
-			table.insert(copies, StudioBackup.copyScript(script, entry.source))
-			table.insert(described, { path = (StudioBridge.pathOf(script)), className = script.ClassName })
+			local path = (StudioBridge.pathOf(script))
+			local copy = StudioBackup.copyScript(script, entry.source)
+			-- Many copies can share a name, such as a module per feature, so
+			-- each says where it came from. The copy is new, so the script in
+			-- the place is not touched.
+			copy:SetAttribute(StudioBackup.ORIGIN_ATTRIBUTE, path)
+			table.insert(copies, copy)
+			table.insert(described, { path = path, className = script.ClassName })
 		end
 		return serializeChecked(copies)
 	end)

@@ -1382,7 +1382,7 @@ impl StudioBridge {
                 }
             },
         };
-        let mut report = comparison.report(list_limit, list_bytes);
+        let (mut report, mut list_budget) = comparison.report_with_budget(list_limit, list_bytes);
         if fix {
             let fixes = comparison.fixable(include_held);
             // Studio's copies of the scripts are saved before any is
@@ -1486,6 +1486,17 @@ impl StudioBridge {
                     break;
                 }
             }
+            // Listed like the report's other lists, within what is left of
+            // the same byte budget, so the report stays within the caller's
+            // output limit however many scripts and however long their paths.
+            let (not_backed_up_listed, _) = verify::list_scripts(
+                not_backed_up.iter().map(|fix| &fix.script),
+                list_limit,
+                &mut list_budget,
+            );
+            if not_backed_up_listed.len() < not_backed_up.len() {
+                report["truncated"] = json!(true);
+            }
             report["fixed"] = json!({
                 "attempted": fixes.len(),
                 "updated": updated,
@@ -1493,11 +1504,7 @@ impl StudioBridge {
                 "skippedChanged": skipped,
                 "skippedHeld": if include_held { 0 } else { comparison.held_count() },
                 "notBackedUp": not_backed_up.len(),
-                "notBackedUpScripts": not_backed_up
-                    .iter()
-                    .take(list_limit)
-                    .map(|fix| json!({"id": fix.script.id, "path": fix.script.path, "file": fix.script.file}))
-                    .collect::<Vec<_>>(),
+                "notBackedUpScripts": not_backed_up_listed,
                 "errors": errors,
             });
         }
@@ -1519,7 +1526,7 @@ impl StudioBridge {
         id: &str,
         fixes: &[&verify::Different],
         started: Instant,
-    ) -> Result<(Vec<backup::Record>, HashSet<String>), String> {
+    ) -> Result<(Vec<Value>, HashSet<String>), String> {
         let mut saved = Vec::new();
         let mut backed_up = HashSet::new();
         for group in verify::backup_groups(fixes) {
@@ -1644,24 +1651,43 @@ impl StudioBridge {
     fn backup_store(dir: Option<PathBuf>, root: &Path) -> anyhow::Result<backup::Store> {
         Ok(match dir {
             Some(dir) => backup::Store::in_dir(&dir),
-            None => backup::Store::at_workdir(root)?,
+            // The same resolution as `rojo studio backup --project`.
+            None => backup::Store::for_project(root)?,
         })
     }
 
     /// Saves an automatic backup in the project's backup folder, which also
     /// prunes old automatic ones (see [`backup::Store::save_automatic`]).
-    async fn save_backup(
-        &self,
-        record: backup::Record,
-        model: Vec<u8>,
-    ) -> anyhow::Result<backup::Record> {
+    ///
+    /// Returns the record with `storeDir`, the folder it is in, since that
+    /// depends on the project `rojo serve` serves rather than where a later
+    /// `rojo studio backup list` runs.
+    async fn save_backup(&self, record: backup::Record, model: Vec<u8>) -> anyhow::Result<Value> {
         let dir = self.backup_dir.get().cloned();
         let root = self.serve.root_dir().to_owned();
-        tokio::task::spawn_blocking(move || {
-            Self::backup_store(dir, &root)?.save_automatic(record, &model)
+        let project = root.clone();
+        let (record, store_dir) = tokio::task::spawn_blocking(move || {
+            let store = Self::backup_store(dir, &root)?;
+            let record = store.save_automatic(record, &model)?;
+            anyhow::Ok((record, store.dir().to_owned()))
         })
         .await
-        .context("The backup stopped before it was saved")?
+        .context("The backup stopped before it was saved")??;
+        log::info!(
+            "Saved automatic backup {} in {}. `rojo studio backup list --project {}` lists it.",
+            record.id,
+            store_dir.display(),
+            project.display()
+        );
+        let mut value = serde_json::to_value(&record)?;
+        value["storeDir"] = json!(store_dir);
+        Ok(value)
+    }
+
+    /// The backup store this bridge saves automatic backups in.
+    #[cfg(test)]
+    fn store_for_tests(&self) -> anyhow::Result<backup::Store> {
+        Self::backup_store(None, self.serve.root_dir())
     }
 
     /// Registers `child` as the batch the verify `id` waits on, unless a
@@ -3222,6 +3248,15 @@ mod tests {
         assert_eq!(report["fixed"]["updated"], 1);
         let saved = &report["backups"][0];
         assert_eq!(saved["automatic"], true);
+        assert_eq!(
+            saved["storeDir"],
+            json!(dir.path().join("backups")),
+            "the report says where the backup is"
+        );
+        assert_eq!(
+            saved["roots"][0]["path"],
+            "game/ReplicatedStorage/Shared/Main"
+        );
         let listed = backup::Store::in_dir(&dir.path().join("backups"))
             .list()
             .unwrap();
@@ -3393,6 +3428,25 @@ mod tests {
             .collect();
         assert_eq!(automatic.len(), backup::KEEP_AUTOMATIC);
         assert!(automatic[0].name.starts_with("auto-verify-fix"));
+    }
+
+    #[test]
+    fn the_server_and_backup_project_open_the_same_store() {
+        for git_repository in [false, true] {
+            let (dir, bridge) = if git_repository {
+                git_fixture(GIT_LOCK_WAIT)
+            } else {
+                fixture()
+            };
+            // Only folders are resolved here; nothing is written.
+            let server = bridge.store_for_tests().unwrap();
+            let by_folder = backup::Store::for_project(dir.path()).unwrap();
+            let by_file =
+                backup::Store::for_project(&dir.path().join("default.project.json")).unwrap();
+            assert_eq!(server.dir(), by_folder.dir());
+            assert_eq!(server.dir(), by_file.dir());
+        }
+        assert!(backup::Store::for_project(Path::new("/does/not/exist")).is_err());
     }
 
     #[tokio::test]
