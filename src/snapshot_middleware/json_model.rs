@@ -13,6 +13,7 @@ use crate::{
     json,
     resolution::UnresolvedValue,
     snapshot::{InstanceContext, InstanceSnapshot},
+    snapshot_middleware::meta_file::UnknownFields,
     syncback::{filter_properties_preallocated, FsSnapshot, SyncbackReturn, SyncbackSnapshot},
     RojoRef,
 };
@@ -53,7 +54,7 @@ pub fn snapshot_json_model(
     let schema = instance.schema.take();
 
     let mut snapshot = instance
-        .into_snapshot()
+        .into_snapshot(path)
         .with_context(|| format!("Could not load JSON model: {}", path.display()))?;
 
     snapshot.metadata = snapshot
@@ -144,6 +145,7 @@ fn json_model_from_pair<'sync>(
         attributes,
         id: None,
         schema: None,
+        unknown_fields: UnknownFields::default(),
     }
 }
 
@@ -156,10 +158,12 @@ struct JsonModel {
     #[serde(alias = "Name", skip_serializing_if = "Option::is_none")]
     name: Option<String>,
 
-    #[serde(alias = "ClassName")]
+    // The `$` spellings are what project files use for the same fields, and
+    // are accepted so that copying a node's fields into a model file works.
+    #[serde(alias = "ClassName", alias = "$className")]
     class_name: Ustr,
 
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(alias = "$id", skip_serializing_if = "Option::is_none")]
     id: Option<String>,
 
     #[serde(
@@ -171,23 +175,33 @@ struct JsonModel {
 
     #[serde(
         alias = "Properties",
+        alias = "$properties",
         default,
         skip_serializing_if = "IndexMap::is_empty"
     )]
     properties: IndexMap<Ustr, UnresolvedValue>,
 
-    #[serde(default = "IndexMap::new", skip_serializing_if = "IndexMap::is_empty")]
+    #[serde(
+        alias = "$attributes",
+        default = "IndexMap::new",
+        skip_serializing_if = "IndexMap::is_empty"
+    )]
     attributes: IndexMap<String, UnresolvedValue>,
+
+    #[serde(flatten, skip_serializing)]
+    unknown_fields: UnknownFields,
 }
 
 impl JsonModel {
-    fn into_snapshot(self) -> anyhow::Result<InstanceSnapshot> {
+    fn into_snapshot(self, path: &Path) -> anyhow::Result<InstanceSnapshot> {
+        self.unknown_fields.warn(path);
+
         let name = self.name.unwrap_or_else(|| self.class_name.to_owned());
         let class_name = self.class_name;
 
         let mut children = Vec::with_capacity(self.children.len());
         for child in self.children {
-            children.push(child.into_snapshot()?);
+            children.push(child.into_snapshot(path)?);
         }
 
         let mut properties = UstrMap::with_capacity(self.properties.len());
@@ -260,6 +274,59 @@ mod test {
         .unwrap();
 
         insta::assert_yaml_snapshot!(instance_snapshot);
+    }
+
+    /// Project files spell these fields with a `$`. Model files used to drop
+    /// that spelling silently, so Tags written that way never appeared.
+    ///
+    /// See: https://github.com/rojo-rbx/rojo/issues/1017
+    #[test]
+    fn model_accepts_project_spelling() {
+        let mut imfs = InMemoryFs::new();
+        imfs.load_snapshot(
+            "/foo.model.json",
+            VfsSnapshot::file(
+                r#"{
+                    "$className": "Folder",
+                    "$properties": { "Tags": ["Hello", "World"] },
+                    "$attributes": { "Speed": 5 },
+                    "children": [
+                        {
+                            "name": "Child",
+                            "className": "Part",
+                            "$properties": { "Tags": ["Child"] },
+                            "notAField": true
+                        }
+                    ]
+                }"#,
+            ),
+        )
+        .unwrap();
+
+        let vfs = Vfs::new(imfs);
+
+        let snapshot = snapshot_json_model(
+            &InstanceContext::default(),
+            &vfs,
+            Path::new("/foo.model.json"),
+            "foo",
+        )
+        .unwrap()
+        .unwrap();
+
+        let tags = |snapshot: &InstanceSnapshot| match snapshot
+            .properties
+            .get(&rbx_dom_weak::ustr("Tags"))
+        {
+            Some(Variant::Tags(tags)) => tags.iter().map(str::to_owned).collect::<Vec<_>>(),
+            other => panic!("expected Tags, got {other:?}"),
+        };
+        assert_eq!(snapshot.class_name, "Folder");
+        assert_eq!(tags(&snapshot), vec!["Hello", "World"]);
+        assert!(snapshot
+            .properties
+            .contains_key(&rbx_dom_weak::ustr("Attributes")));
+        assert_eq!(tags(&snapshot.children[0]), vec!["Child"]);
     }
 
     #[test]

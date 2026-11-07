@@ -241,4 +241,46 @@ return function()
 		target:Destroy()
 		value:Destroy()
 	end)
+
+	-- Tags from meta and model files reach Studio as updates and additions
+	-- like any other property, including tags being removed.
+	it("should apply Tags from updates and additions", function()
+		local CollectionService = game:GetService("CollectionService")
+
+		local root = Instance.new("Folder")
+		root:AddTag("Stale")
+		root.Parent = container
+
+		local instanceMap = InstanceMap.new()
+		instanceMap:insert("ROOT", root)
+
+		local patch = PatchSet.newEmpty()
+		table.insert(patch.updated, {
+			id = "ROOT",
+			changedProperties = {
+				Tags = { Tags = { "Hello", "World" } },
+			},
+		})
+		patch.added.CHILD = {
+			Id = "CHILD",
+			ClassName = "Folder",
+			Name = "Child",
+			Parent = "ROOT",
+			Properties = {
+				Tags = { Tags = { "Child" } },
+			},
+			Children = {},
+		}
+
+		local unapplied = applyPatch(instanceMap, patch)
+		assert(PatchSet.isEmpty(unapplied), "expected remaining patch to be empty")
+
+		expect(root:HasTag("Hello")).to.equal(true)
+		expect(root:HasTag("World")).to.equal(true)
+		expect(root:HasTag("Stale")).to.equal(false)
+		local child = instanceMap.fromIds.CHILD
+		expect(CollectionService:HasTag(child, "Child")).to.equal(true)
+
+		instanceMap:stop()
+	end)
 end
