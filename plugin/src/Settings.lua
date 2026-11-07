@@ -32,6 +32,9 @@ local defaultSettings = {
 	-- Experimental, so off until its known gaps are closed. See
 	-- docs/sync-health.md.
 	guardScriptWipes = false,
+	-- Saves Studio's copies of what the first sync after connecting changes
+	-- or removes, through the server's Studio bridge. See StudioBackup.
+	autoBackupBeforeSync = true,
 	priorEndpoints = {},
 }
 

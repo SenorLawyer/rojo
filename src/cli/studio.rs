@@ -13,7 +13,7 @@ use reqwest::{blocking::Client, Url};
 use serde_json::{json, Value};
 
 #[path = "studio_backup.rs"]
-mod backup;
+pub(crate) mod backup;
 
 use std::io::IsTerminal;
 
@@ -144,6 +144,11 @@ pub enum StudioSubcommand {
         /// because their file became empty.
         #[clap(long, requires = "fix")]
         include_held: bool,
+        /// With --fix, do not save the Studio copies of the scripts it
+        /// overwrites first. Without this, --fix changes nothing when that
+        /// backup cannot be saved.
+        #[clap(long, requires = "fix")]
+        no_backup: bool,
         /// List every script that differs, not just the first 200 of each kind
         /// (up to 10,000).
         #[clap(long, conflicts_with = "limit")]
@@ -157,6 +162,11 @@ pub enum StudioSubcommand {
     },
     /// Save copies of Studio instances outside the place, and put them back.
     Backup {
+        /// The project, a project file or its folder, whose backups to use:
+        /// the folder `rojo serve` saves its automatic backups in. Defaults
+        /// to the current directory's.
+        #[clap(long, global = true)]
+        project: Option<PathBuf>,
         #[clap(subcommand)]
         command: BackupCommand,
     },
@@ -202,6 +212,10 @@ pub enum BackupCommand {
         /// With --json, list at most this many bytes of records.
         #[clap(long)]
         max_bytes: Option<usize>,
+        /// With --json, leave out each backup's list of roots and give only
+        /// `rootCount`.
+        #[clap(long)]
+        no_roots: bool,
     },
     /// Insert a backup into Studio under a parent instance.
     Restore {
@@ -232,11 +246,29 @@ impl StudioCommand {
         }
         // Listing and removing backups only reads local files, so they work
         // without a running server.
-        if let StudioSubcommand::Backup { command } = &self.command {
+        if let StudioSubcommand::Backup { command, project } = &self.command {
             match command {
-                BackupCommand::List { limit, max_bytes } => {
-                    let store = backup::Store::open()?;
-                    let mut backups = store.list()?;
+                BackupCommand::List {
+                    limit,
+                    max_bytes,
+                    no_roots,
+                } => {
+                    let store = open_store(project.as_deref())?;
+                    let mut backups: Vec<Value> = store
+                        .list()?
+                        .into_iter()
+                        .map(|record| {
+                            let count = record.roots.len();
+                            let mut value = serde_json::to_value(record).unwrap_or(Value::Null);
+                            if *no_roots {
+                                if let Some(object) = value.as_object_mut() {
+                                    object.remove("roots");
+                                    object.insert("rootCount".to_owned(), json!(count));
+                                }
+                            }
+                            value
+                        })
+                        .collect();
                     let total = backups.len();
                     if let Some(limit) = limit {
                         backups.truncate(*limit);
@@ -260,6 +292,7 @@ impl StudioCommand {
                         return print_json(
                             &json!({
                                 "backups": backups,
+                                "dir": store.dir(),
                                 "total": total,
                                 "truncated": backups.len() < total,
                                 "orphaned": orphans,
@@ -274,11 +307,15 @@ impl StudioCommand {
                             orphans.join(", ")
                         );
                     }
-                    backup::print_list(&store, &backups);
+                    let records: Vec<backup::Record> = backups
+                        .into_iter()
+                        .filter_map(|value| serde_json::from_value(value).ok())
+                        .collect();
+                    backup::print_list(&store, &records);
                     return Ok(());
                 }
                 BackupCommand::Remove { backup } => {
-                    let store = backup::Store::open()?;
+                    let store = open_store(project.as_deref())?;
                     store.remove(backup)?;
                     return print_json(&json!({"removed": backup}), self.json);
                 }
@@ -314,12 +351,13 @@ impl StudioCommand {
             target,
             fix,
             include_held,
+            no_backup,
             all,
             limit,
             max_bytes,
         } = &self.command
         {
-            let mut args = json!({"fix": fix, "includeHeld": include_held});
+            let mut args = json!({"fix": fix, "includeHeld": include_held, "backup": !no_backup});
             if *all {
                 args["listLimit"] = json!(crate::web::verify::MAX_LISTED);
             } else if let Some(limit) = limit {
@@ -360,8 +398,8 @@ impl StudioCommand {
                 Err(super::ExitStatus(1).into())
             };
         }
-        if let StudioSubcommand::Backup { command } = &self.command {
-            let store = backup::Store::open()?;
+        if let StudioSubcommand::Backup { command, project } = &self.command {
+            let store = open_store(project.as_deref())?;
             match command {
                 BackupCommand::Create {
                     target,
@@ -418,6 +456,8 @@ impl StudioCommand {
                             created_at: backup::now_millis(),
                             bytes: 0,
                             note: note.clone(),
+                            automatic: false,
+                            roots: Vec::new(),
                         },
                         &model,
                     )?;
@@ -613,6 +653,14 @@ impl StudioCommand {
     }
 }
 
+/// The backup store of `--project`, or of the current directory.
+fn open_store(project: Option<&Path>) -> anyhow::Result<backup::Store> {
+    match project {
+        Some(project) => backup::Store::for_project(project),
+        None => backup::Store::open(),
+    }
+}
+
 /// Whether `verify` found Studio matching the files, or, with `--fix`,
 /// managed to make it match. Held wipes that were left alone still count as
 /// differences, because Studio keeps code the files no longer have.
@@ -684,6 +732,17 @@ fn describe_verify(report: &Value) -> String {
         );
     }
     let fixed = &report["fixed"];
+    for backup in report["backups"].as_array().into_iter().flatten() {
+        let id = escape_controls(backup["id"].as_str().unwrap_or("?"));
+        let _ = writeln!(
+            out,
+            "Saved the Studio copies of the scripts it overwrites as backup {id}; \
+             `rojo studio backup restore {id} --parent <instance> --allow-scripts` puts them back."
+        );
+        if let Some(dir) = backup["storeDir"].as_str() {
+            let _ = writeln!(out, "  (in {})", escape_controls(dir));
+        }
+    }
     if fixed.is_object() {
         let _ = writeln!(
             out,
@@ -1207,7 +1266,7 @@ fn read_model(path: &Path, allow_scripts: bool) -> anyhow::Result<Vec<u8>> {
     let bytes = fs::read(path)?;
     // The same isolated check the server runs, so a model that crashes the
     // decoder is reported as invalid instead of ending this command.
-    model_check::check_untrusted_model(bytes, allow_scripts, true, IMPORT_CHECK_LIMIT)
+    model_check::prepare_restore(bytes, allow_scripts, IMPORT_CHECK_LIMIT)
 }
 
 #[cfg(test)]
@@ -1462,6 +1521,84 @@ mod tests {
             {"path":format!("game/A{esc}[31m"),"file":"src/A.luau","held":false}]});
         let text = describe_verify(&report);
         assert!(!text.contains(esc), "{text:?}");
+    }
+
+    #[test]
+    fn backup_commands_take_a_project_before_or_after_the_subcommand() {
+        use crate::cli::{Options, Subcommand};
+        for args in [
+            vec![
+                "rojo",
+                "studio",
+                "backup",
+                "--project",
+                "game",
+                "list",
+                "--no-roots",
+            ],
+            vec![
+                "rojo",
+                "studio",
+                "backup",
+                "list",
+                "--project",
+                "game",
+                "--no-roots",
+            ],
+        ] {
+            let options = Options::try_parse_from(args).unwrap();
+            let Subcommand::Studio(studio) = options.subcommand else {
+                panic!("expected a studio command");
+            };
+            let StudioSubcommand::Backup { project, command } = studio.command else {
+                panic!("expected a backup command");
+            };
+            assert_eq!(project.as_deref(), Some(Path::new("game")));
+            assert!(matches!(
+                command,
+                BackupCommand::List { no_roots: true, .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn verify_fix_backs_up_unless_told_not_to() {
+        use crate::cli::{Options, Subcommand};
+        let session = "00000000-0000-4000-8000-000000000000";
+        let parse = |extra: &[&str]| {
+            let mut args = vec!["rojo", "studio", "verify", "--session", session];
+            args.extend_from_slice(extra);
+            Options::try_parse_from(args).map(|options| match options.subcommand {
+                Subcommand::Studio(studio) => studio.command,
+                _ => panic!("expected a studio command"),
+            })
+        };
+        assert!(matches!(
+            parse(&["--fix"]).unwrap(),
+            StudioSubcommand::Verify {
+                no_backup: false,
+                ..
+            }
+        ));
+        assert!(matches!(
+            parse(&["--fix", "--no-backup"]).unwrap(),
+            StudioSubcommand::Verify {
+                no_backup: true,
+                ..
+            }
+        ));
+        // Without --fix nothing is overwritten, so there is nothing to opt out of.
+        assert!(parse(&["--no-backup"]).is_err());
+
+        let report = json!({"checked":1,"matching":0,"differentCount":1,"different":[],
+            "backups":[{"id":"20261107-000000-auto-verify-fix"}],
+            "fixed":{"attempted":1,"updated":1,"failed":0,"skippedChanged":0,"skippedHeld":0,"errors":[]}});
+        let text = describe_verify(&report);
+        assert!(
+            text.contains("backup 20261107-000000-auto-verify-fix")
+                && text.contains("rojo studio backup restore 20261107-000000-auto-verify-fix"),
+            "{text}"
+        );
     }
 
     #[test]

@@ -1242,6 +1242,343 @@ return function()
 		end)
 	end)
 
+	describe("backups before the first sync", function()
+		local Settings = require(script.Parent.Settings)
+		local HttpService = game:GetService("HttpService")
+		local nativeBridgeRequest = StudioBridge.requestAsync
+		local pairing = { protocolVersion = 1, pluginToken = "plugin-token", identity = { digest = "d" } }
+		local fixture
+		local previousSetting
+
+		beforeEach(function()
+			previousSetting = Settings:get("autoBackupBeforeSync")
+			fixture = Instance.new("Folder")
+			fixture.Name = "__RojoSyncBackupSpec"
+			fixture.Parent = game:GetService("ReplicatedStorage")
+			api.__baseUrl = "http://127.0.0.1:34872"
+		end)
+
+		afterEach(function()
+			Settings:set("autoBackupBeforeSync", previousSetting)
+			StudioBridge.requestAsync = nativeBridgeRequest
+			fixture:Destroy()
+		end)
+
+		-- Runs the first sync with a catch-up patch that removes `removed`,
+		-- and records the order in which the backup and the patch happen.
+		local function syncRemoving(removed, serverInfo, events)
+			events = events or {}
+			local patch = PatchSet.newEmpty()
+			table.insert(patch.removed, removed)
+			session.__reconciler = {
+				hydrate = function() end,
+				diff = function()
+					return true, patch
+				end,
+			}
+			session.__applyPatch = function(_, applied)
+				expect(applied).to.equal(patch)
+				table.insert(events, "patch")
+			end
+			local pending = session:__initialSync(serverInfo)
+			readResolve({ messageCursor = 0, instances = {} })
+			pending:await()
+			return events
+		end
+
+		it("saves what the catch-up patch removes before applying it", function()
+			Settings:set("autoBackupBeforeSync", true)
+			local removed = Instance.new("ModuleScript")
+			removed.Name = "OnlyInStudio"
+			removed.Parent = fixture
+			local body
+			local events
+			StudioBridge.requestAsync = function(options)
+				table.insert(events, "backup")
+				body = HttpService:JSONDecode(options.Body)
+				return {
+					Success = true,
+					StatusCode = 200,
+					Body = HttpService:JSONEncode({ backup = { id = "20261107-000000-auto-sync" } }),
+				}
+			end
+			events = {}
+			syncRemoving(removed, { rootInstanceId = "ROOT", studioBridge = pairing }, events)
+			expect(#events).to.equal(2)
+			expect(events[1]).to.equal("backup")
+			expect(events[2]).to.equal("patch")
+			expect(body.instances[1].path).to.equal("game/ReplicatedStorage/__RojoSyncBackupSpec/OnlyInStudio")
+			expect(body.instances[1].className).to.equal("ModuleScript")
+			expect(type(body.model)).to.equal("string")
+			expect(body.identity.digest).to.equal("d")
+		end)
+
+		it("still syncs when the backup cannot be saved", function()
+			Settings:set("autoBackupBeforeSync", true)
+			local removed = Instance.new("Folder")
+			removed.Parent = fixture
+			local calls = 0
+			StudioBridge.requestAsync = function()
+				calls += 1
+				error("simulated server failure")
+			end
+			local refused = syncRemoving(removed, { rootInstanceId = "ROOT", studioBridge = pairing })
+			expect(calls).to.equal(1)
+			expect(refused[1]).to.equal("patch")
+			-- A server without a Studio bridge cannot save one at all.
+			local unpaired = syncRemoving(removed, { rootInstanceId = "ROOT" })
+			expect(calls).to.equal(1)
+			expect(unpaired[1]).to.equal("patch")
+		end)
+
+		it("warns about changed services it cannot back up and syncs anyway", function()
+			Settings:set("autoBackupBeforeSync", true)
+			local Log = require(script.Parent.Parent.Packages.Log)
+			local nativeWarn = Log.warn
+			local warnings = {}
+			Log.warn = function(template, ...)
+				table.insert(warnings, { template = template, args = { ... } })
+			end
+			local calls = 0
+			StudioBridge.requestAsync = function()
+				calls += 1
+				error("no request expected")
+			end
+			local patch = PatchSet.newEmpty()
+			table.insert(patch.updated, { id = "LIGHTING", changedProperties = { Brightness = { Float32 = 1 } } })
+			session.__instanceMap.fromIds.LIGHTING = game:GetService("Lighting")
+			local applied = false
+			session.__reconciler = {
+				hydrate = function() end,
+				diff = function()
+					return true, patch
+				end,
+			}
+			session.__applyPatch = function()
+				applied = true
+			end
+			local pending = session:__initialSync({ rootInstanceId = "ROOT", studioBridge = pairing })
+			readResolve({ messageCursor = 0, instances = {} })
+			pending:await()
+			Log.warn = nativeWarn
+			session.__instanceMap.fromIds.LIGHTING = nil
+			expect(applied).to.equal(true)
+			expect(calls).to.equal(0)
+			expect(#warnings).to.equal(1)
+			expect(warnings[1].template:find("cannot back up", 1, true)).to.be.ok()
+			expect(warnings[1].args[2]).to.equal("game/Lighting")
+		end)
+
+		it("syncs anyway when collecting what to back up fails", function()
+			Settings:set("autoBackupBeforeSync", true)
+			local Log = require(script.Parent.Parent.Packages.Log)
+			local StudioBackup = require(script.Parent.StudioBackup)
+			local nativeWarn = Log.warn
+			local warnings = {}
+			Log.warn = function(template, ...)
+				table.insert(warnings, { template = template, args = { ... } })
+			end
+			-- The wipe guard reads removed instances too; the stand-in below is
+			-- not an Instance, which only this test's failure injection needs.
+			local previousGuard = Settings:get("guardScriptWipes")
+			Settings:set("guardScriptWipes", false)
+			-- An affected instance that cannot be read, and no bridge at all.
+			local inaccessible = setmetatable({}, {
+				__index = function(_, key)
+					error("The current thread cannot access '" .. tostring(key) .. "'")
+				end,
+			})
+			session.__instanceMap.fromIds.LOCKED = inaccessible
+			local unpaired = syncRemoving("LOCKED", { rootInstanceId = "ROOT" })
+			session.__instanceMap.fromIds.LOCKED = nil
+			-- And collecting itself failing.
+			local nativeCollect = StudioBackup.collect
+			StudioBackup.collect = function()
+				error("simulated failure while collecting")
+			end
+			local failed = syncRemoving(Instance.new("Folder"), { rootInstanceId = "ROOT", studioBridge = pairing })
+			StudioBackup.collect = nativeCollect
+			Log.warn = nativeWarn
+			Settings:set("guardScriptWipes", previousGuard)
+			expect(unpaired[1]).to.equal("patch")
+			expect(failed[1]).to.equal("patch")
+			expect(#warnings).to.equal(2)
+			expect(warnings[1].template:find("cannot back up", 1, true)).to.be.ok()
+			expect(warnings[1].args[2]).to.equal(StudioBackup.INACCESSIBLE)
+			expect(tostring(warnings[2].args[1]):find("simulated failure while collecting", 1, true)).to.be.ok()
+		end)
+
+		it("warns when a backed-up script is edited before the sync overwrites it", function()
+			Settings:set("autoBackupBeforeSync", true)
+			local Log = require(script.Parent.Parent.Packages.Log)
+			local nativeWarn = Log.warn
+			local nativeRead = ServeSession.readEditorText
+			local warnings = {}
+			Log.warn = function(template, ...)
+				table.insert(warnings, { template = template, args = { ... } })
+			end
+			ServeSession.readEditorText = function(instance)
+				return instance.Source
+			end
+			local removed = Instance.new("ModuleScript")
+			removed.Name = "BeingEdited"
+			removed.Source = "return 'captured'"
+			removed.Parent = fixture
+			StudioBridge.requestAsync = function()
+				-- Someone types while the backup is being sent.
+				removed.Source = "return 'typed during the upload'"
+				return {
+					Success = true,
+					StatusCode = 200,
+					Body = HttpService:JSONEncode({ backup = { id = "20261107-000000-auto-sync" } }),
+				}
+			end
+			local events = syncRemoving(removed, { rootInstanceId = "ROOT", studioBridge = pairing })
+			Log.warn = nativeWarn
+			ServeSession.readEditorText = nativeRead
+			expect(events[1]).to.equal("patch")
+			expect(#warnings).to.equal(1)
+			expect(warnings[1].template:find("newest edits are not in the backup", 1, true)).to.be.ok()
+			expect(warnings[1].args[2]).to.equal("game/ReplicatedStorage/__RojoSyncBackupSpec/BeingEdited")
+		end)
+
+		it("takes no backup when it is turned off", function()
+			Settings:set("autoBackupBeforeSync", false)
+			local removed = Instance.new("Folder")
+			removed.Parent = fixture
+			local calls = 0
+			StudioBridge.requestAsync = function()
+				calls += 1
+				error("no request expected")
+			end
+			local events = syncRemoving(removed, { rootInstanceId = "ROOT", studioBridge = pairing })
+			expect(calls).to.equal(0)
+			expect(events[1]).to.equal("patch")
+		end)
+
+		it("exports the scripts verify --fix overwrites, leaving out those not in the place", function()
+			local fixed = Instance.new("ModuleScript")
+			fixed.Name = "Fixed"
+			fixed.Source = "return 1"
+			fixed.Parent = fixture
+			session.__instanceMap:insert("FIXED", fixed)
+			session.__status = ServeSession.Status.Connected
+			local hashSource = require(script.Parent.hashSource)
+			session:__rememberVerified("VERIFY", { FIXED = "return 1" })
+			local exported = session:exportForBackup(
+				{ "FIXED", "GONE" },
+				{ FIXED = (hashSource("return 1")) },
+				"VERIFY"
+			)
+			expect(exported.missing).to.equal(1)
+			expect(#exported.ids).to.equal(1)
+			expect(exported.ids[1]).to.equal("FIXED")
+			expect(#exported.instances).to.equal(1)
+			expect(exported.instances[1].path).to.equal("game/ReplicatedStorage/__RojoSyncBackupSpec/Fixed")
+			expect(type(exported.model)).to.equal("string")
+			expect(exported.bytes > 0).to.equal(true)
+			local none = session:exportForBackup({ "GONE" }, {})
+			expect(none.model).to.equal(nil)
+			expect(#none.ids).to.equal(0)
+			expect(#none.instances).to.equal(0)
+		end)
+
+		it("leaves out a script whose editor text cannot be read rather than export its saved source", function()
+			local unreadable = Instance.new("ModuleScript")
+			unreadable.Name = "Unreadable"
+			unreadable.Source = "return 1"
+			unreadable.Parent = fixture
+			session.__instanceMap:insert("UNREADABLE", unreadable)
+			session.__status = ServeSession.Status.Connected
+			local hashSource = require(script.Parent.hashSource)
+			local nativeRead = ServeSession.readEditorText
+			ServeSession.readEditorText = function()
+				return nil
+			end
+			local exported = session:exportForBackup({ "UNREADABLE" }, { UNREADABLE = (hashSource("return 1")) })
+			ServeSession.readEditorText = nativeRead
+			expect(exported.missing).to.equal(1)
+			expect(#exported.ids).to.equal(0)
+			expect(exported.model).to.equal(nil)
+		end)
+
+		it("warns about scripts whose unsaved editor text it could not back up", function()
+			Settings:set("autoBackupBeforeSync", true)
+			local Log = require(script.Parent.Parent.Packages.Log)
+			local nativeWarn = Log.warn
+			local nativeRead = ServeSession.readEditorText
+			local warnings = {}
+			Log.warn = function(template, ...)
+				table.insert(warnings, { template = template, args = { ... } })
+			end
+			ServeSession.readEditorText = function()
+				return nil
+			end
+			local sent = 0
+			StudioBridge.requestAsync = function()
+				sent += 1
+				return {
+					Success = true,
+					StatusCode = 200,
+					Body = HttpService:JSONEncode({ backup = { id = "20261107-000000-auto-sync" } }),
+				}
+			end
+			local removed = Instance.new("ModuleScript")
+			removed.Name = "OpenInEditor"
+			removed.Parent = fixture
+			local events = syncRemoving(removed, { rootInstanceId = "ROOT", studioBridge = pairing })
+			Log.warn = nativeWarn
+			ServeSession.readEditorText = nativeRead
+			expect(sent).to.equal(1)
+			expect(events[1]).to.equal("patch")
+			expect(#warnings).to.equal(1)
+			expect(warnings[1].template:find("Unsaved editor text could not be backed up", 1, true)).to.be.ok()
+			expect(warnings[1].args[2]).to.equal("game/ReplicatedStorage/__RojoSyncBackupSpec/OpenInEditor")
+		end)
+
+		it("leaves out a script whose source differs from what verify saw though the hashes match", function()
+			local hashSource = require(script.Parent.hashSource)
+			-- Two sources known to share a hash and length.
+			local checked, current = "return '07ilh49'", "return '0v3kbm8'"
+			expect((hashSource(checked))).to.equal((hashSource(current)))
+			local collided = Instance.new("ModuleScript")
+			collided.Name = "Collided"
+			collided.Source = current
+			collided.Parent = fixture
+			session.__instanceMap:insert("COLLIDED", collided)
+			session.__status = ServeSession.Status.Connected
+			session:__rememberVerified("VERIFY", { COLLIDED = checked })
+			local exported = session:exportForBackup({ "COLLIDED" }, { COLLIDED = (hashSource(checked)) }, "VERIFY")
+			expect(exported.missing).to.equal(1)
+			expect(#exported.ids).to.equal(0)
+			-- Without a record of what the verify saw, nothing is exported.
+			collided.Source = checked
+			expect(#session:exportForBackup({ "COLLIDED" }, { COLLIDED = (hashSource(checked)) }, "OTHER").ids).to.equal(
+				0
+			)
+			expect(#session:exportForBackup({ "COLLIDED" }, { COLLIDED = (hashSource(checked)) }, "VERIFY").ids).to.equal(
+				1
+			)
+		end)
+
+		it("leaves out a script whose source changed since verify hashed it", function()
+			local edited = Instance.new("ModuleScript")
+			edited.Name = "Edited"
+			edited.Source = "return 'edited after the check'"
+			edited.Parent = fixture
+			session.__instanceMap:insert("EDITED", edited)
+			session.__status = ServeSession.Status.Connected
+			local hashSource = require(script.Parent.hashSource)
+			-- Verify saw "return 'checked'"; Studio has a newer edit now.
+			local exported = session:exportForBackup({ "EDITED" }, { EDITED = (hashSource("return 'checked'")) })
+			expect(exported.missing).to.equal(1)
+			expect(#exported.ids).to.equal(0)
+			expect(exported.model).to.equal(nil)
+			-- A script without an expected hash is left out too.
+			expect(#session:exportForBackup({ "EDITED" }, {}).ids).to.equal(0)
+		end)
+	end)
+
 	describe("versionMismatchWarning", function()
 		local Config = require(script.Parent.Config)
 		local Version = require(script.Parent.Version)

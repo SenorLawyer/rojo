@@ -21,6 +21,7 @@ local strict = require(script.Parent.strict)
 local Settings = require(script.Parent.Settings)
 local orderSwaps = require(script.Parent.orderSwaps)
 local StudioBridge = require(script.Parent.StudioBridge)
+local StudioBackup = require(script.Parent.StudioBackup)
 local hashSource = require(script.Parent.hashSource)
 local Config = require(script.Parent.Config)
 local Version = require(script.Parent.Version)
@@ -113,6 +114,20 @@ local ServeSession = {}
 ServeSession.__index = ServeSession
 
 ServeSession.Status = Status
+
+-- The text a script's editor holds, which is its `Source` unless it has
+-- unsaved changes, or nil when Studio cannot say. Unlike readSource it never
+-- falls back to `Source`, so a backup can tell that it may miss unsaved text.
+-- Replaced by tests.
+function ServeSession.readEditorText(instance): string?
+	local ok, source = pcall(function()
+		return ScriptEditorService:GetEditorSource(instance)
+	end)
+	if ok and type(source) == "string" then
+		return source
+	end
+	return nil
+end
 
 local validateServeOptions = t.strictInterface({
 	apiContext = t.table,
@@ -342,6 +357,9 @@ function ServeSession:restartStudioBridge()
 		end,
 		applyResync = function(patch, expect, includeHeld, expiresAt, isActive, verifyId)
 			return self:applyResync(patch, expect, includeHeld, expiresAt, isActive, verifyId)
+		end,
+		exportForBackup = function(ids, hashes, verifyId)
+			return self:exportForBackup(ids, hashes, verifyId)
 		end,
 	})
 	self.__studioBridge = bridge
@@ -660,6 +678,176 @@ function ServeSession:getSourceHashes(verifyId, expiresAt, isActive)
 	end
 	self:__rememberVerified(verifyId, seen, generations)
 	return { scripts = scripts, detached = detached, held = held }
+end
+
+--[=[
+	Exports the scripts with the given IDs as they are in Studio, each copied
+	without its children and with the text its open editor shows, for the
+	backup `rojo studio verify --fix` saves before it overwrites them.
+	`hashes` maps each ID to the hash verify saw. A script whose text no longer
+	has that hash is left out: the fix is checked against what verify saw, so
+	a backup of a later edit could be all that is left once the fix writes.
+	`ids` in the result lists the scripts exported, and the server only fixes
+	those. Scripts left out, or no longer in the place, count in `missing`.
+]=]
+function ServeSession:exportForBackup(ids, hashes, verifyId)
+	assert(self.__status == Status.Connected, "Rojo is not syncing this place. Connect it first.")
+	assert(type(ids) == "table" and #ids <= StudioBackup.MAX_INSTANCES, "Back up at most 10,000 scripts at once")
+	assert(type(hashes) == "table", "A backup for verify --fix needs the hash verify saw for each script")
+	-- The exact sources this verify saw, which the fix compares with before
+	-- writing. A matching hash alone is not enough: two sources can share
+	-- one, and the backup must hold the very text the fix replaces.
+	local seen = self:__verifiedSourcesFor(verifyId) or {}
+	local entries = {}
+	local exported = {}
+	local missing = 0
+	for _, id in ids do
+		local instance = self.__instanceMap.fromIds[id]
+		-- From the editor only: a script whose editor text cannot be read is
+		-- left out rather than backed up from a `Source` that may be older.
+		local source = if instance and instance:IsA("LuaSourceContainer")
+			then ServeSession.readEditorText(instance)
+			else nil
+		if
+			source ~= nil
+			and instance:IsDescendantOf(game)
+			and hashes[id] ~= nil
+			and (hashSource(source)) == hashes[id]
+			and source == seen[id]
+		then
+			table.insert(entries, { instance = instance, source = source })
+			table.insert(exported, id)
+		else
+			missing += 1
+		end
+	end
+	local result = { instances = {}, ids = {}, missing = missing, placeId = game.PlaceId, placeName = game.Name }
+	if #entries == 0 then
+		return result
+	end
+	local model, described = StudioBackup.serializeScripts(entries)
+	result.instances = described
+	result.ids = exported
+	result.model = StudioBridge.encodeModel(model)
+	result.bytes = buffer.len(model)
+	return result
+end
+
+-- At most this many paths are named in a warning about instances that were
+-- not backed up.
+local MAX_WARNED_PATHS = 10
+
+local function listPaths(paths)
+	local shown = {}
+	for index = 1, math.min(#paths, MAX_WARNED_PATHS) do
+		table.insert(shown, paths[index])
+	end
+	local text = table.concat(shown, ", ")
+	if #paths > MAX_WARNED_PATHS then
+		text ..= string.format(" and %d more", #paths - MAX_WARNED_PATHS)
+	end
+	return text
+end
+
+--[=[
+	Before the first sync after connecting changes or removes instances in
+	Studio, sends copies of them to the server, which saves them where
+	`rojo studio backup list` finds them. This is the sync that follows a
+	branch switch or a restart of the server, and it can remove code that
+	only Studio had. Syncing never waits on more than this request: when no
+	backup can be saved, it warns and goes ahead.
+]=]
+function ServeSession:__backUpBeforeCatchUp(patch, serverInfo)
+	if not Settings:get("autoBackupBeforeSync") then
+		return nil
+	end
+	-- Collecting reads every affected instance, any of which Studio may
+	-- refuse to let a plugin read. The sync must go ahead whatever happens.
+	local collected, roots, skipped = pcall(StudioBackup.collect, patch, self.__instanceMap)
+	if not collected then
+		Log.warn(
+			"No backup was taken of what this sync changes or removes in Studio: {}. Syncing goes ahead without one.",
+			tostring(roots)
+		)
+		return nil
+	end
+	if #skipped > 0 then
+		-- Services cannot be saved as models, so a sync that changes their
+		-- properties overwrites them with nothing to go back to.
+		Log.warn(
+			"Rojo cannot back up {} instances this sync changes, such as services or instances it cannot read, so their current state is not saved: {}",
+			#skipped,
+			listPaths(skipped)
+		)
+	end
+	if #roots == 0 then
+		return nil
+	end
+	local captured = {}
+	local ok, result = pcall(function()
+		assert(
+			serverInfo.studioBridge ~= nil,
+			"the server was not started with --studio-token-file, so it cannot save backups"
+		)
+		local model, described, unreadable
+		model, described, unreadable, captured = StudioBackup.serialize(roots, ServeSession.readEditorText)
+		if #unreadable > 0 then
+			-- The backup still goes ahead with what was saved.
+			Log.warn(
+				"Unsaved editor text could not be backed up for {} scripts this sync changes or removes, so their backup holds only their saved source: {}",
+				#unreadable,
+				listPaths(unreadable)
+			)
+		end
+		return StudioBackup.send(self.__apiContext.__baseUrl, serverInfo.studioBridge, {
+			model = StudioBridge.encodeModel(model),
+			instances = described,
+			placeId = game.PlaceId,
+			placeName = game.Name,
+		})
+	end)
+	if ok then
+		local id = tostring(result.backup.id)
+		Log.info(
+			"Saved Studio's copies of {} instances this sync changes or removes as backup {}. `rojo studio backup restore {} --parent <instance> --allow-scripts` puts them back.",
+			#roots,
+			id,
+			id
+		)
+		return captured
+	else
+		local paths = {}
+		for _, root in roots do
+			table.insert(paths, root.path)
+		end
+		Log.warn(
+			"No backup was taken of the {} instances this sync changes or removes in Studio ({}): {}. Syncing goes ahead without one. Turn off 'Back Up Before Resync' in Rojo's settings to skip backups.",
+			#roots,
+			listPaths(paths),
+			tostring(result)
+		)
+	end
+	return nil
+end
+
+--[=[
+	Warns about scripts in the backup that were edited after it captured
+	them, such as while it was sent, since the sync is about to overwrite
+	those newest edits and the backup does not hold them. It does not take
+	another backup, so the sync is not held up.
+]=]
+function ServeSession:__warnAboutEditsSinceBackup(captured)
+	if captured == nil or #captured == 0 then
+		return
+	end
+	local ok, changed = pcall(StudioBackup.changedSince, captured, ServeSession.readEditorText)
+	if ok and #changed > 0 then
+		Log.warn(
+			"{} scripts were edited after Rojo backed them up, and this sync overwrites them, so their newest edits are not in the backup: {}",
+			#changed,
+			listPaths(changed)
+		)
+	end
 end
 
 --[=[
@@ -1832,6 +2020,12 @@ function ServeSession:__initialSync(serverInfo)
 
 			return self.__apiContext:write(inversePatch)
 		elseif userDecision == "Accept" then
+			local captured = self:__backUpBeforeCatchUp(catchUpPatch, serverInfo)
+			-- The backup can yield while the user disconnects.
+			if self.__status == Status.Disconnected then
+				return
+			end
+			self:__warnAboutEditsSinceBackup(captured)
 			self:__applyPatch(catchUpPatch)
 			return Promise.resolve()
 		else

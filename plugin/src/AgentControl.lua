@@ -23,6 +23,7 @@ local settingTypes = {
 	typecheckingEnabled = "boolean",
 	timingLogsEnabled = "boolean",
 	guardScriptWipes = "boolean",
+	autoBackupBeforeSync = "boolean",
 	syncReminderMode = { "None", "Notify", "Fullscreen" },
 	confirmationBehavior = { "Never", "Initial", "Always", "Large Changes", "Unlisted PlaceId" },
 	logLevel = { "Trace", "Debug", "Info", "Warn", "Error" },
@@ -80,6 +81,9 @@ function AgentControl.checkConfirmationChange(name, value)
 	elseif name == "guardScriptWipes" then
 		-- Without the guard, an empty file on disk empties the script in Studio.
 		assert(value == true, "Agent control cannot turn off the script wipe guard. " .. CONFIRMATION_SETTING_HINT)
+	elseif name == "autoBackupBeforeSync" then
+		-- Without it, Studio's copies of what a resync overwrites are lost.
+		assert(value == true, "Agent control cannot turn off backups before resyncing. " .. CONFIRMATION_SETTING_HINT)
 	end
 end
 

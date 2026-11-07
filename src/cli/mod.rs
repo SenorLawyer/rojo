@@ -42,6 +42,7 @@ pub use self::packages::PackagesCommand;
 pub use self::plugin::{PluginCommand, PluginSubcommand};
 pub use self::serve::ServeCommand;
 pub use self::sourcemap::SourcemapCommand;
+pub(crate) use self::studio::backup as studio_backup;
 pub use self::studio::{CheckUntrustedModelCommand, StudioCommand};
 pub use self::syncback::SyncbackCommand;
 pub use self::test::TestCommand;
