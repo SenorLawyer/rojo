@@ -96,6 +96,13 @@ const MAX_MODEL_INSTANCES: usize = 10_000;
 /// body, and the last batch may take its full 15-second deadline: 15 + 10 +
 /// 20 + 15 leaves 5 seconds to spare.
 const VERIFY_FIX_BUDGET: Duration = Duration::from_secs(20);
+/// How long after `verify` starts it may begin backing up another group of
+/// the scripts `--fix` overwrites. Each group is a Studio export, a model
+/// check and a save, so a fix of many groups can take longer than the whole
+/// [`VERIFY_FIX_BUDGET`] to back up. The groups backed up by then are fixed
+/// in the time left, and the rest wait for the next run, instead of the
+/// fix running out of time with nothing changed.
+const BACKUP_BUDGET: Duration = Duration::from_secs(12);
 /// How long the backups `verify --fix` saves stay pinned if it never unpins
 /// them, such as when the server crashes. Far longer than a fix runs.
 const BACKUP_PIN: Duration = Duration::from_secs(10 * 60);
@@ -718,6 +725,10 @@ pub struct StudioBridge {
     /// Where automatic backups go instead of the repository's backup folder.
     /// Only tests set it, so they do not write to the user's own folder.
     backup_dir: OnceLock<PathBuf>,
+    /// Replaces [`VERIFY_FIX_BUDGET`] and [`BACKUP_BUDGET`] for a test
+    /// that is about running out of them.
+    #[cfg(test)]
+    fix_budgets: OnceLock<(Duration, Duration)>,
 }
 
 fn reply(status: StatusCode, value: Value) -> Response<Body> {
@@ -848,7 +859,26 @@ impl StudioBridge {
             changed: Notify::new(),
             decodes: Arc::new(Semaphore::new(MAX_CONCURRENT_DECODES)),
             backup_dir: OnceLock::new(),
+            #[cfg(test)]
+            fix_budgets: OnceLock::new(),
         }))
+    }
+
+    /// How long after it starts `verify --fix` may begin another fix batch,
+    /// and another backup.
+    fn fix_budgets(&self) -> (Duration, Duration) {
+        // A test's clock starts before its own setup, such as saving older
+        // backups, and saves with their flushes to disk can take seconds on
+        // a loaded machine, so the real budgets would make tests of large
+        // fixes fail for want of time instead of for what they check.
+        #[cfg(test)]
+        return self
+            .fix_budgets
+            .get()
+            .copied()
+            .unwrap_or((Duration::from_secs(600), Duration::from_secs(600)));
+        #[cfg(not(test))]
+        (VERIFY_FIX_BUDGET, BACKUP_BUDGET)
     }
 
     fn state(&self) -> MutexGuard<'_, State> {
@@ -1403,6 +1433,7 @@ impl StudioBridge {
             let backing_up = args.get("backup") != Some(&json!(false)) && !fixes.is_empty();
             // Holds the pins on this verify's backups until it returns.
             let mut fix_pins = None;
+            let mut deferred = HashSet::new();
             let (backups, backed_up) = if backing_up {
                 match self
                     .back_up_fixes(session_id, &id, &fixes, started, &verify_id)
@@ -1410,6 +1441,7 @@ impl StudioBridge {
                 {
                     Ok(done) => {
                         fix_pins = Some(done.pins);
+                        deferred = done.deferred;
                         (done.summaries, done.scripts)
                     }
                     Err(error) => {
@@ -1439,28 +1471,35 @@ impl StudioBridge {
                 } else {
                     (fixes.clone(), Vec::new())
                 };
+            // Left for the next run because backing them up would have left
+            // too little time to fix them, which is not a failure of their
+            // backup.
+            let deferred_count = not_backed_up
+                .iter()
+                .filter(|fix| deferred.contains(&fix.script.id))
+                .count();
+            let lost = not_backed_up.len() - deferred_count;
             let batches = {
                 let tree = self.serve.tree();
                 verify::resync_batches(&tree, &to_fix)
             };
             let (mut updated, mut failed, mut skipped) = (0, 0, 0);
             let mut errors = Vec::new();
-            if !not_backed_up.is_empty() {
+            if lost > 0 {
                 errors.push(format!(
-                    "{} scripts were not fixed because they are not in a backup: Studio did not \
+                    "{lost} scripts were not fixed because they are not in a backup: Studio did not \
                      export them, for example because they were removed from the place, or their \
-                     backup is gone; run verify again",
-                    not_backed_up.len()
+                     backup is gone; run verify again"
                 ));
             }
             let mut remaining: u64 = batches.iter().map(|batch| batch.count as u64).sum();
             for batch in batches {
                 // The caller stops waiting after its own timeout, and a fix it
                 // no longer hears about must not keep changing Studio.
-                if started.elapsed() > VERIFY_FIX_BUDGET {
+                if started.elapsed() > self.fix_budgets().0 {
                     errors.push(format!(
                         "Stopped after {} seconds; run verify --fix again for the rest",
-                        VERIFY_FIX_BUDGET.as_secs()
+                        self.fix_budgets().0.as_secs()
                     ));
                     break;
                 }
@@ -1526,6 +1565,14 @@ impl StudioBridge {
                     pins.release = true;
                 }
             }
+            // After the pins are settled: scripts that were never sent leave
+            // nothing pending in Studio.
+            if deferred_count > 0 {
+                errors.push(format!(
+                    "{deferred_count} scripts were not fixed because backing them up would have \
+                     left too little time to fix them; run verify --fix again for the rest"
+                ));
+            }
             report["fixed"] = json!({
                 "attempted": fixes.len(),
                 "updated": updated,
@@ -1579,11 +1626,24 @@ impl StudioBridge {
                 backup::MAX_AUTOMATIC
             ));
         }
-        for group in groups_needed {
-            if started.elapsed() > VERIFY_FIX_BUDGET {
+        let (fix_budget, backup_budget) = self.fix_budgets();
+        let mut deferred = HashSet::new();
+        for (index, group) in groups_needed.iter().enumerate() {
+            // Once one group is backed up, the fix can make progress, so the
+            // rest are left for the next run rather than leaving no time to
+            // fix any of them.
+            if !groups.is_empty() && started.elapsed() > backup_budget {
+                deferred = groups_needed[index..]
+                    .iter()
+                    .flatten()
+                    .map(|fix| fix.script.id.clone())
+                    .collect();
+                break;
+            }
+            if started.elapsed() > fix_budget {
                 return Err(format!(
                     "it took longer than {} seconds",
-                    VERIFY_FIX_BUDGET.as_secs()
+                    fix_budget.as_secs()
                 ));
             }
             let child = Uuid::new_v4().to_string();
@@ -1680,7 +1740,7 @@ impl StudioBridge {
                     until,
                     // Within what is left of the fix's time, so a store
                     // another process keeps locked fails the fix in time.
-                    VERIFY_FIX_BUDGET
+                    fix_budget
                         .saturating_sub(started.elapsed())
                         .min(BACKUP_LOCK_WAIT),
                 )
@@ -1702,6 +1762,7 @@ impl StudioBridge {
         Ok(FixBackups {
             summaries,
             scripts,
+            deferred,
             pins,
         })
     }
@@ -2069,6 +2130,8 @@ struct FixBackups {
     /// A bounded summary of each backup, for the report.
     summaries: Vec<Value>,
     scripts: HashSet<String>,
+    /// Scripts left for the next run, for want of time to back them up.
+    deferred: HashSet<String>,
     pins: BackupPins,
 }
 
@@ -3274,7 +3337,11 @@ mod tests {
     /// make progress in between.
     async fn next_command(bridge: &Arc<StudioBridge>, session: &str) -> Value {
         for _ in 0..50 {
-            let (_, value) = plugin(bridge, "/api/studio/poll", json!({"sessionId":session})).await;
+            let (status, value) =
+                plugin(bridge, "/api/studio/poll", json!({"sessionId":session})).await;
+            // Such as a session that expired while the test did something
+            // else, which no number of polls brings back.
+            assert_eq!(status, StatusCode::OK, "polling failed: {value}");
             if let Some(command) = value["commands"].as_array().and_then(|c| c.first()) {
                 return command.clone();
             }
@@ -3395,6 +3462,26 @@ mod tests {
         Vec<verify::TreeScript>,
         tokio::task::JoinHandle<Response<Body>>,
     ) {
+        fix_scripts_past_sources_with(args, count, length, None, None).await
+    }
+
+    /// [`fix_scripts_past_sources`] with the fix's budgets, see
+    /// [`StudioBridge::fix_budgets`], and backups `seed` saves in the store
+    /// first. Seeding while the verify waits would leave the plugin's session
+    /// unpolled, and slow saves on a loaded machine could outlast it.
+    async fn fix_scripts_past_sources_with(
+        args: Value,
+        count: usize,
+        length: usize,
+        budgets: Option<(Duration, Duration)>,
+        seed: Option<&dyn Fn(&backup::Store)>,
+    ) -> (
+        tempfile::TempDir,
+        Arc<StudioBridge>,
+        String,
+        Vec<verify::TreeScript>,
+        tokio::task::JoinHandle<Response<Body>>,
+    ) {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("src")).unwrap();
         std::fs::write(
@@ -3416,6 +3503,12 @@ mod tests {
         }
         std::fs::write(dir.path().join("token"), "0123456789abcdef0123456789abcdef").unwrap();
         let bridge = bridge_for(dir.path(), GIT_LOCK_WAIT);
+        if let Some(budgets) = budgets {
+            bridge.fix_budgets.set(budgets).unwrap();
+        }
+        if let Some(seed) = seed {
+            seed(&backup::Store::in_dir(&dir.path().join("backups")));
+        }
         let session = register(&bridge).await;
         let request = request(
             "POST",
@@ -3648,21 +3741,29 @@ mod tests {
 
     #[tokio::test]
     async fn a_verify_that_fails_part_way_still_leaves_the_store_pruned() {
-        let (dir, bridge, session, _scripts, verify) =
-            fix_scripts_past_sources(json!({"fix":true}), 2, verify::MAX_BACKUP_SOURCE_BYTES).await;
-        let store = backup::Store::in_dir(&dir.path().join("backups"));
         // Old automatic backups, more than are kept, left by earlier runs.
-        for index in 0..backup::KEEP_AUTOMATIC as u64 + 5 {
-            let mut record = backup::automatic_record(
-                "auto-verify-fix",
-                "auto: old",
-                &[("game/Old".to_owned(), "Folder".to_owned())],
-                None,
-                None,
-            );
-            record.created_at = 1_000 + index;
-            store.save(record, b"<roblox!old").unwrap();
-        }
+        let seed = |store: &backup::Store| {
+            for index in 0..backup::KEEP_AUTOMATIC as u64 + 5 {
+                let mut record = backup::automatic_record(
+                    "auto-verify-fix",
+                    "auto: old",
+                    &[("game/Old".to_owned(), "Folder".to_owned())],
+                    None,
+                    None,
+                );
+                record.created_at = 1_000 + index;
+                store.save(record, b"<roblox!old").unwrap();
+            }
+        };
+        let (dir, bridge, session, _scripts, verify) = fix_scripts_past_sources_with(
+            json!({"fix":true}),
+            2,
+            verify::MAX_BACKUP_SOURCE_BYTES,
+            None,
+            Some(&seed),
+        )
+        .await;
+        let store = backup::Store::in_dir(&dir.path().join("backups"));
         let first = next_command(&bridge, &session).await;
         let ids: Vec<String> = first["args"]["ids"]
             .as_array()
@@ -4340,6 +4441,74 @@ mod tests {
             .list()
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn verify_fix_stops_backing_up_in_time_to_fix_and_answer() {
+        // Backing up stops early enough to leave time for fix batches.
+        assert!(BACKUP_BUDGET < VERIFY_FIX_BUDGET);
+        // A backup begun at the last moment, waiting its full deadline, still
+        // ends before the server gives up on the request, after up to 15
+        // seconds waiting for Git and 10 reading the body.
+        let body = Duration::from_secs(10);
+        assert!(GIT_WAIT_LIMIT + body + BACKUP_BUDGET + COMMAND_TIMEOUT < MAX_COMMAND_REQUEST);
+        assert!(GIT_WAIT_LIMIT + body + VERIFY_FIX_BUDGET + COMMAND_TIMEOUT <= MAX_COMMAND_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn verify_fix_out_of_time_to_back_up_fixes_what_is_backed_up() {
+        // No time to back up anything after the first group, and all the
+        // time in the world to fix it.
+        let (dir, bridge, session, scripts, verify) = fix_scripts_past_sources_with(
+            json!({"fix":true}),
+            3,
+            verify::MAX_BACKUP_SOURCE_BYTES,
+            Some((Duration::from_secs(600), Duration::ZERO)),
+            None,
+        )
+        .await;
+        let command = next_command(&bridge, &session).await;
+        assert_eq!(command["action"], "backup");
+        let ids = command_ids(&command);
+        assert_eq!(ids.len(), 1, "one script per group");
+        answer_backup(&bridge, &session, &command, &[&ids[0]]).await;
+        let resync = next_command(&bridge, &session).await;
+        assert_eq!(resync["action"], "resync", "no second backup was asked for");
+        let updated = resync["args"]["patch"]["updated"].as_array().unwrap();
+        assert_eq!(updated.len(), 1, "only the backed-up script is fixed");
+        assert_eq!(updated[0]["id"], json!(ids[0]));
+        plugin(
+            &bridge,
+            "/api/studio/result",
+            json!({"requestId":resync["requestId"],"sessionId":session,"result":{"ok":true,"value":{"updated":1,"failed":0,"skipped":0}}}),
+        )
+        .await;
+        let (status, value) = into_value(verify.await.unwrap()).await;
+        assert_eq!(status, StatusCode::OK, "{value}");
+        let fixed = &value["result"]["value"]["fixed"];
+        assert_eq!(fixed["updated"], 1);
+        assert_eq!(fixed["notBackedUp"], scripts.len() - 1);
+        let errors = fixed["errors"].as_array().unwrap();
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(
+            errors[0]
+                .as_str()
+                .unwrap()
+                .contains("run verify --fix again for the rest"),
+            "{errors:?}"
+        );
+        // Nothing is pending in Studio, so the one backup's pin goes.
+        let backups = dir.path().join("backups");
+        let store = backup::Store::in_dir(&backups);
+        assert!(
+            eventually(|| store
+                .list()
+                .unwrap()
+                .iter()
+                .all(|record| !backups.join(format!("{}.pin", record.id)).exists()))
+            .await
+        );
+        assert_eq!(store.list().unwrap().len(), 1);
     }
 
     #[tokio::test]
