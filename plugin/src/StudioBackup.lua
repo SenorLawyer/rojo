@@ -352,8 +352,7 @@ end
 	- the paths of scripts whose editor text or source could not be read,
 	  whose unsaved text the backup may therefore miss;
 	- `captured`, a list of `{ instance, path, hash }` with the hash of the
-	  text the backup holds for every other script, so `changedSince` can
-	  tell which were edited after the backup was taken;
+	  text the backup holds for every other script;
 	- the paths of instances that are not Archivable and so not in it;
 	- `guarded`, mapping every script in the backup to the hash of the text
 	  it holds, or `false` when that text could not be read, so a later write
@@ -488,25 +487,6 @@ function StudioBackup.serialize(roots, readEditor)
 		error(result, 0)
 	end
 	return result, described, unreadable, captured, unarchivable, guarded
-end
-
---[[
-	The paths of the scripts in `captured`, from `serialize`, whose editor
-	text `readEditor` now reads differently from what the backup holds, such
-	as a script someone typed in while the backup was sent. Scripts whose
-	text cannot be read now are left out, since that was warned about.
-]]
-function StudioBackup.changedSince(captured, readEditor)
-	local changed = {}
-	local counter = { n = 0 }
-	for _, entry in captured do
-		pace(counter)
-		local ok, text = pcall(readEditor, entry.instance)
-		if ok and text ~= nil and (hashSource(text)) ~= entry.hash then
-			table.insert(changed, entry.path)
-		end
-	end
-	return changed
 end
 
 --[[

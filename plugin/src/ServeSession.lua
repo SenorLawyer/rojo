@@ -859,26 +859,6 @@ function ServeSession:__backUpBeforeCatchUp(patch, serverInfo)
 end
 
 --[=[
-	Warns about scripts in the backup that were edited after it captured
-	them, such as while it was sent, since the sync is about to overwrite
-	those newest edits and the backup does not hold them. It does not take
-	another backup, so the sync is not held up.
-]=]
-function ServeSession:__warnAboutEditsSinceBackup(captured)
-	if captured == nil or #captured == 0 then
-		return
-	end
-	local ok, changed = pcall(StudioBackup.changedSince, captured, ServeSession.readEditorText)
-	if ok and #changed > 0 then
-		Log.warn(
-			"{} scripts were edited after Rojo backed them up, and this sync overwrites them, so their newest edits are not in the backup: {}",
-			#changed,
-			listPaths(changed)
-		)
-	end
-end
-
---[=[
 	Applies the script updates that `rojo studio verify --fix` built from the
 	server's tree. `expect` maps each ID to the hash Studio had when verify
 	checked it (`from`) and the hash of the source being sent (`to`). An
@@ -1847,6 +1827,22 @@ function ServeSession:__isEditSinceBackup(instance, text)
 	return now ~= backedUp and now ~= self.__rojoWrittenHashes[instance]
 end
 
+-- During the sync after connecting, notes every script in its backup whose
+-- text is now an edit made since, for the warning that such edits were
+-- overwritten. Reading editor text does not yield, so nothing can change
+-- between this and the changes that follow it.
+function ServeSession:__noteEditsBeforeApply()
+	local guarded = self.__catchUpGuarded
+	if guarded == nil then
+		return
+	end
+	for instance in guarded do
+		if self:__isEditSinceBackup(instance, ServeSession.readEditorText(instance)) then
+			self:__noteOverwrittenEdit(instance:GetFullName())
+		end
+	end
+end
+
 -- Ends one source write of the sync after connecting, and forgets Rojo's
 -- written hashes once that sync and all its writes are done.
 function ServeSession:__finishCatchUpWrite()
@@ -1863,6 +1859,11 @@ local MAX_OVERWRITTEN_NAMED = 10
 
 function ServeSession:__noteOverwrittenEdit(path)
 	self.__overwrittenEdits = self.__overwrittenEdits or {}
+	-- A script checked before applying and again as its write lands is
+	-- named once.
+	if table.find(self.__overwrittenEdits, path) then
+		return
+	end
 	table.insert(self.__overwrittenEdits, path)
 	if self.__overwrittenWarning then
 		return
@@ -1977,6 +1978,15 @@ function ServeSession:__applyPatchInRecording(patch)
 		end
 	end
 	Timer.stop()
+
+	-- The callbacks may yield, as the patch visualizer does, so this is the
+	-- last point before the changes are made, which does not yield. A session
+	-- stopped meanwhile changes nothing, and scripts edited since the
+	-- reconnect backup are named as the sync overwrites or removes them.
+	if self.__status == Status.Disconnected then
+		return patch
+	end
+	self:__noteEditsBeforeApply()
 
 	local reconcilerPatch, sourceWrites = self:__splitSourceWrites(patch)
 	local unappliedPatch = self.__reconciler:applyPatch(reconcilerPatch)
@@ -2188,13 +2198,9 @@ function ServeSession:__initialSync(serverInfo)
 			return self.__apiContext:write(inversePatch)
 		elseif userDecision == "Accept" then
 			local captured, guarded = self:__backUpBeforeCatchUp(catchUpPatch, serverInfo)
-			-- The backup, and the check for edits made during it, both yield,
-			-- and the user may disconnect meanwhile. The patch holds the very
-			-- instances it removes, so a stopped session must not apply it.
-			if self.__status == Status.Disconnected then
-				return
-			end
-			self:__warnAboutEditsSinceBackup(captured)
+			-- The backup yields, and the user may disconnect meanwhile. The
+			-- patch holds the very instances it removes, so a stopped session
+			-- must not apply it. Applying checks again after its own yields.
 			if self.__status == Status.Disconnected then
 				return
 			end

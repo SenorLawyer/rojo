@@ -1429,70 +1429,6 @@ return function()
 			expect(tostring(warnings[2].args[1]):find("simulated failure while collecting", 1, true)).to.be.ok()
 		end)
 
-		it("warns when a backed-up script is edited before the sync overwrites it", function()
-			Settings:set("autoBackupBeforeSync", true)
-			local Log = require(script.Parent.Parent.Packages.Log)
-			local nativeWarn = Log.warn
-			local nativeRead = ServeSession.readEditorText
-			local warnings = {}
-			Log.warn = function(template, ...)
-				table.insert(warnings, { template = template, args = { ... } })
-			end
-			ServeSession.readEditorText = function(instance)
-				return instance.Source
-			end
-			local removed = Instance.new("ModuleScript")
-			removed.Name = "BeingEdited"
-			removed.Source = "return 'captured'"
-			removed.Parent = fixture
-			StudioBridge.requestAsync = function()
-				-- Someone types while the backup is being sent.
-				removed.Source = "return 'typed during the upload'"
-				return {
-					Success = true,
-					StatusCode = 200,
-					Body = HttpService:JSONEncode({ backup = { id = "20261107-000000-auto-sync" } }),
-				}
-			end
-			local events = syncRemoving(removed, { rootInstanceId = "ROOT", studioBridge = pairing })
-			Log.warn = nativeWarn
-			ServeSession.readEditorText = nativeRead
-			expect(events[1]).to.equal("patch")
-			expect(#warnings).to.equal(1)
-			expect(warnings[1].template:find("newest edits are not in the backup", 1, true)).to.be.ok()
-			expect(warnings[1].args[2]).to.equal("game/ReplicatedStorage/__RojoSyncBackupSpec/BeingEdited")
-		end)
-
-		it("does not apply the patch when the session stops while checking for later edits", function()
-			Settings:set("autoBackupBeforeSync", true)
-			local StudioBackup = require(script.Parent.StudioBackup)
-			local nativeChanged = StudioBackup.changedSince
-			local nativeRead = ServeSession.readEditorText
-			ServeSession.readEditorText = function(instance)
-				return instance.Source
-			end
-			StudioBackup.changedSince = function()
-				-- The user disconnects while the scan yields.
-				session:stop()
-				return {}
-			end
-			StudioBridge.requestAsync = function()
-				return {
-					Success = true,
-					StatusCode = 200,
-					Body = HttpService:JSONEncode({ backup = { id = "20261107-000000-auto-sync" } }),
-				}
-			end
-			local removed = Instance.new("ModuleScript")
-			removed.Name = "StillHere"
-			removed.Parent = fixture
-			local events = syncRemoving(removed, { rootInstanceId = "ROOT", studioBridge = pairing })
-			StudioBackup.changedSince = nativeChanged
-			ServeSession.readEditorText = nativeRead
-			expect(#events).to.equal(0)
-			expect(removed.Parent).to.equal(fixture)
-		end)
-
 		it("skips a catch-up source write that lands after its backup's protection ran out", function()
 			local Log = require(script.Parent.Parent.Packages.Log)
 			local nativeWarn = Log.warn
@@ -1763,6 +1699,57 @@ return function()
 			end)
 			expect(session.__instanceMap.fromIds.Late).to.equal(module)
 			expect(#warnings).to.equal(1)
+		end)
+
+		-- A module the reconnect backup holds, edited in Studio while a
+		-- precommit callback yields, and a patch that removes it.
+		local function removeAfterYieldingCallback(module, duringCallback)
+			local hashSource = require(script.Parent.hashSource)
+			session.__instanceMap:insert("REMOVED", module)
+			session.__status = ServeSession.Status.Connected
+			session.__catchUpGuarded = { [module] = (hashSource(module.Source)) }
+			local unhook = session:hookPrecommit(function()
+				-- The patch visualizer yields like this.
+				task.wait()
+				duringCallback()
+			end)
+			local patch = PatchSet.newEmpty()
+			table.insert(patch.removed, "REMOVED")
+			session:__applyPatch(patch)
+			unhook()
+			session.__catchUpGuarded = nil
+		end
+
+		it("names a script edited while precommit callbacks yield, and still removes it", function()
+			local nativeRead = ServeSession.readEditorText
+			local module = Instance.new("ModuleScript")
+			module.Name = "EditedDuringPrecommit"
+			module.Source = "return 'captured'"
+			module.Parent = fixture
+			local warnings = recordingWarnings(function()
+				ServeSession.readEditorText = function(instance)
+					return instance.Source
+				end
+				removeAfterYieldingCallback(module, function()
+					module.Source = "return 'typed while the visualizer was built'"
+				end)
+				ServeSession.readEditorText = nativeRead
+				task.wait(0.8)
+			end)
+			expect(module.Parent).to.equal(nil)
+			expect(#warnings).to.equal(1)
+			expect(warnings[1].template:find("overwrote edits made in Studio after Rojo backed", 1, true)).to.be.ok()
+			expect(warnings[1].args[1]:find("EditedDuringPrecommit", 1, true)).to.be.ok()
+		end)
+
+		it("does not apply a patch when the session stops while precommit callbacks yield", function()
+			local module = Instance.new("ModuleScript")
+			module.Name = "StillHere"
+			module.Parent = fixture
+			removeAfterYieldingCallback(module, function()
+				session:stop()
+			end)
+			expect(module.Parent).to.equal(fixture)
 		end)
 
 		it("takes no backup when it is turned off", function()
