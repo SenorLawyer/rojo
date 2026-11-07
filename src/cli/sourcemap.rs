@@ -474,6 +474,52 @@ mod test {
     }
 
     #[test]
+    fn leaves_out_files_excluded_by_node_glob_ignore_paths() {
+        let sourcemap_dir = tempfile::tempdir().unwrap();
+        let sourcemap_output = sourcemap_dir.path().join("sourcemap.json");
+        let sourcemap_command = SourcemapCommand {
+            project: Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("rojo-test")
+                .join("build-tests")
+                .join("partition_ignore_globs"),
+            output: Some(sourcemap_output.clone()),
+            include_non_scripts: false,
+            watch: false,
+            absolute: false,
+        };
+        assert!(sourcemap_command.run().is_ok());
+
+        let raw = fs_err::read_to_string(sourcemap_output.as_path()).unwrap();
+        let root = serde_json::from_str::<SourcemapNode>(&raw).unwrap();
+        let mut file_paths = Vec::new();
+        let mut queue = vec![&root];
+        while let Some(node) = queue.pop() {
+            file_paths.extend(
+                node.file_paths
+                    .iter()
+                    .map(|path| path.to_string_lossy().replace('\\', "/")),
+            );
+            queue.extend(&node.children);
+        }
+        file_paths.sort_unstable();
+        assert_eq!(
+            file_paths,
+            [
+                "default.project.json",
+                "filtered/Foo.luau",
+                "filtered/Keep.spec.luau",
+                "filtered/Nested/Bar.luau",
+                "unfiltered/Foo.luau",
+                "unfiltered/Foo.spec.luau",
+                "unfiltered/Generated/Gen.luau",
+                "unfiltered/Keep.spec.luau",
+                "unfiltered/Nested/Bar.luau",
+                "unfiltered/Nested/Bar.spec.luau",
+            ]
+        );
+    }
+
+    #[test]
     fn maps_absolute_paths() {
         let sourcemap_dir = tempfile::tempdir().unwrap();
         let sourcemap_output = sourcemap_dir.path().join("sourcemap.json");

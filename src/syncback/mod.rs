@@ -23,10 +23,10 @@ use std::{
 use crate::{
     glob::{Glob, IgnorableGlob},
     snapshot::{
-        content_property_aliases, object_content_warning, remove_object_contents, InstanceWithMeta,
-        RojoTree,
+        content_property_aliases, is_path_ignored, object_content_warning, remove_object_contents,
+        InstanceWithMeta, InstigatingSource, PathIgnoreRule, RojoTree,
     },
-    snapshot_middleware::Middleware,
+    snapshot_middleware::{node_ignore_rules, Middleware},
     syncback::{
         ref_properties::{collect_referents, link_referents},
         snapshot::inst_path,
@@ -181,7 +181,25 @@ pub fn syncback_loop(
     log::debug!("Hashing file DOM");
     let new_hashes = hash_tree(project, &new_tree, new_tree.root_ref());
 
+    // Files a project node's `$globIgnorePaths` exclude never become instances,
+    // so without this an instance Studio has at such a path would be written
+    // there as new. Rules are read from every project node in the old tree to
+    // include nested projects.
+    let node_rules: Vec<PathIgnoreRule> = old_tree
+        .descendants(old_tree.get_root_id())
+        .filter_map(|inst| match &inst.metadata().instigating_source {
+            Some(InstigatingSource::ProjectNode { path, node, .. }) => {
+                Some(node_ignore_rules(path, node))
+            }
+            _ => None,
+        })
+        .flatten()
+        .collect();
+
     let project_path = project.folder_location();
+    let is_writable = |path: &Path| {
+        is_valid_path(&ignore_patterns, project_path, path) && !is_path_ignored(&node_rules, path)
+    };
 
     let syncback_data = SyncbackData {
         vfs,
@@ -219,7 +237,7 @@ pub fn syncback_loop(
             }
         }
 
-        if !is_valid_path(&ignore_patterns, project_path, &snapshot.path) {
+        if !is_writable(&snapshot.path) {
             log::debug!("Skipping {inst_path} because its path matches ignore pattern");
             continue;
         }
@@ -296,7 +314,7 @@ pub fn syncback_loop(
             'remove: for inst in &syncback.removed_children {
                 let path = inst.metadata().instigating_source.as_ref().unwrap().path();
                 let inst_path = snapshot.get_old_inst_path(inst.id());
-                if !is_valid_path(&ignore_patterns, project_path, path) {
+                if !is_writable(path) {
                     log::debug!(
                         "Skipping removing {} because its matches an ignore pattern",
                         path.display()
@@ -321,9 +339,7 @@ pub fn syncback_loop(
 
         // TODO provide replacement snapshots for e.g. two way sync
 
-        fs_snapshot.merge_with_filter(syncback.fs_snapshot, |path| {
-            is_valid_path(&ignore_patterns, project_path, path)
-        });
+        fs_snapshot.merge_with_filter(syncback.fs_snapshot, is_writable);
 
         snapshots.extend(syncback.children);
     }

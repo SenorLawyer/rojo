@@ -56,6 +56,7 @@ gen_build_tests! {
     module_init,
     nested_runcontext,
     optional,
+    partition_ignore_globs,
     project_composed_default,
     project_composed_file,
     project_root_name,

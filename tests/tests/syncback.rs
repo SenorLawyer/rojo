@@ -109,3 +109,24 @@ syncback_tests! {
     // than leaving an incorrect value.
     project_default_properties_remove => ["default.project.json"],
 }
+
+/// Studio holds `Foo.spec` in both partitions, but only the partition without
+/// `$globIgnorePaths` gets the file; the other partition's non-ignored files
+/// are still written.
+#[test]
+fn partition_ignore_globs() {
+    run_syncback_test("partition_ignore_globs", |path| {
+        assert!(
+            !path.join("filtered/Foo.spec.luau").exists(),
+            "syncback wrote into a path the node's $globIgnorePaths exclude"
+        );
+        for name in [
+            "filtered/Foo.luau",
+            "unfiltered/Foo.luau",
+            "unfiltered/Foo.spec.luau",
+        ] {
+            let content = fs_err::read_to_string(path.join(name)).unwrap();
+            assert_snapshot!(format!("partition_ignore_globs-{name}"), content, name);
+        }
+    });
+}

@@ -1,0 +1,20 @@
+{
+  "name": "partition_ignore_globs",
+  "tree": {
+    "$className": "Folder",
+    "Filtered": {
+      "$path": "filtered",
+      "$globIgnorePaths": [
+        "**/*.spec.luau",
+        "Generated/**",
+        "!Keep.spec.luau"
+      ]
+    },
+    "Unfiltered": {
+      "$path": "unfiltered"
+    }
+  },
+  "globIgnorePaths": [
+    "**/*.local.luau"
+  ]
+}

@@ -74,6 +74,13 @@ this guide, `--help` and the bundled topics over them. Each topic prints with
   places, keep hotfix work separate and publish through a staging place
   first. Never publish to a live place without explicit authorization. Read
   `rojo doc --agent releases`.
+* Per-node ignores: a project node with `$path` may set `$globIgnorePaths`,
+  such as `["**/*.spec.luau", "Generated"]`. The globs are relative to that
+  node's `$path`, apply only to files beneath it and come after the project's
+  `globIgnorePaths`, so `!` can re-include a file the project ignores.
+  Matching files become no instances in build, serve, live sync and
+  sourcemap, and syncback does not write them. `Generated/**` leaves an empty
+  `Generated` folder; `Generated` removes it.
 * Packages and merges: `rojo packages doctor` checks Wally and pesde
   mappings, see `rojo doc --agent packages`; `rojo merge` merges binary and
   XML place files, see `rojo doc --agent merge`.

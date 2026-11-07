@@ -1187,3 +1187,75 @@ fn intern_messages(
     }
     redactions.redacted_yaml(messages)
 }
+
+#[test]
+fn partition_ignore_globs() {
+    run_serve_test("partition_ignore_globs", |session, mut redactions| {
+        let info = session.get_api_rojo().unwrap();
+        let root_id = info.root_instance_id;
+
+        let read_response = session.get_api_read(root_id).unwrap();
+        let unfiltered_id = *read_response
+            .instances
+            .iter()
+            .find(|(_, instance)| instance.name == "Unfiltered")
+            .unwrap()
+            .0;
+        with_settings!({ sort_maps => true }, {
+            assert_yaml_snapshot!(
+                "partition_ignore_globs_all",
+                read_response.intern_and_redact(&mut redactions, root_id)
+            );
+        });
+
+        // Editing and adding files that Filtered's `$globIgnorePaths` exclude
+        // must not produce patches.
+        fs::write(
+            session.path().join("filtered/Foo.spec.luau"),
+            "return 'edited'",
+        )
+        .unwrap();
+        fs::write(session.path().join("filtered/New.spec.luau"), "return 1").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(500));
+
+        // The same name in a partition without the glob is synced. Its patch
+        // comes after the ignored writes, so any patch they caused would be
+        // collected before it.
+        fs::write(session.path().join("unfiltered/New.spec.luau"), "return 1").unwrap();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let mut cursor = 0;
+        let mut messages: Vec<SubscribeMessage<'static>> = Vec::new();
+        while !messages.iter().any(|message| !message.added.is_empty()) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for the added instance, received: {messages:#?}"
+            );
+            let packet = session
+                .get_api_socket_packet(SocketPacketType::Messages, cursor)
+                .unwrap();
+            let SocketPacketBody::Messages(packet) = packet.body;
+            cursor = packet.message_cursor;
+            messages.extend(packet.messages);
+        }
+
+        for message in &messages {
+            assert!(message.removed.is_empty(), "{messages:#?}");
+            assert!(message.updated.is_empty(), "{messages:#?}");
+            for instance in message.added.values() {
+                assert_eq!(instance.name, "New.spec", "{messages:#?}");
+                assert_eq!(instance.parent, unfiltered_id, "{messages:#?}");
+            }
+        }
+        let added: usize = messages.iter().map(|message| message.added.len()).sum();
+        assert_eq!(added, 1, "{messages:#?}");
+
+        let read_response = session.get_api_read(root_id).unwrap();
+        with_settings!({ sort_maps => true }, {
+            assert_yaml_snapshot!(
+                "partition_ignore_globs_all-2",
+                read_response.intern_and_redact(&mut redactions, root_id)
+            );
+        });
+    });
+}

@@ -1,0 +1,72 @@
+---
+source: tests/tests/serve.rs
+expression: "read_response.intern_and_redact(&mut redactions, root_id)"
+---
+instances:
+  id-2:
+    Children:
+      - id-3
+      - id-5
+    ClassName: Folder
+    Id: id-2
+    Metadata:
+      ignoreUnknownInstances: true
+    Name: partition_ignore_globs
+    Parent: "00000000000000000000000000000000"
+    Properties: {}
+  id-3:
+    Children:
+      - id-4
+    ClassName: Folder
+    Id: id-3
+    Metadata:
+      ignoreUnknownInstances: false
+    Name: Filtered
+    Parent: id-2
+    Properties: {}
+  id-4:
+    Children: []
+    ClassName: ModuleScript
+    Id: id-4
+    Metadata:
+      ignoreUnknownInstances: false
+    Name: Foo
+    Parent: id-3
+    Properties:
+      Source:
+        String: "return \"Foo\"\n"
+  id-5:
+    Children:
+      - id-6
+      - id-7
+    ClassName: Folder
+    Id: id-5
+    Metadata:
+      ignoreUnknownInstances: false
+    Name: Unfiltered
+    Parent: id-2
+    Properties: {}
+  id-6:
+    Children: []
+    ClassName: ModuleScript
+    Id: id-6
+    Metadata:
+      ignoreUnknownInstances: false
+    Name: Foo
+    Parent: id-5
+    Properties:
+      Source:
+        String: "return \"Foo\"\n"
+  id-7:
+    Children: []
+    ClassName: ModuleScript
+    Id: id-7
+    Metadata:
+      ignoreUnknownInstances: false
+    Name: Foo.spec
+    Parent: id-5
+    Properties:
+      Source:
+        String: "return \"Foo.spec\"\n"
+messageCursor: 0
+sessionId: id-1
