@@ -1216,6 +1216,12 @@ fn partition_ignore_globs() {
         )
         .unwrap();
         fs::write(session.path().join("filtered/New.spec.luau"), "return 1").unwrap();
+        // An excluded init file must not turn its folder into a script.
+        fs::write(
+            session.path().join("filtered/Dir/init.server.luau"),
+            "print(1)",
+        )
+        .unwrap();
         std::thread::sleep(std::time::Duration::from_millis(500));
 
         // The same name in a partition without the glob is synced. Its patch
@@ -1257,5 +1263,47 @@ fn partition_ignore_globs() {
                 read_response.intern_and_redact(&mut redactions, root_id)
             );
         });
+    });
+}
+
+#[test]
+fn partition_ignore_globs_reload() {
+    run_serve_test("partition_ignore_globs_reload", |session, _redactions| {
+        let info = session.get_api_rojo().unwrap();
+        let read_response = session.get_api_read(info.root_instance_id).unwrap();
+        assert!(!read_response
+            .instances
+            .values()
+            .any(|instance| instance.name == "Foo.spec"));
+
+        // Removing the root node's rule must bring the file back without a
+        // restart.
+        fs::write(
+            session.path().join("default.project.json"),
+            r#"{"name": "partition_ignore_globs_reload", "tree": {"$path": "src"}}"#,
+        )
+        .unwrap();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let mut cursor = 0;
+        loop {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "Foo.spec was not added after its rule was removed"
+            );
+            let packet = session
+                .get_api_socket_packet(SocketPacketType::Messages, cursor)
+                .unwrap();
+            let SocketPacketBody::Messages(packet) = packet.body;
+            cursor = packet.message_cursor;
+            if packet
+                .messages
+                .iter()
+                .flat_map(|message| message.added.values())
+                .any(|instance| instance.name == "Foo.spec")
+            {
+                break;
+            }
+        }
     });
 }

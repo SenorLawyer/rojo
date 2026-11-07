@@ -240,6 +240,11 @@ fn recurse_create_node<'a>(
         .iter()
         // Not all paths listed as relevant are guaranteed to exist.
         .filter(|path| path.is_file())
+        // A folder lists its possible init files as relevant, including ones
+        // excluded by ignore globs, which do not make up the instance.
+        .filter(|path| {
+            !crate::snapshot::is_path_ignored(&instance.metadata().context.path_ignore_rules, path)
+        })
         .map(|path| path.as_path());
 
     let mut output_file_paths: Vec<Cow<'a, Path>> =
@@ -509,12 +514,17 @@ mod test {
                 "filtered/Foo.luau",
                 "filtered/Keep.spec.luau",
                 "filtered/Nested/Bar.luau",
+                "filtered/Server/Helper.luau",
+                "package/default.project.json",
+                "package/src/Foo.luau",
                 "unfiltered/Foo.luau",
                 "unfiltered/Foo.spec.luau",
                 "unfiltered/Generated/Gen.luau",
                 "unfiltered/Keep.spec.luau",
                 "unfiltered/Nested/Bar.luau",
                 "unfiltered/Nested/Bar.spec.luau",
+                "unfiltered/Server/Helper.luau",
+                "unfiltered/Server/init.server.luau",
             ]
         );
     }

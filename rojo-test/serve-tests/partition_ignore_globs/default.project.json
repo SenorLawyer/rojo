@@ -5,7 +5,8 @@
     "Filtered": {
       "$path": "filtered",
       "$globIgnorePaths": [
-        "**/*.spec.luau"
+        "**/*.spec.luau",
+        "**/*.server.luau"
       ]
     },
     "Unfiltered": {

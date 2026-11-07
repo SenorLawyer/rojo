@@ -1,0 +1,9 @@
+---
+source: tests/rojo_test/syncback_util.rs
+expression: "String::from_utf8_lossy(&output.stdout)"
+---
+Writing src/Dup.rbxm
+Writing src/Foo.luau
+Removing src/Dup/A.luau
+Removing src/Nested/Bar.luau
+Removing src/Gone

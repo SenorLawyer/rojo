@@ -64,6 +64,7 @@ pub fn snapshot_project(
         None => panic!("Project is missing a name"),
     };
 
+    let inherited_context = context;
     let mut context = context.clone();
     context.clear_sync_rules();
 
@@ -107,6 +108,11 @@ pub fn snapshot_project(
             // file being updated.
             snapshot.metadata.relevant_paths.push(path.to_path_buf());
 
+            // A change to the project file re-snapshots it with this context.
+            // It must not already hold this project's ignore rules, which are
+            // only ever added to, or removing one would need a restart.
+            snapshot.metadata.context = inherited_context.clone();
+
             Ok(Some(snapshot))
         }
         None => Ok(None),
@@ -114,12 +120,16 @@ pub fn snapshot_project(
 }
 
 /// Returns the ignore rules a project node's `$globIgnorePaths` add, based at
-/// the node's `$path`. Nodes without a `$path` add none.
+/// the node's `$path`, or at the folder of the project file that `$path`
+/// names. Nodes without a `$path` add none.
 pub fn node_ignore_rules(project_path: &Path, node: &ProjectNode) -> Vec<PathIgnoreRule> {
     let Some(path_node) = &node.path else {
         return Vec::new();
     };
-    let base_path = project_path.parent().unwrap().join(path_node.path());
+    let mut base_path = project_path.parent().unwrap().join(path_node.path());
+    if Project::is_project_file(&base_path) {
+        base_path.pop();
+    }
 
     node.glob_ignore_paths
         .iter()
@@ -1161,6 +1171,92 @@ mod test {
         .unwrap()
         .unwrap();
         assert_eq!(child_names(&resnapshot), ["Bar"]);
+    }
+
+    #[test]
+    fn node_glob_ignore_paths_treat_ignored_init_files_as_absent() {
+        let server = || {
+            VfsSnapshot::dir([(
+                "Server",
+                VfsSnapshot::dir([
+                    ("init.server.luau", VfsSnapshot::file("print(1)")),
+                    ("Helper.luau", VfsSnapshot::file("")),
+                ]),
+            )])
+        };
+        let mut fs = InMemoryFs::new();
+        fs.load_snapshot(
+            "/foo",
+            VfsSnapshot::dir([
+                (
+                    "default.project.json",
+                    VfsSnapshot::file(
+                        r#"{
+                            "name": "partitions",
+                            "tree": {
+                                "$className": "Folder",
+                                "Filtered": {
+                                    "$path": "filtered",
+                                    "$globIgnorePaths": ["**/*.server.luau"]
+                                },
+                                "Unfiltered": { "$path": "unfiltered" }
+                            }
+                        }"#,
+                    ),
+                ),
+                ("filtered", server()),
+                ("unfiltered", server()),
+            ]),
+        )
+        .unwrap();
+        let snapshot = snapshot_project(
+            &InstanceContext::default(),
+            &Vfs::new(fs),
+            Path::new("/foo/default.project.json"),
+            "partitions",
+        )
+        .unwrap()
+        .unwrap();
+
+        let filtered = child(child(&snapshot, "Filtered"), "Server");
+        assert_eq!(filtered.class_name, "Folder");
+        assert_eq!(child_names(filtered), ["Helper"]);
+        let unfiltered = child(child(&snapshot, "Unfiltered"), "Server");
+        assert_ne!(unfiltered.class_name, "Folder");
+        assert_eq!(child_names(unfiltered), ["Helper"]);
+    }
+
+    #[test]
+    fn node_glob_ignore_paths_are_based_at_a_project_files_folder() {
+        let node: ProjectNode = crate::json::from_str(
+            r#"{"$path": "package/default.project.json", "$globIgnorePaths": ["**"]}"#,
+        )
+        .unwrap();
+        let rules = node_ignore_rules(Path::new("/foo/default.project.json"), &node);
+        assert_eq!(rules[0].base_path, PathBuf::from("/foo/package"));
+
+        let node: ProjectNode =
+            crate::json::from_str(r#"{"$path": "src", "$globIgnorePaths": ["**"]}"#).unwrap();
+        let rules = node_ignore_rules(Path::new("/foo/default.project.json"), &node);
+        assert_eq!(rules[0].base_path, PathBuf::from("/foo/src"));
+    }
+
+    #[test]
+    fn project_root_keeps_the_inherited_context() {
+        // Reloading the project file re-snapshots it with the root's context,
+        // and ignore rules are only ever added, so the root's own rules must
+        // not be in it.
+        let snapshot = snapshot_fixture(
+            r#"{
+                "name": "partitions",
+                "globIgnorePaths": ["**/Gen.luau"],
+                "tree": { "$path": "filtered", "$globIgnorePaths": ["**/*.spec.luau"] }
+            }"#,
+        );
+        assert!(snapshot.metadata.context.path_ignore_rules.is_empty());
+        assert_eq!(child_names(&snapshot), ["Foo", "Generated", "Nested"]);
+        let nested = child(&snapshot, "Nested");
+        assert_eq!(nested.metadata.context.path_ignore_rules.len(), 2);
     }
 
     #[ignore = "Functionality moved to root snapshot middleware"]

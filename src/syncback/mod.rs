@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     env,
-    path::Path,
+    path::{Path, PathBuf},
     sync::OnceLock,
 };
 
@@ -24,7 +24,7 @@ use crate::{
     glob::{Glob, IgnorableGlob},
     snapshot::{
         content_property_aliases, is_path_ignored, object_content_warning, remove_object_contents,
-        InstanceWithMeta, InstigatingSource, PathIgnoreRule, RojoTree,
+        InstanceWithMeta, PathIgnoreRule, RojoTree,
     },
     snapshot_middleware::{node_ignore_rules, Middleware},
     syncback::{
@@ -183,18 +183,8 @@ pub fn syncback_loop(
 
     // Files a project node's `$globIgnorePaths` exclude never become instances,
     // so without this an instance Studio has at such a path would be written
-    // there as new. Rules are read from every project node in the old tree to
-    // include nested projects.
-    let node_rules: Vec<PathIgnoreRule> = old_tree
-        .descendants(old_tree.get_root_id())
-        .filter_map(|inst| match &inst.metadata().instigating_source {
-            Some(InstigatingSource::ProjectNode { path, node, .. }) => {
-                Some(node_ignore_rules(path, node))
-            }
-            _ => None,
-        })
-        .flatten()
-        .collect();
+    // there as new.
+    let node_rules = collect_node_ignore_rules(vfs, old_tree)?;
 
     let project_path = project.folder_location();
     let is_writable = |path: &Path| {
@@ -299,7 +289,7 @@ pub fn syncback_loop(
                 if new_syncback_result.is_ok() && snapshot.old_inst().is_some() {
                     // We need to remove the old FS representation if we're
                     // reserializing it as an rbxm.
-                    fs_snapshot.remove_dir(&snapshot.path);
+                    remove_dir_keeping_ignored(vfs, &mut fs_snapshot, &snapshot.path, &node_rules)?;
                 }
                 new_syncback_result?
             }
@@ -330,7 +320,7 @@ pub fn syncback_loop(
                     }
                 }
                 if path.is_dir() {
-                    fs_snapshot.remove_dir(path)
+                    remove_dir_keeping_ignored(vfs, &mut fs_snapshot, path, &node_rules)?;
                 } else {
                     fs_snapshot.remove_file(path)
                 }
@@ -345,6 +335,119 @@ pub fn syncback_loop(
     }
 
     Ok(fs_snapshot)
+}
+
+/// Reads the `$globIgnorePaths` of every node in every project file the old
+/// tree came from. They are read from the project files rather than from each
+/// instance's `InstigatingSource`, because a project's root node is tagged
+/// with the project file's path instead, which would lose its rules.
+fn collect_node_ignore_rules(
+    vfs: &Vfs,
+    old_tree: &RojoTree,
+) -> anyhow::Result<Vec<PathIgnoreRule>> {
+    let mut project_paths = Vec::new();
+    for inst in old_tree.descendants(old_tree.get_root_id()) {
+        let metadata = inst.metadata();
+        let instigating = metadata
+            .instigating_source
+            .as_ref()
+            .map(|source| source.path());
+        for path in metadata
+            .relevant_paths
+            .iter()
+            .map(PathBuf::as_path)
+            .chain(instigating)
+        {
+            if Project::is_project_file(path) && !project_paths.iter().any(|p| p == path) {
+                project_paths.push(path.to_path_buf());
+            }
+        }
+    }
+
+    let mut rules = Vec::new();
+    for project_path in project_paths {
+        if !vfs.exists(&project_path)? {
+            continue;
+        }
+        // The fallback name only keeps loading from failing for a project
+        // without `name`; the name is not used here.
+        let project = Project::load_exact(vfs, &project_path, Some("project"))?;
+        let mut nodes = vec![&project.tree];
+        while let Some(node) = nodes.pop() {
+            for rule in node_ignore_rules(&project_path, node) {
+                if !rules.contains(&rule) {
+                    rules.push(rule);
+                }
+            }
+            nodes.extend(node.children.values());
+        }
+    }
+    Ok(rules)
+}
+
+/// Removes the directory at `path`, except for files beneath it that a node's
+/// `$globIgnorePaths` exclude. Those files are not part of the tree syncback
+/// compares, so removing them with their directory would delete files that
+/// Studio never held. The directory is kept if anything in it is kept.
+fn remove_dir_keeping_ignored(
+    vfs: &Vfs,
+    fs_snapshot: &mut FsSnapshot,
+    path: &Path,
+    rules: &[PathIgnoreRule],
+) -> anyhow::Result<()> {
+    let may_apply = rules
+        .iter()
+        .any(|rule| path.starts_with(&rule.base_path) || rule.base_path.starts_with(path));
+    if !may_apply {
+        fs_snapshot.remove_dir(path);
+        return Ok(());
+    }
+
+    // Returns whether anything under `dir` is kept, and the removals that
+    // leave only the kept entries.
+    fn plan(
+        vfs: &Vfs,
+        dir: &Path,
+        rules: &[PathIgnoreRule],
+    ) -> anyhow::Result<(bool, Vec<(PathBuf, bool)>)> {
+        let mut kept = false;
+        let mut removals = Vec::new();
+        for entry in vfs.read_dir(dir)? {
+            let entry_path = entry?.path().to_path_buf();
+            if is_path_ignored(rules, &entry_path) {
+                kept = true;
+            } else if vfs.metadata(&entry_path)?.is_dir() {
+                let (child_kept, child_removals) = plan(vfs, &entry_path, rules)?;
+                if child_kept {
+                    kept = true;
+                    removals.extend(child_removals);
+                } else {
+                    removals.push((entry_path, true));
+                }
+            } else {
+                removals.push((entry_path, false));
+            }
+        }
+        Ok((kept, removals))
+    }
+
+    let (kept, removals) = plan(vfs, path, rules)?;
+    if !kept {
+        fs_snapshot.remove_dir(path);
+        return Ok(());
+    }
+    log::warn!(
+        "Keeping {} because it holds files excluded by $globIgnorePaths",
+        path.display()
+    );
+    for (removal, is_dir) in removals {
+        if is_dir {
+            fs_snapshot.remove_dir(removal);
+        } else {
+            fs_snapshot.remove_file(removal);
+        }
+    }
+    Ok(())
 }
 
 pub struct SyncbackReturn<'sync> {
