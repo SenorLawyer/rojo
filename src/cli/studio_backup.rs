@@ -490,12 +490,14 @@ impl Store {
         self.dir.join(format!("{id}.pin"))
     }
 
-    /// Whether `id` has a pin that has not expired by `now`.
+    /// Whether `id` has a pin that has not expired by `now`. A pin that is
+    /// there but cannot be read protects its backup too: only a pin known
+    /// to have expired, or none, lets a backup be removed.
     fn pinned(&self, id: &str, now: u64) -> bool {
-        fs::read_to_string(self.pin_path(id))
-            .ok()
-            .and_then(|text| text.trim().parse::<u64>().ok())
-            .is_some_and(|until| until > now)
+        match fs::read_to_string(self.pin_path(id)) {
+            Ok(text) => text.trim().parse::<u64>().map_or(true, |until| until > now),
+            Err(error) => error.kind() != std::io::ErrorKind::NotFound,
+        }
     }
 
     /// Saves `model` as an automatic backup, then prunes old automatic
@@ -1814,6 +1816,34 @@ mod tests {
         assert!(store
             .model_path("20261107-000000-auto-verify-fix-0123abcd")
             .exists());
+    }
+
+    #[test]
+    fn a_pin_that_cannot_be_read_still_protects_its_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::in_dir(dir.path());
+        let now = now_millis();
+        let limits = PruneLimits {
+            keep: 0,
+            grace_millis: 0,
+            max_count: 1,
+            max_bytes: u64::MAX,
+        };
+        let old = fill(&store, "old", hours_ago(5));
+        fs::write(store.pin_path(&old), b"not a time").unwrap();
+        // Old and over the limit, yet its pin may still be in force, so it
+        // stays, and fills the limit.
+        assert!(store
+            .save_automatic_with(record("new", now), b"new", None, limits, now)
+            .is_err());
+        store.prune_automatic_with(limits, now).unwrap();
+        assert!(store.exists(&old));
+        // A pin known to have expired does not protect it.
+        fs::write(store.pin_path(&old), (now - 1).to_string()).unwrap();
+        store
+            .save_automatic_with(record("new", now), b"new", None, limits, now)
+            .unwrap();
+        assert!(!store.exists(&old));
     }
 
     #[test]

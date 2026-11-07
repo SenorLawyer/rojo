@@ -1723,28 +1723,18 @@ impl StudioBridge {
     /// Runs the isolated check `backup restore` runs on `model`, so a backup
     /// that could never be restored is not saved as if it could.
     async fn check_restorable(&self, model: &[u8], expected: &[u32]) -> Result<(), String> {
-        // Exactly what restore runs, re-encoding and its size limit included.
-        let restored = self
-            .in_check_slot(model.to_vec(), |bytes, remaining| {
-                model_check::prepare_restore(bytes, true, remaining)
-            })
+        // Exactly what restore runs, re-encoding, its size limit and the
+        // import check of what it sends included, in the bounded child
+        // check, which also reports what each script would come back as.
+        let report = self
+            .in_check_slot(model.to_vec(), model_check::restore_report)
             .await
             .map_err(|(_, message)| format!("the backup would not be restorable: {message}"))?;
         // Re-encoding can still change a script's text, such as bytes that
         // are not UTF-8, so each script must come back with the hash verify
-        // saw. The re-encoded model passed the isolated check above.
-        let expected = expected.to_vec();
-        tokio::task::spawn_blocking(move || {
-            std::thread::Builder::new()
-                .stack_size(DECODE_STACK_BYTES)
-                .spawn(move || restored_sources_match(&restored, &expected))
-                .map_err(|error| error.to_string())?
-                .join()
-                .map_err(|_| "the restored backup could not be read".to_owned())?
-        })
-        .await
-        .map_err(|_| "the restored backup could not be read".to_owned())?
-        .map_err(|message| format!("the backup would not be restorable as it is: {message}"))
+        // saw.
+        restored_sources_match(&report, expected)
+            .map_err(|message| format!("the backup would not be restorable as it is: {message}"))
     }
 
     /// The backup folder of the project's repository, which
@@ -2012,11 +2002,11 @@ impl StudioBridge {
     /// Runs `check` on `bytes` in a model check slot, within
     /// [`IMPORT_CHECK_LIMIT`] including the wait for the slot, which `check`
     /// is given the rest of.
-    async fn in_check_slot(
+    async fn in_check_slot<T: Send + 'static>(
         &self,
         bytes: Vec<u8>,
-        check: impl FnOnce(Vec<u8>, Duration) -> anyhow::Result<Vec<u8>> + Send + 'static,
-    ) -> Result<Vec<u8>, (StatusCode, String)> {
+        check: impl FnOnce(Vec<u8>, Duration) -> anyhow::Result<T> + Send + 'static,
+    ) -> Result<T, (StatusCode, String)> {
         let started = Instant::now();
         let slot = match tokio::time::timeout(
             IMPORT_CHECK_LIMIT,
@@ -2148,28 +2138,24 @@ fn backup_summary(record: &backup::Record, store_dir: &Path) -> Value {
     })
 }
 
-/// Whether the roots of the binary model `restored` are scripts whose sources
-/// have the hashes in `expected`, in order.
-fn restored_sources_match(restored: &[u8], expected: &[u32]) -> Result<(), String> {
-    let dom = rbx_binary::from_reader(restored).map_err(|error| error.to_string())?;
-    let roots = dom.root().children();
-    if roots.len() != expected.len() {
+/// Whether `report`, the class and source hash of each root restore would
+/// send, holds scripts whose sources have the hashes in `expected`, in order.
+fn restored_sources_match(
+    report: &[(String, Option<u32>)],
+    expected: &[u32],
+) -> Result<(), String> {
+    if report.len() != expected.len() {
         return Err(format!(
             "it holds {} scripts, not the {} exported",
-            roots.len(),
+            report.len(),
             expected.len()
         ));
     }
-    for (root, &hash) in roots.iter().zip(expected) {
-        let instance = dom.get_by_ref(*root).ok_or("a script is missing")?;
-        let source = match instance.properties.get(&rbx_dom_weak::ustr("Source")) {
-            Some(rbx_dom_weak::types::Variant::String(source)) => source.as_str(),
-            _ => return Err(format!("{} has no source", instance.name)),
-        };
-        if verify::hash_source(source).0 != hash {
+    for (index, ((class, hash), &wanted)) in report.iter().zip(expected).enumerate() {
+        if *hash != Some(wanted) {
             return Err(format!(
-                "{} would not come back with the source it has, such as when it is not valid UTF-8",
-                instance.name
+                "script {} ({class}) would not come back with the source it has, such as when it is not valid UTF-8",
+                index + 1
             ));
         }
     }
@@ -3893,7 +3879,7 @@ mod tests {
                 .is_ok()
         );
         let error =
-            model_check::prepare_restore(bytes.clone(), true, IMPORT_CHECK_LIMIT).unwrap_err();
+            model_check::validate_for_restore(bytes.clone(), true, IMPORT_CHECK_LIMIT).unwrap_err();
         assert!(format!("{error:#}").contains("exceeds 5MiB"), "{error:#}");
         data_encoding::BASE64.encode(&bytes)
     }
@@ -4233,9 +4219,12 @@ mod tests {
         );
         // What restoring gets back, script by script.
         let (_, model) = store.get(&saved[0].id).unwrap();
-        let restored =
-            model_check::prepare_restore(std::fs::read(model).unwrap(), true, IMPORT_CHECK_LIMIT)
-                .unwrap();
+        let restored = model_check::validate_for_restore(
+            std::fs::read(model).unwrap(),
+            true,
+            IMPORT_CHECK_LIMIT,
+        )
+        .unwrap();
         let dom = rbx_binary::from_reader(restored.as_slice()).unwrap();
         for (root, (_, class, editor)) in dom.root().children().iter().zip(&scripts) {
             let instance = dom.get_by_ref(*root).unwrap();
@@ -4263,6 +4252,32 @@ mod tests {
                 .unwrap()
                 .contains("would not come back"),
             "{value}"
+        );
+        assert!(bridge.state().pending.is_empty(), "no resync was sent");
+        assert!(backup::Store::in_dir(&dir.path().join("backups"))
+            .list()
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn verify_fix_does_not_save_a_backup_whose_restored_model_the_import_would_refuse() {
+        let (dir, bridge, session, script, verify) = fix_past_sources(json!({"fix":true})).await;
+        let command = next_command(&bridge, &session).await;
+        answer_export(
+            &bridge,
+            &session,
+            &command,
+            json!({"model": data_encoding::BASE64.encode(&model_check::two_group_fixture()), "ids": [script.id],
+                "instances": [{"path":"game/ReplicatedStorage/Shared/Main","className":"ModuleScript"}]}),
+        )
+        .await;
+        let (status, value) = into_value(verify.await.unwrap()).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{value}");
+        let error = value["error"].as_str().unwrap();
+        assert!(
+            error.starts_with("Changed nothing") && error.contains("oversized chunk"),
+            "{error}"
         );
         assert!(bridge.state().pending.is_empty(), "no resync was sent");
         assert!(backup::Store::in_dir(&dir.path().join("backups"))

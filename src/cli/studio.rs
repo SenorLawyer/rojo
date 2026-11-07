@@ -31,11 +31,14 @@ pub struct CheckUntrustedModelCommand {
     /// Write the model back out as a binary model.
     #[clap(long)]
     pub encode: bool,
+    /// With --encode, write each root's class and source hash instead.
+    #[clap(long)]
+    pub report_sources: bool,
 }
 
 impl CheckUntrustedModelCommand {
     pub fn run(self) -> anyhow::Result<()> {
-        model_check::run_child(self.allow_scripts, self.encode)
+        model_check::run_child(self.allow_scripts, self.encode, self.report_sources)
     }
 }
 
@@ -1304,7 +1307,7 @@ fn read_model(path: &Path, allow_scripts: bool) -> anyhow::Result<Vec<u8>> {
     let bytes = fs::read(path)?;
     // The same isolated check the server runs, so a model that crashes the
     // decoder is reported as invalid instead of ending this command.
-    model_check::prepare_restore(bytes, allow_scripts, IMPORT_CHECK_LIMIT)
+    model_check::validate_for_restore(bytes, allow_scripts, IMPORT_CHECK_LIMIT)
 }
 
 #[cfg(test)]
@@ -1320,7 +1323,8 @@ mod tests {
             options.subcommand,
             Subcommand::CheckUntrustedModel(CheckUntrustedModelCommand {
                 encode: true,
-                allow_scripts: false
+                allow_scripts: false,
+                report_sources: false,
             })
         ));
     }
