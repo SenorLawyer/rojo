@@ -95,6 +95,12 @@ local function readSource(instance): string?
 	return nil
 end
 
+-- How long after the reconnect backup was saved the sync it protects may
+-- still write a script's source. The server pins that backup for 10 minutes
+-- (BACKUP_PIN in src/web/studio.rs), so a write that lands later could
+-- replace code whose backup is already gone.
+local CATCH_UP_WRITE_WINDOW = 5 * 60
+
 -- Holds by the Studio instance they protect. A reconnect makes a new session
 -- with new IDs, and the file may still be empty, so the new session adopts
 -- these instead of starting without holds. Weak keys let destroyed scripts go.
@@ -114,6 +120,9 @@ local ServeSession = {}
 ServeSession.__index = ServeSession
 
 ServeSession.Status = Status
+
+-- Seconds, for the catch-up write deadline. Replaced by tests.
+ServeSession.clock = os.clock
 
 -- The text a script's editor holds, which is its `Source` unless it has
 -- unsaved changes, or nil when Studio cannot say. Unlike readSource it never
@@ -789,8 +798,18 @@ function ServeSession:__backUpBeforeCatchUp(patch, serverInfo)
 			serverInfo.studioBridge ~= nil,
 			"the server was not started with --studio-token-file, so it cannot save backups"
 		)
-		local model, described, unreadable
-		model, described, unreadable, captured = StudioBackup.serialize(roots, ServeSession.readEditorText)
+		local model, described, unreadable, unarchivable
+		model, described, unreadable, captured, unarchivable =
+			StudioBackup.serialize(roots, ServeSession.readEditorText)
+		if #unarchivable > 0 then
+			-- Studio does not save instances that are not Archivable, nor
+			-- anything inside them, so the backup cannot hold them.
+			Log.warn(
+				"{} instances this sync changes or removes are not Archivable, so they and what is inside them are not in the backup: {}",
+				#unarchivable,
+				listPaths(unarchivable)
+			)
+		end
 		if #unreadable > 0 then
 			-- The backup still goes ahead with what was saved.
 			Log.warn(
@@ -807,6 +826,7 @@ function ServeSession:__backUpBeforeCatchUp(patch, serverInfo)
 		})
 	end)
 	if ok then
+		self.__backupSavedAt = ServeSession.clock()
 		local id = tostring(result.backup.id)
 		Log.info(
 			"Saved Studio's copies of {} instances this sync changes or removes as backup {}. `rojo studio backup restore {} --parent <instance> --allow-scripts` puts them back.",
@@ -1771,6 +1791,7 @@ end
 	for the script, and either cancels it.
 ]=]
 function ServeSession:__writeSource(write)
+	local deadline = self.__catchUpWriteDeadline
 	local generation = (self.__sourceGenerations[write.id] or 0) + 1
 	self.__sourceGenerations[write.id] = generation
 	self.__instanceMap:pauseInstance(write.instance)
@@ -1779,6 +1800,13 @@ function ServeSession:__writeSource(write)
 		local ok, err = pcall(function()
 			ScriptEditorService:UpdateSourceAsync(write.instance, function(current)
 				if self.__status == Status.Disconnected or self.__sourceGenerations[write.id] ~= generation then
+					return nil
+				end
+				if deadline ~= nil and ServeSession.clock() > deadline then
+					Log.warn(
+						"Did not change the source of {}: the change from connecting came too late, after the backup Rojo took of it may already have been removed. Reconnect, or run `rojo studio verify --fix`, to sync it.",
+						write.instance:GetFullName()
+					)
 					return nil
 				end
 				local blank = not string.find(write.target, "%S")
@@ -2031,7 +2059,13 @@ function ServeSession:__initialSync(serverInfo)
 			if self.__status == Status.Disconnected then
 				return
 			end
+			-- Source writes finish later, on their own threads. Those still
+			-- pending when the backup's protection runs out are skipped.
+			if captured ~= nil then
+				self.__catchUpWriteDeadline = self.__backupSavedAt + CATCH_UP_WRITE_WINDOW
+			end
 			self:__applyPatch(catchUpPatch)
+			self.__catchUpWriteDeadline = nil
 			return Promise.resolve()
 		else
 			return Promise.reject("Invalid user decision: " .. userDecision)

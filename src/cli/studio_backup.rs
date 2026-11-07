@@ -281,11 +281,13 @@ impl Store {
             &["symbolic-ref", "--quiet", "--short", "HEAD"],
         );
         record.bytes = model.len() as u64;
-        let mut base = format!(
-            "{}-{}",
-            timestamp(record.created_at),
-            sanitize(&record.name)
-        );
+        let mut name = sanitize(&record.name);
+        // IDs of automatic backups start `<time>-auto-`, so a backup made on
+        // purpose never gets one, whatever it is called.
+        if !record.automatic && (name == "auto" || name.starts_with("auto-")) {
+            name = format!("manual-{name}");
+        }
+        let mut base = format!("{}-{name}", timestamp(record.created_at));
         // An operation tells its backups apart by ID, so an automatic one
         // gets a random part: otherwise one saved in the same second as a
         // backup that was just removed would take its ID.
@@ -306,12 +308,22 @@ impl Store {
             "The backup record would be larger than {} KiB",
             MAX_RECORD_BYTES / 1024
         );
-        let mut model_file = tempfile::NamedTempFile::new_in(&self.dir)?;
-        std::io::Write::write_all(&mut model_file, model)?;
-        model_file
-            .persist_noclobber(self.model_path(&id))
-            .map_err(|error| error.error)
-            .context("Could not save the backup model")?;
+        if record.automatic {
+            fs::write(self.claim_path(&id), b"")
+                .context("Could not mark the backup as automatic")?;
+        }
+        let saved_model = (|| -> anyhow::Result<()> {
+            let mut model_file = tempfile::NamedTempFile::new_in(&self.dir)?;
+            std::io::Write::write_all(&mut model_file, model)?;
+            model_file
+                .persist_noclobber(self.model_path(&id))
+                .map_err(|error| error.error)?;
+            Ok(())
+        })();
+        if let Err(error) = saved_model {
+            let _ = fs::remove_file(self.claim_path(&id));
+            return Err(error.context("Could not save the backup model"));
+        }
         // The record is written last, so a backup that `list` shows always
         // has its model.
         let written = (|| -> anyhow::Result<()> {
@@ -327,9 +339,13 @@ impl Store {
         })();
         if let Err(error) = written {
             // A model without its record could not be listed or restored.
-            let _ = fs::remove_file(self.model_path(&id));
+            if fs::remove_file(self.model_path(&id)).is_ok() {
+                let _ = fs::remove_file(self.claim_path(&id));
+            }
             return Err(error.context("Could not save the backup record"));
         }
+        // The record now says it is automatic.
+        let _ = fs::remove_file(self.claim_path(&id));
         Ok(record)
     }
 
@@ -410,6 +426,13 @@ impl Store {
         }
         orphans.sort();
         Ok(orphans)
+    }
+
+    /// A file written before an automatic backup's model and removed once
+    /// its record is written, so a model left without a record can be told
+    /// to be automatic, and removed, from more than its name.
+    fn claim_path(&self, id: &str) -> PathBuf {
+        self.dir.join(format!("{id}.auto"))
     }
 
     fn pin_path(&self, id: &str) -> PathBuf {
@@ -640,9 +663,11 @@ impl Store {
         Ok(removed)
     }
 
-    /// Parts of automatic backups that a failed removal left behind: records
-    /// whose model is gone, and models whose record is gone, with the size
-    /// of each model.
+    /// Parts of automatic backups that a failed removal or an interrupted
+    /// save left behind: records whose model is gone, and models whose record
+    /// is gone but whose claim file says they are automatic, with the size of
+    /// each model. A model without a record or a claim may be a backup made
+    /// on purpose, so it is never removed here; `backup list` shows it.
     fn leftovers_locked(&self) -> anyhow::Result<Vec<(String, Option<u64>)>> {
         let entries = match fs::read_dir(&self.dir) {
             Ok(entries) => entries,
@@ -669,8 +694,12 @@ impl Store {
                         leftovers.push((id.to_owned(), None));
                     }
                 }
-                Some("rbxm") if !self.record_path(id).exists() && automatic_id(id) => {
+                Some("rbxm") if !self.record_path(id).exists() && self.claim_path(id).exists() => {
                     leftovers.push((id.to_owned(), entry_len(&path)));
+                }
+                // A claim left by a save stopped before its model was written.
+                Some("auto") if !self.model_path(id).exists() && !self.record_path(id).exists() => {
+                    let _ = remove_file(&path);
                 }
                 _ => {}
             }
@@ -696,29 +725,9 @@ impl Store {
         remove_file(&self.model_path(id)).context("Could not delete the backup model")?;
         remove_file(&self.record_path(id)).context("Could not delete the backup record")?;
         let _ = remove_file(&self.pin_path(id));
+        let _ = remove_file(&self.claim_path(id));
         Ok(())
     }
-}
-
-/// Whether `id` names an automatic backup's files, `<time>-auto-sync-<8 hex>`
-/// or `<time>-auto-verify-fix-<8 hex>`, maybe with a `-<n>` suffix, so a
-/// model whose record is gone can still be told apart from a manual one.
-fn automatic_id(id: &str) -> bool {
-    // `YYYYMMDD-HHMMSS-` comes first.
-    let Some(rest) = id.get(16..) else {
-        return false;
-    };
-    ["auto-sync-", "auto-verify-fix-"].iter().any(|name| {
-        rest.strip_prefix(name).is_some_and(|tail| {
-            let (hex, suffix) = tail.split_at(tail.len().min(8));
-            hex.len() == 8
-                && hex.bytes().all(|b| b.is_ascii_hexdigit())
-                && (suffix.is_empty()
-                    || suffix
-                        .strip_prefix('-')
-                        .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())))
-        })
-    })
 }
 
 #[cfg(test)]
@@ -1253,13 +1262,52 @@ mod tests {
     }
 
     #[test]
-    fn automatic_ids_are_told_apart_from_manual_ones() {
-        assert!(automatic_id("20261107-000000-auto-sync-0123abcd"));
-        assert!(automatic_id("20261107-000000-auto-verify-fix-0123abcd"));
-        assert!(automatic_id("20261107-000000-auto-sync-0123abcd-2"));
-        assert!(!automatic_id("20261107-000000-Map"));
-        assert!(!automatic_id("20261107-000000-auto-sync"));
-        assert!(!automatic_id("20261107-000000-auto-syncs-0123abcd"));
+    fn manual_backups_never_get_an_automatic_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::in_dir(dir.path());
+        let saved = store
+            .save(record("auto-sync-deadbeef", 1_000), b"m")
+            .unwrap();
+        assert!(
+            saved.id.contains("-manual-auto-sync-deadbeef"),
+            "{}",
+            saved.id
+        );
+        assert_eq!(saved.name, "auto-sync-deadbeef", "its name stays as given");
+        let auto = store
+            .save_automatic(record("auto-sync", now_millis()), b"a")
+            .unwrap();
+        assert!(auto.id.contains("-auto-sync-"));
+        assert!(
+            !store.claim_path(&auto.id).exists(),
+            "the record replaces the claim"
+        );
+    }
+
+    #[test]
+    fn only_models_claimed_as_automatic_are_cleaned_up_without_a_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::in_dir(dir.path());
+        let now = now_millis();
+        // A manual save interrupted between its model and its record, named
+        // like an automatic one.
+        let manual = "20261107-000000-auto-sync-deadbeef";
+        fs::write(store.model_path(manual), b"manual").unwrap();
+        // An automatic one interrupted the same way, which left its claim.
+        let automatic = "20261107-000001-auto-sync-0123abcd";
+        fs::write(store.model_path(automatic), b"auto").unwrap();
+        fs::write(store.claim_path(automatic), b"").unwrap();
+        // A claim whose save stopped before the model was written.
+        let stray = "20261107-000002-auto-sync-00000000";
+        fs::write(store.claim_path(stray), b"").unwrap();
+        store.save_automatic(record("new", now), b"new").unwrap();
+        assert!(
+            store.model_path(manual).exists(),
+            "an unclaimed model is never removed"
+        );
+        assert!(store.orphans().unwrap().contains(&manual.to_owned()));
+        assert!(!store.model_path(automatic).exists() && !store.claim_path(automatic).exists());
+        assert!(!store.claim_path(stray).exists());
     }
 
     #[test]
@@ -1307,6 +1355,7 @@ mod tests {
         // is gone.
         let orphan = "20261107-000000-auto-sync-0123abcd";
         fs::write(store.model_path(orphan), [0u8; 100]).unwrap();
+        fs::write(store.claim_path(orphan), b"").unwrap();
         let mut stray = record("auto-verify-fix", 1);
         stray.automatic = true;
         let stray = store.save(stray, b"x").unwrap().id;

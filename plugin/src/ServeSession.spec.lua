@@ -1472,6 +1472,79 @@ return function()
 			expect(removed.Parent).to.equal(fixture)
 		end)
 
+		it("skips a catch-up source write that lands after its backup's protection ran out", function()
+			local Log = require(script.Parent.Parent.Packages.Log)
+			local nativeWarn = Log.warn
+			local nativeClock = ServeSession.clock
+			local warnings = {}
+			Log.warn = function(template, ...)
+				table.insert(warnings, { template = template, args = { ... } })
+			end
+			local now = 1000
+			ServeSession.clock = function()
+				return now
+			end
+			local module = Instance.new("ModuleScript")
+			module.Name = "Late"
+			module.Source = "return 'studio'"
+			module.Parent = fixture
+			session.__instanceMap:insert("LATE", module)
+			session.__status = ServeSession.Status.Connected
+			-- Queued while the deadline was set, written after it passed.
+			session.__catchUpWriteDeadline = now + 300
+			now += 301
+			session:__writeSource({ id = "LATE", instance = module, target = "return 'disk'" })
+			session.__catchUpWriteDeadline = nil
+			task.wait(0.3)
+			local late = module.Source
+			-- In time, the same write goes through.
+			session.__catchUpWriteDeadline = now + 300
+			session:__writeSource({ id = "LATE", instance = module, target = "return 'disk'" })
+			session.__catchUpWriteDeadline = nil
+			task.wait(0.3)
+			Log.warn = nativeWarn
+			ServeSession.clock = nativeClock
+			expect(late).to.equal("return 'studio'")
+			expect(module.Source).to.equal("return 'disk'")
+			expect(#warnings).to.equal(1)
+			expect(warnings[1].template:find("came too late", 1, true)).to.be.ok()
+		end)
+
+		it("gives the catch-up patch's writes a deadline from when the backup was saved", function()
+			Settings:set("autoBackupBeforeSync", true)
+			local nativeClock = ServeSession.clock
+			ServeSession.clock = function()
+				return 5000
+			end
+			StudioBridge.requestAsync = function()
+				return {
+					Success = true,
+					StatusCode = 200,
+					Body = HttpService:JSONEncode({ backup = { id = "20261107-000000-auto-sync" } }),
+				}
+			end
+			local removed = Instance.new("Folder")
+			removed.Parent = fixture
+			local deadline
+			local patch = PatchSet.newEmpty()
+			table.insert(patch.removed, removed)
+			session.__reconciler = {
+				hydrate = function() end,
+				diff = function()
+					return true, patch
+				end,
+			}
+			session.__applyPatch = function()
+				deadline = session.__catchUpWriteDeadline
+			end
+			local pending = session:__initialSync({ rootInstanceId = "ROOT", studioBridge = pairing })
+			readResolve({ messageCursor = 0, instances = {} })
+			pending:await()
+			ServeSession.clock = nativeClock
+			expect(deadline).to.equal(5000 + 300)
+			expect(session.__catchUpWriteDeadline).to.equal(nil)
+		end)
+
 		it("takes no backup when it is turned off", function()
 			Settings:set("autoBackupBeforeSync", false)
 			local removed = Instance.new("Folder")

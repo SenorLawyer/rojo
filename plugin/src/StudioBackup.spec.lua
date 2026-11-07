@@ -283,6 +283,26 @@ return function()
 			expect((pcall(StudioBackup.serialize, roots))).to.equal(true)
 		end)
 
+		it("names instances that are not Archivable, which the model leaves out", function()
+			local removed = make("Folder", "Removed", fixture)
+			local hidden = make("Folder", "Hidden", removed)
+			hidden.Archivable = false
+			make("Part", "Inside", hidden)
+			make("Part", "Kept", removed)
+			local model, _, _, _, unarchivable = StudioBackup.serialize({ { instance = removed } }, function(instance)
+				return instance.Source
+			end)
+			expect(#unarchivable).to.equal(1)
+			expect(unarchivable[1]).to.equal("game/ReplicatedStorage/__RojoBackupSpec/Removed/Hidden")
+			-- What SerializeInstancesAsync does with them, which the warning
+			-- relies on.
+			local roots = SerializationService:DeserializeInstancesAsync(model)
+			local copy = roots[1]
+			expect(copy:FindFirstChild("Kept")).to.be.ok()
+			expect(copy:FindFirstChild("Hidden")).to.equal(nil)
+			destroyAll(roots)
+		end)
+
 		it("refuses a backup over the instance limit before serializing", function()
 			local removed = make("Folder", "Removed", fixture)
 			make("Part", "One", removed)

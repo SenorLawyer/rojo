@@ -171,15 +171,24 @@ end
 	The scripts in `roots` and their descendants, and checks that their
 	sources add up to at most MAX_SOURCE_BYTES, stopping as soon as they do
 	not, so a huge subtree fails before anything is hashed or serialized.
+	Also returns the paths of instances that are not Archivable, which
+	SerializeInstancesAsync leaves out, along with what is inside them.
 ]]
 function StudioBackup.scriptsWithin(roots)
 	local scripts = {}
+	local unarchivable = {}
 	local total = 0
 	local counter = { n = 0 }
 	for _, root in roots do
 		local candidates = root.instance:GetDescendants()
 		table.insert(candidates, root.instance)
 		for _, candidate in candidates do
+			local readArchivable, archivable = pcall(function()
+				return candidate.Archivable
+			end)
+			if readArchivable and archivable == false then
+				table.insert(unarchivable, (StudioBridge.pathOf(candidate)))
+			end
 			if not candidate:IsA("LuaSourceContainer") then
 				continue
 			end
@@ -200,7 +209,8 @@ function StudioBackup.scriptsWithin(roots)
 			pace(counter)
 		end
 	end
-	return scripts
+	table.sort(unarchivable)
+	return scripts, unarchivable
 end
 
 local function serializeChecked(instances)
@@ -236,7 +246,7 @@ function StudioBackup.serialize(roots, readEditor)
 		count <= StudioBackup.MAX_INSTANCES,
 		string.format("it would hold %d instances, over the %d a backup can restore", count, StudioBackup.MAX_INSTANCES)
 	)
-	local scripts = StudioBackup.scriptsWithin(roots)
+	local scripts, unarchivable = StudioBackup.scriptsWithin(roots)
 	local instances = {}
 	local described = {}
 	local unreadable = {}
@@ -328,7 +338,7 @@ function StudioBackup.serialize(roots, readEditor)
 	if not ok then
 		error(result, 0)
 	end
-	return result, described, unreadable, captured
+	return result, described, unreadable, captured, unarchivable
 end
 
 --[[
