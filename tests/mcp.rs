@@ -171,6 +171,71 @@ fn older_protocol_uses_text_content_and_unknown_versions_negotiate_latest() {
     assert_eq!(replies[0]["result"]["protocolVersion"], "2025-06-18");
 }
 
+/// Every tool stays listed; the instructions and the descriptions of tools
+/// that overlap Roblox's Studio MCP server route agents between the two.
+#[test]
+fn listing_routes_agents_between_rojo_and_roblox_studio_mcp() {
+    let directory = fixture();
+    let replies = exchange_messages(
+        directory.path(),
+        &[
+            initialize("2025-06-18"),
+            initialized(),
+            json!({"jsonrpc":"2.0","id":2,"method":"tools/list"}),
+        ],
+    );
+    let instructions = reply(&replies, 1)["result"]["instructions"]
+        .as_str()
+        .unwrap();
+    assert!(instructions.contains("open_cloud_invoke"));
+    assert!(instructions.contains("studio_verify"));
+    // Data stores are reached through Luau, not Open Cloud, in Roblox's server.
+    assert!(instructions.contains("running Luau including data store and memory store access"));
+    let tools = reply(&replies, 2)["result"]["tools"].as_array().unwrap();
+    let mut names: Vec<_> = tools
+        .iter()
+        .map(|tool| tool["name"].as_str().unwrap())
+        .collect();
+    names.sort_unstable();
+    assert_eq!(
+        names,
+        [
+            "checkpoint_list",
+            "packages_doctor",
+            "run_tests",
+            "studio_backup",
+            "studio_backup_list",
+            "studio_export",
+            "studio_lock_acquire",
+            "studio_lock_release",
+            "studio_lock_status",
+            "studio_logs",
+            "studio_properties",
+            "studio_sessions",
+            "studio_status",
+            "studio_test",
+            "studio_tree",
+            "studio_verify",
+            "workspace_list",
+        ]
+    );
+    let description = |name: &str| {
+        tools.iter().find(|tool| tool["name"] == name).unwrap()["description"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    // Tools that overlap with Roblox's point agents at its equivalents.
+    assert!(description("studio_test").contains("start_stop_play"));
+    assert!(description("studio_logs").contains("get_console_output"));
+    assert!(description("studio_sessions").contains("list_roblox_studios"));
+    assert!(description("studio_tree").contains("search_game_tree"));
+    assert!(description("studio_properties").contains("inspect_instance"));
+    for name in ["studio_backup", "studio_export"] {
+        assert!(description(name).contains("studio_tree"), "{name}");
+    }
+}
+
 #[test]
 fn native_test_tool_requires_a_session_and_bounded_seconds() {
     let directory = fixture();

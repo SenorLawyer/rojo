@@ -111,6 +111,43 @@ Set `servePlaceIds` in the project file to restrict which place may sync.
 Inspect the root `$ignoreUnknownInstances` and each service mapping before
 connecting a populated place. Test a small isolated place first.
 
+## Which MCP server to use for what
+
+Roblox's Studio MCP server and `rojo mcp` can be connected at the same time.
+They do different jobs:
+
+* Roblox's Studio MCP: reading and editing the place (`search_game_tree`,
+  `inspect_instance`, `script_read`, `multi_edit`, `execute_luau`), play tests
+  and screenshots (`start_stop_play`, `get_console_output`, `screen_capture`),
+  inserting and uploading assets that the project does not track
+  (`insert_asset`, `upload_image`, the asset import Skill), and any Open Cloud
+  call through `open_cloud_invoke`: developer products, game passes, game and
+  place settings, analytics and server restarts. Data stores and memory
+  stores are reached from Luau through `execute_luau`, not through
+  `open_cloud_invoke`.
+* `rojo mcp` and the `rojo` CLI: anything that depends on the files. Check
+  Studio against them with `studio_verify`, read sync health from
+  `studio_sessions`, back up before replacing with `studio_backup`, take a
+  Studio lock before using a shared window, run specs with `run_tests`, export
+  models into the project, and list checkpoints, workspaces and packages.
+  Take instance IDs for `studio_backup` and `studio_export` from
+  `studio_tree` or `studio_properties`; Roblox's instance IDs do not work
+  with them.
+  Asset uploads the project refers to go through `rojo assets sync`, so the
+  generated id module and lockfile stay current; cloud test runs through
+  `rojo test --cloud`; place publishing through `rojo release stage` and
+  `rojo release promote`, or `rojo release publish` straight to the live
+  place.
+
+Don't edit scripts Rojo syncs through Roblox's tools: a later sync from the
+files can overwrite those edits, and with two-way sync on, Studio can write
+them back over the file instead. Never count on a sync to undo a Studio edit;
+change the file. Roblox's tools do not
+check Studio locks, so acquire one first. Each server names Studio sessions
+its own way: `rojo` tools take a session UUID from `studio_sessions`, and
+Roblox's take a `studio_id` from `list_roblox_studios`. See
+`rojo doc --agent mcp` for the tool-by-tool comparison.
+
 ## Control the plugin through Roblox Studio MCP
 
 The plugin exposes a local BindableFunction under
