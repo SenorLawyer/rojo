@@ -1539,7 +1539,7 @@ return function()
 			end)
 			expect(module.Source).to.equal("return 'disk'")
 			expect(#warnings).to.equal(1)
-			expect(warnings[1].template:find("overwrote edits made in Studio after Rojo backed", 1, true)).to.be.ok()
+			expect(warnings[1].template:find("edited or added in Studio after Rojo backed them up", 1, true)).to.be.ok()
 			expect(warnings[1].args[1]:find("Captured", 1, true)).to.be.ok()
 		end)
 
@@ -1738,7 +1738,7 @@ return function()
 			end)
 			expect(module.Parent).to.equal(nil)
 			expect(#warnings).to.equal(1)
-			expect(warnings[1].template:find("overwrote edits made in Studio after Rojo backed", 1, true)).to.be.ok()
+			expect(warnings[1].template:find("edited or added in Studio after Rojo backed them up", 1, true)).to.be.ok()
 			expect(warnings[1].args[1]:find("EditedDuringPrecommit", 1, true)).to.be.ok()
 		end)
 
@@ -1750,6 +1750,85 @@ return function()
 				session:stop()
 			end)
 			expect(module.Parent).to.equal(fixture)
+		end)
+
+		it("names a script added under a backed-up instance after the backup was prepared", function()
+			local hashSource = require(script.Parent.hashSource)
+			local nativeRead = ServeSession.readEditorText
+			local folder = Instance.new("Folder")
+			folder.Name = "Removed"
+			folder.Parent = fixture
+			local captured = Instance.new("ModuleScript")
+			captured.Name = "Captured"
+			captured.Source = "return 1"
+			captured.Parent = folder
+			local warnings = recordingWarnings(function()
+				ServeSession.readEditorText = function(instance)
+					return instance.Source
+				end
+				session.__instanceMap:insert("REMOVED", folder)
+				session.__status = ServeSession.Status.Connected
+				session.__catchUpGuarded = { [captured] = (hashSource("return 1")) }
+				session.__catchUpRoots = { folder }
+				-- Added while the backup was being prepared.
+				local added = Instance.new("ModuleScript")
+				added.Name = "AddedLater"
+				added.Parent = folder
+				local patch = PatchSet.newEmpty()
+				table.insert(patch.removed, "REMOVED")
+				session:__applyPatch(patch)
+				session.__catchUpGuarded = nil
+				session.__catchUpRoots = nil
+				ServeSession.readEditorText = nativeRead
+				task.wait(0.8)
+			end)
+			expect(folder.Parent).to.equal(nil)
+			expect(#warnings).to.equal(1)
+			expect(warnings[1].args[1]:find("AddedLater", 1, true)).to.be.ok()
+			expect(warnings[1].args[1]:find("Captured", 1, true)).to.equal(nil)
+		end)
+
+		it("applies nothing once the backup's protection has run out, and ends the sync", function()
+			local nativeClock = ServeSession.clock
+			local module = Instance.new("ModuleScript")
+			module.Name = "Protected"
+			module.Parent = fixture
+			local warnings = recordingWarnings(function()
+				ServeSession.clock = function()
+					return 1000
+				end
+				session.__instanceMap:insert("PROTECTED", module)
+				session.__status = ServeSession.Status.Connected
+				session.__catchUpWriteDeadline = 500
+				local patch = PatchSet.newEmpty()
+				table.insert(patch.removed, "PROTECTED")
+				session:__applyPatch(patch)
+				session.__catchUpWriteDeadline = nil
+				ServeSession.clock = nativeClock
+			end)
+			expect(module.Parent).to.equal(fixture)
+			expect(session.__catchUpExpired).to.equal(true)
+			expect(#warnings).to.equal(1)
+			expect(warnings[1].args[1]:find("Reconnect to take a fresh backup", 1, true)).to.be.ok()
+
+			-- The initial sync then ends instead of carrying on.
+			session.__catchUpExpired = false
+			session.__status = ServeSession.Status.NotStarted
+			Settings:set("autoBackupBeforeSync", false)
+			session.__reconciler = {
+				hydrate = function() end,
+				diff = function()
+					return true, PatchSet.newEmpty()
+				end,
+			}
+			session.__applyPatch = function()
+				session.__catchUpExpired = true
+			end
+			local pending = session:__initialSync({ rootInstanceId = "ROOT" })
+			readResolve({ messageCursor = 0, instances = {} })
+			local ok, err = pending:await()
+			expect(ok).to.equal(false)
+			expect(tostring(err):find("Reconnect to take a fresh backup", 1, true)).to.be.ok()
 		end)
 
 		it("takes no backup when it is turned off", function()

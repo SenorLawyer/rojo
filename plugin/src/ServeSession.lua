@@ -100,6 +100,8 @@ end
 -- (BACKUP_PIN in src/web/studio.rs), so a write that lands later could
 -- replace code whose backup is already gone.
 local CATCH_UP_WRITE_WINDOW = 5 * 60
+local CATCH_UP_EXPIRED =
+	"Rojo did not apply the sync after connecting: it was ready only after the backup it took had stopped being protected, so that backup may already be gone. Reconnect to take a fresh backup and sync."
 
 -- Holds by the Studio instance they protect. A reconnect makes a new session
 -- with new IDs, and the file may still be empty, so the new session adopts
@@ -842,7 +844,11 @@ function ServeSession:__backUpBeforeCatchUp(patch, serverInfo)
 			id,
 			id
 		)
-		return captured, guarded
+		local backedUpRoots = {}
+		for _, root in roots do
+			table.insert(backedUpRoots, root.instance)
+		end
+		return captured, guarded, backedUpRoots
 	else
 		local paths = {}
 		for _, root in roots do
@@ -1841,6 +1847,20 @@ function ServeSession:__noteEditsBeforeApply()
 			self:__noteOverwrittenEdit(instance:GetFullName())
 		end
 	end
+	-- Scripts added under the backed-up instances while the backup was
+	-- prepared are not in it at all. Listing them does not yield either.
+	for _, root in self.__catchUpRoots or {} do
+		local ok, descendants = pcall(root.GetDescendants, root)
+		if not ok then
+			continue
+		end
+		table.insert(descendants, root)
+		for _, descendant in descendants do
+			if descendant:IsA("LuaSourceContainer") and guarded[descendant] == nil then
+				self:__noteOverwrittenEdit(descendant:GetFullName())
+			end
+		end
+	end
 end
 
 -- Ends one source write of the sync after connecting, and forgets Rojo's
@@ -1881,7 +1901,7 @@ function ServeSession:__noteOverwrittenEdit(path)
 			text ..= string.format(" and %d more", #paths - MAX_OVERWRITTEN_NAMED)
 		end
 		Log.warn(
-			"The sync after connecting overwrote edits made in Studio after Rojo backed these scripts up, so the backup does not hold them: {}",
+			"The sync after connecting overwrote or removed scripts edited or added in Studio after Rojo backed them up, so the backup does not hold their newest text: {}",
 			text
 		)
 	end)
@@ -1984,6 +2004,13 @@ function ServeSession:__applyPatchInRecording(patch)
 	-- stopped meanwhile changes nothing, and scripts edited since the
 	-- reconnect backup are named as the sync overwrites or removes them.
 	if self.__status == Status.Disconnected then
+		return patch
+	end
+	-- Past the backup's protection, the backup may be gone, so the sync
+	-- after connecting changes nothing and ends instead.
+	if self:__catchUpTooLate() then
+		Log.warn("{}", CATCH_UP_EXPIRED)
+		self.__catchUpExpired = true
 		return patch
 	end
 	self:__noteEditsBeforeApply()
@@ -2197,7 +2224,7 @@ function ServeSession:__initialSync(serverInfo)
 
 			return self.__apiContext:write(inversePatch)
 		elseif userDecision == "Accept" then
-			local captured, guarded = self:__backUpBeforeCatchUp(catchUpPatch, serverInfo)
+			local captured, guarded, backedUpRoots = self:__backUpBeforeCatchUp(catchUpPatch, serverInfo)
 			-- The backup yields, and the user may disconnect meanwhile. The
 			-- patch holds the very instances it removes, so a stopped session
 			-- must not apply it. Applying checks again after its own yields.
@@ -2211,13 +2238,23 @@ function ServeSession:__initialSync(serverInfo)
 			if captured ~= nil then
 				self.__catchUpWriteDeadline = self.__backupSavedAt + CATCH_UP_WRITE_WINDOW
 				self.__catchUpGuarded = guarded
+				self.__catchUpRoots = backedUpRoots
 			end
+			self.__catchUpExpired = false
 			self:__applyPatch(catchUpPatch)
+			local expired = self.__catchUpExpired
 			self.__catchUpWriteDeadline = nil
 			self.__catchUpGuarded = nil
+			self.__catchUpRoots = nil
+			self.__catchUpExpired = false
 			-- Forgets Rojo's written hashes once the writes are done too.
 			self.__catchUpPendingWrites += 1
 			self:__finishCatchUpWrite()
+			if expired then
+				-- Nothing was applied, and the session ends, like a
+				-- disconnect; connecting again takes a fresh backup.
+				return Promise.reject(CATCH_UP_EXPIRED)
+			end
 			return Promise.resolve()
 		else
 			return Promise.reject("Invalid user decision: " .. userDecision)
