@@ -38,6 +38,7 @@ Use the host's own configuration format when it differs. Rojo writes only JSON-R
 | `studio_status` | `studio status --json` | `session` |
 | `studio_test` | `studio test --json` | `session`, optional `seconds` |
 | `run_tests` | `test --json` | optional `session`, `roots`, `filter`, `framework`, `module`, `timeout` |
+| `studio_tree` | `studio tree --json` | `session`, optional `instance`, `depth`, `limit` |
 | `studio_logs` | `studio logs --json` | `session`, optional `limit`, `after` |
 | `studio_export` | `studio export --json` | `session`, `instance`, `output` |
 | `studio_verify` | `studio verify --json` | `session`, optional `fix`, `includeHeld` |
@@ -50,7 +51,9 @@ Use the host's own configuration format when it differs. Rojo writes only JSON-R
 | `workspace_list` | `workspace list --json` | None |
 | `packages_doctor` | `packages doctor --json` | None |
 
-`studio_tree` (`studio tree --json`; `session`, optional `instance`, `depth`, `limit`) and `studio_properties` (`studio properties --json`; `session`, `instance`, `properties`) are not in `tools/list`, since Roblox's Studio MCP server does the same with `search_game_tree` and `inspect_instance`; see [Which MCP server to use](#which-mcp-server-to-use). They still answer `tools/call` with the same arguments and limits, so agents and configurations that already use them keep working. `rojo studio tree` and `rojo studio properties` are unchanged.
+`studio_properties` (`studio properties --json`; `session`, `instance`, `properties`) is not in `tools/list`, since Roblox's Studio MCP server does the same with `inspect_instance`; see [Which MCP server to use](#which-mcp-server-to-use). It still answers `tools/call` with the same arguments and limits, so agents and configurations that already use it keep working. `rojo studio properties` is unchanged.
+
+`studio_tree` returns the bridge's ID for each instance. `studio_backup` and `studio_export` accept that ID as well as a `game/...` path, and need it when two siblings share a name, since such a path is ambiguous. The instance IDs Roblox's `inspect_instance` returns are engine IDs this bridge does not resolve.
 
 List Studio sessions first and choose the exact UUID for every targeted operation. The adapter never chooses the first available session; `run_tests` without a `session` lets `rojo test` use the only connected session and fails when there are several. It forwards the configured address and token file to each Studio command. Package, workspace and checkpoint tools use the project fixed at server startup; a tool call cannot override it.
 
@@ -81,10 +84,10 @@ Roblox's [Studio MCP server](https://create.roblox.com/docs/studio/mcp-open-clou
 | `checkpoint_list`, `workspace_list`, `packages_doctor` | None | Keep: project files and Git |
 | `studio_test` | `start_stop_play` | Keep, pointing at Roblox's: a bounded run that always returns to Edit; use `start_stop_play` for a play test that keeps running |
 | `studio_logs` | `get_console_output` | Keep, pointing at Roblox's: follows the log across calls with `after` |
-| `studio_tree` | `search_game_tree` | Not listed: Roblox's filters by class and name and reads Client and Server during a play test |
+| `studio_tree` | `search_game_tree` | Keep: the only source of the IDs `studio_backup` and `studio_export` accept; browse and search with Roblox's, which filters by class and name and reads Client and Server during a play test |
 | `studio_properties` | `inspect_instance` | Not listed: Roblox's returns every property and attribute |
 
-Open Cloud work is split the same way. `open_cloud_invoke` covers developer products, game passes, game and place settings, analytics, data stores (through `execute_luau`), server restarts and one-off uploads. Uploads that project code refers to go through `rojo assets sync`, which records them in `assets.lock.json` and the generated module; cloud test runs use `rojo test --cloud`, and publishing uses `rojo release`, which publishes to a staging place before the live one. These remain CLI commands; this server does not call Roblox's server or Open Cloud.
+Open Cloud work is split the same way. `open_cloud_invoke` covers developer products, game passes, game and place settings, analytics, server restarts and one-off uploads. Data stores and memory stores are not Open Cloud calls in Roblox's server: scripts reach them through `execute_luau`, with the matching Save & load data permission and the game's Studio access to API services. Uploads that project code refers to go through `rojo assets sync`, which records them in `assets.lock.json` and the generated module; cloud test runs use `rojo test --cloud`. Places are published from archived checkpoints with `rojo release`: `rojo release stage` publishes to a separate test place, `rojo release promote` then publishes the same bytes live after a recent passing stage, and `rojo release publish` publishes live directly. These remain CLI commands; this server does not call Roblox's server or Open Cloud.
 
 Edits made with Roblox's tools to scripts Rojo syncs are overwritten from the files on the next sync, and `studio_verify` reports them until then. Change the file instead.
 

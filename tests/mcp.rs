@@ -105,7 +105,7 @@ fn stdio_handshake_catalog_native_call_and_error_recovery() {
         .iter()
         .map(|tool| tool["name"].as_str().unwrap())
         .collect();
-    assert_eq!(names.len(), 15);
+    assert_eq!(names.len(), 16);
     assert!(names.contains(&"studio_test") && names.contains(&"run_tests"));
     assert!(names.contains(&"studio_verify") && names.contains(&"studio_backup"));
     assert!(names.contains(&"studio_lock_acquire") && names.contains(&"studio_lock_status"));
@@ -173,6 +173,7 @@ fn older_protocol_uses_text_content_and_unknown_versions_negotiate_latest() {
 
 /// The listing is the decided split with Roblox's Studio MCP server: tools it
 /// duplicates are left out, but stay callable for agents that already use them.
+/// `studio_tree` stays listed, since it gives the IDs other tools accept.
 #[test]
 fn listing_leaves_out_studio_mcp_duplicates_that_stay_callable() {
     let directory = fixture();
@@ -183,9 +184,8 @@ fn listing_leaves_out_studio_mcp_duplicates_that_stay_callable() {
             initialize("2025-06-18"),
             initialized(),
             json!({"jsonrpc":"2.0","id":2,"method":"tools/list"}),
-            json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"studio_tree","arguments":{"session":session,"depth":1}}}),
-            json!({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"studio_properties","arguments":{"session":session,"instance":"game/Workspace","properties":["Name"]}}}),
-            json!({"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"studio_tree","arguments":{"session":session,"depth":7}}}),
+            json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"studio_properties","arguments":{"session":session,"instance":"game/Workspace","properties":["Name"]}}}),
+            json!({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"studio_properties","arguments":{"session":session,"instance":"game/Workspace","properties":[]}}}),
         ],
     );
     let instructions = reply(&replies, 1)["result"]["instructions"]
@@ -193,6 +193,8 @@ fn listing_leaves_out_studio_mcp_duplicates_that_stay_callable() {
         .unwrap();
     assert!(instructions.contains("open_cloud_invoke"));
     assert!(instructions.contains("studio_verify"));
+    // Data stores are reached through Luau, not Open Cloud, in Roblox's server.
+    assert!(instructions.contains("running Luau including data store and memory store access"));
     let tools = reply(&replies, 2)["result"]["tools"].as_array().unwrap();
     let mut names: Vec<_> = tools
         .iter()
@@ -215,6 +217,7 @@ fn listing_leaves_out_studio_mcp_duplicates_that_stay_callable() {
             "studio_sessions",
             "studio_status",
             "studio_test",
+            "studio_tree",
             "studio_verify",
             "workspace_list",
         ]
@@ -229,17 +232,19 @@ fn listing_leaves_out_studio_mcp_duplicates_that_stay_callable() {
     assert!(description("studio_test").contains("start_stop_play"));
     assert!(description("studio_logs").contains("get_console_output"));
     assert!(description("studio_sessions").contains("list_roblox_studios"));
+    assert!(description("studio_tree").contains("search_game_tree"));
+    for name in ["studio_backup", "studio_export"] {
+        assert!(description(name).contains("studio_tree"), "{name}");
+    }
     // Unlisted tools still reach the native command (which fails here for
     // want of a token) and still validate their arguments.
-    for id in [3, 4] {
-        let call = &reply(&replies, id)["result"];
-        assert_eq!(call["isError"], true, "{call}");
-        assert!(call["content"][0]["text"]
-            .as_str()
-            .unwrap()
-            .contains("--token-file"));
-    }
-    assert_eq!(reply(&replies, 5)["error"]["code"], -32602);
+    let call = &reply(&replies, 3)["result"];
+    assert_eq!(call["isError"], true, "{call}");
+    assert!(call["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .contains("--token-file"));
+    assert_eq!(reply(&replies, 4)["error"]["code"], -32602);
 }
 
 #[test]

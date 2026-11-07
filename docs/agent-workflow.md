@@ -122,15 +122,21 @@ They do different jobs:
   inserting and uploading assets that the project does not track
   (`insert_asset`, `upload_image`, the asset import Skill), and any Open Cloud
   call through `open_cloud_invoke`: developer products, game passes, game and
-  place settings, analytics, data stores and server restarts.
+  place settings, analytics and server restarts. Data stores and memory
+  stores are reached from Luau through `execute_luau`, not through
+  `open_cloud_invoke`.
 * `rojo mcp` and the `rojo` CLI: anything that depends on the files. Check
   Studio against them with `studio_verify`, read sync health from
   `studio_sessions`, back up before replacing with `studio_backup`, take a
   Studio lock before using a shared window, run specs with `run_tests`, export
   models into the project, and list checkpoints, workspaces and packages.
+  Take instance IDs for `studio_backup` and `studio_export` from
+  `studio_tree`; Roblox's instance IDs do not work with them.
   Asset uploads the project refers to go through `rojo assets sync`, so the
   generated id module and lockfile stay current; cloud test runs through
-  `rojo test --cloud`; place publishing through `rojo release`.
+  `rojo test --cloud`; place publishing through `rojo release stage` and
+  `rojo release promote`, or `rojo release publish` straight to the live
+  place.
 
 Edits made through Roblox's tools to scripts Rojo syncs are overwritten by
 the next sync from the files; change the file instead. Roblox's tools do not
