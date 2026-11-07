@@ -7,6 +7,7 @@ mod doctor;
 mod fmt_project;
 mod init;
 mod lifecycle;
+mod logs;
 mod mcp;
 mod merge;
 mod packages;
@@ -38,6 +39,7 @@ pub use self::doctor::DoctorCommand;
 pub use self::fmt_project::FmtProjectCommand;
 pub use self::init::{InitCommand, InitKind};
 pub use self::lifecycle::{CheckpointCommand, ReleaseCommand, WorkspaceCommand};
+pub use self::logs::LogsCommand;
 pub use self::mcp::McpCommand;
 pub use self::merge::MergeCommand;
 pub use self::packages::PackagesCommand;
@@ -83,6 +85,7 @@ impl Options {
             Subcommand::Merge(subcommand) => subcommand.run(),
             Subcommand::Packages(subcommand) => subcommand.run(),
             Subcommand::Studio(subcommand) => subcommand.run(),
+            Subcommand::Logs(subcommand) => subcommand.run(),
             Subcommand::Test(subcommand) => subcommand.run(),
             Subcommand::Mcp(subcommand) => subcommand.run(),
             Subcommand::Assets(subcommand) => subcommand.run(),
@@ -169,6 +172,7 @@ pub enum Subcommand {
     Merge(MergeCommand),
     Packages(PackagesCommand),
     Studio(StudioCommand),
+    Logs(LogsCommand),
     Test(TestCommand),
     Mcp(McpCommand),
     Assets(AssetsCommand),
