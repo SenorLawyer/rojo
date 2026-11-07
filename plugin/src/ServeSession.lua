@@ -208,9 +208,13 @@ function ServeSession.new(options)
 		__precommitCallbacks = {},
 		__postcommitCallbacks = {},
 		__updateLoadingText = function() end,
-		-- Hashes of the text Rojo itself wrote to each script, so a later
-		-- write can tell its own text from an edit made in Studio.
-		__rojoWrittenHashes = setmetatable({}, { __mode = "k" }),
+		-- During the sync after connecting, the hash of the text Rojo last
+		-- wrote to each script it backed up, so a later write or swap can
+		-- tell Rojo's own text from an edit made in Studio. Cleared when
+		-- that sync's writes are all done. See `__finishCatchUpWrite`.
+		__rojoWrittenHashes = {},
+		-- Source writes from that sync still running.
+		__catchUpPendingWrites = 0,
 		-- Scripts whose emptying was held back, by ID. See `__holdScriptWipes`.
 		__heldWipes = {},
 		-- The sources recent verifies saw, by verify request ID.
@@ -1614,6 +1618,11 @@ function ServeSession:__replaceInstances(idList)
 			replacement:Destroy()
 			continue
 		end
+		-- The swap goes ahead, as syncing does, but an edit made while the
+		-- fallback waited is not in the backup, so that is said.
+		if self:__isEditSinceBackup(oldInstance, ServeSession.readEditorText(oldInstance)) then
+			self:__noteOverwrittenEdit(oldInstance:GetFullName())
+		end
 
 		-- The server's copy is read when the fallback runs, so its file may
 		-- have become empty since the patch was sent, and a hold may have
@@ -1825,6 +1834,29 @@ function ServeSession:__catchUpTooLate()
 	return deadline ~= nil and ServeSession.clock() > deadline
 end
 
+-- Whether `instance`'s current text is an edit made after the reconnect
+-- backup: neither what the backup holds for it nor what Rojo last wrote.
+-- Only scripts the backup could read are checked.
+function ServeSession:__isEditSinceBackup(instance, text)
+	local guarded = self.__catchUpGuarded
+	local backedUp = if guarded then guarded[instance] else nil
+	if type(backedUp) ~= "number" or text == nil then
+		return false
+	end
+	local now = (hashSource(text))
+	return now ~= backedUp and now ~= self.__rojoWrittenHashes[instance]
+end
+
+-- Ends one source write of the sync after connecting, and forgets Rojo's
+-- written hashes once that sync and all its writes are done.
+function ServeSession:__finishCatchUpWrite()
+	self.__catchUpPendingWrites -= 1
+	if self.__catchUpPendingWrites <= 0 and self.__catchUpGuarded == nil then
+		self.__catchUpPendingWrites = 0
+		table.clear(self.__rojoWrittenHashes)
+	end
+end
+
 -- Scripts whose edits made after the reconnect backup a sync write
 -- overwrote, reported together shortly after, at most this many by name.
 local MAX_OVERWRITTEN_NAMED = 10
@@ -1859,6 +1891,12 @@ function ServeSession:__writeSource(write)
 	-- For a script in the reconnect backup, the hash of the text the backup
 	-- holds; false when it could not read it, which was warned about then.
 	local backedUp = if self.__catchUpGuarded then self.__catchUpGuarded[write.instance] else nil
+	-- Only writes of the sync after connecting to scripts it backed up are
+	-- tracked; ordinary syncing keeps nothing.
+	local tracked = backedUp ~= nil
+	if tracked then
+		self.__catchUpPendingWrites += 1
+	end
 	local generation = (self.__sourceGenerations[write.id] or 0) + 1
 	self.__sourceGenerations[write.id] = generation
 	self.__instanceMap:pauseInstance(write.instance)
@@ -1883,8 +1921,7 @@ function ServeSession:__writeSource(write)
 				-- Text Rojo wrote itself in this sync is not such an edit.
 				if type(backedUp) == "number" then
 					local now = (hashSource(current))
-					local written = self.__rojoWrittenHashes[write.instance]
-					if now ~= backedUp and not (written and written[now]) then
+					if now ~= backedUp and now ~= self.__rojoWrittenHashes[write.instance] then
 						self:__noteOverwrittenEdit(write.instance:GetFullName())
 					end
 				end
@@ -1913,13 +1950,12 @@ function ServeSession:__writeSource(write)
 			end)
 		end)
 		self.__syncStats.pendingSourceWrites -= 1
-		if ok and wrote then
-			local written = self.__rojoWrittenHashes[write.instance]
-			if written == nil then
-				written = {}
-				self.__rojoWrittenHashes[write.instance] = written
+		if tracked then
+			-- The latest write is what the script can still hold.
+			if ok and wrote then
+				self.__rojoWrittenHashes[write.instance] = (hashSource(write.target))
 			end
-			written[(hashSource(write.target))] = true
+			self:__finishCatchUpWrite()
 		end
 		if not ok or tooLate then
 			self.__syncStats.failedSourceWrites += 1
@@ -2173,6 +2209,9 @@ function ServeSession:__initialSync(serverInfo)
 			self:__applyPatch(catchUpPatch)
 			self.__catchUpWriteDeadline = nil
 			self.__catchUpGuarded = nil
+			-- Forgets Rojo's written hashes once the writes are done too.
+			self.__catchUpPendingWrites += 1
+			self:__finishCatchUpWrite()
 			return Promise.resolve()
 		else
 			return Promise.reject("Invalid user decision: " .. userDecision)

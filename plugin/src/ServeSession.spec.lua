@@ -1660,6 +1660,79 @@ return function()
 			expect(#warnings).to.equal(0)
 		end)
 
+		it("swaps a script edited while the fallback waited, and says so", function()
+			local hashSource = require(script.Parent.hashSource)
+			local module = backedUpModule("EditedDuringFallback", "return 'captured'")
+			local nativeRead = ServeSession.readEditorText
+			local warnings = recordingWarnings(function()
+				ServeSession.readEditorText = function(instance)
+					return instance.Source
+				end
+				session.__catchUpGuarded = { [module] = (hashSource("return 'captured'")) }
+				api.serialize = function()
+					return Promise.resolve({ modelContents = buffer.create(0), missingIds = {} })
+				end
+				api.refPatch = function()
+					-- The user types while the fallback waits for the server.
+					module.Source = "return 'typed during the fallback'"
+					return Promise.resolve({ patch = PatchSet.newEmpty() })
+				end
+				session.__deserializeInstances = function()
+					local container = Instance.new("Folder")
+					local pointer = Instance.new("ObjectValue")
+					pointer.Name = "EditedDuringFallback"
+					local replacement = Instance.new("ModuleScript")
+					replacement.Source = "return 'replacement'"
+					pointer.Value = replacement
+					pointer.Parent = container
+					return { container }
+				end
+				local ok = session:__replaceInstances({ "EditedDuringFallback" })
+				session.__catchUpGuarded = nil
+				ServeSession.readEditorText = nativeRead
+				expect(ok).to.equal(true)
+				task.wait(0.8)
+			end)
+			expect(session.__instanceMap.fromIds.EditedDuringFallback).never.to.equal(module)
+			expect(#warnings).to.equal(1)
+			expect(warnings[1].args[1]:find("EditedDuringFallback", 1, true)).to.be.ok()
+		end)
+
+		it("keeps no written hashes for ordinary syncing", function()
+			local module = backedUpModule("Ordinary", "return 0")
+			for index = 1, 1000 do
+				session:__writeSource({ id = "Ordinary", instance = module, target = "return " .. index })
+			end
+			local waited = 0
+			while session.__syncStats.pendingSourceWrites > 0 and waited < 10 do
+				waited += task.wait()
+			end
+			expect(session.__syncStats.pendingSourceWrites).to.equal(0)
+			expect(next(session.__rojoWrittenHashes)).to.equal(nil)
+			expect(session.__catchUpPendingWrites).to.equal(0)
+		end)
+
+		it("keeps only the latest written hash per script, and forgets them when the sync's writes end", function()
+			local hashSource = require(script.Parent.hashSource)
+			local module = backedUpModule("Latest", "return 'captured'")
+			session.__catchUpGuarded = { [module] = (hashSource("return 'captured'")) }
+			session:__writeSource({ id = "Latest", instance = module, target = "return 'first'" })
+			task.wait(0.3)
+			session:__writeSource({ id = "Latest", instance = module, target = "return 'second'" })
+			task.wait(0.3)
+			local count = 0
+			for _ in session.__rojoWrittenHashes do
+				count += 1
+			end
+			expect(count).to.equal(1)
+			expect(session.__rojoWrittenHashes[module]).to.equal((hashSource("return 'second'")))
+			-- The sync is over, as `__initialSync` ends it.
+			session.__catchUpGuarded = nil
+			session.__catchUpPendingWrites += 1
+			session:__finishCatchUpWrite()
+			expect(next(session.__rojoWrittenHashes)).to.equal(nil)
+		end)
+
 		it("keeps a fallback replacement that came too late as unapplied", function()
 			local module = backedUpModule("Late", "return 'studio'")
 			local nativeClock = ServeSession.clock
