@@ -4287,6 +4287,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn verify_fix_changes_nothing_when_its_backup_cannot_be_written_to_disk() {
+        let (dir, bridge, session, script, verify) = fix_past_sources(json!({"fix":true})).await;
+        let backups = dir.path().join("backups");
+        backup::fail_flushes_in(&backups, true);
+        let command = next_command(&bridge, &session).await;
+        answer_backup(&bridge, &session, &command, &[&script.id]).await;
+        let (status, value) = into_value(verify.await.unwrap()).await;
+        backup::fail_flushes_in(&backups, false);
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{value}");
+        let error = value["error"].as_str().unwrap();
+        assert!(
+            error.starts_with("Changed nothing") && error.contains("to disk"),
+            "{error}"
+        );
+        assert!(bridge.state().pending.is_empty(), "no resync was sent");
+        assert!(backup::Store::in_dir(&backups).list().unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn verify_fix_with_more_groups_than_the_hard_cap_changes_nothing() {
         let groups = backup::MAX_AUTOMATIC + 1;
         let (dir, bridge, _session, _scripts, verify) =

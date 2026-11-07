@@ -366,6 +366,9 @@ impl Store {
         let saved_model = (|| -> anyhow::Result<()> {
             let mut model_file = self.temp_file(&record)?;
             std::io::Write::write_all(&mut model_file, model)?;
+            // On disk before it is named, so a power loss after the fix
+            // cannot leave the backup's model incomplete.
+            self.flush(model_file.as_file())?;
             model_file
                 .persist_noclobber(self.model_path(&id))
                 .map_err(|error| error.error)?;
@@ -377,18 +380,29 @@ impl Store {
         }
         // The record is written last, so a backup that `list` shows always
         // has its model.
+        let mut named = false;
         let written = (|| -> anyhow::Result<()> {
             let mut record_file = self.temp_file(&record)?;
             std::io::Write::write_all(
                 &mut record_file,
                 serde_json::to_string_pretty(&record)?.as_bytes(),
             )?;
+            self.flush(record_file.as_file())?;
             record_file
                 .persist_noclobber(self.record_path(&id))
                 .map_err(|error| error.error)?;
+            named = true;
+            // And the names of both, which live in the folder.
+            self.flush_dir()?;
             Ok(())
         })();
         if let Err(error) = written {
+            // A backup that may not be on disk is no backup. Only a record
+            // this save named is removed; a failed persist leaves alone
+            // whatever already had the name.
+            if named {
+                let _ = fs::remove_file(self.record_path(&id));
+            }
             // A model without its record could not be listed or restored.
             if fs::remove_file(self.model_path(&id)).is_ok() {
                 let _ = fs::remove_file(self.claim_path(&id));
@@ -398,6 +412,27 @@ impl Store {
         // The record now says it is automatic.
         let _ = fs::remove_file(self.claim_path(&id));
         Ok(record)
+    }
+
+    /// Writes `file`'s contents through to disk.
+    fn flush(&self, file: &fs::File) -> anyhow::Result<()> {
+        #[cfg(test)]
+        if failing_flushes(&self.dir) {
+            anyhow::bail!("Simulated failure to write a backup to disk");
+        }
+        file.sync_all()
+            .context("Could not write the backup to disk")
+    }
+
+    /// Writes the store folder's entries through to disk, where the system
+    /// allows it. Windows cannot open a folder as a file to flush it, and
+    /// writes a renamed file's name with the file there.
+    fn flush_dir(&self) -> anyhow::Result<()> {
+        #[cfg(unix)]
+        fs::File::open(&self.dir)
+            .and_then(|dir| dir.sync_all())
+            .context("Could not write the backup folder to disk")?;
+        Ok(())
     }
 
     pub fn list(&self) -> anyhow::Result<Vec<Record>> {
@@ -950,6 +985,32 @@ thread_local! {
     static FAILING_REMOVALS: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
     /// Whether writing a pin fails, for tests.
     static FAILING_PINS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Store folders where writing a backup through to disk fails, for tests.
+/// Shared by every thread, since a server saves its backups on another one.
+#[cfg(test)]
+static FAILING_FLUSHES: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+fn failing_flushes(dir: &Path) -> bool {
+    FAILING_FLUSHES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .any(|failing| failing == dir)
+}
+
+/// Makes writing backups through to disk fail in `dir`, or work again.
+#[cfg(test)]
+pub(crate) fn fail_flushes_in(dir: &Path, failing: bool) {
+    let mut dirs = FAILING_FLUSHES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    dirs.retain(|existing| existing != dir);
+    if failing {
+        dirs.push(dir.to_owned());
+    }
 }
 
 /// Deletes `path`, which may already be gone.
@@ -1844,6 +1905,28 @@ mod tests {
             .save_automatic_with(record("new", now), b"new", None, limits, now)
             .unwrap();
         assert!(!store.exists(&old));
+    }
+
+    #[test]
+    fn a_backup_that_cannot_be_written_to_disk_is_not_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::in_dir(dir.path());
+        fail_flushes_in(dir.path(), true);
+        let error = store
+            .save_automatic(record("auto", now_millis()), b"model")
+            .unwrap_err();
+        fail_flushes_in(dir.path(), false);
+        assert!(format!("{error:#}").contains("to disk"), "{error:#}");
+        let left: Vec<String> = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name != ".store.lock")
+            .collect();
+        assert!(left.is_empty(), "nothing is left of it: {left:?}");
+        store
+            .save_automatic(record("auto", now_millis()), b"model")
+            .unwrap();
+        assert_eq!(store.list().unwrap().len(), 1);
     }
 
     #[test]
