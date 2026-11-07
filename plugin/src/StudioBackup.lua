@@ -7,6 +7,7 @@ local HttpService = game:GetService("HttpService")
 local SerializationService = game:GetService("SerializationService")
 
 local StudioBridge = require(script.Parent.StudioBridge)
+local hashSource = require(script.Parent.hashSource)
 
 local StudioBackup = {}
 
@@ -23,9 +24,27 @@ StudioBackup.DRAFTS_FOLDER = "Rojo editor drafts"
 -- script it copies, by its full path in the place.
 StudioBackup.ORIGIN_ATTRIBUTE = "RojoBackupOf"
 
--- Services and the DataModel cannot be saved as models.
+-- Services and the DataModel cannot be saved as models. Errors when the
+-- instance cannot be read.
 local function canCopy(instance)
 	return instance ~= game and instance.Parent ~= game
+end
+
+-- What to call an instance whose properties Studio will not let Rojo read.
+StudioBackup.INACCESSIBLE = "an instance Rojo cannot read"
+
+-- The instance's path, or INACCESSIBLE when it cannot be read.
+local function safePath(instance)
+	local ok, path = pcall(StudioBridge.pathOf, instance)
+	return if ok then path else StudioBackup.INACCESSIBLE
+end
+
+-- The instance's parent, or nil when it cannot be read.
+local function safeParent(instance)
+	local ok, parent = pcall(function()
+		return instance.Parent
+	end)
+	return if ok then parent else nil
 end
 
 local function hasChanges(update)
@@ -38,7 +57,9 @@ end
 	The instances in Studio that applying `patch` would remove or change, as
 	backup roots sorted by path, leaving out any inside another root, whose
 	copy holds them already. Also returns the sorted paths of those that
-	cannot be backed up, such as services, which the patch changes anyway.
+	cannot be backed up, such as services, which the patch changes anyway, or
+	instances whose properties cannot be read, which are skipped rather than
+	stopping the backup.
 ]]
 function StudioBackup.collect(patch, instanceMap)
 	local candidates = {}
@@ -47,7 +68,8 @@ function StudioBackup.collect(patch, instanceMap)
 		if instance == nil or candidates[instance] or skipped[instance] then
 			return
 		end
-		if canCopy(instance) then
+		local read, copyable = pcall(canCopy, instance)
+		if read and copyable then
 			candidates[instance] = true
 		else
 			skipped[instance] = true
@@ -65,16 +87,22 @@ function StudioBackup.collect(patch, instanceMap)
 	local roots = {}
 	for instance in candidates do
 		local inside = false
-		local parent = instance.Parent
+		local parent = safeParent(instance)
 		while parent do
 			if candidates[parent] then
 				inside = true
 				break
 			end
-			parent = parent.Parent
+			parent = safeParent(parent)
 		end
-		if not inside then
-			table.insert(roots, { instance = instance, path = (StudioBridge.pathOf(instance)) })
+		if inside then
+			continue
+		end
+		local read, path = pcall(StudioBridge.pathOf, instance)
+		if read then
+			table.insert(roots, { instance = instance, path = path })
+		else
+			skipped[instance] = true
 		end
 	end
 	table.sort(roots, function(a, b)
@@ -82,7 +110,7 @@ function StudioBackup.collect(patch, instanceMap)
 	end)
 	local skippedPaths = {}
 	for instance in skipped do
-		table.insert(skippedPaths, (StudioBridge.pathOf(instance)))
+		table.insert(skippedPaths, safePath(instance))
 	end
 	table.sort(skippedPaths)
 	return roots, skippedPaths
@@ -140,8 +168,11 @@ end
 	returns nil when it cannot. The model only holds `Source`, so a script
 	whose editor shows other text also gets a draft copy with that text, in a
 	folder named DRAFTS_FOLDER. Returns the model, the paths and classes of
-	its roots, and the paths of scripts whose editor text or source could not
-	be read, whose unsaved text the backup may therefore miss.
+	its roots, the paths of scripts whose editor text or source could not be
+	read, whose unsaved text the backup may therefore miss, and for every
+	other script the hash of the text the backup holds for it (`captured`, a
+	list of `{ instance, path, hash }`), so `changedSince` can tell which
+	were edited after the backup was taken.
 ]]
 function StudioBackup.serialize(roots, readEditor)
 	local count = StudioBackup.countInstances(roots)
@@ -152,6 +183,7 @@ function StudioBackup.serialize(roots, readEditor)
 	local instances = {}
 	local described = {}
 	local unreadable = {}
+	local captured = {}
 	local drafts
 	local ok, result = pcall(function()
 		for _, root in roots do
@@ -177,6 +209,11 @@ function StudioBackup.serialize(roots, readEditor)
 					table.insert(unreadable, (StudioBridge.pathOf(script)))
 					continue
 				end
+				table.insert(captured, {
+					instance = script,
+					path = (StudioBridge.pathOf(script)),
+					hash = (hashSource(editor)),
+				})
 				if editor == saved then
 					continue
 				end
@@ -207,7 +244,24 @@ function StudioBackup.serialize(roots, readEditor)
 	if not ok then
 		error(result, 0)
 	end
-	return result, described, unreadable
+	return result, described, unreadable, captured
+end
+
+--[[
+	The paths of the scripts in `captured`, from `serialize`, whose editor
+	text `readEditor` now reads differently from what the backup holds, such
+	as a script someone typed in while the backup was sent. Scripts whose
+	text cannot be read now are left out, since that was warned about.
+]]
+function StudioBackup.changedSince(captured, readEditor)
+	local changed = {}
+	for _, entry in captured do
+		local ok, text = pcall(readEditor, entry.instance)
+		if ok and text ~= nil and (hashSource(text)) ~= entry.hash then
+			table.insert(changed, entry.path)
+		end
+	end
+	return changed
 end
 
 --[[

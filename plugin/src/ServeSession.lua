@@ -754,27 +754,38 @@ end
 ]=]
 function ServeSession:__backUpBeforeCatchUp(patch, serverInfo)
 	if not Settings:get("autoBackupBeforeSync") then
-		return
+		return nil
 	end
-	local roots, skipped = StudioBackup.collect(patch, self.__instanceMap)
+	-- Collecting reads every affected instance, any of which Studio may
+	-- refuse to let a plugin read. The sync must go ahead whatever happens.
+	local collected, roots, skipped = pcall(StudioBackup.collect, patch, self.__instanceMap)
+	if not collected then
+		Log.warn(
+			"No backup was taken of what this sync changes or removes in Studio: {}. Syncing goes ahead without one.",
+			tostring(roots)
+		)
+		return nil
+	end
 	if #skipped > 0 then
 		-- Services cannot be saved as models, so a sync that changes their
 		-- properties overwrites them with nothing to go back to.
 		Log.warn(
-			"Rojo cannot back up {} instances this sync changes, such as services, so their current properties are not saved: {}",
+			"Rojo cannot back up {} instances this sync changes, such as services or instances it cannot read, so their current state is not saved: {}",
 			#skipped,
 			listPaths(skipped)
 		)
 	end
 	if #roots == 0 then
-		return
+		return nil
 	end
+	local captured = {}
 	local ok, result = pcall(function()
 		assert(
 			serverInfo.studioBridge ~= nil,
 			"the server was not started with --studio-token-file, so it cannot save backups"
 		)
-		local model, described, unreadable = StudioBackup.serialize(roots, ServeSession.readEditorText)
+		local model, described, unreadable
+		model, described, unreadable, captured = StudioBackup.serialize(roots, ServeSession.readEditorText)
 		if #unreadable > 0 then
 			-- The backup still goes ahead with what was saved.
 			Log.warn(
@@ -798,6 +809,7 @@ function ServeSession:__backUpBeforeCatchUp(patch, serverInfo)
 			id,
 			id
 		)
+		return captured
 	else
 		local paths = {}
 		for _, root in roots do
@@ -808,6 +820,27 @@ function ServeSession:__backUpBeforeCatchUp(patch, serverInfo)
 			#roots,
 			listPaths(paths),
 			tostring(result)
+		)
+	end
+	return nil
+end
+
+--[=[
+	Warns about scripts in the backup that were edited after it captured
+	them, such as while it was sent, since the sync is about to overwrite
+	those newest edits and the backup does not hold them. It does not take
+	another backup, so the sync is not held up.
+]=]
+function ServeSession:__warnAboutEditsSinceBackup(captured)
+	if captured == nil or #captured == 0 then
+		return
+	end
+	local ok, changed = pcall(StudioBackup.changedSince, captured, ServeSession.readEditorText)
+	if ok and #changed > 0 then
+		Log.warn(
+			"{} scripts were edited after Rojo backed them up, and this sync overwrites them, so their newest edits are not in the backup: {}",
+			#changed,
+			listPaths(changed)
 		)
 	end
 end
@@ -1982,11 +2015,12 @@ function ServeSession:__initialSync(serverInfo)
 
 			return self.__apiContext:write(inversePatch)
 		elseif userDecision == "Accept" then
-			self:__backUpBeforeCatchUp(catchUpPatch, serverInfo)
+			local captured = self:__backUpBeforeCatchUp(catchUpPatch, serverInfo)
 			-- The backup can yield while the user disconnects.
 			if self.__status == Status.Disconnected then
 				return
 			end
+			self:__warnAboutEditsSinceBackup(captured)
 			self:__applyPatch(catchUpPatch)
 			return Promise.resolve()
 		else

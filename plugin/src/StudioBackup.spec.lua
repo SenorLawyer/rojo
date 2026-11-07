@@ -74,6 +74,25 @@ return function()
 			expect(StudioBackup.countInstances(roots)).to.equal(3)
 		end)
 
+		it("skips and reports an instance whose properties cannot be read", function()
+			local map = make("Folder", "Map", fixture)
+			-- Stands in for an instance Studio will not let a plugin read.
+			local inaccessible = setmetatable({}, {
+				__index = function(_, key)
+					error("The current thread cannot access '" .. tostring(key) .. "' (lacking capability Plugin)")
+				end,
+			})
+			local patch = PatchSet.newEmpty()
+			table.insert(patch.removed, "LOCKED")
+			table.insert(patch.removed, map)
+			table.insert(patch.updated, { id = "LOCKED", changedName = "Other" })
+			local roots, skipped = StudioBackup.collect(patch, { fromIds = { LOCKED = inaccessible } })
+			expect(#roots).to.equal(1)
+			expect(roots[1].instance).to.equal(map)
+			expect(#skipped).to.equal(1)
+			expect(skipped[1]).to.equal(StudioBackup.INACCESSIBLE)
+		end)
+
 		it("finds nothing to copy in a patch that only adds", function()
 			local patch = PatchSet.newEmpty()
 			patch.added.NEW = { Name = "New", ClassName = "Folder", Children = {}, Properties = {} }
@@ -167,6 +186,28 @@ return function()
 			for _, copy in roots do
 				copy:Destroy()
 			end
+		end)
+
+		it("tells which backed-up scripts were edited after the backup captured them", function()
+			local removed = make("Folder", "Removed", fixture)
+			local edited = make("ModuleScript", "Edited", removed)
+			edited.Source = "return 1"
+			local untouched = make("ModuleScript", "Untouched", removed)
+			untouched.Source = "return 2"
+			local function read(instance)
+				return instance.Source
+			end
+			local _, _, _, captured = StudioBackup.serialize({ { instance = removed } }, read)
+			expect(#captured).to.equal(2)
+			expect(#StudioBackup.changedSince(captured, read)).to.equal(0)
+			edited.Source = "return 'typed during the upload'"
+			local changed = StudioBackup.changedSince(captured, read)
+			expect(#changed).to.equal(1)
+			expect(changed[1]).to.equal("game/ReplicatedStorage/__RojoBackupSpec/Removed/Edited")
+			-- A script whose text cannot be read now is not reported again.
+			expect(#StudioBackup.changedSince(captured, function()
+				return nil
+			end)).to.equal(0)
 		end)
 
 		it("refuses a backup over the instance limit before serializing", function()

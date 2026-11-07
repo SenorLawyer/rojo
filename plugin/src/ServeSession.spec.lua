@@ -1369,6 +1369,79 @@ return function()
 			expect(warnings[1].args[2]).to.equal("game/Lighting")
 		end)
 
+		it("syncs anyway when collecting what to back up fails", function()
+			Settings:set("autoBackupBeforeSync", true)
+			local Log = require(script.Parent.Parent.Packages.Log)
+			local StudioBackup = require(script.Parent.StudioBackup)
+			local nativeWarn = Log.warn
+			local warnings = {}
+			Log.warn = function(template, ...)
+				table.insert(warnings, { template = template, args = { ... } })
+			end
+			-- The wipe guard reads removed instances too; the stand-in below is
+			-- not an Instance, which only this test's failure injection needs.
+			local previousGuard = Settings:get("guardScriptWipes")
+			Settings:set("guardScriptWipes", false)
+			-- An affected instance that cannot be read, and no bridge at all.
+			local inaccessible = setmetatable({}, {
+				__index = function(_, key)
+					error("The current thread cannot access '" .. tostring(key) .. "'")
+				end,
+			})
+			session.__instanceMap.fromIds.LOCKED = inaccessible
+			local unpaired = syncRemoving("LOCKED", { rootInstanceId = "ROOT" })
+			session.__instanceMap.fromIds.LOCKED = nil
+			-- And collecting itself failing.
+			local nativeCollect = StudioBackup.collect
+			StudioBackup.collect = function()
+				error("simulated failure while collecting")
+			end
+			local failed = syncRemoving(Instance.new("Folder"), { rootInstanceId = "ROOT", studioBridge = pairing })
+			StudioBackup.collect = nativeCollect
+			Log.warn = nativeWarn
+			Settings:set("guardScriptWipes", previousGuard)
+			expect(unpaired[1]).to.equal("patch")
+			expect(failed[1]).to.equal("patch")
+			expect(#warnings).to.equal(2)
+			expect(warnings[1].template:find("cannot back up", 1, true)).to.be.ok()
+			expect(warnings[1].args[2]).to.equal(StudioBackup.INACCESSIBLE)
+			expect(tostring(warnings[2].args[1]):find("simulated failure while collecting", 1, true)).to.be.ok()
+		end)
+
+		it("warns when a backed-up script is edited before the sync overwrites it", function()
+			Settings:set("autoBackupBeforeSync", true)
+			local Log = require(script.Parent.Parent.Packages.Log)
+			local nativeWarn = Log.warn
+			local nativeRead = ServeSession.readEditorText
+			local warnings = {}
+			Log.warn = function(template, ...)
+				table.insert(warnings, { template = template, args = { ... } })
+			end
+			ServeSession.readEditorText = function(instance)
+				return instance.Source
+			end
+			local removed = Instance.new("ModuleScript")
+			removed.Name = "BeingEdited"
+			removed.Source = "return 'captured'"
+			removed.Parent = fixture
+			StudioBridge.requestAsync = function()
+				-- Someone types while the backup is being sent.
+				removed.Source = "return 'typed during the upload'"
+				return {
+					Success = true,
+					StatusCode = 200,
+					Body = HttpService:JSONEncode({ backup = { id = "20261107-000000-auto-sync" } }),
+				}
+			end
+			local events = syncRemoving(removed, { rootInstanceId = "ROOT", studioBridge = pairing })
+			Log.warn = nativeWarn
+			ServeSession.readEditorText = nativeRead
+			expect(events[1]).to.equal("patch")
+			expect(#warnings).to.equal(1)
+			expect(warnings[1].template:find("newest edits are not in the backup", 1, true)).to.be.ok()
+			expect(warnings[1].args[2]).to.equal("game/ReplicatedStorage/__RojoSyncBackupSpec/BeingEdited")
+		end)
+
 		it("takes no backup when it is turned off", function()
 			Settings:set("autoBackupBeforeSync", false)
 			local removed = Instance.new("Folder")
