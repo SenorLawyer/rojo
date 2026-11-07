@@ -1711,7 +1711,13 @@ impl StudioBridge {
         if !backup::record_fits(&record) {
             return failure(StatusCode::PAYLOAD_TOO_LARGE, RECORD_TOO_LARGE);
         }
-        match self.save_backup(record, model, None).await {
+        // Pinned for a while, so another save cannot prune it while Studio
+        // applies the sync it backs up; the pin just expires.
+        let until = backup::now_millis() + BACKUP_PIN.as_millis() as u64;
+        match self
+            .save_backup(record, model, Some((until, Vec::new())))
+            .await
+        {
             Ok((record, store_dir)) => reply(
                 StatusCode::OK,
                 json!({ "backup": backup_summary(&record, &store_dir) }),
@@ -4118,6 +4124,69 @@ mod tests {
             .list()
             .unwrap()
             .is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_reconnect_backup_is_pinned_until_its_pin_expires() {
+        let (dir, bridge) = fixture();
+        let (status, value) = plugin(
+            &bridge,
+            "/api/studio/backup",
+            json!({"model": model(&["Part"]), "instances": [{"path":"game/Workspace/Folder","className":"Folder"}]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{value}");
+        let id = value["backup"]["id"].as_str().unwrap().to_owned();
+        // Another process fills the folder with backups dated in the future,
+        // as after a clock correction, and saves one more.
+        let other = backup::Store::in_dir(&dir.path().join("backups"));
+        let future = backup::now_millis() + 86_400_000;
+        for index in 0..backup::MAX_AUTOMATIC as u64 {
+            let mut record = backup::automatic_record(
+                "auto-sync",
+                "auto: future",
+                &[("game/Future".to_owned(), "Folder".to_owned())],
+                None,
+                None,
+            );
+            record.created_at = future + index;
+            other.save(record, b"<roblox!future").unwrap();
+        }
+        let mut record = backup::automatic_record(
+            "auto-sync",
+            "auto: later",
+            &[("game/Later".to_owned(), "Folder".to_owned())],
+            None,
+            None,
+        );
+        record.created_at = backup::now_millis();
+        other.save_automatic(record, b"<roblox!later").unwrap();
+        assert!(
+            other.exists(&id),
+            "its pin keeps it while Studio applies the sync"
+        );
+        // Once the pin has expired, the next save prunes it like any other:
+        // it is the oldest of those over the cap.
+        let later = backup::now_millis() + BACKUP_PIN.as_millis() as u64 + 1;
+        let mut record = backup::automatic_record(
+            "auto-sync",
+            "auto: after the pin",
+            &[("game/After".to_owned(), "Folder".to_owned())],
+            None,
+            None,
+        );
+        record.created_at = later;
+        other
+            .save_automatic_with(
+                record,
+                b"<roblox!after",
+                None,
+                &[],
+                backup::PruneLimits::DEFAULT,
+                later,
+            )
+            .unwrap();
+        assert!(!other.exists(&id));
     }
 
     #[tokio::test]

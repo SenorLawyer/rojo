@@ -210,6 +210,57 @@ return function()
 			end)).to.equal(0)
 		end)
 
+		it("skips a backup with too much script source before reading or serializing it", function()
+			local removed = make("Folder", "Removed", fixture)
+			for index = 1, 3 do
+				make("ModuleScript", "Module" .. index, removed).Source = string.rep("x", 100)
+			end
+			local previous = StudioBackup.MAX_SOURCE_BYTES
+			local nativeSerialize = StudioBackup.serializeInstances
+			local serialized, read = 0, 0
+			StudioBackup.serializeInstances = function(instances)
+				serialized += 1
+				return nativeSerialize(instances)
+			end
+			StudioBackup.MAX_SOURCE_BYTES = 250
+			local ok, err = pcall(StudioBackup.serialize, { { instance = removed } }, function(instance)
+				read += 1
+				return instance.Source
+			end)
+			StudioBackup.MAX_SOURCE_BYTES = previous
+			-- Within the budget, the same backup goes ahead.
+			local fine = pcall(StudioBackup.serialize, { { instance = removed } }, function(instance)
+				return instance.Source
+			end)
+			StudioBackup.serializeInstances = nativeSerialize
+			expect(ok).to.equal(false)
+			expect(tostring(err):find("of source", 1, true)).to.be.ok()
+			expect(serialized).to.equal(1, "only the backup within the budget was serialized")
+			expect(read).to.equal(0, "no editor text was read for the refused one")
+			expect(fine).to.equal(true)
+		end)
+
+		it("keeps instance count, serialized size and source volume as separate limits", function()
+			local removed = make("Folder", "Removed", fixture)
+			make("ModuleScript", "Module", removed).Source = string.rep("x", 1000)
+			local roots = { { instance = removed } }
+			local function failsWith(limit, value)
+				local previous = StudioBackup[limit]
+				StudioBackup[limit] = value
+				local ok, err = pcall(StudioBackup.serialize, roots, function(instance)
+					return instance.Source
+				end)
+				StudioBackup[limit] = previous
+				expect(ok).to.equal(false)
+				return tostring(err)
+			end
+			expect(failsWith("MAX_INSTANCES", 1):find("instances", 1, true)).to.be.ok()
+			expect(failsWith("MAX_SOURCE_BYTES", 999):find("of source", 1, true)).to.be.ok()
+			expect(failsWith("MAX_MODEL_BYTES", 64):find("model limit", 1, true)).to.be.ok()
+			-- Each limit alone lets the others pass.
+			expect((pcall(StudioBackup.serialize, roots))).to.equal(true)
+		end)
+
 		it("refuses a backup over the instance limit before serializing", function()
 			local removed = make("Folder", "Removed", fixture)
 			make("Part", "One", removed)

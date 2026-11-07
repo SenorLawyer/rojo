@@ -16,6 +16,13 @@ StudioBackup.MAX_MODEL_BYTES = 5 * 1024 * 1024
 -- Restoring counts every instance against the import limit, so a larger
 -- backup could never be put back.
 StudioBackup.MAX_INSTANCES = 10_000
+-- The most script source a backup reads before it is serialized. A subtree
+-- within the instance limit can still hold hundreds of MB of source, which
+-- would freeze Studio while it is read, hashed and serialized only to fail
+-- the model limit afterwards.
+StudioBackup.MAX_SOURCE_BYTES = 16 * 1024 * 1024
+-- Scripts handled between yields, so reading many keeps Studio responsive.
+StudioBackup.SCRIPTS_PER_YIELD = 200
 local MAX_BODY_BYTES = 8 * 1024 * 1024
 
 -- The folder in a backup that holds scripts as their open editors show them.
@@ -147,8 +154,57 @@ function StudioBackup.copyScript(script, source)
 	return copy
 end
 
+-- Serializes `instances` as one model. Replaced by tests.
+function StudioBackup.serializeInstances(instances)
+	return SerializationService:SerializeInstancesAsync(instances)
+end
+
+-- Yields every SCRIPTS_PER_YIELD calls, counted in `counter.n`.
+local function pace(counter)
+	counter.n += 1
+	if counter.n % StudioBackup.SCRIPTS_PER_YIELD == 0 then
+		task.wait()
+	end
+end
+
+--[[
+	The scripts in `roots` and their descendants, and checks that their
+	sources add up to at most MAX_SOURCE_BYTES, stopping as soon as they do
+	not, so a huge subtree fails before anything is hashed or serialized.
+]]
+function StudioBackup.scriptsWithin(roots)
+	local scripts = {}
+	local total = 0
+	local counter = { n = 0 }
+	for _, root in roots do
+		local candidates = root.instance:GetDescendants()
+		table.insert(candidates, root.instance)
+		for _, candidate in candidates do
+			if not candidate:IsA("LuaSourceContainer") then
+				continue
+			end
+			local read, source = pcall(function()
+				return (candidate :: any).Source
+			end)
+			if read and type(source) == "string" then
+				total += #source
+			end
+			assert(
+				total <= StudioBackup.MAX_SOURCE_BYTES,
+				string.format(
+					"its scripts hold more than %d MiB of source, over what a backup reads",
+					StudioBackup.MAX_SOURCE_BYTES // (1024 * 1024)
+				)
+			)
+			table.insert(scripts, candidate)
+			pace(counter)
+		end
+	end
+	return scripts
+end
+
 local function serializeChecked(instances)
-	local model = SerializationService:SerializeInstancesAsync(instances)
+	local model = StudioBackup.serializeInstances(instances)
 	assert(
 		buffer.len(model) <= StudioBackup.MAX_MODEL_BYTES,
 		string.format("the copy is %.1f MiB, over the 5 MiB model limit", buffer.len(model) / (1024 * 1024))
@@ -180,11 +236,13 @@ function StudioBackup.serialize(roots, readEditor)
 		count <= StudioBackup.MAX_INSTANCES,
 		string.format("it would hold %d instances, over the %d a backup can restore", count, StudioBackup.MAX_INSTANCES)
 	)
+	local scripts = StudioBackup.scriptsWithin(roots)
 	local instances = {}
 	local described = {}
 	local unreadable = {}
 	local captured = {}
 	local drafts
+	local counter = { n = 0 }
 	local ok, result = pcall(function()
 		for _, root in roots do
 			table.insert(instances, root.instance)
@@ -192,15 +250,10 @@ function StudioBackup.serialize(roots, readEditor)
 				path = root.path or (StudioBridge.pathOf(root.instance)),
 				className = root.instance.ClassName,
 			})
-			if not readEditor then
-				continue
-			end
-			local scripts = root.instance:GetDescendants()
-			table.insert(scripts, root.instance)
+		end
+		if readEditor then
 			for _, script in scripts do
-				if not script:IsA("LuaSourceContainer") then
-					continue
-				end
+				pace(counter)
 				local editor = readEditor(script)
 				local read, saved = pcall(function()
 					return (script :: any).Source
@@ -255,7 +308,9 @@ end
 ]]
 function StudioBackup.changedSince(captured, readEditor)
 	local changed = {}
+	local counter = { n = 0 }
 	for _, entry in captured do
+		pace(counter)
 		local ok, text = pcall(readEditor, entry.instance)
 		if ok and text ~= nil and (hashSource(text)) ~= entry.hash then
 			table.insert(changed, entry.path)
