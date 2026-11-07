@@ -25,6 +25,9 @@ const GIT_IGNORE_PLACEHOLDER: &str = "gitignore.txt";
 const CI_WORKFLOW_PLACEHOLDER: &str = "rojo-workflow.yml";
 const CI_WORKFLOW_PATH: &str = ".github/workflows/rojo.yml";
 
+/// How much of a subdirectory project's path goes into its workflow's name.
+const MAX_WORKFLOW_NAME_CHARS: usize = 60;
+
 static TEMPLATE_BINCODE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/templates.bincode"));
 
 /// Initializes a new Rojo project.
@@ -228,7 +231,14 @@ impl WorkflowTarget {
                         'A'..='Z' => c.to_ascii_lowercase(),
                         _ => '-',
                     })
+                    // File names are limited to 255 bytes. The hash still
+                    // covers the whole path, so a cut name stays unique.
+                    .take(MAX_WORKFLOW_NAME_CHARS)
                     .collect();
+                let name = match name.trim_end_matches('-') {
+                    "" => "project",
+                    name => name,
+                };
                 let hash = blake3::hash(dir.as_bytes()).to_hex();
                 format!(".github/workflows/rojo-{name}-{}.yml", &hash[..8])
             }
@@ -275,19 +285,41 @@ fn single_quoted(value: &str) -> String {
 }
 
 /// The top level of the Git repository that contains `path`, or `None` when
-/// it is not in one or Git is not installed, as in `should_git_init`.
+/// it is not in one.
 fn git_toplevel(path: &Path) -> Option<PathBuf> {
-    let output = Command::new("git")
+    let output = match Command::new("git")
         .args(["rev-parse", "--show-toplevel"])
         .stderr(Stdio::null())
         .current_dir(path)
         .output()
-        .ok()?;
+    {
+        Ok(output) => output,
+        // Without Git, a checkout is still recognizable by its marker, and
+        // GitHub still only reads workflows at its root.
+        Err(_) => return find_git_marker(path),
+    };
     if !output.status.success() {
         return None;
     }
     let toplevel = String::from_utf8(output.stdout).ok()?;
     dunce::canonicalize(toplevel.trim_end_matches(['\r', '\n'])).ok()
+}
+
+/// The nearest folder at or above `path` that has a `.git` entry: a
+/// directory with a HEAD file in a normal checkout, or a file naming the Git
+/// directory with `gitdir:` in worktrees and submodules. Other `.git` entries,
+/// which Git itself would not accept, are skipped.
+fn find_git_marker(path: &Path) -> Option<PathBuf> {
+    path.ancestors()
+        .find(|dir| {
+            let marker = dir.join(".git");
+            if marker.is_dir() {
+                marker.join("HEAD").is_file()
+            } else {
+                fs::read_to_string(&marker).is_ok_and(|contents| contents.starts_with("gitdir:"))
+            }
+        })
+        .map(Path::to_path_buf)
 }
 
 /// The templates we support for initializing a Rojo project.
@@ -763,4 +795,68 @@ fn init_at_a_repository_root_keeps_the_workflow_unchanged() {
     assert_eq!(body(&at_root), body(&not_in_repo));
     assert!(!at_root.contains("working-directory"));
     assert!(at_root.contains("\nname: Rojo\n"));
+}
+
+#[test]
+fn git_marker_is_found_as_a_directory_or_a_file() {
+    let tree = tempfile::tempdir().unwrap();
+    let checkout = tree.path().join("checkout");
+    let worktree = checkout.join("worktrees").join("feature");
+    let project = worktree.join("games").join("racer");
+    fs::create_dir_all(&project).unwrap();
+    fs::create_dir(checkout.join(".git")).unwrap();
+    fs::write(checkout.join(".git").join("HEAD"), "ref: refs/heads/main\n").unwrap();
+    // Worktrees and submodules have a `.git` file pointing elsewhere.
+    fs::write(worktree.join(".git"), "gitdir: elsewhere\n").unwrap();
+    // Entries Git would not accept are passed over.
+    let games = worktree.join("games");
+    fs::create_dir(games.join(".git")).unwrap();
+    fs::write(project.join(".git"), "not a checkout\n").unwrap();
+
+    assert_eq!(find_git_marker(&project), Some(worktree.clone()));
+    assert_eq!(find_git_marker(&worktree), Some(worktree.clone()));
+    assert_eq!(
+        find_git_marker(&checkout.join("worktrees")),
+        Some(checkout.clone())
+    );
+    // A sibling folder is not taken to be in either checkout. Whether
+    // something above the temporary folder has a `.git` depends on the
+    // machine, so only the folders in this tree are checked.
+    let outside = tree.path().join("outside");
+    fs::create_dir(&outside).unwrap();
+    let found = find_git_marker(&outside);
+    assert!(
+        found
+            .as_deref()
+            .is_none_or(|dir| !dir.starts_with(tree.path())),
+        "{found:?}"
+    );
+}
+
+#[test]
+fn long_project_paths_give_workflow_names_within_the_file_name_limit() {
+    let long = "a".repeat(80);
+    let target = |dir: String| WorkflowTarget {
+        root: PathBuf::from("repo"),
+        project_dir: Some(dir),
+    };
+    let first = target(format!("{long}/{long}/{long}")).display_path();
+    let second = target(format!("{long}/{long}/{long}b")).display_path();
+
+    for path in [&first, &second] {
+        let name = path.strip_prefix(".github/workflows/").unwrap();
+        assert!(name.len() <= 255, "{name}");
+        assert_eq!(
+            name.len(),
+            "rojo-".len() + MAX_WORKFLOW_NAME_CHARS + "-12345678.yml".len()
+        );
+    }
+    // The names are cut alike, but the hash of the whole path differs.
+    assert_ne!(first, second);
+
+    // A cut that ends on a separator does not leave a dangling '-'.
+    let cut = target(format!("{}/x", "a".repeat(MAX_WORKFLOW_NAME_CHARS - 1))).display_path();
+    let expected = format!("rojo-{}-", "a".repeat(MAX_WORKFLOW_NAME_CHARS - 1));
+    assert!(cut.contains(&expected), "{cut}");
+    assert!(!cut.contains("--"), "{cut}");
 }
