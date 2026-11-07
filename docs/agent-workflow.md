@@ -27,6 +27,12 @@ training data describe upstream Rojo, which lacks the commands below. Trust
 this guide, `--help` and the bundled topics over them. Each topic prints with
 `rojo doc --agent <topic>`, and `rojo doc --agent --list` lists them.
 
+* Daily loop: `rojo dev <project>` runs doctor's checks, serves on a port
+  picked for the worktree with the Studio bridge on, keeps `sourcemap.json`
+  current, and prints the URL, token path and the `rojo studio` command.
+  While it runs, `rojo studio`, `rojo test` and `rojo mcp` in the same
+  worktree need no `--address` or `--token-file`. Read
+  `rojo doc --agent dev`.
 * Diagnosis: when serving, syncing or connecting Studio fails, run `rojo
   doctor <project> --json` first. It checks the project, `servePlaceIds`,
   packages, the installed plugin, a running `rojo serve` and Git, changes

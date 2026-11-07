@@ -46,9 +46,12 @@ impl CheckUntrustedModelCommand {
 #[derive(Debug, Parser)]
 pub struct StudioCommand {
     /// Local rojo serve address. Remote control is intentionally unsupported.
-    #[clap(long, global = true, default_value = "http://127.0.0.1:34872")]
-    pub address: String,
-    /// Secret token file passed to rojo serve --studio-token-file.
+    /// Defaults to where a `rojo dev` in this worktree listens, or
+    /// http://127.0.0.1:34872.
+    #[clap(long, global = true)]
+    pub address: Option<String>,
+    /// Secret token file passed to rojo serve --studio-token-file. Defaults
+    /// to the one a `rojo dev` in this repository uses.
     #[clap(long, global = true)]
     pub token_file: Option<PathBuf>,
     /// Emit compact JSON for automation.
@@ -329,11 +332,14 @@ impl StudioCommand {
             create_token(output)?;
             return print_json(&json!({"tokenFile":output,"created":true}), self.json);
         }
-        let address = local_address(&self.address)?;
-        let token_file = self.token_file.as_ref().context(
-            "Pass --token-file with the secret file used by rojo serve --studio-token-file",
-        )?;
-        let token = read_token_file(token_file)?;
+        let (address, token_file) = super::dev::bridge_target(
+            self.address.as_deref(),
+            self.token_file.as_deref(),
+            &std::env::current_dir().unwrap_or_default(),
+        );
+        let address = local_address(&address)?;
+        let token_file = token_file.context(super::dev::MISSING_TOKEN)?;
+        let token = read_token_file(&token_file)?;
         // Outlast the server's own bound on a command, so a slow command (for
         // example while Git is busy) reports the server's answer, not a
         // timeout that leaves the command running in Studio.
@@ -1247,7 +1253,7 @@ fn parse_response(status: reqwest::StatusCode, bytes: &[u8]) -> anyhow::Result<V
     value.context("Invalid Studio bridge JSON response")
 }
 
-fn create_token(path: &Path) -> anyhow::Result<()> {
+pub(super) fn create_token(path: &Path) -> anyhow::Result<()> {
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]

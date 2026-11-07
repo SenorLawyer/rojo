@@ -65,6 +65,22 @@ impl LiveServer {
         allowed_hosts: Vec<String>,
         on_listening: impl FnOnce(),
     ) -> anyhow::Result<()> {
+        self.start_until(address, allowed_hosts, on_listening, std::future::pending())
+    }
+
+    /// Like [`Self::start`], but returns once `shutdown` completes. The future
+    /// is polled inside the server's runtime, so it may wait on Tokio signals.
+    ///
+    /// Open connections, such as the plugin's long-polling requests, are
+    /// dropped rather than drained: waiting for them would keep the process
+    /// alive for as long as Studio stays connected.
+    pub fn start_until(
+        self,
+        address: SocketAddr,
+        allowed_hosts: Vec<String>,
+        on_listening: impl FnOnce(),
+        shutdown: impl std::future::Future<Output = ()>,
+    ) -> anyhow::Result<()> {
         let serve_session = Arc::clone(&self.serve_session);
         let studio = self.studio.clone();
         let allowed_hosts = origin::allowed_hosts(address.ip(), address.port(), &allowed_hosts);
@@ -142,9 +158,16 @@ impl LiveServer {
         // Binding succeeded, so it's now safe to tell the user we're listening.
         on_listening();
 
-        rt.block_on(server)
-            .context("The Rojo web server encountered a fatal error")?;
-
-        Ok(())
+        let result = rt.block_on(async {
+            tokio::select! {
+                result = server => result.context("The Rojo web server encountered a fatal error"),
+                () = shutdown => Ok(()),
+            }
+        });
+        drop(_guard);
+        // Blocking work the Studio bridge started (for example waiting on a
+        // Git lock) must not hold up the exit.
+        rt.shutdown_timeout(std::time::Duration::from_secs(1));
+        result
     }
 }
