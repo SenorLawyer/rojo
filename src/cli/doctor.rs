@@ -2180,9 +2180,16 @@ mod tests {
             .checks
             .iter()
             .any(|check| check.category == Category::ServePlaceIds && check.code == "absent"));
+        // Doctor canonicalizes the project path, so the temp directory's
+        // canonical form is what it reports (8.3 names on Windows runners,
+        // /private/var on macOS).
         assert_eq!(
             report.project_file,
-            Some(dir.path().join("default.project.json"))
+            Some(
+                dunce::canonicalize(dir.path())
+                    .unwrap()
+                    .join("default.project.json")
+            )
         );
     }
 
