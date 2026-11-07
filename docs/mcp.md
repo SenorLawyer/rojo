@@ -38,8 +38,6 @@ Use the host's own configuration format when it differs. Rojo writes only JSON-R
 | `studio_status` | `studio status --json` | `session` |
 | `studio_test` | `studio test --json` | `session`, optional `seconds` |
 | `run_tests` | `test --json` | optional `session`, `roots`, `filter`, `framework`, `module`, `timeout` |
-| `studio_tree` | `studio tree --json` | `session`, optional `instance`, `depth`, `limit` |
-| `studio_properties` | `studio properties --json` | `session`, `instance`, `properties` |
 | `studio_logs` | `studio logs --json` | `session`, optional `limit`, `after` |
 | `studio_export` | `studio export --json` | `session`, `instance`, `output` |
 | `studio_verify` | `studio verify --json` | `session`, optional `fix`, `includeHeld` |
@@ -51,6 +49,8 @@ Use the host's own configuration format when it differs. Rojo writes only JSON-R
 | `checkpoint_list` | `checkpoint list --json` | None |
 | `workspace_list` | `workspace list --json` | None |
 | `packages_doctor` | `packages doctor --json` | None |
+
+`studio_tree` (`studio tree --json`; `session`, optional `instance`, `depth`, `limit`) and `studio_properties` (`studio properties --json`; `session`, `instance`, `properties`) are not in `tools/list`, since Roblox's Studio MCP server does the same with `search_game_tree` and `inspect_instance`; see [Which MCP server to use](#which-mcp-server-to-use). They still answer `tools/call` with the same arguments and limits, so agents and configurations that already use them keep working. `rojo studio tree` and `rojo studio properties` are unchanged.
 
 List Studio sessions first and choose the exact UUID for every targeted operation. The adapter never chooses the first available session; `run_tests` without a `session` lets `rojo test` use the only connected session and fails when there are several. It forwards the configured address and token file to each Studio command. Package, workspace and checkpoint tools use the project fixed at server startup; a tool call cannot override it.
 
@@ -65,6 +65,28 @@ List Studio sessions first and choose the exact UUID for every targeted operatio
 `run_tests` runs the place's `*.spec` modules in Run mode, as described in [Running specs](testing.md), and returns the report as JSON: `status` (`passed`, `failed`, `error` or `timedOut`), counts, and each failure's test path and messages. A run whose tests fail is a successful tool call with `isError: false` and `status: "failed"`; `isError: true` means the run could not be requested at all, such as when no session is connected. It carries the same annotations as `studio_test`, since it executes the same scripts. Only a call with an explicit `session` can be cancelled at the bridge. Roots and the module are `game/...` paths without empty names (anything else is rejected as invalid arguments before Studio is asked), the filter is at most 256 bytes of UTF-8 and the timeout is `1..300` seconds. A report too large for the 256 KiB output limit is cut to fit rather than failing the call: `rojo test` keeps failures and load errors in order while they fit, shortens the messages of the first one that does not, and counts the rest in `omittedFailures`, `omittedLoadErrors` and `truncatedMessages`. The `failed` count still covers every failure.
 
 Unknown arguments and incorrect types are rejected before starting a child command. Tree depth is limited to `0..6`, tree limits to `1..500`, log limits to `1..200` (the most entries the plugin returns), log `after` values to `0..2^53-1`, and property reads to `1..64` ordinary property names. All commands use native argument arrays without a shell. Tool descriptions include JSON Schemas with additional properties disabled.
+
+## Which MCP server to use
+
+Roblox's [Studio MCP server](https://create.roblox.com/docs/studio/mcp-open-cloud) can run next to this one. It reads and edits the place, runs Luau, play tests, inserts and uploads assets, and calls Open Cloud through `open_cloud_invoke` with the scopes the creator has granted for the game. This server is for work that depends on the Rojo project on disk. The initialization `instructions` and the tool descriptions say the same, so an agent connected to both picks the right one.
+
+| `rojo mcp` tool | Closest Roblox Studio MCP tool | Decision |
+| --- | --- | --- |
+| `studio_verify` | None | Keep: compares Studio with the files and fixes it from them |
+| `studio_sessions`, `studio_status` | `list_roblox_studios`, `get_studio_state` | Keep: Rojo sync health and the session UUIDs every `rojo` tool takes |
+| `studio_backup`, `studio_backup_list` | None | Keep: backups in the repository, restored with `rojo studio backup restore` |
+| `studio_lock_acquire`, `studio_lock_release`, `studio_lock_status` | None | Keep: shared by every worktree; Roblox's tools do not check them |
+| `run_tests` | None | Keep: TestEZ or Jest-Lua report |
+| `studio_export` | None | Keep: writes `.rbxm` into the project, outside the synced folders |
+| `checkpoint_list`, `workspace_list`, `packages_doctor` | None | Keep: project files and Git |
+| `studio_test` | `start_stop_play` | Keep, pointing at Roblox's: a bounded run that always returns to Edit; use `start_stop_play` for a play test that keeps running |
+| `studio_logs` | `get_console_output` | Keep, pointing at Roblox's: follows the log across calls with `after` |
+| `studio_tree` | `search_game_tree` | Not listed: Roblox's filters by class and name and reads Client and Server during a play test |
+| `studio_properties` | `inspect_instance` | Not listed: Roblox's returns every property and attribute |
+
+Open Cloud work is split the same way. `open_cloud_invoke` covers developer products, game passes, game and place settings, analytics, data stores (through `execute_luau`), server restarts and one-off uploads. Uploads that project code refers to go through `rojo assets sync`, which records them in `assets.lock.json` and the generated module; cloud test runs use `rojo test --cloud`, and publishing uses `rojo release`, which publishes to a staging place before the live one. These remain CLI commands; this server does not call Roblox's server or Open Cloud.
+
+Edits made with Roblox's tools to scripts Rojo syncs are overwritten from the files on the next sync, and `studio_verify` reports them until then. Change the file instead.
 
 ## Protocol and limits
 
