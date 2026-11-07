@@ -208,6 +208,9 @@ function ServeSession.new(options)
 		__precommitCallbacks = {},
 		__postcommitCallbacks = {},
 		__updateLoadingText = function() end,
+		-- Hashes of the text Rojo itself wrote to each script, so a later
+		-- write can tell its own text from an edit made in Studio.
+		__rojoWrittenHashes = setmetatable({}, { __mode = "k" }),
 		-- Scripts whose emptying was held back, by ID. See `__holdScriptWipes`.
 		__heldWipes = {},
 		-- The sources recent verifies saw, by verify request ID.
@@ -1593,6 +1596,8 @@ function ServeSession:__replaceInstances(idList)
 		})
 	end
 
+	-- Replacements left out, which stay unapplied.
+	local skipped = {}
 	for _, swap in orderSwaps(swaps) do
 		local id, replacement, oldInstance = swap.id, swap.replacement, swap.oldInstance
 
@@ -1600,13 +1605,12 @@ function ServeSession:__replaceInstances(idList)
 		-- holds, so it is held to the same checks as a source write: not
 		-- after the backup's protection runs out, and not over edits made
 		-- since the backup.
-		local blocked = self:__catchUpChangeBlocked(oldInstance)
-		if blocked then
+		if self:__catchUpTooLate() then
 			Log.warn(
-				"Did not replace {} through the sync fallback: {}. Reconnect, or run `rojo studio verify --fix`, to sync it.",
-				oldInstance:GetFullName(),
-				blocked
+				"Did not replace {} through the sync fallback: the change came too late, after the backup Rojo took of it may already have been removed. Reconnect, or run `rojo studio verify --fix`, to sync it.",
+				oldInstance:GetFullName()
 			)
+			skipped[id] = true
 			replacement:Destroy()
 			continue
 		end
@@ -1695,7 +1699,7 @@ function ServeSession:__replaceInstances(idList)
 	if not patchApplySuccess then
 		error(unappliedPatch, 0)
 	end
-	return true, unappliedPatch
+	return true, unappliedPatch, skipped
 end
 
 function ServeSession:__applyPatch(patch, options)
@@ -1814,38 +1818,53 @@ end
 	then a newer change may have replaced this one, or a hold may have started
 	for the script, and either cancels it.
 ]=]
---[=[
-	Why a change from the sync after connecting must not be made to
-	`instance` now, or nil when it may: its backup's protection ran out, or
-	the instance is a script whose text no longer matches what the backup
-	holds. Outside that sync there is no reason.
-]=]
-function ServeSession:__catchUpChangeBlocked(instance)
+-- Whether a change from the sync after connecting comes after its backup's
+-- protection ran out, when the backup may already have been removed.
+function ServeSession:__catchUpTooLate()
 	local deadline = self.__catchUpWriteDeadline
-	if deadline ~= nil and ServeSession.clock() > deadline then
-		return "the change came too late, after the backup Rojo took of it may already have been removed"
+	return deadline ~= nil and ServeSession.clock() > deadline
+end
+
+-- Scripts whose edits made after the reconnect backup a sync write
+-- overwrote, reported together shortly after, at most this many by name.
+local MAX_OVERWRITTEN_NAMED = 10
+
+function ServeSession:__noteOverwrittenEdit(path)
+	self.__overwrittenEdits = self.__overwrittenEdits or {}
+	table.insert(self.__overwrittenEdits, path)
+	if self.__overwrittenWarning then
+		return
 	end
-	local guarded = self.__catchUpGuarded
-	local backedUp = if guarded then guarded[instance] else nil
-	if backedUp ~= nil then
-		local text = ServeSession.readEditorText(instance)
-		if backedUp == false or text == nil or (hashSource(text)) ~= backedUp then
-			return "it has edits made in Studio that the backup Rojo took does not hold"
+	self.__overwrittenWarning = task.delay(0.5, function()
+		local paths = self.__overwrittenEdits
+		self.__overwrittenEdits = nil
+		self.__overwrittenWarning = nil
+		local shown = {}
+		for index = 1, math.min(#paths, MAX_OVERWRITTEN_NAMED) do
+			table.insert(shown, paths[index])
 		end
-	end
-	return nil
+		local text = table.concat(shown, ", ")
+		if #paths > MAX_OVERWRITTEN_NAMED then
+			text ..= string.format(" and %d more", #paths - MAX_OVERWRITTEN_NAMED)
+		end
+		Log.warn(
+			"The sync after connecting overwrote edits made in Studio after Rojo backed these scripts up, so the backup does not hold them: {}",
+			text
+		)
+	end)
 end
 
 function ServeSession:__writeSource(write)
 	local deadline = self.__catchUpWriteDeadline
 	-- For a script in the reconnect backup, the hash of the text the backup
-	-- holds, or false when it could not read it; nil for other writes.
+	-- holds; false when it could not read it, which was warned about then.
 	local backedUp = if self.__catchUpGuarded then self.__catchUpGuarded[write.instance] else nil
 	local generation = (self.__sourceGenerations[write.id] or 0) + 1
 	self.__sourceGenerations[write.id] = generation
 	self.__instanceMap:pauseInstance(write.instance)
 	self.__syncStats.pendingSourceWrites += 1
 	task.spawn(function()
+		local wrote, tooLate = false, false
 		local ok, err = pcall(function()
 			ScriptEditorService:UpdateSourceAsync(write.instance, function(current)
 				if self.__status == Status.Disconnected or self.__sourceGenerations[write.id] ~= generation then
@@ -1856,16 +1875,18 @@ function ServeSession:__writeSource(write)
 						"Did not change the source of {}: the change from connecting came too late, after the backup Rojo took of it may already have been removed. Reconnect, or run `rojo studio verify --fix`, to sync it.",
 						write.instance:GetFullName()
 					)
+					tooLate = true
 					return nil
 				end
-				-- Edits made after the backup are in neither the backup nor
-				-- the files, so they are not overwritten.
-				if backedUp ~= nil and (backedUp == false or (hashSource(current)) ~= backedUp) then
-					Log.warn(
-						"Did not change the source of {}, to keep edits made in Studio that the backup Rojo took does not hold. Reconnect, or run `rojo studio verify --fix`, to sync it.",
-						write.instance:GetFullName()
-					)
-					return nil
+				-- Syncing overwrites Studio's edits, as it always does, but
+				-- edits made after the backup are not in it, so that is said.
+				-- Text Rojo wrote itself in this sync is not such an edit.
+				if type(backedUp) == "number" then
+					local now = (hashSource(current))
+					local written = self.__rojoWrittenHashes[write.instance]
+					if now ~= backedUp and not (written and written[now]) then
+						self:__noteOverwrittenEdit(write.instance:GetFullName())
+					end
 				end
 				local blank = not string.find(write.target, "%S")
 				if blank and Settings:get("guardScriptWipes") then
@@ -1887,12 +1908,23 @@ function ServeSession:__writeSource(write)
 						return nil
 					end
 				end
+				wrote = true
 				return write.target
 			end)
 		end)
 		self.__syncStats.pendingSourceWrites -= 1
-		if not ok then
+		if ok and wrote then
+			local written = self.__rojoWrittenHashes[write.instance]
+			if written == nil then
+				written = {}
+				self.__rojoWrittenHashes[write.instance] = written
+			end
+			written[(hashSource(write.target))] = true
+		end
+		if not ok or tooLate then
 			self.__syncStats.failedSourceWrites += 1
+		end
+		if not ok then
 			Log.warn("Could not write the source of {}: {}", write.instance:GetFullName(), err)
 		end
 	end)
@@ -1948,22 +1980,35 @@ function ServeSession:__applyPatchInRecording(patch)
 
 		Log.debug("ServeSession:__replaceInstances(unappliedPatch.added)")
 		Timer.start("ServeSession:__replaceInstances(unappliedPatch.added)")
-		local addSuccess, unappliedAddedRefs = self:__replaceInstances(addedIdList)
+		local previousAdded = table.clone(unappliedPatch.added)
+		local previousUpdated = table.clone(unappliedPatch.updated)
+		local addSuccess, unappliedAddedRefs, skippedAdded = self:__replaceInstances(addedIdList)
 		Timer.stop()
 
 		Log.debug("ServeSession:__replaceInstances(unappliedPatch.updated)")
 		Timer.start("ServeSession:__replaceInstances(unappliedPatch.updated)")
-		local updateSuccess, unappliedUpdateRefs = self:__replaceInstances(updatedIdList)
+		local updateSuccess, unappliedUpdateRefs, skippedUpdated = self:__replaceInstances(updatedIdList)
 		Timer.stop()
 
-		-- Update the unapplied patch to reflect which Instances were replaced successfully
+		-- Update the unapplied patch to reflect which Instances were replaced
+		-- successfully. Those the fallback left out are still unapplied.
 		if addSuccess then
 			table.clear(unappliedPatch.added)
 			PatchSet.assign(unappliedPatch, unappliedAddedRefs)
+			for id, added in previousAdded do
+				if skippedAdded and skippedAdded[id] then
+					unappliedPatch.added[id] = added
+				end
+			end
 		end
 		if updateSuccess then
 			table.clear(unappliedPatch.updated)
 			PatchSet.assign(unappliedPatch, unappliedUpdateRefs)
+			for _, update in previousUpdated do
+				if skippedUpdated and skippedUpdated[update.id] then
+					table.insert(unappliedPatch.updated, update)
+				end
+			end
 		end
 	end
 	for _, update in heldUpdates do

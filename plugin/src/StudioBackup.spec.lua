@@ -327,6 +327,36 @@ return function()
 			expect(serialized).to.equal(0)
 		end)
 
+		it("counts the text of a TextLabel against the content budget", function()
+			local previous = StudioBackup.MAX_CONTENT_BYTES
+			StudioBackup.MAX_CONTENT_BYTES = 100
+			local gui = make("Frame", "Gui", fixture)
+			make("TextLabel", "Label", gui).Text = string.rep("t", 200)
+			local ok, err = pcall(StudioBackup.serialize, { { instance = gui } })
+			StudioBackup.MAX_CONTENT_BYTES = previous
+			expect(ok).to.equal(false)
+			expect(tostring(err):find("values and attributes", 1, true)).to.be.ok()
+		end)
+
+		it("gives up a backup whose serializing outlasts the time budget", function()
+			local removed = make("Folder", "Removed", fixture)
+			local nativeSerialize = StudioBackup.serializeInstances
+			local previous = StudioBackup.MAX_PREPARE_SECONDS
+			StudioBackup.MAX_PREPARE_SECONDS = 0.2
+			StudioBackup.serializeInstances = function(instances)
+				task.wait(1)
+				return nativeSerialize(instances)
+			end
+			local started = os.clock()
+			local ok, err = pcall(StudioBackup.serialize, { { instance = removed } })
+			local waited = os.clock() - started
+			StudioBackup.MAX_PREPARE_SECONDS = previous
+			StudioBackup.serializeInstances = nativeSerialize
+			expect(ok).to.equal(false)
+			expect(tostring(err):find("took longer than", 1, true)).to.be.ok()
+			expect(waited < 0.9).to.equal(true)
+		end)
+
 		it("gives up a backup that takes too long to prepare", function()
 			local removed = make("Folder", "Removed", fixture)
 			make("ModuleScript", "Module", removed)

@@ -177,8 +177,29 @@ end
 local function checkTime(started)
 	assert(
 		StudioBackup.clock() - started <= StudioBackup.MAX_PREPARE_SECONDS,
-		string.format("preparing it took longer than %d seconds", StudioBackup.MAX_PREPARE_SECONDS)
+		string.format("preparing it took longer than %g seconds", StudioBackup.MAX_PREPARE_SECONDS)
 	)
+end
+
+-- Runs `work` on its own thread and waits for it at most what is left of
+-- the time budget since `started`. On time out its result is dropped.
+local function withinBudget(started, work)
+	checkTime(started)
+	local finished, ok, result = false, false, nil
+	task.spawn(function()
+		ok, result = pcall(work)
+		finished = true
+	end)
+	while not finished do
+		task.wait()
+		if not finished then
+			checkTime(started)
+		end
+	end
+	if not ok then
+		error(result, 0)
+	end
+	return result
 end
 
 -- Yields every SCRIPTS_PER_YIELD calls, counted in `counter.n`, and checks
@@ -194,8 +215,8 @@ local function pace(counter, started)
 end
 
 -- The bytes of variable-size data an instance holds that are cheap to read:
--- a StringValue's value and its string attributes. Script source is counted
--- separately.
+-- a StringValue's value, the text of a TextLabel and the like, and its
+-- attributes. Script source is counted separately.
 local function contentBytes(instance)
 	local bytes = 0
 	if instance:IsA("StringValue") then
@@ -205,6 +226,13 @@ local function contentBytes(instance)
 		if ok and type(value) == "string" then
 			bytes += #value
 		end
+	end
+	-- Many classes have a `Text`; reading it on others just fails.
+	local hasText, text = pcall(function()
+		return (instance :: any).Text
+	end)
+	if hasText and type(text) == "string" then
+		bytes += #text
 	end
 	local ok, attributes = pcall(instance.GetAttributes, instance)
 	if ok then
@@ -444,10 +472,14 @@ function StudioBackup.serialize(roots, readEditor)
 				StudioBackup.MAX_INSTANCES
 			)
 		)
-		checkTime(started)
-		local model = serializeChecked(instances)
-		checkRoundTrip(model, instances)
-		return model
+		-- Serializing, and reading the model back, are single engine calls
+		-- that can take long; they get what is left of the time budget, and a
+		-- result that comes later is dropped.
+		return withinBudget(started, function()
+			local model = serializeChecked(instances)
+			checkRoundTrip(model, instances)
+			return model
+		end)
 	end)
 	if drafts then
 		drafts:Destroy()

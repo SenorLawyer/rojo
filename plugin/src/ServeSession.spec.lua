@@ -1566,37 +1566,130 @@ return function()
 			expect(session.__catchUpWriteDeadline).to.equal(nil)
 		end)
 
-		it("does not write over edits made after the backup captured a script", function()
+		-- Runs `body` with Log.warn recorded, and returns the warnings.
+		local function recordingWarnings(body)
 			local Log = require(script.Parent.Parent.Packages.Log)
-			local hashSource = require(script.Parent.hashSource)
 			local nativeWarn = Log.warn
 			local warnings = {}
 			Log.warn = function(template, ...)
 				table.insert(warnings, { template = template, args = { ... } })
 			end
-			local module = Instance.new("ModuleScript")
-			module.Name = "Captured"
-			module.Source = "return 'captured'"
-			module.Parent = fixture
-			session.__instanceMap:insert("CAPTURED", module)
-			session.__status = ServeSession.Status.Connected
-			-- The backup holds "return 'captured'"; the user types after the
-			-- scan, before the write's callback runs.
-			session.__catchUpGuarded = { [module] = (hashSource("return 'captured'")) }
-			module.Source = "return 'typed after the scan'"
-			session:__writeSource({ id = "CAPTURED", instance = module, target = "return 'disk'" })
-			task.wait(0.3)
-			local edited = module.Source
-			-- With the text the backup holds, the same write goes through.
-			module.Source = "return 'captured'"
-			session:__writeSource({ id = "CAPTURED", instance = module, target = "return 'disk'" })
-			task.wait(0.3)
-			session.__catchUpGuarded = nil
+			local ok, err = pcall(body)
 			Log.warn = nativeWarn
-			expect(edited).to.equal("return 'typed after the scan'")
+			assert(ok, err)
+			return warnings
+		end
+
+		local function backedUpModule(name, source)
+			local module = Instance.new("ModuleScript")
+			module.Name = name
+			module.Source = source
+			module.Parent = fixture
+			session.__instanceMap:insert(name, module)
+			session.__status = ServeSession.Status.Connected
+			return module
+		end
+
+		it("writes over a user's edit made after the backup and says so", function()
+			local hashSource = require(script.Parent.hashSource)
+			local module = backedUpModule("Captured", "return 'captured'")
+			local warnings = recordingWarnings(function()
+				session.__catchUpGuarded = { [module] = (hashSource("return 'captured'")) }
+				-- The user types after the backup, before the write lands.
+				module.Source = "return 'typed after the backup'"
+				session:__writeSource({ id = "Captured", instance = module, target = "return 'disk'" })
+				session.__catchUpGuarded = nil
+				task.wait(0.8)
+			end)
 			expect(module.Source).to.equal("return 'disk'")
 			expect(#warnings).to.equal(1)
-			expect(warnings[1].template:find("to keep edits made in Studio", 1, true)).to.be.ok()
+			expect(warnings[1].template:find("overwrote edits made in Studio after Rojo backed", 1, true)).to.be.ok()
+			expect(warnings[1].args[1]:find("Captured", 1, true)).to.be.ok()
+		end)
+
+		it("still writes a script whose editor text the backup could not read", function()
+			local module = backedUpModule("Unread", "return 'studio'")
+			local warnings = recordingWarnings(function()
+				session.__catchUpGuarded = { [module] = false }
+				session:__writeSource({ id = "Unread", instance = module, target = "return 'disk'" })
+				session.__catchUpGuarded = nil
+				task.wait(0.8)
+			end)
+			expect(module.Source).to.equal("return 'disk'")
+			expect(#warnings).to.equal(0)
+		end)
+
+		it("does not mistake Rojo's own write for an edit, and replaces through the fallback after it", function()
+			local hashSource = require(script.Parent.hashSource)
+			local module = backedUpModule("Swapped", "return 'captured'")
+			local warnings = recordingWarnings(function()
+				session.__catchUpGuarded = { [module] = (hashSource("return 'captured'")) }
+				session:__writeSource({ id = "Swapped", instance = module, target = "return 'disk'" })
+				task.wait(0.3)
+				-- A second write lands on the text Rojo just wrote.
+				session:__writeSource({ id = "Swapped", instance = module, target = "return 'disk again'" })
+				task.wait(0.3)
+				-- Then the fallback replaces the script.
+				api.serialize = function()
+					return Promise.resolve({ modelContents = buffer.create(0), missingIds = {} })
+				end
+				api.refPatch = function()
+					return Promise.resolve({ patch = PatchSet.newEmpty() })
+				end
+				session.__deserializeInstances = function()
+					local container = Instance.new("Folder")
+					local pointer = Instance.new("ObjectValue")
+					pointer.Name = "Swapped"
+					local replacement = Instance.new("ModuleScript")
+					replacement.Name = "Swapped"
+					replacement.Source = "return 'replacement'"
+					pointer.Value = replacement
+					pointer.Parent = container
+					return { container }
+				end
+				local ok, unapplied = session:__replaceInstances({ "Swapped" })
+				session.__catchUpGuarded = nil
+				expect(ok).to.equal(true)
+				expect(PatchSet.isEmpty(unapplied)).to.equal(true)
+				task.wait(0.8)
+			end)
+			local current = session.__instanceMap.fromIds.Swapped
+			expect(current).never.to.equal(module)
+			expect(current.Source).to.equal("return 'replacement'")
+			expect(module.Source).to.equal("return 'disk again'")
+			expect(#warnings).to.equal(0)
+		end)
+
+		it("keeps a fallback replacement that came too late as unapplied", function()
+			local module = backedUpModule("Late", "return 'studio'")
+			local nativeClock = ServeSession.clock
+			local warnings = recordingWarnings(function()
+				ServeSession.clock = function()
+					return 1000
+				end
+				session.__catchUpWriteDeadline = 500
+				api.serialize = function()
+					return Promise.resolve({ modelContents = buffer.create(0), missingIds = {} })
+				end
+				api.refPatch = function()
+					return Promise.resolve({ patch = PatchSet.newEmpty() })
+				end
+				session.__deserializeInstances = function()
+					local container = Instance.new("Folder")
+					local pointer = Instance.new("ObjectValue")
+					pointer.Name = "Late"
+					pointer.Value = Instance.new("ModuleScript")
+					pointer.Parent = container
+					return { container }
+				end
+				local ok, _, skipped = session:__replaceInstances({ "Late" })
+				session.__catchUpWriteDeadline = nil
+				ServeSession.clock = nativeClock
+				expect(ok).to.equal(true)
+				expect(skipped.Late).to.equal(true)
+			end)
+			expect(session.__instanceMap.fromIds.Late).to.equal(module)
+			expect(#warnings).to.equal(1)
 		end)
 
 		it("takes no backup when it is turned off", function()
