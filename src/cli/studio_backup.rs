@@ -502,6 +502,7 @@ impl Store {
     /// backups (see [`Self::prune_automatic`]), so every save keeps the store
     /// bounded, including in operations that fail or are cancelled part way.
     /// A failure to prune is only logged, because the backup is saved.
+    #[cfg(test)]
     pub fn save_automatic(&self, record: Record, model: &[u8]) -> anyhow::Result<Record> {
         self.save_automatic_with(record, model, None, PruneLimits::DEFAULT, now_millis())
     }
@@ -510,13 +511,24 @@ impl Store {
     /// milliseconds), so no prune removes it while the operation that saved
     /// it still relies on it. The operation removes the pin with
     /// [`Self::unpin`] when it ends; the expiry covers a crash.
+    ///
+    /// Waits at most `lock_wait` for the store lock, which another process,
+    /// even a suspended one, may hold, so the operation can fail in time
+    /// instead of hanging.
     pub fn save_automatic_pinned(
         &self,
         record: Record,
         model: &[u8],
         until: u64,
+        lock_wait: std::time::Duration,
     ) -> anyhow::Result<Record> {
-        self.save_automatic_with(
+        let _lock = self.lock_within(lock_wait).with_context(|| {
+            format!(
+                "The backup folder {} is locked by another process",
+                self.dir.display()
+            )
+        })?;
+        self.save_automatic_locked(
             record,
             model,
             Some(until),
@@ -529,7 +541,20 @@ impl Store {
     /// the backup, saving nothing, when pinned backups, the caller's own
     /// included, already fill the limits, since none of them can be removed
     /// to make room: an operation never goes over them.
+    #[cfg(test)]
     pub(crate) fn save_automatic_with(
+        &self,
+        record: Record,
+        model: &[u8],
+        pin: Option<u64>,
+        limits: PruneLimits,
+        now: u64,
+    ) -> anyhow::Result<Record> {
+        let _lock = self.lock()?;
+        self.save_automatic_locked(record, model, pin, limits, now)
+    }
+
+    fn save_automatic_locked(
         &self,
         mut record: Record,
         model: &[u8],
@@ -538,7 +563,6 @@ impl Store {
         now: u64,
     ) -> anyhow::Result<Record> {
         record.automatic = true;
-        let _lock = self.lock()?;
         let (pinned_count, pinned_bytes) = self
             .list()?
             .into_iter()
@@ -546,9 +570,14 @@ impl Store {
             .fold((0usize, 0u64), |(count, bytes), record| {
                 (count + 1, bytes.saturating_add(record.bytes))
             });
-        // What cannot be removed to make room: pinned backups, and temporary
-        // files of saves that may still be running.
-        let pinned_bytes = pinned_bytes.saturating_add(self.young_temp_bytes(now));
+        // What cannot be removed to make room: pinned backups, temporary
+        // files of saves that may still be running, and records that cannot
+        // be read, which may be automatic backups too.
+        let (unreadable_count, unreadable_bytes) = self.unreadable_records();
+        let pinned_count = pinned_count + unreadable_count;
+        let pinned_bytes = pinned_bytes
+            .saturating_add(self.young_temp_bytes(now))
+            .saturating_add(unreadable_bytes);
         anyhow::ensure!(
             pinned_count < limits.max_count
                 && pinned_bytes.saturating_add(model.len() as u64) <= limits.max_bytes,
@@ -708,10 +737,15 @@ impl Store {
             .into_iter()
             .filter(|record| record.automatic)
             .partition(|record| protected.contains(&record.id) || self.pinned(&record.id, now));
-        count += kept.len();
+        // A record that cannot be read is never removed, but may be an
+        // automatic backup, so it takes up its room.
+        let (unreadable_count, unreadable_bytes) = self.unreadable_records();
+        count += kept.len() + unreadable_count;
         bytes = kept
             .iter()
-            .fold(bytes, |total, record| total.saturating_add(record.bytes));
+            .fold(bytes.saturating_add(unreadable_bytes), |total, record| {
+                total.saturating_add(record.bytes)
+            });
         let doomed: Vec<Record> = others
             .into_iter()
             .filter(|record| {
@@ -739,6 +773,39 @@ impl Store {
             failures.join("; ")
         );
         Ok(removed)
+    }
+
+    /// How many records in the store cannot be read, and the bytes of their
+    /// models. `list` leaves them out, but nothing tells whether they are
+    /// automatic, so the limits count them as if they were.
+    fn unreadable_records(&self) -> (usize, u64) {
+        let Ok(entries) = fs::read_dir(&self.dir) else {
+            return (0, 0);
+        };
+        let mut count = 0;
+        let mut bytes = 0u64;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            let Some(id) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            if !valid_id(id) {
+                continue;
+            }
+            let readable = entry_len(&path).is_some_and(|len| len <= MAX_RECORD_BYTES)
+                && fs::read(&path)
+                    .ok()
+                    .and_then(|data| serde_json::from_slice::<Record>(&data).ok())
+                    .is_some();
+            if !readable {
+                count += 1;
+                bytes = bytes.saturating_add(entry_len(&self.model_path(id)).unwrap_or(0));
+            }
+        }
+        (count, bytes)
     }
 
     /// The bytes of the temporary files of automatic saves younger than
@@ -1704,6 +1771,49 @@ mod tests {
         assert!(store.list().unwrap().is_empty());
         store.remove(&saved.id).unwrap();
         assert!(!store.record_path(&saved.id).exists());
+    }
+
+    #[test]
+    fn unreadable_records_count_towards_the_limits_and_are_never_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::in_dir(dir.path());
+        let now = now_millis();
+        let limits = PruneLimits {
+            keep: 0,
+            grace_millis: 0,
+            max_count: 2,
+            max_bytes: u64::MAX,
+        };
+        // Two records that cannot be read, which may be automatic backups.
+        for id in [
+            "20261107-000000-auto-verify-fix-0123abcd",
+            "20261107-000001-Map",
+        ] {
+            fs::write(store.record_path(id), b"{ not json").unwrap();
+            fs::write(store.model_path(id), b"model").unwrap();
+        }
+        assert!(store.list().unwrap().is_empty(), "list leaves them out");
+        let error = store
+            .save_automatic_with(record("new", now), b"new", None, limits, now)
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("limit of 2"), "{error:#}");
+        assert_eq!(
+            fs::read_dir(dir.path()).unwrap().count(),
+            5,
+            "nothing was written or removed"
+        );
+        // Below the count limit, a save goes ahead, and they stay.
+        let limits = PruneLimits {
+            max_count: 3,
+            ..limits
+        };
+        store
+            .save_automatic_with(record("new", now), b"new", None, limits, now)
+            .unwrap();
+        assert!(store.record_path("20261107-000001-Map").exists());
+        assert!(store
+            .model_path("20261107-000000-auto-verify-fix-0123abcd")
+            .exists());
     }
 
     #[test]

@@ -22,6 +22,12 @@ use super::{model_check, origin::canonical, untrusted_model, util::json as json_
 use crate::{cli::studio_backup as backup, serve_session::ServeSession};
 
 pub(super) const MAX_BODY: usize = 8 * 1024 * 1024;
+/// What this server's bridge does beyond its protocol version, listed with
+/// the sessions, so a CLI can tell whether an older `rojo serve` would
+/// ignore what it asks for.
+pub(crate) const SERVER_CAPABILITIES: [&str; 1] = [VERIFY_BACKUP_CAPABILITY];
+/// `verify --fix` backs up the scripts it overwrites first.
+pub(crate) const VERIFY_BACKUP_CAPABILITY: &str = "verifyBackup";
 const SESSION_TTL: Duration = Duration::from_secs(30);
 const MAX_SESSIONS: usize = 16;
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(15);
@@ -1000,7 +1006,12 @@ impl StudioBridge {
             sessions.sort_by_key(|session| session["registeredAt"].as_u64());
             return reply(
                 StatusCode::OK,
-                json!({"protocolVersion":1,"identity":self.identity_json,"sessions":sessions}),
+                json!({
+                    "protocolVersion": 1,
+                    "capabilities": SERVER_CAPABILITIES,
+                    "identity": self.identity_json,
+                    "sessions": sessions,
+                }),
             );
         }
         if request.method() != Method::POST {
@@ -1663,7 +1674,16 @@ impl StudioBridge {
             }
             let until = backup::now_millis() + BACKUP_PIN.as_millis() as u64;
             let (record, store_dir) = self
-                .save_backup(record, model, Some(until))
+                .save_backup(
+                    record,
+                    model,
+                    until,
+                    // Within what is left of the fix's time, so a store
+                    // another process keeps locked fails the fix in time.
+                    VERIFY_FIX_BUDGET
+                        .saturating_sub(started.elapsed())
+                        .min(BACKUP_LOCK_WAIT),
+                )
                 .await
                 .map_err(|error| format!("{error:#}"))?;
             pins.ids.push(record.id.clone());
@@ -1748,17 +1768,15 @@ impl StudioBridge {
         &self,
         record: backup::Record,
         model: Vec<u8>,
-        pin: Option<u64>,
+        pin: u64,
+        lock_wait: Duration,
     ) -> anyhow::Result<(backup::Record, PathBuf)> {
         let dir = self.backup_dir.get().cloned();
         let root = self.serve.root_dir().to_owned();
         let project = root.clone();
         let (record, store_dir) = tokio::task::spawn_blocking(move || {
             let store = Self::backup_store(dir, &root)?;
-            let record = match pin {
-                Some(until) => store.save_automatic_pinned(record, &model, until)?,
-                None => store.save_automatic(record, &model)?,
-            };
+            let record = store.save_automatic_pinned(record, &model, pin, lock_wait)?;
             anyhow::Ok((record, store.dir().to_owned()))
         })
         .await
@@ -2082,6 +2100,8 @@ struct BackupPins {
 /// How long releasing a fix's pins waits for the store lock, which another
 /// process, even a suspended one, may hold.
 const UNPIN_LOCK_WAIT: Duration = Duration::from_secs(3);
+/// The longest saving one of a fix's backups waits for the store lock.
+const BACKUP_LOCK_WAIT: Duration = Duration::from_secs(3);
 
 impl Drop for BackupPins {
     fn drop(&mut self) {
@@ -3986,6 +4006,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_sessions_list_says_verify_fix_backs_up() {
+        let (_dir, bridge) = fixture();
+        let request = request("GET", "/api/studio/sessions", &bridge.token, None);
+        let (status, value) =
+            into_value(bridge.clone().call(PEER.parse().unwrap(), request).await).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(value["capabilities"]
+            .as_array()
+            .unwrap()
+            .contains(&json!(VERIFY_BACKUP_CAPABILITY)));
+    }
+
+    #[tokio::test]
+    async fn verify_fix_fails_in_time_when_another_process_holds_the_store() {
+        let (dir, bridge, session, script, verify) = fix_past_sources(json!({"fix":true})).await;
+        let store = backup::Store::in_dir(&dir.path().join("backups"));
+        let held = store.hold_lock();
+        let command = next_command(&bridge, &session).await;
+        let started = Instant::now();
+        answer_backup(&bridge, &session, &command, &[&script.id]).await;
+        let (status, value) = into_value(verify.await.unwrap()).await;
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{value}");
+        let error = value["error"].as_str().unwrap();
+        assert!(
+            error.starts_with("Changed nothing") && error.contains("locked by another process"),
+            "{error}"
+        );
+        assert!(bridge.state().pending.is_empty(), "no resync was sent");
+        drop(held);
+        assert!(store.list().unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn releasing_pins_never_waits_for_a_held_store_lock() {
         let dir = tempfile::tempdir().unwrap();
         let backups = dir.path().join("backups");
@@ -4001,6 +4055,7 @@ mod tests {
                 ),
                 b"<roblox!x",
                 backup::now_millis() + 600_000,
+                Duration::from_secs(1),
             )
             .unwrap();
         // Another process, perhaps a suspended one, holds the store.

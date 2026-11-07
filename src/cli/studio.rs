@@ -357,6 +357,14 @@ impl StudioCommand {
             max_bytes,
         } = &self.command
         {
+            let backing_up = *fix && !no_backup;
+            // An older `rojo serve` ignores the request to back up and fixes
+            // anyway, so the fix is only asked for once the server says it
+            // backs up first.
+            if backing_up {
+                let sessions = request(&client, &address, token.trim(), None)?;
+                check_verify_backup_support(&sessions)?;
+            }
             let mut args = json!({"fix": fix, "includeHeld": include_held, "backup": !no_backup});
             if *all {
                 args["listLimit"] = json!(crate::web::verify::MAX_LISTED);
@@ -388,6 +396,9 @@ impl StudioCommand {
                 );
             }
             let report = &response["value"];
+            if backing_up {
+                check_fix_backed_up(report)?;
+            }
             if !self.json {
                 eprint!("{}", describe_verify(report));
             }
@@ -659,6 +670,33 @@ fn open_store(project: Option<&Path>) -> anyhow::Result<backup::Store> {
         Some(project) => backup::Store::for_project(project),
         None => backup::Store::open(),
     }
+}
+
+/// Fails unless the `rojo serve` that answered with `sessions` backs up the
+/// scripts `verify --fix` overwrites.
+fn check_verify_backup_support(sessions: &Value) -> anyhow::Result<()> {
+    let supported = sessions["capabilities"]
+        .as_array()
+        .is_some_and(|capabilities| {
+            capabilities.contains(&json!(crate::web::studio::VERIFY_BACKUP_CAPABILITY))
+        });
+    anyhow::ensure!(
+        supported,
+        "This rojo serve is too old to back up the scripts verify --fix overwrites, so nothing was \
+         changed. Update Rojo and restart rojo serve, or pass --no-backup to fix without a backup."
+    );
+    Ok(())
+}
+
+/// Fails when a fix that was asked to back up reports no backups, as a
+/// server that ignored the request would.
+fn check_fix_backed_up(report: &Value) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !report["fixed"].is_object() || report["backups"].is_array(),
+        "rojo serve fixed scripts without saying it backed them up first. \
+         Update Rojo and restart rojo serve."
+    );
+    Ok(())
 }
 
 /// Whether `verify` found Studio matching the files, or, with `--fix`,
@@ -1559,6 +1597,99 @@ mod tests {
                 BackupCommand::List { no_roots: true, .. }
             ));
         }
+    }
+
+    #[test]
+    fn a_fix_with_backups_is_never_asked_of_a_server_that_cannot_back_up() {
+        use std::io::{BufRead, BufReader};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        // An older rojo serve: its sessions list has no capabilities, and it
+        // would fix any verify it is sent.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let posts = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&posts);
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                let mut length = 0;
+                loop {
+                    let mut header = String::new();
+                    reader.read_line(&mut header).unwrap();
+                    if header.trim().is_empty() {
+                        break;
+                    }
+                    if let Some(value) = header.to_ascii_lowercase().strip_prefix("content-length:")
+                    {
+                        length = value.trim().parse().unwrap();
+                    }
+                }
+                let mut body = vec![0; length];
+                reader.read_exact(&mut body).unwrap();
+                let answer = if line.starts_with("POST") {
+                    counted.fetch_add(1, Ordering::SeqCst);
+                    json!({"result":{"ok":true,"value":{"inSync":true,"fixed":{"updated":1}}}})
+                } else {
+                    json!({"protocolVersion":1,"sessions":[]})
+                };
+                let body = answer.to_string();
+                let mut stream = stream;
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+            }
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let token = dir.path().join("token");
+        fs::write(&token, "0123456789abcdef0123456789abcdef").unwrap();
+        let run = |extra: &[&str]| {
+            let address = format!("http://127.0.0.1:{port}");
+            let mut args = vec![
+                "rojo".to_owned(),
+                "studio".to_owned(),
+                "--address".to_owned(),
+                address,
+                "--token-file".to_owned(),
+                token.to_string_lossy().into_owned(),
+                "--json".to_owned(),
+                "verify".to_owned(),
+                "--session".to_owned(),
+                "00000000-0000-4000-8000-000000000000".to_owned(),
+                "--fix".to_owned(),
+            ];
+            args.extend(extra.iter().map(|arg| (*arg).to_owned()));
+            let options = crate::cli::Options::try_parse_from(args).unwrap();
+            let crate::cli::Subcommand::Studio(studio) = options.subcommand else {
+                panic!("expected a studio command");
+            };
+            studio.run()
+        };
+        let error = run(&[]).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("too old to back up"),
+            "{error:#}"
+        );
+        assert_eq!(posts.load(Ordering::SeqCst), 0, "no fix was asked for");
+        // Told not to back up, it fixes as before.
+        assert!(run(&["--no-backup"]).is_ok());
+        assert_eq!(posts.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn a_fix_reported_without_backups_is_an_error() {
+        assert!(check_verify_backup_support(&json!({"protocolVersion":1,"sessions":[]})).is_err());
+        assert!(check_verify_backup_support(&json!({"capabilities":["verifyBackup"]})).is_ok());
+        // A server that ignored the request fixes and reports no backups.
+        assert!(check_fix_backed_up(&json!({"fixed":{"updated":1}})).is_err());
+        assert!(check_fix_backed_up(&json!({"fixed":{"updated":1},"backups":[]})).is_ok());
+        // Without a fix, there is nothing to back up.
+        assert!(check_fix_backed_up(&json!({"inSync":true})).is_ok());
     }
 
     #[test]
