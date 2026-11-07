@@ -252,16 +252,47 @@ impl Store {
     /// backup still being written for one left by an interrupted save. The
     /// system releases it if the process dies.
     fn lock(&self) -> anyhow::Result<fs::File> {
+        let file = self.lock_file()?;
+        file.lock().context("Could not lock the backup store")?;
+        Ok(file)
+    }
+
+    fn lock_file(&self) -> anyhow::Result<fs::File> {
         fs::create_dir_all(&self.dir)
             .with_context(|| format!("Could not create {}", self.dir.display()))?;
-        let file = fs::OpenOptions::new()
+        fs::OpenOptions::new()
             .create(true)
             .truncate(false)
             .write(true)
             .open(self.dir.join(".store.lock"))
-            .context("Could not open the backup store lock")?;
-        file.lock().context("Could not lock the backup store")?;
-        Ok(file)
+            .context("Could not open the backup store lock")
+    }
+
+    /// [`Self::lock`], giving up after `wait` when another process holds
+    /// the lock, such as one that is suspended.
+    fn lock_within(&self, wait: std::time::Duration) -> anyhow::Result<fs::File> {
+        let file = self.lock_file()?;
+        let started = std::time::Instant::now();
+        loop {
+            match file.try_lock() {
+                Ok(()) => return Ok(file),
+                Err(fs::TryLockError::WouldBlock) if started.elapsed() < wait => {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                Err(fs::TryLockError::WouldBlock) => {
+                    anyhow::bail!("Another process kept the backup store locked")
+                }
+                Err(fs::TryLockError::Error(error)) => {
+                    return Err(error).context("Could not lock the backup store")
+                }
+            }
+        }
+    }
+
+    /// Holds the store lock, as another process would, for tests.
+    #[cfg(test)]
+    pub(crate) fn hold_lock(&self) -> fs::File {
+        self.lock().unwrap()
     }
 
     /// Saves `model` and its record. Never overwrites an existing backup.
@@ -515,12 +546,15 @@ impl Store {
             .fold((0usize, 0u64), |(count, bytes), record| {
                 (count + 1, bytes.saturating_add(record.bytes))
             });
+        // What cannot be removed to make room: pinned backups, and temporary
+        // files of saves that may still be running.
+        let pinned_bytes = pinned_bytes.saturating_add(self.young_temp_bytes(now));
         anyhow::ensure!(
             pinned_count < limits.max_count
                 && pinned_bytes.saturating_add(model.len() as u64) <= limits.max_bytes,
-            "The backup folder {} already holds {pinned_count} automatic backups ({} MiB) that running \
-             operations still rely on, which fill its limit of {} backups and {} MiB. \
-             Wait for them to finish and try again.",
+            "The backup folder {} already holds {pinned_count} automatic backups and files ({} MiB) \
+             that running operations still rely on, which with this one would go over its limit of \
+             {} backups and {} MiB. Wait for them to finish and try again.",
             self.dir.display(),
             pinned_bytes / (1024 * 1024),
             limits.max_count,
@@ -567,10 +601,19 @@ impl Store {
     /// That prune never removes `ids` themselves, the backups of the
     /// operation that just ended, and other operations' unexpired pins still
     /// protect theirs.
+    #[cfg(test)]
     pub fn unpin(&self, ids: &[String]) -> anyhow::Result<()> {
         self.unpin_with(ids, PruneLimits::DEFAULT, now_millis())
     }
 
+    /// [`Self::unpin`], giving up after `wait` for the store lock. The pins
+    /// then stay until they expire.
+    pub fn unpin_within(&self, ids: &[String], wait: std::time::Duration) -> anyhow::Result<()> {
+        let _lock = self.lock_within(wait)?;
+        self.unpin_locked(ids, PruneLimits::DEFAULT, now_millis())
+    }
+
+    #[cfg(test)]
     pub(crate) fn unpin_with(
         &self,
         ids: &[String],
@@ -578,6 +621,10 @@ impl Store {
         now: u64,
     ) -> anyhow::Result<()> {
         let _lock = self.lock()?;
+        self.unpin_locked(ids, limits, now)
+    }
+
+    fn unpin_locked(&self, ids: &[String], limits: PruneLimits, now: u64) -> anyhow::Result<()> {
         for id in ids {
             if valid_id(id) {
                 match fs::remove_file(self.pin_path(id)) {
@@ -692,6 +739,33 @@ impl Store {
             failures.join("; ")
         );
         Ok(removed)
+    }
+
+    /// The bytes of the temporary files of automatic saves younger than
+    /// [`STALE_TEMP_MILLIS`], which may belong to a save still running.
+    fn young_temp_bytes(&self, now: u64) -> u64 {
+        let Ok(entries) = fs::read_dir(&self.dir) else {
+            return 0;
+        };
+        entries
+            .flatten()
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(AUTOMATIC_TEMP_PREFIX)
+            })
+            .filter_map(|entry| entry.metadata().ok())
+            .filter(|metadata| {
+                let modified = metadata
+                    .modified()
+                    .ok()
+                    .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+                    .map_or(0, |since| since.as_millis() as u64);
+                modified.saturating_add(STALE_TEMP_MILLIS) > now
+            })
+            .map(|metadata| metadata.len())
+            .sum()
     }
 
     /// Removes the temporary files of automatic saves that are older than
@@ -1386,13 +1460,19 @@ mod tests {
             fs::write(&manual, b"manual").unwrap();
             (dir, store, older, temp, manual)
         };
-        // A young one may be a save in progress: its 50 bytes count, so the
-        // older backup makes room for the new one.
+        // A young one may be a save in progress, so its 50 bytes cannot make
+        // room: with the new one's 20 they are over the 64-byte limit, and
+        // the save is refused without removing anything.
         let (_dir, store, older, temp, _) = setup();
-        store
+        assert!(store
             .save_automatic_with(record("new", now), &[0u8; 20], None, limits, now)
-            .unwrap();
+            .is_err());
         assert!(temp.exists());
+        assert!(store.exists(&older));
+        // A smaller one fits beside it, once the older backup makes room.
+        store
+            .save_automatic_with(record("small", now), &[0u8; 10], None, limits, now)
+            .unwrap();
         assert!(!store.exists(&older));
         // Ten minutes later it is stale: removed, and nothing else has to go.
         let (_dir, store, older, temp, manual) = setup();

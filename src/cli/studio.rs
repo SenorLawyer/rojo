@@ -1602,6 +1602,73 @@ mod tests {
     }
 
     #[test]
+    fn restoring_an_automatic_backup_gives_back_each_script() {
+        use rbx_dom_weak::{InstanceBuilder, WeakDom};
+        let dir = tempfile::tempdir().unwrap();
+        let store = backup::Store::in_dir(dir.path());
+        // As verify --fix saves them: one copy per script, of mixed classes,
+        // two of them named alike, each with its own text.
+        let scripts = [
+            ("Script", "Main", "print('server')\n"),
+            ("LocalScript", "Main", "print('client')\n"),
+            ("ModuleScript", "Same", "return 1\n"),
+            ("ModuleScript", "Same", "return 2\n"),
+        ];
+        let mut dom = WeakDom::new(InstanceBuilder::new("DataModel"));
+        let root = dom.root_ref();
+        let refs: Vec<_> = scripts
+            .iter()
+            .map(|(class, name, source)| {
+                dom.insert(
+                    root,
+                    InstanceBuilder::new(*class)
+                        .with_name(*name)
+                        .with_property("Source", *source),
+                )
+            })
+            .collect();
+        let mut model = Vec::new();
+        rbx_binary::to_writer(&mut model, &dom, &refs).unwrap();
+        let contents: Vec<(String, String)> = scripts
+            .iter()
+            .enumerate()
+            .map(|(index, (class, name, _))| {
+                (
+                    format!("game/ServerScriptService/{index}/{name}"),
+                    class.to_string(),
+                )
+            })
+            .collect();
+        let saved = store
+            .save_automatic(
+                backup::automatic_record(
+                    "auto-verify-fix",
+                    "auto: before verify --fix",
+                    &contents,
+                    None,
+                    None,
+                ),
+                &model,
+            )
+            .unwrap();
+        // What `backup restore` sends to Studio.
+        let (_, path) = store.get(&saved.id).unwrap();
+        let restored = read_model(&path, true).unwrap();
+        let restored = rbx_binary::from_reader(restored.as_slice()).unwrap();
+        let roots = restored.root().children();
+        assert_eq!(roots.len(), scripts.len());
+        for (root, (class, name, source)) in roots.iter().zip(scripts) {
+            let instance = restored.get_by_ref(*root).unwrap();
+            assert_eq!(instance.class.as_str(), class);
+            assert_eq!(instance.name, name);
+            assert_eq!(
+                instance.properties.get(&rbx_dom_weak::ustr("Source")),
+                Some(&rbx_dom_weak::types::Variant::String(source.to_owned()))
+            );
+        }
+    }
+
+    #[test]
     fn read_model_shares_server_import_validation() {
         use rbx_dom_weak::{InstanceBuilder, WeakDom};
         let dir = tempfile::tempdir().unwrap();

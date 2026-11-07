@@ -1552,6 +1552,7 @@ impl StudioBridge {
             root: self.serve.root_dir().to_owned(),
             ids: Vec::new(),
             release: false,
+            lock_wait: UNPIN_LOCK_WAIT,
         };
         let mut summaries = Vec::new();
         let mut groups: Vec<(String, Vec<String>)> = Vec::new();
@@ -2073,19 +2074,43 @@ struct BackupPins {
     root: PathBuf,
     ids: Vec<String>,
     release: bool,
+    /// How long releasing waits for the store lock before leaving the pins
+    /// to expire.
+    lock_wait: Duration,
 }
+
+/// How long releasing a fix's pins waits for the store lock, which another
+/// process, even a suspended one, may hold.
+const UNPIN_LOCK_WAIT: Duration = Duration::from_secs(3);
 
 impl Drop for BackupPins {
     fn drop(&mut self) {
         if self.ids.is_empty() || !self.release {
             return;
         }
-        let unpinned = StudioBridge::backup_store(self.dir.clone(), &self.root)
-            .and_then(|store| store.unpin(&self.ids));
-        if let Err(error) = unpinned {
-            log::warn!(
-                "Could not unpin automatic backups, which stay pinned until they expire: {error:#}"
-            );
+        let (dir, root, ids, wait) = (
+            self.dir.clone(),
+            self.root.clone(),
+            std::mem::take(&mut self.ids),
+            self.lock_wait,
+        );
+        // On its own thread, so the fix's answer never waits for the lock.
+        let release = move || {
+            let unpinned = StudioBridge::backup_store(dir, &root)
+                .and_then(|store| store.unpin_within(&ids, wait));
+            if let Err(error) = unpinned {
+                log::warn!(
+                    "Could not unpin automatic backups, which stay pinned until they expire: {error:#}"
+                );
+            }
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => {
+                runtime.spawn_blocking(release);
+            }
+            Err(_) => {
+                std::thread::spawn(release);
+            }
         }
     }
 }
@@ -3481,12 +3506,13 @@ mod tests {
             saved.get("roots").is_none(),
             "the report holds only a summary"
         );
-        // The fix is over, so its backup is no longer pinned.
-        assert!(!dir
+        // The fix is over, so its backup is no longer pinned once the
+        // release, which runs after the answer, is done.
+        let pin = dir
             .path()
             .join("backups")
-            .join(format!("{}.pin", saved["id"].as_str().unwrap()))
-            .exists());
+            .join(format!("{}.pin", saved["id"].as_str().unwrap()));
+        assert!(eventually(|| !pin.exists()).await);
         let listed = backup::Store::in_dir(&dir.path().join("backups"))
             .list()
             .unwrap();
@@ -3947,6 +3973,249 @@ mod tests {
             .is_empty());
     }
 
+    /// Whether `condition` holds within a few seconds, for work that runs
+    /// after a request's answer, such as releasing a fix's pins.
+    async fn eventually(condition: impl Fn() -> bool) -> bool {
+        for _ in 0..100 {
+            if condition() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        condition()
+    }
+
+    #[tokio::test]
+    async fn releasing_pins_never_waits_for_a_held_store_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let backups = dir.path().join("backups");
+        let store = backup::Store::in_dir(&backups);
+        let saved = store
+            .save_automatic_pinned(
+                backup::automatic_record(
+                    "auto-verify-fix",
+                    "auto: before verify --fix",
+                    &[("game/S".to_owned(), "ModuleScript".to_owned())],
+                    None,
+                    None,
+                ),
+                b"<roblox!x",
+                backup::now_millis() + 600_000,
+            )
+            .unwrap();
+        // Another process, perhaps a suspended one, holds the store.
+        let held = store.hold_lock();
+        let pins = BackupPins {
+            dir: Some(backups.clone()),
+            root: dir.path().to_owned(),
+            ids: vec![saved.id.clone()],
+            release: true,
+            lock_wait: Duration::from_millis(300),
+        };
+        let started = Instant::now();
+        drop(pins);
+        assert!(
+            started.elapsed() < Duration::from_millis(100),
+            "the fix's answer does not wait for the lock"
+        );
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        assert!(
+            backups.join(format!("{}.pin", saved.id)).exists(),
+            "the release gave up, and the pin stays until it expires"
+        );
+        drop(held);
+    }
+
+    /// A project whose scripts differ in class, share a name and hold
+    /// different text in Studio, and a verify --fix past its `sources` step
+    /// where Studio reports each script's editor text from `editor`.
+    async fn fix_mixed_past_sources() -> (
+        tempfile::TempDir,
+        Arc<StudioBridge>,
+        String,
+        Vec<(verify::TreeScript, String, String)>,
+        tokio::task::JoinHandle<Response<Body>>,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        for folder in ["src", "src/One", "src/Two"] {
+            std::fs::create_dir_all(dir.path().join(folder)).unwrap();
+        }
+        std::fs::write(
+            dir.path().join("default.project.json"),
+            r#"{"name":"v","tree":{"$className":"DataModel","ReplicatedStorage":{"Shared":{"$path":"src"}}}}"#,
+        )
+        .unwrap();
+        for file in [
+            "Server.server.luau",
+            "Client.client.luau",
+            "One/Same.luau",
+            "Two/Same.luau",
+        ] {
+            std::fs::write(dir.path().join("src").join(file), "return 'disk'\n").unwrap();
+        }
+        std::fs::write(dir.path().join("token"), "0123456789abcdef0123456789abcdef").unwrap();
+        let bridge = bridge_for(dir.path(), GIT_LOCK_WAIT);
+        let session = register(&bridge).await;
+        let request = request(
+            "POST",
+            "/api/studio/command",
+            &bridge.token,
+            Some(
+                json!({"sessionId":session,"action":"verify","requestId":Uuid::new_v4().to_string(),"args":{"fix":true}}),
+            ),
+        );
+        let verify = tokio::spawn(bridge.clone().call(PEER.parse().unwrap(), request));
+        let sources = next_command(&bridge, &session).await;
+        let scripts: Vec<(verify::TreeScript, String, String)> = {
+            let tree = bridge.serve.tree();
+            verify::tree_scripts(&tree, bridge.serve.root_dir())
+                .into_iter()
+                .enumerate()
+                .map(|(index, script)| {
+                    let class = tree
+                        .get_instance(script.ref_id)
+                        .unwrap()
+                        .class_name()
+                        .to_string();
+                    // What each script's editor holds, unlike its file and
+                    // unlike the others.
+                    let editor = format!("-- edited in Studio, {index}\nreturn {index}\n");
+                    (script, class, editor)
+                })
+                .collect()
+        };
+        let entries: Vec<Value> = scripts
+            .iter()
+            .map(|(script, _, editor)| {
+                let (hash, length) = verify::hash_source(editor);
+                json!({"id": script.id, "hash": hash, "hash2": verify::second_hash(editor), "length": length})
+            })
+            .collect();
+        plugin(
+            &bridge,
+            "/api/studio/result",
+            json!({"requestId":sources["requestId"],"sessionId":session,"result":{"ok":true,"value":{
+                "scripts":entries,"detached":[],"held":[]}}}),
+        )
+        .await;
+        (dir, bridge, session, scripts, verify)
+    }
+
+    /// The plugin's export of `order`, each script copied with its editor
+    /// text and class and named as in the place.
+    fn mixed_export(scripts: &[(verify::TreeScript, String, String)], order: &[usize]) -> Value {
+        let mut dom = WeakDom::new(InstanceBuilder::new("DataModel"));
+        let root = dom.root_ref();
+        let refs: Vec<_> = order
+            .iter()
+            .map(|&index| {
+                let (script, class, editor) = &scripts[index];
+                let name = script.path.rsplit('/').next().unwrap();
+                dom.insert(
+                    root,
+                    InstanceBuilder::new(class.as_str())
+                        .with_name(name)
+                        .with_property("Source", editor.as_str()),
+                )
+            })
+            .collect();
+        let mut bytes = Vec::new();
+        rbx_binary::to_writer(&mut bytes, &dom, &refs).unwrap();
+        // The plugin lists them in the order it exported them.
+        let ids: Vec<&str> = scripts
+            .iter()
+            .map(|(script, _, _)| script.id.as_str())
+            .collect();
+        let instances: Vec<Value> = scripts
+            .iter()
+            .map(|(script, class, _)| json!({"path": script.path, "className": class}))
+            .collect();
+        json!({"model": data_encoding::BASE64.encode(&bytes), "ids": ids, "instances": instances})
+    }
+
+    #[tokio::test]
+    async fn verify_fix_backs_up_mixed_scripts_with_their_own_text_in_order() {
+        let (dir, bridge, session, scripts, verify) = fix_mixed_past_sources().await;
+        let classes: HashSet<&str> = scripts.iter().map(|(_, class, _)| class.as_str()).collect();
+        assert_eq!(classes, ["Script", "LocalScript", "ModuleScript"].into());
+        assert_eq!(
+            scripts
+                .iter()
+                .filter(|(script, _, _)| script.path.ends_with("/Same"))
+                .count(),
+            2,
+            "two scripts share a name"
+        );
+        let command = next_command(&bridge, &session).await;
+        assert_eq!(command["action"], "backup");
+        let order: Vec<usize> = (0..scripts.len()).collect();
+        answer_export(&bridge, &session, &command, mixed_export(&scripts, &order)).await;
+        let resync = next_command(&bridge, &session).await;
+        assert_eq!(resync["action"], "resync");
+        plugin(
+            &bridge,
+            "/api/studio/result",
+            json!({"requestId":resync["requestId"],"sessionId":session,"result":{"ok":true,"value":{"updated":scripts.len(),"failed":0,"skipped":0}}}),
+        )
+        .await;
+        let (status, value) = into_value(verify.await.unwrap()).await;
+        assert_eq!(status, StatusCode::OK, "{value}");
+        let store = backup::Store::in_dir(&dir.path().join("backups"));
+        let saved = store.list().unwrap();
+        assert_eq!(saved.len(), 1);
+        let paths: Vec<&str> = saved[0]
+            .roots
+            .iter()
+            .map(|root| root.path.as_str())
+            .collect();
+        let expected: Vec<&str> = scripts
+            .iter()
+            .map(|(script, _, _)| script.path.as_str())
+            .collect();
+        assert_eq!(
+            paths, expected,
+            "the record lists the scripts in model order"
+        );
+        // What restoring gets back, script by script.
+        let (_, model) = store.get(&saved[0].id).unwrap();
+        let restored =
+            model_check::prepare_restore(std::fs::read(model).unwrap(), true, IMPORT_CHECK_LIMIT)
+                .unwrap();
+        let dom = rbx_binary::from_reader(restored.as_slice()).unwrap();
+        for (root, (_, class, editor)) in dom.root().children().iter().zip(&scripts) {
+            let instance = dom.get_by_ref(*root).unwrap();
+            assert_eq!(instance.class.as_str(), class);
+            assert_eq!(
+                instance.properties.get(&rbx_dom_weak::ustr("Source")),
+                Some(&rbx_dom_weak::types::Variant::String(editor.clone()))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn verify_fix_refuses_a_backup_whose_scripts_are_out_of_order() {
+        let (dir, bridge, session, scripts, verify) = fix_mixed_past_sources().await;
+        let command = next_command(&bridge, &session).await;
+        // The model holds the scripts in another order than the export
+        // lists them, so each would be restored as another script.
+        let order: Vec<usize> = (0..scripts.len()).rev().collect();
+        answer_export(&bridge, &session, &command, mixed_export(&scripts, &order)).await;
+        let (status, value) = into_value(verify.await.unwrap()).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{value}");
+        assert!(
+            value["error"]
+                .as_str()
+                .unwrap()
+                .contains("would not come back"),
+            "{value}"
+        );
+        assert!(bridge.state().pending.is_empty(), "no resync was sent");
+        assert!(backup::Store::in_dir(&dir.path().join("backups"))
+            .list()
+            .unwrap()
+            .is_empty());
+    }
+
     #[tokio::test]
     async fn verify_fix_with_more_groups_than_the_hard_cap_changes_nothing() {
         let groups = backup::MAX_AUTOMATIC + 1;
@@ -4016,11 +4285,15 @@ mod tests {
         );
         // The verify is over, so its pins are gone, and releasing them kept
         // every one of its backups.
-        let listed = store.list().unwrap();
-        assert!(listed
-            .iter()
-            .all(|record| !backups.join(format!("{}.pin", record.id)).exists()));
-        assert_eq!(listed.len(), groups);
+        assert!(
+            eventually(|| store
+                .list()
+                .unwrap()
+                .iter()
+                .all(|record| !backups.join(format!("{}.pin", record.id)).exists()))
+            .await
+        );
+        assert_eq!(store.list().unwrap().len(), groups);
     }
 
     #[tokio::test]
