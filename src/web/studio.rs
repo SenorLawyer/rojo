@@ -3711,6 +3711,19 @@ mod tests {
         assert!(backup::Store::for_project(Path::new("/does/not/exist")).is_err());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_project_file_opens_its_targets_store() {
+        let (dir, _bridge) = fixture();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let link = elsewhere.path().join("default.project.json");
+        std::os::unix::fs::symlink(dir.path().join("default.project.json"), &link).unwrap();
+        assert_eq!(
+            backup::Store::for_project(&link).unwrap().dir(),
+            backup::Store::for_project(dir.path()).unwrap().dir()
+        );
+    }
+
     #[tokio::test]
     async fn a_cancelled_fix_keeps_its_backups_pinned() {
         let (dir, bridge, session, script, verify) = fix_past_sources(json!({"fix":true})).await;

@@ -183,6 +183,10 @@ impl Store {
     /// file or the folder holding it, which is where its automatic backups
     /// go. `backup --project` opens this one.
     pub fn for_project(project: &Path) -> anyhow::Result<Store> {
+        // `rojo serve` canonicalizes its project path before using it, so a
+        // symlinked project file must resolve to its target's folder here too.
+        let resolved = dunce::canonicalize(project).unwrap_or_else(|_| project.to_owned());
+        let project = resolved.as_path();
         let folder = if project.is_file() {
             project
                 .parent()
