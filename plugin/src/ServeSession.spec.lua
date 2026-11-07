@@ -1925,27 +1925,22 @@ return function()
 		end)
 
 		it("checks many affected instances against the backup quickly", function()
-			local hashSource = require(script.Parent.hashSource)
-			local nativeRead = ServeSession.readEditorText
+			-- Folders are cheap stand-ins: only the walk up to the roots is
+			-- measured, and everything is removed again afterwards.
 			local folder = Instance.new("Folder")
 			folder.Name = "Siblings"
 			folder.Parent = fixture
-			local guarded = {}
 			local roots = {}
 			local patch = PatchSet.newEmpty()
 			for index = 1, 10_000 do
-				local module = Instance.new("ModuleScript")
-				module.Name = "Module" .. index
-				module.Parent = folder
-				guarded[module] = (hashSource(""))
-				table.insert(roots, module)
-				session.__instanceMap.fromIds["M" .. index] = module
-				table.insert(patch.updated, { id = "M" .. index, changedName = "Renamed" .. index })
+				local child = Instance.new("Folder")
+				child.Name = "Child" .. index
+				child.Parent = folder
+				table.insert(roots, child)
+				session.__instanceMap.fromIds["F" .. index] = child
+				table.insert(patch.updated, { id = "F" .. index, changedName = "Renamed" .. index })
 			end
-			ServeSession.readEditorText = function(instance)
-				return instance.Source
-			end
-			session.__catchUpGuarded = guarded
+			session.__catchUpGuarded = {}
 			session.__catchUpRoots = roots
 			local started = os.clock()
 			session:__noteEditsBeforeApply(patch)
@@ -1953,12 +1948,58 @@ return function()
 			session.__catchUpGuarded = nil
 			session.__catchUpRoots = nil
 			session.__catchUpRootSet = nil
-			ServeSession.readEditorText = nativeRead
 			for index = 1, 10_000 do
-				session.__instanceMap.fromIds["M" .. index] = nil
+				session.__instanceMap.fromIds["F" .. index] = nil
 			end
+			table.clear(roots)
+			folder:Destroy()
 			expect(elapsed < 2).to.equal(true)
 			expect(session.__overwrittenEdits).to.equal(nil)
+		end)
+
+		it("applies the patch when the overwrite check meets an instance it cannot read", function()
+			local hashSource = require(script.Parent.hashSource)
+			local module = Instance.new("ModuleScript")
+			module.Name = "Readable"
+			module.Source = "return 1"
+			module.Parent = fixture
+			local inaccessible = setmetatable({}, {
+				__index = function(_, key)
+					error("The current thread cannot access '" .. tostring(key) .. "'")
+				end,
+			})
+			local warnings = recordingWarnings(function()
+				session.__instanceMap:insert("READABLE", module)
+				session.__instanceMap.fromIds.LOCKED = inaccessible
+				session.__status = ServeSession.Status.Connected
+				session.__catchUpGuarded = { [module] = (hashSource("return 1")) }
+				session.__catchUpRoots = { module }
+				local patch = PatchSet.newEmpty()
+				table.insert(patch.removed, "READABLE")
+				table.insert(patch.removed, "LOCKED")
+				-- The real apply, so a failing check would stop it. The wipe
+				-- guard is off: it reads removed instances too, and the
+				-- stand-in above is not a real Instance.
+				-- Trace logging prints the instance map, which reads every
+				-- instance in it, so it is quieter here too.
+				local previousGuard = Settings:get("guardScriptWipes")
+				local previousLevel = Settings:get("logLevel")
+				Settings:set("guardScriptWipes", false)
+				Settings:set("logLevel", "Info")
+				local applied, err = pcall(session.__applyPatch, session, patch)
+				Settings:set("guardScriptWipes", previousGuard)
+				Settings:set("logLevel", previousLevel)
+				assert(applied, err)
+				session.__instanceMap.fromIds.LOCKED = nil
+				session.__catchUpGuarded = nil
+				session.__catchUpRoots = nil
+				session.__catchUpRootSet = nil
+				task.wait(0.8)
+			end)
+			expect(module.Parent).to.equal(nil)
+			for _, warning in warnings do
+				expect(warning.template:find("Could not finish checking", 1, true)).to.equal(nil)
+			end
 		end)
 
 		it("names a fallback reference repair outside the backup, and still applies it", function()

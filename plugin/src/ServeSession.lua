@@ -1745,7 +1745,9 @@ function ServeSession:__replaceInstances(idList)
 					table.insert(properties, name)
 				end
 				table.sort(properties)
-				local ok, path = pcall(target.GetFullName, target)
+				local ok, path = pcall(function()
+					return target:GetFullName()
+				end)
 				if ok then
 					self:__noteOverwrittenEdit(path .. " (" .. table.concat(properties, ", ") .. ")")
 				end
@@ -1937,8 +1939,11 @@ function ServeSession:__noteEditsBeforeApply(patch)
 		return
 	end
 	self.__catchUpRootSet = nil
-	local function inBackup(instance)
-		return self:__inCatchUpBackup(instance)
+	-- Every read of an instance is guarded, since Studio may refuse one,
+	-- and that must not stop the sync.
+	local function read(callback)
+		local ok, value = pcall(callback)
+		return if ok then value else nil
 	end
 	-- What the patch removes, with everything inside it, and what it
 	-- changes or replaces. Only these lose anything; the rest is untouched.
@@ -1947,8 +1952,11 @@ function ServeSession:__noteEditsBeforeApply(patch)
 		local instance = if typeof(removed) == "Instance" then removed else self.__instanceMap.fromIds[removed]
 		if instance then
 			affected[instance] = true
-			local ok, descendants = pcall(instance.GetDescendants, instance)
-			for _, descendant in if ok then descendants else {} do
+			for _, descendant in
+				read(function()
+					return instance:GetDescendants()
+				end) or {}
+			do
 				affected[descendant] = true
 			end
 		end
@@ -1963,19 +1971,25 @@ function ServeSession:__noteEditsBeforeApply(patch)
 		end
 	end
 	for instance in affected do
-		local ok, path = pcall(instance.GetFullName, instance)
-		if not ok then
+		local path = read(function()
+			return instance:GetFullName()
+		end)
+		if path == nil then
 			continue
 		end
-		if not inBackup(instance) then
+		if not self:__inCatchUpBackup(instance) then
 			-- Moved out of what was serialized while the backup was made, so
 			-- the backup does not hold it. Services were never in it, which
 			-- the warning about them already says.
-			local service = instance == game or instance.Parent == game
-			if not service then
+			local service = read(function()
+				return instance == game or instance.Parent == game
+			end)
+			if service == false then
 				self:__noteOverwrittenEdit(path)
 			end
-		elseif instance:IsA("LuaSourceContainer") then
+		elseif read(function()
+			return instance:IsA("LuaSourceContainer")
+		end) then
 			-- Added under a backed-up instance after the backup captured
 			-- the scripts, or edited since.
 			if
@@ -2141,7 +2155,14 @@ function ServeSession:__applyPatchInRecording(patch)
 		self.__catchUpExpired = true
 		return patch
 	end
-	self:__noteEditsBeforeApply(patch)
+	-- Advisory only: whatever goes wrong in it, the patch is applied.
+	local checked, checkError = pcall(self.__noteEditsBeforeApply, self, patch)
+	if not checked then
+		Log.warn(
+			"Could not finish checking whether this sync overwrites changes the backup does not hold: {}. Syncing goes ahead.",
+			checkError
+		)
+	end
 
 	local reconcilerPatch, sourceWrites = self:__splitSourceWrites(patch)
 	local unappliedPatch = self.__reconciler:applyPatch(reconcilerPatch)
@@ -2228,9 +2249,12 @@ function ServeSession:__applyPatchInRecording(patch)
 	end
 
 	if not PatchSet.isEmpty(unappliedPatch) then
+		-- Describing them reads the instances, any of which Studio may not let
+		-- the plugin read; a log line must not fail the patch.
+		local described, summary = pcall(PatchSet.humanSummary, self.__instanceMap, unappliedPatch)
 		Log.debug(
 			"Could not apply all changes requested by the Rojo server:\n{}",
-			PatchSet.humanSummary(self.__instanceMap, unappliedPatch)
+			if described then summary else "(they could not be described: " .. tostring(summary) .. ")"
 		)
 	end
 

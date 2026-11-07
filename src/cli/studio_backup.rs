@@ -514,31 +514,39 @@ impl Store {
             limits.max_count,
             limits.max_bytes / (1024 * 1024)
         );
+        // Room is made before anything is written: the prune counts the new
+        // backup as kept, and when what it must remove cannot be removed,
+        // such as when Windows will not let an old model be deleted, the
+        // backup is refused, so the folder never grows past its limits.
+        self.prune_locked(limits, now, Some(model.len() as u64))
+            .context("The backup was not saved, because old automatic backups could not be removed to make room")?;
         let record = self.save_locked(record, model)?;
         if let Some(until) = pin {
-            let pinned = (|| -> anyhow::Result<()> {
-                let mut file = tempfile::NamedTempFile::new_in(&self.dir)?;
-                std::io::Write::write_all(&mut file, until.to_string().as_bytes())?;
-                file.persist(self.pin_path(&record.id))
-                    .map_err(|error| error.error)?;
-                Ok(())
-            })();
-            if let Err(error) = pinned {
+            if let Err(error) = self.write_pin(&record.id, until) {
                 // An unpinned backup could be pruned before it is needed.
-                let _ = self.remove_locked(&record.id);
-                return Err(error.context("Could not pin the backup"));
+                return Err(match self.remove_locked(&record.id) {
+                    Ok(()) => error.context("Could not pin the backup, so it was not kept"),
+                    // Still listed and counted, so the next prune removes it.
+                    Err(removal) => error.context(format!(
+                        "Could not pin the backup, nor remove it again ({removal:#}); \
+                         it stays until a later prune removes it"
+                    )),
+                });
             }
         }
-        // A store that cannot be brought back within its limits, such as when
-        // Windows will not let an old model be deleted, must not keep growing,
-        // so the new backup is refused rather than saved over them.
-        if let Err(error) = self.prune_locked(limits, now, Some(&record.id)) {
-            let _ = self.remove_locked(&record.id);
-            return Err(error.context(
-                "The backup was not kept, because old automatic backups could not be removed to make room",
-            ));
-        }
         Ok(record)
+    }
+
+    fn write_pin(&self, id: &str, until: u64) -> anyhow::Result<()> {
+        #[cfg(test)]
+        if FAILING_PINS.with(std::cell::Cell::get) {
+            anyhow::bail!("Simulated failure to write a pin");
+        }
+        let mut file = tempfile::NamedTempFile::new_in(&self.dir)?;
+        std::io::Write::write_all(&mut file, until.to_string().as_bytes())?;
+        file.persist(self.pin_path(id))
+            .map_err(|error| error.error)?;
+        Ok(())
     }
 
     /// Removes the pins of `ids`, then prunes, so an operation that went over
@@ -596,21 +604,24 @@ impl Store {
         self.prune_locked(limits, now, None)
     }
 
-    /// Prunes, never removing a pinned backup nor `saved`, the one just
-    /// saved. Those are kept first and count towards every limit; the rest,
-    /// newest first by `created_at` then ID, fill what is left. So a backup
-    /// just saved stays even when others are dated in the future, as after
-    /// the clock was set back.
+    /// Prunes, never removing a pinned backup, nor taking the room of one
+    /// about to be saved. Those are kept first and count towards every limit;
+    /// the rest, newest first by `created_at` then ID, fill what is left. So
+    /// a backup about to be saved fits even when others are dated in the
+    /// future, as after the clock was set back. Leftovers of failed removals
+    /// count too until they go, and any removal that fails is an error.
     fn prune_locked(
         &self,
         limits: PruneLimits,
         now: u64,
-        saved: Option<&str>,
+        incoming: Option<u64>,
     ) -> anyhow::Result<Vec<String>> {
         let mut removed = Vec::new();
         let mut failures = Vec::new();
-        let mut count = 0;
-        let mut bytes: u64 = 0;
+        // A backup about to be saved, of `incoming` bytes, is counted as kept
+        // and newest, so room is made for it.
+        let mut count = usize::from(incoming.is_some());
+        let mut bytes: u64 = incoming.unwrap_or(0);
         // What removals that failed part way left behind is removed again
         // first. Until a leftover model goes, it still takes up its room.
         for (id, model_bytes) in self.leftovers_locked()? {
@@ -629,7 +640,7 @@ impl Store {
             .list()?
             .into_iter()
             .filter(|record| record.automatic)
-            .partition(|record| Some(record.id.as_str()) == saved || self.pinned(&record.id, now));
+            .partition(|record| self.pinned(&record.id, now));
         count += kept.len();
         bytes = kept
             .iter()
@@ -732,14 +743,23 @@ impl Store {
 
 #[cfg(test)]
 thread_local! {
-    /// Paths whose deletion fails, for tests of failed removals.
-    static FAILING_REMOVALS: std::cell::RefCell<Vec<PathBuf>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// Text whose deletion fails for any path containing it, for tests of
+    /// failed removals.
+    static FAILING_REMOVALS: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// Whether writing a pin fails, for tests.
+    static FAILING_PINS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Deletes `path`, which may already be gone.
 fn remove_file(path: &Path) -> std::io::Result<()> {
     #[cfg(test)]
-    if FAILING_REMOVALS.with(|failing| failing.borrow().iter().any(|failing| failing == path)) {
+    let text = path.to_string_lossy();
+    if FAILING_REMOVALS.with(|failing| {
+        failing
+            .borrow()
+            .iter()
+            .any(|failing| text.contains(failing.as_str()))
+    }) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
             "The process cannot access the file because it is being used by another process",
@@ -1254,11 +1274,87 @@ mod tests {
     }
 
     fn fail_removing(path: PathBuf) {
-        FAILING_REMOVALS.with(|failing| failing.borrow_mut().push(path));
+        FAILING_REMOVALS.with(|failing| {
+            failing
+                .borrow_mut()
+                .push(path.to_string_lossy().into_owned())
+        });
     }
 
     fn stop_failing() {
         FAILING_REMOVALS.with(|failing| failing.borrow_mut().clear());
+        FAILING_PINS.with(|failing| failing.set(false));
+    }
+
+    #[test]
+    fn a_save_that_cannot_make_room_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::in_dir(dir.path());
+        let now = now_millis();
+        let limits = PruneLimits {
+            keep: 1,
+            grace_millis: 0,
+            max_count: 2,
+            max_bytes: u64::MAX,
+        };
+        let old = fill(&store, "old", hours_ago(3));
+        let older = fill(&store, "older", hours_ago(4));
+        fail_removing(store.model_path(&older));
+        assert!(store
+            .save_automatic_with(record("new", now), b"new", None, &[], limits, now)
+            .is_err());
+        stop_failing();
+        let written: Vec<String> = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains("-new-"))
+            .collect();
+        assert!(
+            written.is_empty(),
+            "the refused backup left nothing: {written:?}"
+        );
+        // What could be removed was; the one that could not stays counted.
+        assert!(!store.exists(&old));
+        assert!(store.exists(&older));
+    }
+
+    #[test]
+    fn a_backup_whose_pin_and_removal_both_fail_is_reported_and_counted() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::in_dir(dir.path());
+        let now = now_millis();
+        let limits = PruneLimits {
+            keep: 1,
+            grace_millis: 0,
+            max_count: 100,
+            max_bytes: u64::MAX,
+        };
+        FAILING_PINS.with(|failing| failing.set(true));
+        FAILING_REMOVALS.with(|failing| failing.borrow_mut().push("rollback-me".to_owned()));
+        let error = store
+            .save_automatic_with(
+                record("rollback-me", now),
+                b"x",
+                Some(now + 60_000),
+                &[],
+                limits,
+                now,
+            )
+            .unwrap_err();
+        stop_failing();
+        assert!(
+            format!("{error:#}").contains("nor remove it again"),
+            "{error:#}"
+        );
+        // It is still there and counted, so a later prune removes it once it
+        // is old.
+        let left = automatic_ids(&store);
+        assert_eq!(left.len(), 1);
+        let later = now + 1;
+        store
+            .save_automatic_with(record("next", later), b"y", None, &[], limits, later)
+            .unwrap();
+        assert!(!automatic_ids(&store).contains(&left[0]));
     }
 
     #[test]
