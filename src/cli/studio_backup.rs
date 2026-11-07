@@ -753,17 +753,19 @@ thread_local! {
 /// Deletes `path`, which may already be gone.
 fn remove_file(path: &Path) -> std::io::Result<()> {
     #[cfg(test)]
-    let text = path.to_string_lossy();
-    if FAILING_REMOVALS.with(|failing| {
-        failing
-            .borrow()
-            .iter()
-            .any(|failing| text.contains(failing.as_str()))
-    }) {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            "The process cannot access the file because it is being used by another process",
-        ));
+    {
+        let text = path.to_string_lossy();
+        if FAILING_REMOVALS.with(|failing| {
+            failing
+                .borrow()
+                .iter()
+                .any(|failing| text.contains(failing.as_str()))
+        }) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "The process cannot access the file because it is being used by another process",
+            ));
+        }
     }
     match fs::remove_file(path) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
