@@ -105,7 +105,7 @@ fn stdio_handshake_catalog_native_call_and_error_recovery() {
         .iter()
         .map(|tool| tool["name"].as_str().unwrap())
         .collect();
-    assert_eq!(names.len(), 16);
+    assert_eq!(names.len(), 17);
     assert!(names.contains(&"studio_test") && names.contains(&"run_tests"));
     assert!(names.contains(&"studio_verify") && names.contains(&"studio_backup"));
     assert!(names.contains(&"studio_lock_acquire") && names.contains(&"studio_lock_status"));
@@ -171,21 +171,17 @@ fn older_protocol_uses_text_content_and_unknown_versions_negotiate_latest() {
     assert_eq!(replies[0]["result"]["protocolVersion"], "2025-06-18");
 }
 
-/// The listing is the decided split with Roblox's Studio MCP server: tools it
-/// duplicates are left out, but stay callable for agents that already use them.
-/// `studio_tree` stays listed, since it gives the IDs other tools accept.
+/// Every tool stays listed; the instructions and the descriptions of tools
+/// that overlap Roblox's Studio MCP server route agents between the two.
 #[test]
-fn listing_leaves_out_studio_mcp_duplicates_that_stay_callable() {
+fn listing_routes_agents_between_rojo_and_roblox_studio_mcp() {
     let directory = fixture();
-    let session = "00000000-0000-0000-0000-000000000001";
     let replies = exchange_messages(
         directory.path(),
         &[
             initialize("2025-06-18"),
             initialized(),
             json!({"jsonrpc":"2.0","id":2,"method":"tools/list"}),
-            json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"studio_properties","arguments":{"session":session,"instance":"game/Workspace","properties":["Name"]}}}),
-            json!({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"studio_properties","arguments":{"session":session,"instance":"game/Workspace","properties":[]}}}),
         ],
     );
     let instructions = reply(&replies, 1)["result"]["instructions"]
@@ -214,6 +210,7 @@ fn listing_leaves_out_studio_mcp_duplicates_that_stay_callable() {
             "studio_lock_release",
             "studio_lock_status",
             "studio_logs",
+            "studio_properties",
             "studio_sessions",
             "studio_status",
             "studio_test",
@@ -233,18 +230,10 @@ fn listing_leaves_out_studio_mcp_duplicates_that_stay_callable() {
     assert!(description("studio_logs").contains("get_console_output"));
     assert!(description("studio_sessions").contains("list_roblox_studios"));
     assert!(description("studio_tree").contains("search_game_tree"));
+    assert!(description("studio_properties").contains("inspect_instance"));
     for name in ["studio_backup", "studio_export"] {
         assert!(description(name).contains("studio_tree"), "{name}");
     }
-    // Unlisted tools still reach the native command (which fails here for
-    // want of a token) and still validate their arguments.
-    let call = &reply(&replies, 3)["result"];
-    assert_eq!(call["isError"], true, "{call}");
-    assert!(call["content"][0]["text"]
-        .as_str()
-        .unwrap()
-        .contains("--token-file"));
-    assert_eq!(reply(&replies, 4)["error"]["code"], -32602);
 }
 
 #[test]

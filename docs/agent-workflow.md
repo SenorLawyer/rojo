@@ -131,7 +131,8 @@ They do different jobs:
   Studio lock before using a shared window, run specs with `run_tests`, export
   models into the project, and list checkpoints, workspaces and packages.
   Take instance IDs for `studio_backup` and `studio_export` from
-  `studio_tree`; Roblox's instance IDs do not work with them.
+  `studio_tree` or `studio_properties`; Roblox's instance IDs do not work
+  with them.
   Asset uploads the project refers to go through `rojo assets sync`, so the
   generated id module and lockfile stay current; cloud test runs through
   `rojo test --cloud`; place publishing through `rojo release stage` and
