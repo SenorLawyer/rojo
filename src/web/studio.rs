@@ -90,6 +90,9 @@ const MAX_MODEL_INSTANCES: usize = 10_000;
 /// body, and the last batch may take its full 15-second deadline: 15 + 10 +
 /// 20 + 15 leaves 5 seconds to spare.
 const VERIFY_FIX_BUDGET: Duration = Duration::from_secs(20);
+/// How long the backups `verify --fix` saves stay pinned if it never unpins
+/// them, such as when the server crashes. Far longer than a fix runs.
+const BACKUP_PIN: Duration = Duration::from_secs(10 * 60);
 /// Bound on the sync summary a plugin sends with each poll.
 const MAX_SYNC_SUMMARY_BYTES: usize = 16 * 1024;
 
@@ -1389,9 +1392,14 @@ impl StudioBridge {
             // overwritten, so a wrong fix can be put back. Without that
             // backup nothing is changed, unless the caller opted out.
             let backing_up = args.get("backup") != Some(&json!(false)) && !fixes.is_empty();
+            // Holds the pins on this verify's backups until it returns.
+            let mut _pins = None;
             let (backups, backed_up) = if backing_up {
                 match self.back_up_fixes(session_id, &id, &fixes, started).await {
-                    Ok(done) => done,
+                    Ok(done) => {
+                        _pins = Some(done.pins);
+                        (done.summaries, done.scripts)
+                    }
                     Err(error) => {
                         return failure(
                             StatusCode::BAD_GATEWAY,
@@ -1409,7 +1417,8 @@ impl StudioBridge {
             report["backups"] = json!(backups);
             // Only scripts whose Studio copy is in a backup are fixed. One the
             // export left out, such as a script removed from the place since
-            // the check, would otherwise be overwritten with no copy kept.
+            // the check, would otherwise be overwritten with no copy kept,
+            // and so would one whose backup is gone from the store by now.
             let (to_fix, not_backed_up): (Vec<&verify::Different>, Vec<&verify::Different>) =
                 if backing_up {
                     fixes
@@ -1426,8 +1435,9 @@ impl StudioBridge {
             let mut errors = Vec::new();
             if !not_backed_up.is_empty() {
                 errors.push(format!(
-                    "{} scripts were not fixed because Studio did not export them for the backup, \
-                     for example because they were removed from the place; run verify again",
+                    "{} scripts were not fixed because they are not in a backup: Studio did not \
+                     export them, for example because they were removed from the place, or their \
+                     backup is gone; run verify again",
                     not_backed_up.len()
                 ));
             }
@@ -1516,19 +1526,25 @@ impl StudioBridge {
 
     /// Has Studio export the scripts in `fixes` as they are now and saves
     /// them as automatic backups, one per group from
-    /// [`verify::backup_groups`]. Returns the backups and the IDs of the
-    /// scripts they hold. Fails on the first group that cannot be exported or
-    /// saved. Each save prunes old automatic backups, never young ones, so
-    /// this verify's own stay however many there are.
+    /// [`verify::backup_groups`], each checked to be restorable and pinned
+    /// until the returned [`BackupPins`] is dropped. Fails on the first group
+    /// that cannot be exported, checked or saved, which also unpins the ones
+    /// saved before it. Right before returning, checks that every backup is
+    /// still in the store, and leaves out the scripts of any that is not.
     async fn back_up_fixes(
         &self,
         session_id: &str,
         id: &str,
         fixes: &[&verify::Different],
         started: Instant,
-    ) -> Result<(Vec<Value>, HashSet<String>), String> {
-        let mut saved = Vec::new();
-        let mut backed_up = HashSet::new();
+    ) -> Result<FixBackups, String> {
+        let mut pins = BackupPins {
+            dir: self.backup_dir.get().cloned(),
+            root: self.serve.root_dir().to_owned(),
+            ids: Vec::new(),
+        };
+        let mut summaries = Vec::new();
+        let mut groups: Vec<(String, Vec<String>)> = Vec::new();
         for group in verify::backup_groups(fixes) {
             if started.elapsed() > VERIFY_FIX_BUDGET {
                 return Err(format!(
@@ -1594,6 +1610,7 @@ impl StudioBridge {
                 continue;
             }
             let model = backup_model_bytes(exported).map_err(|error| format!("{error:#}"))?;
+            self.check_restorable(&model).await?;
             let record = backup::automatic_record(
                 "auto-verify-fix",
                 "auto: before verify --fix",
@@ -1601,14 +1618,61 @@ impl StudioBridge {
                 exported["placeId"].as_u64(),
                 exported["placeName"].as_str(),
             );
-            saved.push(
-                self.save_backup(record, model)
-                    .await
-                    .map_err(|error| format!("{error:#}"))?,
-            );
-            backed_up.extend(held);
+            let until = backup::now_millis() + BACKUP_PIN.as_millis() as u64;
+            let (record, store_dir) = self
+                .save_backup(record, model, Some((until, pins.ids.clone())))
+                .await
+                .map_err(|error| format!("{error:#}"))?;
+            pins.ids.push(record.id.clone());
+            summaries.push(backup_summary(&record, &store_dir));
+            groups.push((record.id, held));
         }
-        Ok((saved, backed_up))
+        // Another process may have removed one since, for example from a
+        // pin that expired; its scripts must not be overwritten.
+        let ids: Vec<String> = groups.iter().map(|(id, _)| id.clone()).collect();
+        let present = self.backups_present(ids).await;
+        let scripts = groups
+            .into_iter()
+            .filter(|(id, _)| present.contains(id))
+            .flat_map(|(_, held)| held)
+            .collect();
+        Ok(FixBackups {
+            summaries,
+            scripts,
+            pins,
+        })
+    }
+
+    /// Which of `ids` are still in the backup store.
+    async fn backups_present(&self, ids: Vec<String>) -> HashSet<String> {
+        let dir = self.backup_dir.get().cloned();
+        let root = self.serve.root_dir().to_owned();
+        tokio::task::spawn_blocking(move || {
+            let Ok(store) = Self::backup_store(dir, &root) else {
+                return HashSet::new();
+            };
+            ids.into_iter().filter(|id| store.exists(id)).collect()
+        })
+        .await
+        .unwrap_or_default()
+    }
+
+    /// Runs the isolated check `backup restore` runs on `model`, so a backup
+    /// that could never be restored is not saved as if it could.
+    async fn check_restorable(&self, model: &[u8]) -> Result<(), String> {
+        let args = json!({
+            "model": data_encoding::BASE64.encode(model),
+            "allowScripts": true,
+        });
+        let Err(response) = self.check_import(&args).await else {
+            return Ok(());
+        };
+        let (_, value) = response_value(*response).await;
+        let message = value
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("the model could not be checked");
+        Err(format!("the backup would not be restorable: {message}"))
     }
 
     /// Saves a backup the plugin took before its first sync after connecting
@@ -1630,6 +1694,9 @@ impl StudioBridge {
             }
             Err(error) => return failure(StatusCode::BAD_REQUEST, error),
         };
+        if let Err(error) = self.check_restorable(&model).await {
+            return failure(StatusCode::UNPROCESSABLE_ENTITY, error);
+        }
         let record = backup::automatic_record(
             "auto-sync",
             "auto: before Rojo synced Studio with the files on connecting",
@@ -1637,8 +1704,11 @@ impl StudioBridge {
             value["placeId"].as_u64(),
             value["placeName"].as_str(),
         );
-        match self.save_backup(record, model).await {
-            Ok(record) => reply(StatusCode::OK, json!({ "backup": record })),
+        match self.save_backup(record, model, None).await {
+            Ok((record, store_dir)) => reply(
+                StatusCode::OK,
+                json!({ "backup": backup_summary(&record, &store_dir) }),
+            ),
             Err(error) => failure(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("Could not save the backup: {error:#}"),
@@ -1659,16 +1729,25 @@ impl StudioBridge {
     /// Saves an automatic backup in the project's backup folder, which also
     /// prunes old automatic ones (see [`backup::Store::save_automatic`]).
     ///
-    /// Returns the record with `storeDir`, the folder it is in, since that
-    /// depends on the project `rojo serve` serves rather than where a later
-    /// `rojo studio backup list` runs.
-    async fn save_backup(&self, record: backup::Record, model: Vec<u8>) -> anyhow::Result<Value> {
+    /// Pins it until the time `pin` gives, when given, along with the other
+    /// backups the same operation pinned. Returns the record and the folder it
+    /// is in, which depends on the project `rojo serve` serves rather than on
+    /// where a later `rojo studio backup list` runs.
+    async fn save_backup(
+        &self,
+        record: backup::Record,
+        model: Vec<u8>,
+        pin: Option<(u64, Vec<String>)>,
+    ) -> anyhow::Result<(backup::Record, PathBuf)> {
         let dir = self.backup_dir.get().cloned();
         let root = self.serve.root_dir().to_owned();
         let project = root.clone();
         let (record, store_dir) = tokio::task::spawn_blocking(move || {
             let store = Self::backup_store(dir, &root)?;
-            let record = store.save_automatic(record, &model)?;
+            let record = match pin {
+                Some((until, own)) => store.save_automatic_pinned(record, &model, until, &own)?,
+                None => store.save_automatic(record, &model)?,
+            };
             anyhow::Ok((record, store.dir().to_owned()))
         })
         .await
@@ -1679,9 +1758,7 @@ impl StudioBridge {
             store_dir.display(),
             project.display()
         );
-        let mut value = serde_json::to_value(&record)?;
-        value["storeDir"] = json!(store_dir);
-        Ok(value)
+        Ok((record, store_dir))
     }
 
     /// The backup store this bridge saves automatic backups in.
@@ -1944,6 +2021,50 @@ fn import_model_bytes(args: &Value) -> anyhow::Result<Vec<u8>> {
     data_encoding::BASE64
         .decode(model.as_bytes())
         .context("Import model is not valid base64")
+}
+
+/// What `verify --fix` saved, with the scripts the backups hold.
+struct FixBackups {
+    /// A bounded summary of each backup, for the report.
+    summaries: Vec<Value>,
+    scripts: HashSet<String>,
+    pins: BackupPins,
+}
+
+/// Unpins the backups of a `verify --fix` when dropped, however the verify
+/// ends. A pin left by a crash expires after [`BACKUP_PIN`].
+struct BackupPins {
+    dir: Option<PathBuf>,
+    root: PathBuf,
+    ids: Vec<String>,
+}
+
+impl Drop for BackupPins {
+    fn drop(&mut self) {
+        if self.ids.is_empty() {
+            return;
+        }
+        let unpinned = StudioBridge::backup_store(self.dir.clone(), &self.root)
+            .and_then(|store| store.unpin(&self.ids));
+        if let Err(error) = unpinned {
+            log::warn!(
+                "Could not unpin automatic backups, which stay pinned until they expire: {error:#}"
+            );
+        }
+    }
+}
+
+/// What a report says about a saved backup: enough to find and restore it,
+/// and bounded however many roots it holds, which `backup list` shows.
+fn backup_summary(record: &backup::Record, store_dir: &Path) -> Value {
+    json!({
+        "id": record.id,
+        "name": record.name,
+        "storeDir": store_dir,
+        "automatic": record.automatic,
+        "rootCount": record.roots.len(),
+        "bytes": record.bytes,
+    })
 }
 
 /// The model bytes of a backup the plugin sent, within the model limit.
@@ -3253,10 +3374,17 @@ mod tests {
             json!(dir.path().join("backups")),
             "the report says where the backup is"
         );
-        assert_eq!(
-            saved["roots"][0]["path"],
-            "game/ReplicatedStorage/Shared/Main"
+        assert_eq!(saved["rootCount"], 1);
+        assert!(
+            saved.get("roots").is_none(),
+            "the report holds only a summary"
         );
+        // The fix is over, so its backup is no longer pinned.
+        assert!(!dir
+            .path()
+            .join("backups")
+            .join(format!("{}.pin", saved["id"].as_str().unwrap()))
+            .exists());
         let listed = backup::Store::in_dir(&dir.path().join("backups"))
             .list()
             .unwrap();
@@ -3356,7 +3484,7 @@ mod tests {
         assert!(fixed["errors"][0]
             .as_str()
             .unwrap()
-            .contains("not fixed because Studio did not export them"));
+            .contains("not fixed because they are not in a backup"));
     }
 
     #[tokio::test]
@@ -3468,6 +3596,224 @@ mod tests {
         assert_eq!(value["result"]["value"]["backups"], json!([]));
         // No resync was sent.
         assert!(bridge.state().pending.is_empty());
+    }
+
+    /// Answers a `backup` command as the plugin with `value`.
+    async fn answer_export(
+        bridge: &Arc<StudioBridge>,
+        session: &str,
+        command: &Value,
+        value: Value,
+    ) {
+        plugin(
+            bridge,
+            "/api/studio/result",
+            json!({"requestId":command["requestId"],"sessionId":session,"result":{"ok":true,"value":value}}),
+        )
+        .await;
+    }
+
+    fn command_ids(command: &Value) -> Vec<String> {
+        command["args"]["ids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|id| id.as_str().unwrap().to_owned())
+            .collect()
+    }
+
+    /// A model small enough to send but with a chunk larger than restoring
+    /// accepts once decompressed, as a script of repeated text makes.
+    fn unrestorable_model() -> String {
+        let mut dom = WeakDom::new(InstanceBuilder::new("DataModel"));
+        let root = dom.root_ref();
+        let script = dom.insert(
+            root,
+            InstanceBuilder::new("ModuleScript")
+                .with_property("Source", "a".repeat(65 * 1024 * 1024)),
+        );
+        let mut bytes = Vec::new();
+        rbx_binary::to_writer(&mut bytes, &dom, &[script]).unwrap();
+        assert!(bytes.len() <= MAX_MODEL_BYTES, "{} bytes", bytes.len());
+        data_encoding::BASE64.encode(&bytes)
+    }
+
+    #[tokio::test]
+    async fn backups_that_could_not_be_restored_are_not_saved() {
+        let unrestorable = unrestorable_model();
+        // The sync route refuses it, so the plugin warns and syncs anyway.
+        let (dir, bridge) = fixture();
+        let (status, value) = plugin(
+            &bridge,
+            "/api/studio/backup",
+            json!({"model": unrestorable, "instances": [{"path":"game/Workspace/S","className":"ModuleScript"}]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{value}");
+        assert!(value["error"]
+            .as_str()
+            .unwrap()
+            .contains("not be restorable"));
+        assert!(backup::Store::in_dir(&dir.path().join("backups"))
+            .list()
+            .unwrap()
+            .is_empty());
+
+        // verify --fix changes nothing.
+        let (dir, bridge, session, script, verify) = fix_past_sources(json!({"fix":true})).await;
+        let command = next_command(&bridge, &session).await;
+        answer_export(
+            &bridge,
+            &session,
+            &command,
+            json!({"model": unrestorable, "ids": [script.id],
+                "instances": [{"path":"game/ReplicatedStorage/Shared/Main","className":"ModuleScript"}]}),
+        )
+        .await;
+        let (status, value) = into_value(verify.await.unwrap()).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{value}");
+        assert!(
+            value["error"]
+                .as_str()
+                .unwrap()
+                .contains("not be restorable"),
+            "{value}"
+        );
+        assert!(bridge.state().pending.is_empty(), "no resync was sent");
+        assert!(backup::Store::in_dir(&dir.path().join("backups"))
+            .list()
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn verify_fix_does_not_fix_scripts_whose_backup_is_gone() {
+        let (dir, bridge, session, scripts, verify) =
+            fix_scripts_past_sources(json!({"fix":true}), 2, verify::MAX_BACKUP_SOURCE_BYTES).await;
+        let store = backup::Store::in_dir(&dir.path().join("backups"));
+        let first = next_command(&bridge, &session).await;
+        let first_ids = command_ids(&first);
+        let refs: Vec<&str> = first_ids.iter().map(String::as_str).collect();
+        answer_backup(&bridge, &session, &first, &refs).await;
+        let second = next_command(&bridge, &session).await;
+        // Something removes the first backup while the second is exported.
+        let saved = store.list().unwrap();
+        assert_eq!(saved.len(), 1);
+        assert!(dir
+            .path()
+            .join("backups")
+            .join(format!("{}.pin", saved[0].id))
+            .exists());
+        store.remove(&saved[0].id).unwrap();
+        let second_ids = command_ids(&second);
+        let refs: Vec<&str> = second_ids.iter().map(String::as_str).collect();
+        answer_backup(&bridge, &session, &second, &refs).await;
+        let resync = next_command(&bridge, &session).await;
+        let updated = resync["args"]["patch"]["updated"].as_array().unwrap();
+        assert_eq!(updated.len(), 1);
+        assert_eq!(updated[0]["id"], json!(second_ids[0]));
+        plugin(
+            &bridge,
+            "/api/studio/result",
+            json!({"requestId":resync["requestId"],"sessionId":session,"result":{"ok":true,"value":{"updated":1,"failed":0,"skipped":0}}}),
+        )
+        .await;
+        let (_, value) = into_value(verify.await.unwrap()).await;
+        let fixed = &value["result"]["value"]["fixed"];
+        assert_eq!(fixed["notBackedUp"], 1);
+        assert_eq!(fixed["notBackedUpScripts"][0]["id"], json!(first_ids[0]));
+        assert_eq!(scripts.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn verify_fix_with_more_groups_than_the_hard_cap_keeps_all_of_them() {
+        let groups = backup::MAX_AUTOMATIC + 1;
+        let (dir, bridge, session, _scripts, verify) =
+            fix_scripts_past_sources(json!({"fix":true}), groups, verify::MAX_BACKUP_SOURCE_BYTES)
+                .await;
+        let backups = dir.path().join("backups");
+        let store = backup::Store::in_dir(&backups);
+        for _ in 0..groups {
+            let command = next_command(&bridge, &session).await;
+            assert_eq!(command["action"], "backup");
+            let ids = command_ids(&command);
+            let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+            answer_backup(&bridge, &session, &command, &refs).await;
+        }
+        let resync = next_command(&bridge, &session).await;
+        assert_eq!(resync["action"], "resync");
+        // Over the hard cap, yet every group is still there and pinned
+        // before any script is overwritten.
+        let listed = store.list().unwrap();
+        assert_eq!(listed.len(), groups);
+        assert!(listed
+            .iter()
+            .all(|record| backups.join(format!("{}.pin", record.id)).exists()));
+        assert_eq!(
+            resync["args"]["patch"]["updated"].as_array().unwrap().len(),
+            groups
+        );
+        plugin(
+            &bridge,
+            "/api/studio/result",
+            json!({"requestId":resync["requestId"],"sessionId":session,"result":{"ok":true,"value":{"updated":groups,"failed":0,"skipped":0}}}),
+        )
+        .await;
+        let (status, value) = into_value(verify.await.unwrap()).await;
+        assert_eq!(status, StatusCode::OK, "{value}");
+        assert_eq!(
+            value["result"]["value"]["backups"]
+                .as_array()
+                .unwrap()
+                .len(),
+            groups
+        );
+        // The verify is over, so its pins are gone and the next prune brings
+        // the folder back under the cap.
+        assert!(store
+            .list()
+            .unwrap()
+            .iter()
+            .all(|record| !backups.join(format!("{}.pin", record.id)).exists()));
+        let mut record = backup::automatic_record(
+            "auto-sync",
+            "auto: later",
+            &[("game/Later".to_owned(), "Folder".to_owned())],
+            None,
+            None,
+        );
+        record.created_at = backup::now_millis();
+        store.save_automatic(record, b"<roblox!later").unwrap();
+        assert_eq!(store.list().unwrap().len(), backup::MAX_AUTOMATIC);
+    }
+
+    #[tokio::test]
+    async fn the_verify_report_lists_a_summary_of_each_backup() {
+        let (_dir, bridge, session, script, verify) = fix_past_sources(json!({"fix":true})).await;
+        let command = next_command(&bridge, &session).await;
+        let instances: Vec<Value> = (0..2_000)
+            .map(|index| json!({"path": format!("game/ServerScriptService/Feature{index}/Module{}", "x".repeat(150)), "className": "ModuleScript"}))
+            .collect();
+        answer_export(
+            &bridge,
+            &session,
+            &command,
+            json!({"model": model(&["ModuleScript"]), "ids": [script.id], "instances": instances}),
+        )
+        .await;
+        let resync = next_command(&bridge, &session).await;
+        plugin(
+            &bridge,
+            "/api/studio/result",
+            json!({"requestId":resync["requestId"],"sessionId":session,"result":{"ok":true,"value":{"updated":1,"failed":0,"skipped":0}}}),
+        )
+        .await;
+        let (status, value) = into_value(verify.await.unwrap()).await;
+        assert_eq!(status, StatusCode::OK, "{value}");
+        let backups = &value["result"]["value"]["backups"];
+        assert_eq!(backups[0]["rootCount"], 2_000);
+        assert!(backups.to_string().len() < 1024, "{backups}");
+        assert!(value.to_string().len() < 16 * 1024);
     }
 
     #[tokio::test]
