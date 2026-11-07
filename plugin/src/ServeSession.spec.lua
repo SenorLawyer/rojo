@@ -391,6 +391,27 @@ return function()
 			container:Destroy()
 		end)
 
+		it("swaps nothing when the session stops while the fallback waits for the server", function()
+			local container = Instance.new("Folder")
+			local present = Instance.new("Folder")
+			present.Parent = container
+			session.__instanceMap:insert("PRESENT", present)
+			api.serialize = function()
+				session:stop()
+				return Promise.resolve({ modelContents = buffer.create(0), missingIds = {} })
+			end
+			api.refPatch = function()
+				return Promise.resolve({ patch = PatchSet.newEmpty() })
+			end
+			session.__deserializeInstances = function()
+				return model({ "PRESENT" })
+			end
+			local ok = session:__replaceInstances({ "PRESENT" })
+			expect(ok).to.equal(false)
+			expect(present.Parent).to.equal(container)
+			container:Destroy()
+		end)
+
 		it("succeeds without further requests when every id is missing", function()
 			local refPatchCalls = 0
 			api.serialize = function()
@@ -1543,6 +1564,39 @@ return function()
 			ServeSession.clock = nativeClock
 			expect(deadline).to.equal(5000 + 300)
 			expect(session.__catchUpWriteDeadline).to.equal(nil)
+		end)
+
+		it("does not write over edits made after the backup captured a script", function()
+			local Log = require(script.Parent.Parent.Packages.Log)
+			local hashSource = require(script.Parent.hashSource)
+			local nativeWarn = Log.warn
+			local warnings = {}
+			Log.warn = function(template, ...)
+				table.insert(warnings, { template = template, args = { ... } })
+			end
+			local module = Instance.new("ModuleScript")
+			module.Name = "Captured"
+			module.Source = "return 'captured'"
+			module.Parent = fixture
+			session.__instanceMap:insert("CAPTURED", module)
+			session.__status = ServeSession.Status.Connected
+			-- The backup holds "return 'captured'"; the user types after the
+			-- scan, before the write's callback runs.
+			session.__catchUpGuarded = { [module] = (hashSource("return 'captured'")) }
+			module.Source = "return 'typed after the scan'"
+			session:__writeSource({ id = "CAPTURED", instance = module, target = "return 'disk'" })
+			task.wait(0.3)
+			local edited = module.Source
+			-- With the text the backup holds, the same write goes through.
+			module.Source = "return 'captured'"
+			session:__writeSource({ id = "CAPTURED", instance = module, target = "return 'disk'" })
+			task.wait(0.3)
+			session.__catchUpGuarded = nil
+			Log.warn = nativeWarn
+			expect(edited).to.equal("return 'typed after the scan'")
+			expect(module.Source).to.equal("return 'disk'")
+			expect(#warnings).to.equal(1)
+			expect(warnings[1].template:find("to keep edits made in Studio", 1, true)).to.be.ok()
 		end)
 
 		it("takes no backup when it is turned off", function()

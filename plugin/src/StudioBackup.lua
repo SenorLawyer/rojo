@@ -23,6 +23,12 @@ StudioBackup.MAX_INSTANCES = 10_000
 StudioBackup.MAX_SOURCE_BYTES = 16 * 1024 * 1024
 -- Scripts handled between yields, so reading many keeps Studio responsive.
 StudioBackup.SCRIPTS_PER_YIELD = 200
+-- The most other variable-size data, StringValue values and attributes, a
+-- backup reads before it is serialized, for the same reason.
+StudioBackup.MAX_CONTENT_BYTES = 16 * 1024 * 1024
+-- How long preparing a backup may take before it is given up, checked
+-- between steps, so a slow one cannot hold up the sync for long.
+StudioBackup.MAX_PREPARE_SECONDS = 10
 local MAX_BODY_BYTES = 8 * 1024 * 1024
 
 -- The folder in a backup that holds scripts as their open editors show them.
@@ -159,36 +165,92 @@ function StudioBackup.serializeInstances(instances)
 	return SerializationService:SerializeInstancesAsync(instances)
 end
 
--- Yields every SCRIPTS_PER_YIELD calls, counted in `counter.n`.
-local function pace(counter)
+-- Seconds, for the time budget. Replaced by tests.
+StudioBackup.clock = os.clock
+
+-- Deserializes a model, to check what serializing emitted. Replaced by tests.
+function StudioBackup.deserializeInstances(model)
+	return SerializationService:DeserializeInstancesAsync(model)
+end
+
+-- Fails once preparing a backup has taken longer than MAX_PREPARE_SECONDS.
+local function checkTime(started)
+	assert(
+		StudioBackup.clock() - started <= StudioBackup.MAX_PREPARE_SECONDS,
+		string.format("preparing it took longer than %d seconds", StudioBackup.MAX_PREPARE_SECONDS)
+	)
+end
+
+-- Yields every SCRIPTS_PER_YIELD calls, counted in `counter.n`, and checks
+-- the time budget when `started` is given.
+local function pace(counter, started)
 	counter.n += 1
 	if counter.n % StudioBackup.SCRIPTS_PER_YIELD == 0 then
 		task.wait()
+		if started then
+			checkTime(started)
+		end
 	end
 end
 
+-- The bytes of variable-size data an instance holds that are cheap to read:
+-- a StringValue's value and its string attributes. Script source is counted
+-- separately.
+local function contentBytes(instance)
+	local bytes = 0
+	if instance:IsA("StringValue") then
+		local ok, value = pcall(function()
+			return (instance :: any).Value
+		end)
+		if ok and type(value) == "string" then
+			bytes += #value
+		end
+	end
+	local ok, attributes = pcall(instance.GetAttributes, instance)
+	if ok then
+		for name, value in attributes do
+			bytes += #name + (if type(value) == "string" then #value else 16)
+		end
+	end
+	return bytes
+end
+
 --[[
-	The scripts in `roots` and their descendants, and checks that their
-	sources add up to at most MAX_SOURCE_BYTES, stopping as soon as they do
-	not, so a huge subtree fails before anything is hashed or serialized.
-	Also returns the paths of instances that are not Archivable, which
-	SerializeInstancesAsync leaves out, along with what is inside them.
+	Walks `roots` and their descendants before anything is hashed or
+	serialized. Fails as soon as their script source passes MAX_SOURCE_BYTES,
+	or their other variable-size data (StringValue values and attributes)
+	passes MAX_CONTENT_BYTES, or the walk takes longer than the time budget
+	since `started`, so a huge subtree costs little before it is refused.
+	Returns the scripts, and the paths of instances below the roots that are
+	not Archivable, which SerializeInstancesAsync leaves out along with what
+	is inside them.
 ]]
-function StudioBackup.scriptsWithin(roots)
+function StudioBackup.preflight(roots, started)
+	started = started or StudioBackup.clock()
 	local scripts = {}
 	local unarchivable = {}
-	local total = 0
+	local sourceBytes = 0
+	local otherBytes = 0
 	local counter = { n = 0 }
 	for _, root in roots do
 		local candidates = root.instance:GetDescendants()
 		table.insert(candidates, root.instance)
 		for _, candidate in candidates do
+			pace(counter, started)
 			local readArchivable, archivable = pcall(function()
 				return candidate.Archivable
 			end)
 			if readArchivable and archivable == false then
 				table.insert(unarchivable, (StudioBridge.pathOf(candidate)))
 			end
+			otherBytes += contentBytes(candidate)
+			assert(
+				otherBytes <= StudioBackup.MAX_CONTENT_BYTES,
+				string.format(
+					"its values and attributes hold more than %d MiB, over what a backup reads",
+					StudioBackup.MAX_CONTENT_BYTES // (1024 * 1024)
+				)
+			)
 			if not candidate:IsA("LuaSourceContainer") then
 				continue
 			end
@@ -196,17 +258,16 @@ function StudioBackup.scriptsWithin(roots)
 				return (candidate :: any).Source
 			end)
 			if read and type(source) == "string" then
-				total += #source
+				sourceBytes += #source
 			end
 			assert(
-				total <= StudioBackup.MAX_SOURCE_BYTES,
+				sourceBytes <= StudioBackup.MAX_SOURCE_BYTES,
 				string.format(
 					"its scripts hold more than %d MiB of source, over what a backup reads",
 					StudioBackup.MAX_SOURCE_BYTES // (1024 * 1024)
 				)
 			)
 			table.insert(scripts, candidate)
-			pace(counter)
 		end
 	end
 	table.sort(unarchivable)
@@ -222,6 +283,27 @@ local function serializeChecked(instances)
 	return model
 end
 
+-- Checks that `model` holds exactly `instances` as its roots, in order, so
+-- the record's list of roots says what the model holds.
+local function checkRoundTrip(model, instances)
+	local copies = StudioBackup.deserializeInstances(model)
+	local matches = #copies == #instances
+	if matches then
+		for index, copy in copies do
+			local original = instances[index]
+			if copy.Name ~= original.Name or copy.ClassName ~= original.ClassName then
+				matches = false
+				break
+			end
+		end
+	end
+	local count = #copies
+	for _, copy in copies do
+		copy:Destroy()
+	end
+	assert(matches, string.format("the model holds %d roots, not the %d it was given, in order", count, #instances))
+end
+
 --[[
 	Serializes `roots` from `collect` as they are in the place, with
 	everything inside them, in one native model. Serializing them in one call
@@ -229,31 +311,60 @@ end
 	pointing at another backed-up instance; references to instances outside
 	the backup are not kept. Nothing in the place is copied, and the size is
 	counted first, so a backup over the import limit fails before any work.
+	A root that is not Archivable cannot be in the model, so it is left out
+	and named with the others that are not.
 
 	`readEditor`, when given, reads the text a script's editor holds, or
 	returns nil when it cannot. The model only holds `Source`, so a script
 	whose editor shows other text also gets a draft copy with that text, in a
-	folder named DRAFTS_FOLDER. Returns the model, the paths and classes of
-	its roots, the paths of scripts whose editor text or source could not be
-	read, whose unsaved text the backup may therefore miss, and for every
-	other script the hash of the text the backup holds for it (`captured`, a
-	list of `{ instance, path, hash }`), so `changedSince` can tell which
-	were edited after the backup was taken.
+	folder named DRAFTS_FOLDER. Returns:
+
+	- the model, checked to hold exactly the roots recorded, in order;
+	- the paths and classes of its roots;
+	- the paths of scripts whose editor text or source could not be read,
+	  whose unsaved text the backup may therefore miss;
+	- `captured`, a list of `{ instance, path, hash }` with the hash of the
+	  text the backup holds for every other script, so `changedSince` can
+	  tell which were edited after the backup was taken;
+	- the paths of instances that are not Archivable and so not in it;
+	- `guarded`, mapping every script in the backup to the hash of the text
+	  it holds, or `false` when that text could not be read, so a later write
+	  can tell whether it would overwrite what the backup does not hold.
 ]]
 function StudioBackup.serialize(roots, readEditor)
+	local started = StudioBackup.clock()
+	local unarchivable = {}
+	local kept = {}
+	for _, root in roots do
+		local read, archivable = pcall(function()
+			return root.instance.Archivable
+		end)
+		if read and archivable == false then
+			table.insert(unarchivable, root.path or (StudioBridge.pathOf(root.instance)))
+		else
+			table.insert(kept, root)
+		end
+	end
+	roots = kept
+	assert(#roots > 0, "none of the instances can be saved, since none is Archivable")
 	local count = StudioBackup.countInstances(roots)
 	assert(
 		count <= StudioBackup.MAX_INSTANCES,
 		string.format("it would hold %d instances, over the %d a backup can restore", count, StudioBackup.MAX_INSTANCES)
 	)
-	local scripts, unarchivable = StudioBackup.scriptsWithin(roots)
+	local scripts, below = StudioBackup.preflight(roots, started)
+	for _, path in below do
+		table.insert(unarchivable, path)
+	end
+	table.sort(unarchivable)
 	local instances = {}
 	local described = {}
 	local unreadable = {}
 	local captured = {}
+	local guarded = {}
 	local drafts
 	local counter = { n = 0 }
-	-- `scriptsWithin` counted saved sources, but an editor can hold far more
+	-- `preflight` counted saved sources, but an editor can hold far more
 	-- unsaved text, which the backup holds too as a draft. So what is read is
 	-- counted again here, against the same budget, before serializing.
 	local capturedBytes = 0
@@ -277,13 +388,14 @@ function StudioBackup.serialize(roots, readEditor)
 		end
 		if readEditor then
 			for _, script in scripts do
-				pace(counter)
+				pace(counter, started)
 				local editor = readEditor(script)
 				local read, saved = pcall(function()
 					return (script :: any).Source
 				end)
 				if editor == nil or not read or type(saved) ~= "string" then
 					table.insert(unreadable, (StudioBridge.pathOf(script)))
+					guarded[script] = false
 					if read and type(saved) == "string" then
 						capture(#saved)
 					end
@@ -292,10 +404,12 @@ function StudioBackup.serialize(roots, readEditor)
 				-- The saved source is in the model, and a different editor text
 				-- is a draft beside it, so both count.
 				capture(if editor == saved then #saved else #saved + #editor)
+				local hash = (hashSource(editor))
+				guarded[script] = hash
 				table.insert(captured, {
 					instance = script,
 					path = (StudioBridge.pathOf(script)),
-					hash = (hashSource(editor)),
+					hash = hash,
 				})
 				if editor == saved then
 					continue
@@ -330,7 +444,10 @@ function StudioBackup.serialize(roots, readEditor)
 				StudioBackup.MAX_INSTANCES
 			)
 		)
-		return serializeChecked(instances)
+		checkTime(started)
+		local model = serializeChecked(instances)
+		checkRoundTrip(model, instances)
+		return model
 	end)
 	if drafts then
 		drafts:Destroy()
@@ -338,7 +455,7 @@ function StudioBackup.serialize(roots, readEditor)
 	if not ok then
 		error(result, 0)
 	end
-	return result, described, unreadable, captured, unarchivable
+	return result, described, unreadable, captured, unarchivable, guarded
 end
 
 --[[

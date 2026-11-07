@@ -793,13 +793,14 @@ function ServeSession:__backUpBeforeCatchUp(patch, serverInfo)
 		return nil
 	end
 	local captured = {}
+	local guarded = {}
 	local ok, result = pcall(function()
 		assert(
 			serverInfo.studioBridge ~= nil,
 			"the server was not started with --studio-token-file, so it cannot save backups"
 		)
 		local model, described, unreadable, unarchivable
-		model, described, unreadable, captured, unarchivable =
+		model, described, unreadable, captured, unarchivable, guarded =
 			StudioBackup.serialize(roots, ServeSession.readEditorText)
 		if #unarchivable > 0 then
 			-- Studio does not save instances that are not Archivable, nor
@@ -834,7 +835,7 @@ function ServeSession:__backUpBeforeCatchUp(patch, serverInfo)
 			id,
 			id
 		)
-		return captured
+		return captured, guarded
 	else
 		local paths = {}
 		for _, root in roots do
@@ -1560,6 +1561,14 @@ function ServeSession:__replaceInstances(idList)
 		Log.warn("Could not fetch references for the sync fallback: {}", refPatch)
 		return false
 	end
+	-- Both requests yielded. A session stopped meanwhile must not swap out
+	-- the instances it was given.
+	if self.__status == Status.Disconnected then
+		for _, replacement in replacements do
+			replacement:Destroy()
+		end
+		return false
+	end
 
 	-- Roblox appends to GetChildren() on every reparent, so the order in which
 	-- we re-parent replacements determines their final sibling order.
@@ -1586,6 +1595,21 @@ function ServeSession:__replaceInstances(idList)
 
 	for _, swap in orderSwaps(swaps) do
 		local id, replacement, oldInstance = swap.id, swap.replacement, swap.oldInstance
+
+		-- During the sync after connecting, a swap replaces what the backup
+		-- holds, so it is held to the same checks as a source write: not
+		-- after the backup's protection runs out, and not over edits made
+		-- since the backup.
+		local blocked = self:__catchUpChangeBlocked(oldInstance)
+		if blocked then
+			Log.warn(
+				"Did not replace {} through the sync fallback: {}. Reconnect, or run `rojo studio verify --fix`, to sync it.",
+				oldInstance:GetFullName(),
+				blocked
+			)
+			replacement:Destroy()
+			continue
+		end
 
 		-- The server's copy is read when the fallback runs, so its file may
 		-- have become empty since the patch was sent, and a hold may have
@@ -1790,8 +1814,33 @@ end
 	then a newer change may have replaced this one, or a hold may have started
 	for the script, and either cancels it.
 ]=]
+--[=[
+	Why a change from the sync after connecting must not be made to
+	`instance` now, or nil when it may: its backup's protection ran out, or
+	the instance is a script whose text no longer matches what the backup
+	holds. Outside that sync there is no reason.
+]=]
+function ServeSession:__catchUpChangeBlocked(instance)
+	local deadline = self.__catchUpWriteDeadline
+	if deadline ~= nil and ServeSession.clock() > deadline then
+		return "the change came too late, after the backup Rojo took of it may already have been removed"
+	end
+	local guarded = self.__catchUpGuarded
+	local backedUp = if guarded then guarded[instance] else nil
+	if backedUp ~= nil then
+		local text = ServeSession.readEditorText(instance)
+		if backedUp == false or text == nil or (hashSource(text)) ~= backedUp then
+			return "it has edits made in Studio that the backup Rojo took does not hold"
+		end
+	end
+	return nil
+end
+
 function ServeSession:__writeSource(write)
 	local deadline = self.__catchUpWriteDeadline
+	-- For a script in the reconnect backup, the hash of the text the backup
+	-- holds, or false when it could not read it; nil for other writes.
+	local backedUp = if self.__catchUpGuarded then self.__catchUpGuarded[write.instance] else nil
 	local generation = (self.__sourceGenerations[write.id] or 0) + 1
 	self.__sourceGenerations[write.id] = generation
 	self.__instanceMap:pauseInstance(write.instance)
@@ -1805,6 +1854,15 @@ function ServeSession:__writeSource(write)
 				if deadline ~= nil and ServeSession.clock() > deadline then
 					Log.warn(
 						"Did not change the source of {}: the change from connecting came too late, after the backup Rojo took of it may already have been removed. Reconnect, or run `rojo studio verify --fix`, to sync it.",
+						write.instance:GetFullName()
+					)
+					return nil
+				end
+				-- Edits made after the backup are in neither the backup nor
+				-- the files, so they are not overwritten.
+				if backedUp ~= nil and (backedUp == false or (hashSource(current)) ~= backedUp) then
+					Log.warn(
+						"Did not change the source of {}, to keep edits made in Studio that the backup Rojo took does not hold. Reconnect, or run `rojo studio verify --fix`, to sync it.",
 						write.instance:GetFullName()
 					)
 					return nil
@@ -2048,7 +2106,7 @@ function ServeSession:__initialSync(serverInfo)
 
 			return self.__apiContext:write(inversePatch)
 		elseif userDecision == "Accept" then
-			local captured = self:__backUpBeforeCatchUp(catchUpPatch, serverInfo)
+			local captured, guarded = self:__backUpBeforeCatchUp(catchUpPatch, serverInfo)
 			-- The backup, and the check for edits made during it, both yield,
 			-- and the user may disconnect meanwhile. The patch holds the very
 			-- instances it removes, so a stopped session must not apply it.
@@ -2061,11 +2119,15 @@ function ServeSession:__initialSync(serverInfo)
 			end
 			-- Source writes finish later, on their own threads. Those still
 			-- pending when the backup's protection runs out are skipped.
+			-- Each also checks, as it writes, that the script still holds the
+			-- text the backup holds for it.
 			if captured ~= nil then
 				self.__catchUpWriteDeadline = self.__backupSavedAt + CATCH_UP_WRITE_WINDOW
+				self.__catchUpGuarded = guarded
 			end
 			self:__applyPatch(catchUpPatch)
 			self.__catchUpWriteDeadline = nil
+			self.__catchUpGuarded = nil
 			return Promise.resolve()
 		else
 			return Promise.reject("Invalid user decision: " .. userDecision)

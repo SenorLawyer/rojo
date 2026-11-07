@@ -303,6 +303,86 @@ return function()
 			destroyAll(roots)
 		end)
 
+		it("refuses large values and attributes before serializing", function()
+			local nativeSerialize = StudioBackup.serializeInstances
+			local previous = StudioBackup.MAX_CONTENT_BYTES
+			local serialized = 0
+			StudioBackup.serializeInstances = function(instances)
+				serialized += 1
+				return nativeSerialize(instances)
+			end
+			StudioBackup.MAX_CONTENT_BYTES = 100
+			local value = make("Folder", "WithValue", fixture)
+			make("StringValue", "Big", value).Value = string.rep("v", 200)
+			local valueOk, valueError = pcall(StudioBackup.serialize, { { instance = value } })
+			local attribute = make("Folder", "WithAttribute", fixture)
+			attribute:SetAttribute("Blob", string.rep("a", 200))
+			local attributeOk, attributeError = pcall(StudioBackup.serialize, { { instance = attribute } })
+			StudioBackup.MAX_CONTENT_BYTES = previous
+			StudioBackup.serializeInstances = nativeSerialize
+			expect(valueOk).to.equal(false)
+			expect(tostring(valueError):find("values and attributes", 1, true)).to.be.ok()
+			expect(attributeOk).to.equal(false)
+			expect(tostring(attributeError):find("values and attributes", 1, true)).to.be.ok()
+			expect(serialized).to.equal(0)
+		end)
+
+		it("gives up a backup that takes too long to prepare", function()
+			local removed = make("Folder", "Removed", fixture)
+			make("ModuleScript", "Module", removed)
+			local nativeClock = StudioBackup.clock
+			local now = 0
+			StudioBackup.clock = function()
+				now += 11
+				return now
+			end
+			local ok, err = pcall(StudioBackup.serialize, { { instance = removed } }, function(instance)
+				return instance.Source
+			end)
+			StudioBackup.clock = nativeClock
+			expect(ok).to.equal(false)
+			expect(tostring(err):find("took longer than", 1, true)).to.be.ok()
+		end)
+
+		it("leaves out roots that are not Archivable and checks the model holds the rest in order", function()
+			local first = make("Folder", "Same", fixture)
+			make("Part", "A", first)
+			local hidden = make("Folder", "Hidden", fixture)
+			hidden.Archivable = false
+			local second = make("Folder", "Same", fixture)
+			make("Part", "B", second)
+			local value = make("StringValue", "Value", fixture)
+			local model, described, _, _, unarchivable = StudioBackup.serialize({
+				{ instance = first, path = "game/ReplicatedStorage/__RojoBackupSpec/Same" },
+				{ instance = hidden, path = "game/ReplicatedStorage/__RojoBackupSpec/Hidden" },
+				{ instance = second, path = "game/ReplicatedStorage/__RojoBackupSpec/Same" },
+				{ instance = value, path = "game/ReplicatedStorage/__RojoBackupSpec/Value" },
+			})
+			expect(#described).to.equal(3)
+			expect(described[3].className).to.equal("StringValue")
+			expect(unarchivable[1]).to.equal("game/ReplicatedStorage/__RojoBackupSpec/Hidden")
+			local roots = SerializationService:DeserializeInstancesAsync(model)
+			expect(#roots).to.equal(3)
+			expect(roots[1].Name).to.equal("Same")
+			expect(roots[1]:FindFirstChild("A")).to.be.ok()
+			expect(roots[2]:FindFirstChild("B")).to.be.ok()
+			expect(roots[3].ClassName).to.equal("StringValue")
+			destroyAll(roots)
+			-- A model that does not hold what was recorded is refused.
+			local nativeDeserialize = StudioBackup.deserializeInstances
+			StudioBackup.deserializeInstances = function(bytes)
+				local copies = nativeDeserialize(bytes)
+				table.remove(copies, 1):Destroy()
+				return copies
+			end
+			local ok, err = pcall(StudioBackup.serialize, { { instance = first }, { instance = second } })
+			StudioBackup.deserializeInstances = nativeDeserialize
+			expect(ok).to.equal(false)
+			expect(tostring(err):find("roots", 1, true)).to.be.ok()
+			-- Only roots that are not Archivable: nothing to back up.
+			expect((pcall(StudioBackup.serialize, { { instance = hidden } }))).to.equal(false)
+		end)
+
 		it("refuses a backup over the instance limit before serializing", function()
 			local removed = make("Folder", "Removed", fixture)
 			make("Part", "One", removed)
