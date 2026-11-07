@@ -90,7 +90,7 @@ Every tool is listed. The descriptions of the overlapping tools name Roblox's co
 
 Open Cloud work is split the same way. `open_cloud_invoke` covers developer products, game passes, game and place settings, analytics, server restarts and one-off uploads. Data stores and memory stores are not Open Cloud calls in Roblox's server: scripts reach them through `execute_luau`, with the matching Save & load data permission and the game's Studio access to API services. Uploads that project code refers to go through `rojo assets sync`, which records them in `assets.lock.json` and the generated module; cloud test runs use `rojo test --cloud`. Places are published from archived checkpoints with `rojo release`: `rojo release stage` publishes to a separate test place, `rojo release promote` then publishes the same bytes live after a recent passing stage, and `rojo release publish` publishes live directly. These remain CLI commands; this server does not call Roblox's server or Open Cloud.
 
-Edits made with Roblox's tools to scripts Rojo syncs are overwritten from the files on the next sync, and `studio_verify` reports them until then. Change the file instead.
+Don't edit scripts Rojo syncs with Roblox's tools. A later sync from the files can overwrite those edits, and with two-way sync on, Studio can write them back over the file instead, after which `studio_verify` no longer shows the difference. Never count on a sync to undo a Studio edit: change the file.
 
 ## Protocol and limits
 

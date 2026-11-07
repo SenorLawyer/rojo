@@ -139,8 +139,10 @@ They do different jobs:
   `rojo release promote`, or `rojo release publish` straight to the live
   place.
 
-Edits made through Roblox's tools to scripts Rojo syncs are overwritten by
-the next sync from the files; change the file instead. Roblox's tools do not
+Don't edit scripts Rojo syncs through Roblox's tools: a later sync from the
+files can overwrite those edits, and with two-way sync on, Studio can write
+them back over the file instead. Never count on a sync to undo a Studio edit;
+change the file. Roblox's tools do not
 check Studio locks, so acquire one first. Each server names Studio sessions
 its own way: `rojo` tools take a session UUID from `studio_sessions`, and
 Roblox's take a `studio_id` from `list_roblox_studios`. See
