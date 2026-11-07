@@ -7,6 +7,15 @@ preserves existing files. For a project that already exists, or after
 upgrading the CLI, `rojo doc --agent --write .` replaces ROJO_AGENT.md with
 this version's guide and creates AGENTS.md if the project has none.
 
+`rojo init` also creates a GitHub Actions workflow,
+`.github/workflows/rojo.yml`, unless it is given `--no-ci` or the file
+already exists. It runs `rojo packages doctor` and `rojo typecheck` on every
+push and pull request. For places, it also runs `rojo test --cloud` on pushes
+once the repository has the `ROBLOX_API_KEY` secret and the
+`TEST_UNIVERSE_ID` and `TEST_PLACE_ID` variables; until then that job is
+skipped. The comments at the top of the workflow explain each setting. Keep
+the workflow passing: run the same commands locally before pushing.
+
 ## This is not upstream Rojo
 
 This CLI is the SenorLawyer/rojo fork. The upstream Rojo website and your
