@@ -81,7 +81,7 @@ Roblox's [Studio MCP server](https://create.roblox.com/docs/studio/mcp-open-clou
 | `run_tests` | None | Keep: TestEZ or Jest-Lua report |
 | `studio_export` | None | Keep: writes `.rbxm` into the project, outside the synced folders |
 | `checkpoint_list`, `workspace_list`, `packages_doctor` | None | Keep: project files and Git |
-| `studio_test` | `start_stop_play` | Keep, pointing at Roblox's: a bounded run that always returns to Edit; use `start_stop_play` for a play test that keeps running |
+| `studio_test` | `start_stop_play` | Keep, pointing at Roblox's: a short bounded run meant to end back in Edit mode (if it times out or is cancelled, check the mode with `get_studio_state` and stop it with `start_stop_play` before releasing a lock); use `start_stop_play` for a play test that keeps running |
 | `studio_logs` | `get_console_output` | Keep, pointing at Roblox's: follows the log across calls with `after` |
 | `studio_tree` | `search_game_tree` | Keep, pointing at Roblox's: gives the IDs `studio_backup` and `studio_export` accept; browse and search with Roblox's, which filters by class and name and reads Client and Server during a play test |
 | `studio_properties` | `inspect_instance` | Keep, pointing at Roblox's: reads by exact ID and returns IDs for Instance-valued properties, to pick one of several same-named siblings; browse properties and attributes with Roblox's |
