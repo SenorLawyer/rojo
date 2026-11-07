@@ -34,6 +34,15 @@ pub(crate) const MAX_LISTED: usize = 10_000;
 /// for JSON escaping, which can double the size of some sources.
 pub(crate) const MAX_RESYNC_BYTES: usize = 2 * 1024 * 1024;
 
+/// How many bytes of Studio source one backup taken before `--fix` may hold.
+/// The plugin refuses a model over 5 MiB, and a script's copy is a little
+/// larger than its source, so this leaves room for that and for its
+/// properties.
+pub(crate) const MAX_BACKUP_SOURCE_BYTES: usize = 4 * 1024 * 1024;
+/// How many scripts one backup before `--fix` may hold, well under the
+/// 10,000 instances the plugin exports and a backup can restore.
+pub(crate) const MAX_BACKUP_SCRIPTS: usize = 2_000;
+
 /// 32-bit FNV-1a of `source` with CRLF line endings turned into LF, and the
 /// length of that normalized text. Must match `plugin/src/hashSource.lua`.
 pub(crate) fn hash_source(source: &str) -> (u32, usize) {
@@ -341,7 +350,14 @@ impl Comparison {
     /// The report, listing at most `limit` scripts of each kind, in at most
     /// `max_bytes` of JSON for the lists together. The counts cover every
     /// script either way.
+    #[cfg(test)]
     pub(crate) fn report(&self, limit: usize, max_bytes: usize) -> Value {
+        self.report_with_budget(limit, max_bytes).0
+    }
+
+    /// [`Self::report`], with what is left of `max_bytes` for further lists,
+    /// such as those `--fix` adds.
+    pub(crate) fn report_with_budget(&self, limit: usize, max_bytes: usize) -> (Value, usize) {
         let mut budget = max_bytes;
         let (different, different_count) = listed(
             self.different.iter().map(|different| {
@@ -357,7 +373,7 @@ impl Comparison {
             listed(self.missing.iter().map(describe), limit, &mut budget);
         let (detached, detached_count) =
             listed(self.detached.iter().map(describe), limit, &mut budget);
-        json!({
+        let report = json!({
             "inSync": self.in_sync(),
             "checked": self.checked,
             "matching": self.matching,
@@ -371,7 +387,8 @@ impl Comparison {
             "truncated": different.len() < different_count
                 || missing.len() < missing_count
                 || detached.len() < detached_count,
-        })
+        });
+        (report, budget)
     }
 
     /// The scripts `--fix` sets back to their files' contents. Held wipes stay
@@ -389,6 +406,43 @@ impl Comparison {
             .filter(|different| self.held.contains(&different.script.id))
             .count()
     }
+}
+
+/// Splits the scripts `--fix` overwrites into groups of at most
+/// [`MAX_BACKUP_SCRIPTS`] whose Studio sources add up to at most
+/// [`MAX_BACKUP_SOURCE_BYTES`], one backup each. A script
+/// larger than that gets a group of its own, which the plugin refuses if its
+/// copy does not fit the model limit.
+pub(crate) fn backup_groups<'a>(fixes: &[&'a Different]) -> Vec<Vec<&'a Different>> {
+    let mut groups = Vec::new();
+    let mut group = Vec::new();
+    let mut bytes = 0;
+    for &fix in fixes {
+        if !group.is_empty()
+            && (bytes + fix.studio_length > MAX_BACKUP_SOURCE_BYTES
+                || group.len() >= MAX_BACKUP_SCRIPTS)
+        {
+            groups.push(std::mem::take(&mut group));
+            bytes = 0;
+        }
+        bytes += fix.studio_length;
+        group.push(fix);
+    }
+    if !group.is_empty() {
+        groups.push(group);
+    }
+    groups
+}
+
+/// Lists `scripts` like the report's lists: paths shortened, at most
+/// `limit` of them, within what is left of `budget`, which they use up.
+/// Returns them and how many there were in all.
+pub(crate) fn list_scripts<'a>(
+    scripts: impl ExactSizeIterator<Item = &'a TreeScript> + 'a,
+    limit: usize,
+    budget: &mut usize,
+) -> (Vec<Value>, usize) {
+    listed(scripts.map(describe), limit, budget)
 }
 
 /// One batch of `resync`: a sync message that sets each script's `Source` to
@@ -661,6 +715,96 @@ mod test {
             &json!({"scripts": [{"id": "x", "hash": 4_294_967_296_u64, "length": 1}]})
         )
         .is_err());
+    }
+
+    #[test]
+    fn backups_before_a_fix_are_split_by_studio_source_size() {
+        let tree = tree();
+        let scripts = tree_scripts(&tree, Path::new("/"));
+        let sized = |lengths: &[usize]| -> Vec<Different> {
+            lengths
+                .iter()
+                .zip(scripts.iter().cycle())
+                .map(|(&studio_length, script)| Different {
+                    script: script.clone(),
+                    studio_hash: 1,
+                    studio_length,
+                })
+                .collect()
+        };
+        assert!(backup_groups(&[]).is_empty());
+        let half = MAX_BACKUP_SOURCE_BYTES / 2;
+        let fixes = sized(&[half, half, 1, MAX_BACKUP_SOURCE_BYTES * 2, 10]);
+        let refs: Vec<&Different> = fixes.iter().collect();
+        let groups = backup_groups(&refs);
+        let lengths: Vec<Vec<usize>> = groups
+            .iter()
+            .map(|group| group.iter().map(|fix| fix.studio_length).collect())
+            .collect();
+        assert_eq!(
+            lengths,
+            vec![
+                vec![half, half],
+                vec![1],
+                vec![MAX_BACKUP_SOURCE_BYTES * 2],
+                vec![10]
+            ],
+            "every script is in exactly one group, in order, and an oversized one alone"
+        );
+    }
+
+    #[test]
+    fn extra_lists_share_the_reports_byte_budget_and_shorten_paths() {
+        let long = "N".repeat(5_000);
+        let scripts: Vec<TreeScript> = (0..200)
+            .map(|index| TreeScript {
+                id: format!("{index}"),
+                ref_id: rbx_dom_weak::types::Ref::none(),
+                path: format!("game/ServerScriptService/{long}{index}"),
+                file: Some(format!("src/{long}{index}.luau")),
+                hash: 1,
+                hash2: 1,
+                length: 1,
+            })
+            .collect();
+        let comparison = compare(scripts.clone(), &json!({"scripts": []})).unwrap();
+        let (report, mut budget) = comparison.report_with_budget(MAX_LISTED, 64 * 1024);
+        assert_eq!(report["truncated"], true);
+        let before = budget;
+        let (listed, total) = list_scripts(scripts.iter(), MAX_LISTED, &mut budget);
+        assert_eq!(total, 200);
+        assert!(listed.len() < 200, "the budget cuts the list short");
+        let used: usize = listed.iter().map(|item| item.to_string().len() + 1).sum();
+        assert!(used <= before);
+        for item in &listed {
+            assert!(item["path"].as_str().unwrap().len() <= MAX_REPORTED_PATH + 3);
+        }
+    }
+
+    #[test]
+    fn backups_before_a_fix_hold_a_bounded_number_of_scripts() {
+        let tree = tree();
+        let script = tree_scripts(&tree, Path::new("/")).remove(0);
+        let fixes: Vec<Different> = (0..MAX_BACKUP_SCRIPTS * 5 + 1)
+            .map(|_| Different {
+                script: script.clone(),
+                studio_hash: 1,
+                studio_length: 10,
+            })
+            .collect();
+        let refs: Vec<&Different> = fixes.iter().collect();
+        let sizes: Vec<usize> = backup_groups(&refs).iter().map(Vec::len).collect();
+        assert_eq!(
+            sizes,
+            vec![
+                MAX_BACKUP_SCRIPTS,
+                MAX_BACKUP_SCRIPTS,
+                MAX_BACKUP_SCRIPTS,
+                MAX_BACKUP_SCRIPTS,
+                MAX_BACKUP_SCRIPTS,
+                1
+            ]
+        );
     }
 
     #[test]

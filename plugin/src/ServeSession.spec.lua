@@ -1242,6 +1242,157 @@ return function()
 		end)
 	end)
 
+	describe("backups for verify --fix", function()
+		local hashSource = require(script.Parent.hashSource)
+		local fixture
+
+		beforeEach(function()
+			fixture = Instance.new("Folder")
+			fixture.Name = "__RojoVerifyBackupSpec"
+			fixture.Parent = game:GetService("ReplicatedStorage")
+			session.__status = ServeSession.Status.Connected
+		end)
+
+		afterEach(function()
+			fixture:Destroy()
+		end)
+
+		local function trackedModule(id, source)
+			local module = Instance.new("ModuleScript")
+			module.Name = id
+			module.Source = source
+			module.Parent = fixture
+			session.__instanceMap:insert(id, module)
+			return module
+		end
+
+		it("exports the scripts verify --fix overwrites, leaving out those not in the place", function()
+			trackedModule("FIXED", "return 1")
+			session:__rememberVerified("VERIFY", { FIXED = "return 1" })
+			local exported = session:exportForBackup(
+				{ "FIXED", "GONE" },
+				{ FIXED = (hashSource("return 1")) },
+				"VERIFY"
+			)
+			expect(exported.missing).to.equal(1)
+			expect(#exported.ids).to.equal(1)
+			expect(exported.ids[1]).to.equal("FIXED")
+			expect(#exported.instances).to.equal(1)
+			expect(exported.instances[1].path).to.equal("game/ReplicatedStorage/__RojoVerifyBackupSpec/FIXED")
+			expect(type(exported.model)).to.equal("string")
+			expect(exported.bytes > 0).to.equal(true)
+			local none = session:exportForBackup({ "GONE" }, {}, "VERIFY")
+			expect(none.model).to.equal(nil)
+			expect(#none.ids).to.equal(0)
+			expect(#none.instances).to.equal(0)
+		end)
+
+		it("leaves out a script whose editor text cannot be read rather than export its saved source", function()
+			trackedModule("UNREADABLE", "return 1")
+			session:__rememberVerified("VERIFY", { UNREADABLE = "return 1" })
+			local nativeRead = ServeSession.readEditorText
+			ServeSession.readEditorText = function()
+				return nil
+			end
+			local exported = session:exportForBackup(
+				{ "UNREADABLE" },
+				{ UNREADABLE = (hashSource("return 1")) },
+				"VERIFY"
+			)
+			ServeSession.readEditorText = nativeRead
+			expect(exported.missing).to.equal(1)
+			expect(#exported.ids).to.equal(0)
+			expect(exported.model).to.equal(nil)
+		end)
+
+		it("leaves out a script whose source differs from what verify saw though the hashes match", function()
+			-- Two sources known to share a hash and length.
+			local checked, current = "return '07ilh49'", "return '0v3kbm8'"
+			expect((hashSource(checked))).to.equal((hashSource(current)))
+			local collided = trackedModule("COLLIDED", current)
+			session:__rememberVerified("VERIFY", { COLLIDED = checked })
+			local exported = session:exportForBackup({ "COLLIDED" }, { COLLIDED = (hashSource(checked)) }, "VERIFY")
+			expect(exported.missing).to.equal(1)
+			expect(#exported.ids).to.equal(0)
+			-- Without a record of what the verify saw, nothing is exported.
+			collided.Source = checked
+			local unknown = session:exportForBackup({ "COLLIDED" }, { COLLIDED = (hashSource(checked)) }, "OTHER")
+			expect(#unknown.ids).to.equal(0)
+			local known = session:exportForBackup({ "COLLIDED" }, { COLLIDED = (hashSource(checked)) }, "VERIFY")
+			expect(#known.ids).to.equal(1)
+		end)
+
+		it("leaves out a script whose text is not valid UTF-8", function()
+			local text = "return '\xFF'"
+			trackedModule("BYTES", text)
+			session:__rememberVerified("VERIFY", { BYTES = text })
+			local nativeRead = ServeSession.readEditorText
+			ServeSession.readEditorText = function()
+				return text
+			end
+			local exported = session:exportForBackup({ "BYTES" }, { BYTES = (hashSource(text)) }, "VERIFY")
+			ServeSession.readEditorText = nativeRead
+			expect(exported.missing).to.equal(1)
+			expect(#exported.ids).to.equal(0)
+			expect(exported.model).to.equal(nil)
+		end)
+
+		it("leaves out a script whose source changed since verify hashed it", function()
+			trackedModule("EDITED", "return 'edited after the check'")
+			session:__rememberVerified("VERIFY", { EDITED = "return 'checked'" })
+			local exported = session:exportForBackup(
+				{ "EDITED" },
+				{ EDITED = (hashSource("return 'checked'")) },
+				"VERIFY"
+			)
+			expect(exported.missing).to.equal(1)
+			expect(#exported.ids).to.equal(0)
+			expect(exported.model).to.equal(nil)
+			-- A script without an expected hash is left out too.
+			expect(#session:exportForBackup({ "EDITED" }, {}, "VERIFY").ids).to.equal(0)
+		end)
+
+		it("does not let a cancelled resync's pending write land", function()
+			local nativeUpdate = ServeSession.updateSourceAsync
+			local module = trackedModule("Resynced", "return 'studio'")
+			session:__rememberVerified("VERIFY", { Resynced = "return 'studio'" }, {})
+			local committed = false
+			ServeSession.updateSourceAsync = function(instance, callback)
+				-- Studio keeps the write waiting.
+				task.wait(0.6)
+				local result = callback(instance.Source)
+				if result ~= nil then
+					instance.Source = result
+					committed = true
+				end
+			end
+			local active = true
+			task.delay(0.1, function()
+				active = false
+			end)
+			local patch = PatchSet.newEmpty()
+			table.insert(patch.updated, {
+				id = "Resynced",
+				changedProperties = { Source = { String = "return 'disk'" } },
+			})
+			local result = session:applyResync(
+				patch,
+				{ Resynced = { from = (hashSource("return 'studio'")) } },
+				false,
+				DateTime.now().UnixTimestampMillis + 10_000,
+				function()
+					return active
+				end,
+				"VERIFY"
+			)
+			task.wait(0.8)
+			ServeSession.updateSourceAsync = nativeUpdate
+			expect(committed).to.equal(false)
+			expect(module.Source).to.equal("return 'studio'")
+			expect(result.updated).to.equal(0)
+		end)
+	end)
+
 	describe("versionMismatchWarning", function()
 		local Config = require(script.Parent.Config)
 		local Version = require(script.Parent.Version)

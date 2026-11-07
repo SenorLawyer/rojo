@@ -13,7 +13,7 @@ use reqwest::{blocking::Client, Url};
 use serde_json::{json, Value};
 
 #[path = "studio_backup.rs"]
-mod backup;
+pub(crate) mod backup;
 
 use std::io::IsTerminal;
 
@@ -31,11 +31,14 @@ pub struct CheckUntrustedModelCommand {
     /// Write the model back out as a binary model.
     #[clap(long)]
     pub encode: bool,
+    /// With --encode, write each root's class and source hash instead.
+    #[clap(long)]
+    pub report_sources: bool,
 }
 
 impl CheckUntrustedModelCommand {
     pub fn run(self) -> anyhow::Result<()> {
-        model_check::run_child(self.allow_scripts, self.encode)
+        model_check::run_child(self.allow_scripts, self.encode, self.report_sources)
     }
 }
 
@@ -144,6 +147,11 @@ pub enum StudioSubcommand {
         /// because their file became empty.
         #[clap(long, requires = "fix")]
         include_held: bool,
+        /// With --fix, do not save the Studio copies of the scripts it
+        /// overwrites first. Without this, --fix changes nothing when that
+        /// backup cannot be saved.
+        #[clap(long, requires = "fix")]
+        no_backup: bool,
         /// List every script that differs, not just the first 200 of each kind
         /// (up to 10,000).
         #[clap(long, conflicts_with = "limit")]
@@ -157,6 +165,11 @@ pub enum StudioSubcommand {
     },
     /// Save copies of Studio instances outside the place, and put them back.
     Backup {
+        /// The project, a project file or its folder, whose backups to use:
+        /// the folder `rojo serve` saves its automatic backups in. Defaults
+        /// to the current directory's.
+        #[clap(long, global = true)]
+        project: Option<PathBuf>,
         #[clap(subcommand)]
         command: BackupCommand,
     },
@@ -202,6 +215,10 @@ pub enum BackupCommand {
         /// With --json, list at most this many bytes of records.
         #[clap(long)]
         max_bytes: Option<usize>,
+        /// With --json, leave out each backup's list of roots and give only
+        /// `rootCount`.
+        #[clap(long)]
+        no_roots: bool,
     },
     /// Insert a backup into Studio under a parent instance.
     Restore {
@@ -232,11 +249,29 @@ impl StudioCommand {
         }
         // Listing and removing backups only reads local files, so they work
         // without a running server.
-        if let StudioSubcommand::Backup { command } = &self.command {
+        if let StudioSubcommand::Backup { command, project } = &self.command {
             match command {
-                BackupCommand::List { limit, max_bytes } => {
-                    let store = backup::Store::open()?;
-                    let mut backups = store.list()?;
+                BackupCommand::List {
+                    limit,
+                    max_bytes,
+                    no_roots,
+                } => {
+                    let store = open_store(project.as_deref())?;
+                    let mut backups: Vec<Value> = store
+                        .list()?
+                        .into_iter()
+                        .map(|record| {
+                            let count = record.roots.len();
+                            let mut value = serde_json::to_value(record).unwrap_or(Value::Null);
+                            if *no_roots {
+                                if let Some(object) = value.as_object_mut() {
+                                    object.remove("roots");
+                                    object.insert("rootCount".to_owned(), json!(count));
+                                }
+                            }
+                            value
+                        })
+                        .collect();
                     let total = backups.len();
                     if let Some(limit) = limit {
                         backups.truncate(*limit);
@@ -260,6 +295,7 @@ impl StudioCommand {
                         return print_json(
                             &json!({
                                 "backups": backups,
+                                "dir": store.dir(),
                                 "total": total,
                                 "truncated": backups.len() < total,
                                 "orphaned": orphans,
@@ -274,11 +310,15 @@ impl StudioCommand {
                             orphans.join(", ")
                         );
                     }
-                    backup::print_list(&store, &backups);
+                    let records: Vec<backup::Record> = backups
+                        .into_iter()
+                        .filter_map(|value| serde_json::from_value(value).ok())
+                        .collect();
+                    backup::print_list(&store, &records);
                     return Ok(());
                 }
                 BackupCommand::Remove { backup } => {
-                    let store = backup::Store::open()?;
+                    let store = open_store(project.as_deref())?;
                     store.remove(backup)?;
                     return print_json(&json!({"removed": backup}), self.json);
                 }
@@ -314,12 +354,21 @@ impl StudioCommand {
             target,
             fix,
             include_held,
+            no_backup,
             all,
             limit,
             max_bytes,
         } = &self.command
         {
-            let mut args = json!({"fix": fix, "includeHeld": include_held});
+            let backing_up = *fix && !no_backup;
+            // An older `rojo serve` ignores the request to back up and fixes
+            // anyway, so the fix is only asked for once the server says it
+            // backs up first.
+            if backing_up {
+                let sessions = request(&client, &address, token.trim(), None)?;
+                check_verify_backup_support(&sessions)?;
+            }
+            let mut args = json!({"fix": fix, "includeHeld": include_held, "backup": !no_backup});
             if *all {
                 args["listLimit"] = json!(crate::web::verify::MAX_LISTED);
             } else if let Some(limit) = limit {
@@ -350,6 +399,9 @@ impl StudioCommand {
                 );
             }
             let report = &response["value"];
+            if backing_up {
+                check_fix_backed_up(report)?;
+            }
             if !self.json {
                 eprint!("{}", describe_verify(report));
             }
@@ -360,8 +412,8 @@ impl StudioCommand {
                 Err(super::ExitStatus(1).into())
             };
         }
-        if let StudioSubcommand::Backup { command } = &self.command {
-            let store = backup::Store::open()?;
+        if let StudioSubcommand::Backup { command, project } = &self.command {
+            let store = open_store(project.as_deref())?;
             match command {
                 BackupCommand::Create {
                     target,
@@ -418,6 +470,8 @@ impl StudioCommand {
                             created_at: backup::now_millis(),
                             bytes: 0,
                             note: note.clone(),
+                            automatic: false,
+                            roots: Vec::new(),
                         },
                         &model,
                     )?;
@@ -613,6 +667,41 @@ impl StudioCommand {
     }
 }
 
+/// The backup store of `--project`, or of the current directory.
+fn open_store(project: Option<&Path>) -> anyhow::Result<backup::Store> {
+    match project {
+        Some(project) => backup::Store::for_project(project),
+        None => backup::Store::open(),
+    }
+}
+
+/// Fails unless the `rojo serve` that answered with `sessions` backs up the
+/// scripts `verify --fix` overwrites.
+fn check_verify_backup_support(sessions: &Value) -> anyhow::Result<()> {
+    let supported = sessions["capabilities"]
+        .as_array()
+        .is_some_and(|capabilities| {
+            capabilities.contains(&json!(crate::web::studio::VERIFY_BACKUP_CAPABILITY))
+        });
+    anyhow::ensure!(
+        supported,
+        "This rojo serve is too old to back up the scripts verify --fix overwrites, so nothing was \
+         changed. Update Rojo and restart rojo serve, or pass --no-backup to fix without a backup."
+    );
+    Ok(())
+}
+
+/// Fails when a fix that was asked to back up reports no backups, as a
+/// server that ignored the request would.
+fn check_fix_backed_up(report: &Value) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !report["fixed"].is_object() || report["backups"].is_array(),
+        "rojo serve fixed scripts without saying it backed them up first. \
+         Update Rojo and restart rojo serve."
+    );
+    Ok(())
+}
+
 /// Whether `verify` found Studio matching the files, or, with `--fix`,
 /// managed to make it match. Held wipes that were left alone still count as
 /// differences, because Studio keeps code the files no longer have.
@@ -684,6 +773,17 @@ fn describe_verify(report: &Value) -> String {
         );
     }
     let fixed = &report["fixed"];
+    for backup in report["backups"].as_array().into_iter().flatten() {
+        let id = escape_controls(backup["id"].as_str().unwrap_or("?"));
+        let _ = writeln!(
+            out,
+            "Saved the Studio copies of the scripts it overwrites as backup {id}; \
+             `rojo studio backup restore {id} --parent <instance> --allow-scripts` puts them back."
+        );
+        if let Some(dir) = backup["storeDir"].as_str() {
+            let _ = writeln!(out, "  (in {})", escape_controls(dir));
+        }
+    }
     if fixed.is_object() {
         let _ = writeln!(
             out,
@@ -1207,7 +1307,7 @@ fn read_model(path: &Path, allow_scripts: bool) -> anyhow::Result<Vec<u8>> {
     let bytes = fs::read(path)?;
     // The same isolated check the server runs, so a model that crashes the
     // decoder is reported as invalid instead of ending this command.
-    model_check::check_untrusted_model(bytes, allow_scripts, true, IMPORT_CHECK_LIMIT)
+    model_check::validate_for_restore(bytes, allow_scripts, IMPORT_CHECK_LIMIT)
 }
 
 #[cfg(test)]
@@ -1223,7 +1323,8 @@ mod tests {
             options.subcommand,
             Subcommand::CheckUntrustedModel(CheckUntrustedModelCommand {
                 encode: true,
-                allow_scripts: false
+                allow_scripts: false,
+                report_sources: false,
             })
         ));
     }
@@ -1462,6 +1563,244 @@ mod tests {
             {"path":format!("game/A{esc}[31m"),"file":"src/A.luau","held":false}]});
         let text = describe_verify(&report);
         assert!(!text.contains(esc), "{text:?}");
+    }
+
+    #[test]
+    fn backup_commands_take_a_project_before_or_after_the_subcommand() {
+        use crate::cli::{Options, Subcommand};
+        for args in [
+            vec![
+                "rojo",
+                "studio",
+                "backup",
+                "--project",
+                "game",
+                "list",
+                "--no-roots",
+            ],
+            vec![
+                "rojo",
+                "studio",
+                "backup",
+                "list",
+                "--project",
+                "game",
+                "--no-roots",
+            ],
+        ] {
+            let options = Options::try_parse_from(args).unwrap();
+            let Subcommand::Studio(studio) = options.subcommand else {
+                panic!("expected a studio command");
+            };
+            let StudioSubcommand::Backup { project, command } = studio.command else {
+                panic!("expected a backup command");
+            };
+            assert_eq!(project.as_deref(), Some(Path::new("game")));
+            assert!(matches!(
+                command,
+                BackupCommand::List { no_roots: true, .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn a_fix_with_backups_is_never_asked_of_a_server_that_cannot_back_up() {
+        use std::io::{BufRead, BufReader};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        // An older rojo serve: its sessions list has no capabilities, and it
+        // would fix any verify it is sent.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let posts = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&posts);
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                let mut length = 0;
+                loop {
+                    let mut header = String::new();
+                    reader.read_line(&mut header).unwrap();
+                    if header.trim().is_empty() {
+                        break;
+                    }
+                    if let Some(value) = header.to_ascii_lowercase().strip_prefix("content-length:")
+                    {
+                        length = value.trim().parse().unwrap();
+                    }
+                }
+                let mut body = vec![0; length];
+                reader.read_exact(&mut body).unwrap();
+                let answer = if line.starts_with("POST") {
+                    counted.fetch_add(1, Ordering::SeqCst);
+                    json!({"result":{"ok":true,"value":{"inSync":true,"fixed":{"updated":1}}}})
+                } else {
+                    json!({"protocolVersion":1,"sessions":[]})
+                };
+                let body = answer.to_string();
+                let mut stream = stream;
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+            }
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let token = dir.path().join("token");
+        fs::write(&token, "0123456789abcdef0123456789abcdef").unwrap();
+        let run = |extra: &[&str]| {
+            let address = format!("http://127.0.0.1:{port}");
+            let mut args = vec![
+                "rojo".to_owned(),
+                "studio".to_owned(),
+                "--address".to_owned(),
+                address,
+                "--token-file".to_owned(),
+                token.to_string_lossy().into_owned(),
+                "--json".to_owned(),
+                "verify".to_owned(),
+                "--session".to_owned(),
+                "00000000-0000-4000-8000-000000000000".to_owned(),
+                "--fix".to_owned(),
+            ];
+            args.extend(extra.iter().map(|arg| (*arg).to_owned()));
+            let options = crate::cli::Options::try_parse_from(args).unwrap();
+            let crate::cli::Subcommand::Studio(studio) = options.subcommand else {
+                panic!("expected a studio command");
+            };
+            studio.run()
+        };
+        let error = run(&[]).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("too old to back up"),
+            "{error:#}"
+        );
+        assert_eq!(posts.load(Ordering::SeqCst), 0, "no fix was asked for");
+        // Told not to back up, it fixes as before.
+        assert!(run(&["--no-backup"]).is_ok());
+        assert_eq!(posts.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn a_fix_reported_without_backups_is_an_error() {
+        assert!(check_verify_backup_support(&json!({"protocolVersion":1,"sessions":[]})).is_err());
+        assert!(check_verify_backup_support(&json!({"capabilities":["verifyBackup"]})).is_ok());
+        // A server that ignored the request fixes and reports no backups.
+        assert!(check_fix_backed_up(&json!({"fixed":{"updated":1}})).is_err());
+        assert!(check_fix_backed_up(&json!({"fixed":{"updated":1},"backups":[]})).is_ok());
+        // Without a fix, there is nothing to back up.
+        assert!(check_fix_backed_up(&json!({"inSync":true})).is_ok());
+    }
+
+    #[test]
+    fn verify_fix_backs_up_unless_told_not_to() {
+        use crate::cli::{Options, Subcommand};
+        let session = "00000000-0000-4000-8000-000000000000";
+        let parse = |extra: &[&str]| {
+            let mut args = vec!["rojo", "studio", "verify", "--session", session];
+            args.extend_from_slice(extra);
+            Options::try_parse_from(args).map(|options| match options.subcommand {
+                Subcommand::Studio(studio) => studio.command,
+                _ => panic!("expected a studio command"),
+            })
+        };
+        assert!(matches!(
+            parse(&["--fix"]).unwrap(),
+            StudioSubcommand::Verify {
+                no_backup: false,
+                ..
+            }
+        ));
+        assert!(matches!(
+            parse(&["--fix", "--no-backup"]).unwrap(),
+            StudioSubcommand::Verify {
+                no_backup: true,
+                ..
+            }
+        ));
+        // Without --fix nothing is overwritten, so there is nothing to opt out of.
+        assert!(parse(&["--no-backup"]).is_err());
+
+        let report = json!({"checked":1,"matching":0,"differentCount":1,"different":[],
+            "backups":[{"id":"20261107-000000-auto-verify-fix"}],
+            "fixed":{"attempted":1,"updated":1,"failed":0,"skippedChanged":0,"skippedHeld":0,"errors":[]}});
+        let text = describe_verify(&report);
+        assert!(
+            text.contains("backup 20261107-000000-auto-verify-fix")
+                && text.contains("rojo studio backup restore 20261107-000000-auto-verify-fix"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn restoring_an_automatic_backup_gives_back_each_script() {
+        use rbx_dom_weak::{InstanceBuilder, WeakDom};
+        let dir = tempfile::tempdir().unwrap();
+        let store = backup::Store::in_dir(dir.path());
+        // As verify --fix saves them: one copy per script, of mixed classes,
+        // two of them named alike, each with its own text.
+        let scripts = [
+            ("Script", "Main", "print('server')\n"),
+            ("LocalScript", "Main", "print('client')\n"),
+            ("ModuleScript", "Same", "return 1\n"),
+            ("ModuleScript", "Same", "return 2\n"),
+        ];
+        let mut dom = WeakDom::new(InstanceBuilder::new("DataModel"));
+        let root = dom.root_ref();
+        let refs: Vec<_> = scripts
+            .iter()
+            .map(|(class, name, source)| {
+                dom.insert(
+                    root,
+                    InstanceBuilder::new(*class)
+                        .with_name(*name)
+                        .with_property("Source", *source),
+                )
+            })
+            .collect();
+        let mut model = Vec::new();
+        rbx_binary::to_writer(&mut model, &dom, &refs).unwrap();
+        let contents: Vec<(String, String)> = scripts
+            .iter()
+            .enumerate()
+            .map(|(index, (class, name, _))| {
+                (
+                    format!("game/ServerScriptService/{index}/{name}"),
+                    class.to_string(),
+                )
+            })
+            .collect();
+        let saved = store
+            .save_automatic(
+                backup::automatic_record(
+                    "auto-verify-fix",
+                    "auto: before verify --fix",
+                    &contents,
+                    None,
+                    None,
+                ),
+                &model,
+            )
+            .unwrap();
+        // What `backup restore` sends to Studio.
+        let (_, path) = store.get(&saved.id).unwrap();
+        let restored = read_model(&path, true).unwrap();
+        let restored = rbx_binary::from_reader(restored.as_slice()).unwrap();
+        let roots = restored.root().children();
+        assert_eq!(roots.len(), scripts.len());
+        for (root, (class, name, source)) in roots.iter().zip(scripts) {
+            let instance = restored.get_by_ref(*root).unwrap();
+            assert_eq!(instance.class.as_str(), class);
+            assert_eq!(instance.name, name);
+            assert_eq!(
+                instance.properties.get(&rbx_dom_weak::ustr("Source")),
+                Some(&rbx_dom_weak::types::Variant::String(source.to_owned()))
+            );
+        }
     }
 
     #[test]

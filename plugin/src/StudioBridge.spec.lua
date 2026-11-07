@@ -1314,6 +1314,30 @@ return function()
 			expect(pcall(bridge.execute, bridge, command("resync", { patch = { updated = {} } }))).to.equal(false)
 		end)
 
+		it("exports scripts for verify --fix's backup through the sync session", function()
+			local asked
+			bridge.sync = {
+				getSummary = function()
+					return {}
+				end,
+				exportForBackup = function(ids, hashes, verifyId)
+					asked = ids
+					expect(hashes.A).to.equal(7)
+					expect(verifyId).to.equal("VERIFY")
+					return { instances = { { path = "game/A", className = "ModuleScript" } }, model = "AAAA" }
+				end,
+			}
+			expect(bridge:capabilities().backup.available).to.equal(true)
+			local result = bridge:execute(
+				command("backup", { ids = { "A", "B" }, hashes = { A = 7, B = 8 }, verifyId = "VERIFY" })
+			)
+			expect(result.model).to.equal("AAAA")
+			expect(#asked).to.equal(2)
+			bridge.sync = nil
+			expect(bridge:capabilities().backup.available).to.equal(false)
+			expect(pcall(bridge.execute, bridge, command("backup", { ids = {} }))).to.equal(false)
+		end)
+
 		it("sends no summary when the sync session cannot give one", function()
 			bridge.sync = {
 				getSummary = function()

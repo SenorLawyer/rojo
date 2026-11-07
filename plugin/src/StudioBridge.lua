@@ -267,10 +267,17 @@ function StudioBridge.pathOf(instance)
 	return table.concat(escaped, "/"), segments
 end
 
+-- Native model bytes as base64, which JSON can carry.
+function StudioBridge.encodeModel(model)
+	assert(EncodingService, "This Studio has no EncodingService, so it cannot send models")
+	return buffer.tostring(EncodingService:Base64Encode(model))
+end
+
 -- `sync`, when given, connects the bridge to the sync session it runs beside:
 -- `getSummary()` for the health summary sent with every poll,
--- `getSourceHashes()` for `rojo studio verify` and `applyResync(patch)` for
--- `rojo studio verify --fix`.
+-- `getSourceHashes()` for `rojo studio verify`, `exportForBackup(ids,
+-- hashes, verifyId)` for the backup `rojo studio verify --fix` takes first
+-- and `applyResync(patch)` for the fix itself.
 function StudioBridge.new(apiContext, pairing, onFailure, sync)
 	assert(
 		pairing.protocolVersion == 1 and type(pairing.pluginToken) == "string" and type(pairing.identity) == "table",
@@ -451,6 +458,10 @@ function StudioBridge:capabilities()
 		resync = {
 			available = self.sync ~= nil,
 			reason = "Sets the source of scripts that rojo studio verify --fix found different from their files",
+		},
+		backup = {
+			available = self.sync ~= nil and self.sync.exportForBackup ~= nil,
+			reason = "Exports the scripts rojo studio verify --fix is about to overwrite, which the server saves as a backup",
 		},
 	}
 end
@@ -879,6 +890,13 @@ function StudioBridge:execute(command)
 			isActive,
 			args.verifyId
 		)
+	elseif command.action == "backup" then
+		-- Only `verify --fix` sends this, with the IDs of the scripts it is
+		-- about to overwrite; the server saves what comes back.
+		assert(self.sync and self.sync.exportForBackup, "This bridge is not attached to a sync session")
+		local exported = self.sync.exportForBackup(args.ids, args.hashes, args.verifyId)
+		self:ensureActive(command)
+		return exported
 	elseif command.action == "selection" then
 		local result = {}
 		for index, instance in Selection:Get() do
@@ -997,7 +1015,7 @@ function StudioBridge:execute(command)
 		assert(buffer.len(model) <= MAX_MODEL_BYTES, "Export exceeds 5MiB")
 		return {
 			instance = self:describe(instance),
-			model = buffer.tostring(EncodingService:Base64Encode(model)),
+			model = StudioBridge.encodeModel(model),
 			bytes = buffer.len(model),
 			format = "rbxm",
 		}

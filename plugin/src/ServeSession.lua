@@ -21,6 +21,7 @@ local strict = require(script.Parent.strict)
 local Settings = require(script.Parent.Settings)
 local orderSwaps = require(script.Parent.orderSwaps)
 local StudioBridge = require(script.Parent.StudioBridge)
+local StudioBackup = require(script.Parent.StudioBackup)
 local hashSource = require(script.Parent.hashSource)
 local Config = require(script.Parent.Config)
 local Version = require(script.Parent.Version)
@@ -113,6 +114,25 @@ local ServeSession = {}
 ServeSession.__index = ServeSession
 
 ServeSession.Status = Status
+
+-- The text a script's editor holds, which is its `Source` unless it has
+-- unsaved changes, or nil when Studio cannot say. Unlike readSource it never
+-- falls back to `Source`, so a backup can tell that it may miss unsaved text.
+-- Replaced by tests.
+function ServeSession.readEditorText(instance): string?
+	local ok, source = pcall(function()
+		return ScriptEditorService:GetEditorSource(instance)
+	end)
+	if ok and type(source) == "string" then
+		return source
+	end
+	return nil
+end
+
+-- Writes a script's source through its editor. Replaced by tests.
+function ServeSession.updateSourceAsync(instance, callback)
+	return ScriptEditorService:UpdateSourceAsync(instance, callback)
+end
 
 local validateServeOptions = t.strictInterface({
 	apiContext = t.table,
@@ -342,6 +362,9 @@ function ServeSession:restartStudioBridge()
 		end,
 		applyResync = function(patch, expect, includeHeld, expiresAt, isActive, verifyId)
 			return self:applyResync(patch, expect, includeHeld, expiresAt, isActive, verifyId)
+		end,
+		exportForBackup = function(ids, hashes, verifyId)
+			return self:exportForBackup(ids, hashes, verifyId)
 		end,
 	})
 	self.__studioBridge = bridge
@@ -663,6 +686,63 @@ function ServeSession:getSourceHashes(verifyId, expiresAt, isActive)
 end
 
 --[=[
+	Exports the scripts with the given IDs as they are in Studio, each copied
+	without its children and with the text its open editor shows, for the
+	backup `rojo studio verify --fix` saves before it overwrites them.
+	`hashes` maps each ID to the hash verify saw, and `verifyId` names the
+	verify whose exact sources the fix compares with. A script whose editor
+	text cannot be read, or is not exactly what that verify saw, is left out:
+	a backup of a later edit could be all that is left once the fix writes.
+	`ids` in the result lists the scripts exported, and the server only fixes
+	those. Scripts left out, or no longer in the place, count in `missing`.
+]=]
+function ServeSession:exportForBackup(ids, hashes, verifyId)
+	assert(self.__status == Status.Connected, "Rojo is not syncing this place. Connect it first.")
+	assert(type(ids) == "table" and #ids <= StudioBackup.MAX_INSTANCES, "Back up at most 10,000 scripts at once")
+	assert(type(hashes) == "table", "A backup for verify --fix needs the hash verify saw for each script")
+	-- The exact sources this verify saw, which the fix compares with before
+	-- writing. A matching hash alone is not enough: two sources can share
+	-- one, and the backup must hold the very text the fix replaces.
+	local seen = self:__verifiedSourcesFor(verifyId) or {}
+	local entries = {}
+	local exported = {}
+	local missing = 0
+	for _, id in ids do
+		local instance = self.__instanceMap.fromIds[id]
+		-- From the editor only: a script whose editor text cannot be read is
+		-- left out rather than backed up from a `Source` that may be older.
+		local source = if instance and instance:IsA("LuaSourceContainer")
+			then ServeSession.readEditorText(instance)
+			else nil
+		-- A model holds text as UTF-8, so other bytes would not come back
+		-- as they are once restored.
+		if
+			source ~= nil
+			and utf8.len(source) ~= nil
+			and instance:IsDescendantOf(game)
+			and hashes[id] ~= nil
+			and (hashSource(source)) == hashes[id]
+			and source == seen[id]
+		then
+			table.insert(entries, { instance = instance, source = source })
+			table.insert(exported, id)
+		else
+			missing += 1
+		end
+	end
+	local result = { instances = {}, ids = {}, missing = missing, placeId = game.PlaceId, placeName = game.Name }
+	if #entries == 0 then
+		return result
+	end
+	local model, described = StudioBackup.serializeScripts(entries)
+	result.instances = described
+	result.ids = exported
+	result.model = StudioBridge.encodeModel(model)
+	result.bytes = buffer.len(model)
+	return result
+end
+
+--[=[
 	Applies the script updates that `rojo studio verify --fix` built from the
 	server's tree. `expect` maps each ID to the hash Studio had when verify
 	checked it (`from`) and the hash of the source being sent (`to`). An
@@ -814,7 +894,7 @@ function ServeSession:applyResync(patch, expect, includeHeld, expiresAt, isActiv
 			local done, wrote, abandoned = false, false, false
 			task.spawn(function()
 				wrote = pcall(function()
-					ScriptEditorService:UpdateSourceAsync(write.instance, function(current)
+					ServeSession.updateSourceAsync(write.instance, function(current)
 						-- Returning nil cancels the update. The callback can run
 						-- again when Studio retries, so each check is repeated.
 						if abandoned or self.__sourceGenerations[write.id] ~= generation then
@@ -851,9 +931,19 @@ function ServeSession:applyResync(patch, expect, includeHeld, expiresAt, isActiv
 			end)
 			-- Studio can keep a write waiting. The server stops waiting at the
 			-- deadline, so the write is abandoned then: its callback refuses to
-			-- commit if it runs later, and the undo recording is closed.
+			-- commit if it runs later, and the undo recording is closed. The
+			-- same goes when the fix is cancelled meanwhile: the server then
+			-- stops relying on this write, and its backup may not outlast it.
+			local lastAsked = os.clock()
 			while not done and not expired() do
 				task.wait(0.05)
+				if not done and isActive and os.clock() - lastAsked > 0.25 then
+					lastAsked = os.clock()
+					if not isActive() then
+						cancelled = true
+						break
+					end
+				end
 			end
 			if not done then
 				abandoned = true
