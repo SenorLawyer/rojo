@@ -1924,6 +1924,133 @@ return function()
 			expect(unapplied.updated[1].id).to.equal("LateRefs")
 		end)
 
+		it("checks many affected instances against the backup quickly", function()
+			local hashSource = require(script.Parent.hashSource)
+			local nativeRead = ServeSession.readEditorText
+			local folder = Instance.new("Folder")
+			folder.Name = "Siblings"
+			folder.Parent = fixture
+			local guarded = {}
+			local roots = {}
+			local patch = PatchSet.newEmpty()
+			for index = 1, 10_000 do
+				local module = Instance.new("ModuleScript")
+				module.Name = "Module" .. index
+				module.Parent = folder
+				guarded[module] = (hashSource(""))
+				table.insert(roots, module)
+				session.__instanceMap.fromIds["M" .. index] = module
+				table.insert(patch.updated, { id = "M" .. index, changedName = "Renamed" .. index })
+			end
+			ServeSession.readEditorText = function(instance)
+				return instance.Source
+			end
+			session.__catchUpGuarded = guarded
+			session.__catchUpRoots = roots
+			local started = os.clock()
+			session:__noteEditsBeforeApply(patch)
+			local elapsed = os.clock() - started
+			session.__catchUpGuarded = nil
+			session.__catchUpRoots = nil
+			session.__catchUpRootSet = nil
+			ServeSession.readEditorText = nativeRead
+			for index = 1, 10_000 do
+				session.__instanceMap.fromIds["M" .. index] = nil
+			end
+			expect(elapsed < 2).to.equal(true)
+			expect(session.__overwrittenEdits).to.equal(nil)
+		end)
+
+		it("names a fallback reference repair outside the backup, and still applies it", function()
+			local hashSource = require(script.Parent.hashSource)
+			local inside = backedUpModule("InsideBackup", "return 1")
+			local warnings = recordingWarnings(function()
+				session.__catchUpGuarded = { [inside] = (hashSource("return 1")) }
+				session.__catchUpRoots = { inside }
+				-- An ObjectValue elsewhere that the user pointed somewhere
+				-- else while the fallback waited.
+				local outside = Instance.new("ObjectValue")
+				outside.Name = "Pointer"
+				outside.Parent = fixture
+				session.__instanceMap:insert("POINTER", outside)
+				local applied
+				session.__reconciler = {
+					applyPatch = function(_, refPatch)
+						applied = refPatch
+						return PatchSet.newEmpty()
+					end,
+				}
+				api.serialize = function()
+					return Promise.resolve({ modelContents = buffer.create(0), missingIds = {} })
+				end
+				local refPatch = PatchSet.newEmpty()
+				table.insert(refPatch.updated, { id = "POINTER", changedProperties = { Value = { Ref = "X" } } })
+				api.refPatch = function()
+					return Promise.resolve({ patch = refPatch })
+				end
+				session.__deserializeInstances = function()
+					local container = Instance.new("Folder")
+					local pointer = Instance.new("ObjectValue")
+					pointer.Name = "InsideBackup"
+					local replacement = Instance.new("ModuleScript")
+					replacement.Source = "return 1"
+					pointer.Value = replacement
+					pointer.Parent = container
+					return { container }
+				end
+				local ok = session:__replaceInstances({ "InsideBackup" })
+				session.__catchUpGuarded = nil
+				session.__catchUpRoots = nil
+				session.__catchUpRootSet = nil
+				expect(ok).to.equal(true)
+				expect(#applied.updated).to.equal(1)
+				task.wait(0.8)
+			end)
+			expect(#warnings).to.equal(1)
+			expect(warnings[1].args[1]:find("Pointer (Value)", 1, true)).to.be.ok()
+		end)
+
+		it("does not let a cancelled resync's pending write land", function()
+			local hashSource = require(script.Parent.hashSource)
+			local nativeUpdate = ServeSession.updateSourceAsync
+			local module = backedUpModule("Resynced", "return 'studio'")
+			session:__rememberVerified("VERIFY", { Resynced = "return 'studio'" }, {})
+			local committed = false
+			ServeSession.updateSourceAsync = function(instance, callback)
+				-- Studio keeps the write waiting.
+				task.wait(0.6)
+				local result = callback(instance.Source)
+				if result ~= nil then
+					instance.Source = result
+					committed = true
+				end
+			end
+			local active = true
+			task.delay(0.1, function()
+				active = false
+			end)
+			local patch = PatchSet.newEmpty()
+			table.insert(patch.updated, {
+				id = "Resynced",
+				changedProperties = { Source = { String = "return 'disk'" } },
+			})
+			local result = session:applyResync(
+				patch,
+				{ Resynced = { from = (hashSource("return 'studio'")) } },
+				false,
+				DateTime.now().UnixTimestampMillis + 10_000,
+				function()
+					return active
+				end,
+				"VERIFY"
+			)
+			task.wait(0.8)
+			ServeSession.updateSourceAsync = nativeUpdate
+			expect(committed).to.equal(false)
+			expect(module.Source).to.equal("return 'studio'")
+			expect(result.updated).to.equal(0)
+		end)
+
 		it("takes no backup when it is turned off", function()
 			Settings:set("autoBackupBeforeSync", false)
 			local removed = Instance.new("Folder")

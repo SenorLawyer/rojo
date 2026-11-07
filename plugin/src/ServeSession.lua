@@ -126,6 +126,11 @@ ServeSession.Status = Status
 -- Seconds, for the catch-up write deadline. Replaced by tests.
 ServeSession.clock = os.clock
 
+-- Writes a script's source through its editor. Replaced by tests.
+function ServeSession.updateSourceAsync(instance, callback)
+	return ScriptEditorService:UpdateSourceAsync(instance, callback)
+end
+
 -- The text a script's editor holds, which is its `Source` unless it has
 -- unsaved changes, or nil when Studio cannot say. Unlike readSource it never
 -- falls back to `Source`, so a backup can tell that it may miss unsaved text.
@@ -1013,7 +1018,7 @@ function ServeSession:applyResync(patch, expect, includeHeld, expiresAt, isActiv
 			local done, wrote, abandoned = false, false, false
 			task.spawn(function()
 				wrote = pcall(function()
-					ScriptEditorService:UpdateSourceAsync(write.instance, function(current)
+					ServeSession.updateSourceAsync(write.instance, function(current)
 						-- Returning nil cancels the update. The callback can run
 						-- again when Studio retries, so each check is repeated.
 						if abandoned or self.__sourceGenerations[write.id] ~= generation then
@@ -1050,9 +1055,19 @@ function ServeSession:applyResync(patch, expect, includeHeld, expiresAt, isActiv
 			end)
 			-- Studio can keep a write waiting. The server stops waiting at the
 			-- deadline, so the write is abandoned then: its callback refuses to
-			-- commit if it runs later, and the undo recording is closed.
+			-- commit if it runs later, and the undo recording is closed. The
+			-- same goes when the fix is cancelled meanwhile: the server then
+			-- stops relying on this write, and its backup may not outlast it.
+			local lastAsked = os.clock()
 			while not done and not expired() do
 				task.wait(0.05)
+				if not done and isActive and os.clock() - lastAsked > 0.25 then
+					lastAsked = os.clock()
+					if not isActive() then
+						cancelled = true
+						break
+					end
+				end
 			end
 			if not done then
 				abandoned = true
@@ -1587,6 +1602,8 @@ function ServeSession:__replaceInstances(idList)
 	-- not happen, whose reference repairs are not applied either.
 	local skipped = {}
 	local notSwapped = {}
+	-- The instance each swap replaced, by ID.
+	local swappedFrom = {}
 	for _, swap in orderSwaps(swaps) do
 		local id, replacement, oldInstance = swap.id, swap.replacement, swap.oldInstance
 
@@ -1641,6 +1658,7 @@ function ServeSession:__replaceInstances(idList)
 		end
 
 		self.__instanceMap:insert(id, replacement)
+		swappedFrom[id] = oldInstance
 		Log.trace("Swapping Instance {} out via api/models/ endpoint", id)
 		local oldParent = oldInstance.Parent
 		for _, child in oldInstance:GetChildren() do
@@ -1706,6 +1724,32 @@ function ServeSession:__replaceInstances(idList)
 			table.insert(excluded, update)
 		else
 			table.insert(applicable.updated, update)
+		end
+	end
+
+	-- During the sync after connecting, a repair changes an instance's
+	-- references after the fallback waited, which the backup only holds for
+	-- instances inside it. Repairs elsewhere still apply, as syncing does,
+	-- and are named.
+	if self.__catchUpGuarded ~= nil then
+		for _, update in applicable.updated do
+			local target = self.__instanceMap.fromIds[update.id]
+			local replaced = swappedFrom[update.id]
+			if
+				target
+				and not self:__inCatchUpBackup(target)
+				and not (replaced and self:__inCatchUpBackup(replaced))
+			then
+				local properties = {}
+				for name in update.changedProperties or {} do
+					table.insert(properties, name)
+				end
+				table.sort(properties)
+				local ok, path = pcall(target.GetFullName, target)
+				if ok then
+					self:__noteOverwrittenEdit(path .. " (" .. table.concat(properties, ", ") .. ")")
+				end
+			end
 		end
 	end
 
@@ -1862,19 +1906,39 @@ end
 -- text is now an edit made since, for the warning that such edits were
 -- overwritten. Reading editor text does not yield, so nothing can change
 -- between this and the changes that follow it.
+-- Whether `instance` is one of the roots the reconnect backup serialized,
+-- or inside one, found by walking up from it, so checking many instances
+-- costs their depth rather than the number of roots.
+function ServeSession:__inCatchUpBackup(instance)
+	local roots = self.__catchUpRootSet
+	if roots == nil then
+		roots = {}
+		for _, root in self.__catchUpRoots or {} do
+			roots[root] = true
+		end
+		self.__catchUpRootSet = roots
+	end
+	local ok, inside = pcall(function()
+		local node = instance
+		while node do
+			if roots[node] then
+				return true
+			end
+			node = node.Parent
+		end
+		return false
+	end)
+	return ok and inside
+end
+
 function ServeSession:__noteEditsBeforeApply(patch)
 	local guarded = self.__catchUpGuarded
 	if guarded == nil then
 		return
 	end
-	local roots = self.__catchUpRoots or {}
+	self.__catchUpRootSet = nil
 	local function inBackup(instance)
-		for _, root in roots do
-			if instance == root or instance:IsDescendantOf(root) then
-				return true
-			end
-		end
-		return false
+		return self:__inCatchUpBackup(instance)
 	end
 	-- What the patch removes, with everything inside it, and what it
 	-- changes or replaces. Only these lose anything; the rest is untouched.
@@ -1940,11 +2004,13 @@ local MAX_OVERWRITTEN_NAMED = 10
 
 function ServeSession:__noteOverwrittenEdit(path)
 	self.__overwrittenEdits = self.__overwrittenEdits or {}
+	self.__overwrittenNoted = self.__overwrittenNoted or {}
 	-- A script checked before applying and again as its write lands is
 	-- named once.
-	if table.find(self.__overwrittenEdits, path) then
+	if self.__overwrittenNoted[path] then
 		return
 	end
+	self.__overwrittenNoted[path] = true
 	table.insert(self.__overwrittenEdits, path)
 	if self.__overwrittenWarning then
 		return
@@ -1952,6 +2018,7 @@ function ServeSession:__noteOverwrittenEdit(path)
 	self.__overwrittenWarning = task.delay(0.5, function()
 		local paths = self.__overwrittenEdits
 		self.__overwrittenEdits = nil
+		self.__overwrittenNoted = nil
 		self.__overwrittenWarning = nil
 		local shown = {}
 		for index = 1, math.min(#paths, MAX_OVERWRITTEN_NAMED) do
@@ -2300,6 +2367,7 @@ function ServeSession:__initialSync(serverInfo)
 				self.__catchUpWriteDeadline = self.__backupSavedAt + CATCH_UP_WRITE_WINDOW
 				self.__catchUpGuarded = guarded
 				self.__catchUpRoots = backedUpRoots
+				self.__catchUpRootSet = nil
 			end
 			self.__catchUpExpired = false
 			self:__applyPatch(catchUpPatch)
@@ -2307,6 +2375,7 @@ function ServeSession:__initialSync(serverInfo)
 			self.__catchUpWriteDeadline = nil
 			self.__catchUpGuarded = nil
 			self.__catchUpRoots = nil
+			self.__catchUpRootSet = nil
 			self.__catchUpExpired = false
 			-- Forgets Rojo's written hashes once the writes are done too.
 			self.__catchUpPendingWrites += 1

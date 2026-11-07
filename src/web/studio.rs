@@ -1393,14 +1393,14 @@ impl StudioBridge {
             // backup nothing is changed, unless the caller opted out.
             let backing_up = args.get("backup") != Some(&json!(false)) && !fixes.is_empty();
             // Holds the pins on this verify's backups until it returns.
-            let mut _pins = None;
+            let mut fix_pins = None;
             let (backups, backed_up) = if backing_up {
                 match self
                     .back_up_fixes(session_id, &id, &fixes, started, &verify_id)
                     .await
                 {
                     Ok(done) => {
-                        _pins = Some(done.pins);
+                        fix_pins = Some(done.pins);
                         (done.summaries, done.scripts)
                     }
                     Err(error) => {
@@ -1510,6 +1510,13 @@ impl StudioBridge {
             if not_backed_up_listed.len() < not_backed_up.len() {
                 report["truncated"] = json!(true);
             }
+            // Every write Studio was sent is done, so nothing can still land
+            // on a script after its backup's pin goes.
+            if errors.is_empty() && failed == 0 && remaining == 0 {
+                if let Some(pins) = fix_pins.as_mut() {
+                    pins.release = true;
+                }
+            }
             report["fixed"] = json!({
                 "attempted": fixes.len(),
                 "updated": updated,
@@ -1546,6 +1553,7 @@ impl StudioBridge {
             dir: self.backup_dir.get().cloned(),
             root: self.serve.root_dir().to_owned(),
             ids: Vec::new(),
+            release: false,
         };
         let mut summaries = Vec::new();
         let mut groups: Vec<(String, Vec<String>)> = Vec::new();
@@ -2066,17 +2074,21 @@ struct FixBackups {
     pins: BackupPins,
 }
 
-/// Unpins the backups of a `verify --fix` when dropped, however the verify
-/// ends. A pin left by a crash expires after [`BACKUP_PIN`].
+/// The pins on a `verify --fix`'s backups. They are released when dropped
+/// only after a clean fix, one where Studio reported every write done. A fix
+/// that failed, stopped or was cancelled may still have writes pending in
+/// Studio, so its pins stay until they expire after [`BACKUP_PIN`], as they
+/// do when the server crashes.
 struct BackupPins {
     dir: Option<PathBuf>,
     root: PathBuf,
     ids: Vec<String>,
+    release: bool,
 }
 
 impl Drop for BackupPins {
     fn drop(&mut self) {
-        if self.ids.is_empty() {
+        if self.ids.is_empty() || !self.release {
             return;
         }
         let unpinned = StudioBridge::backup_store(self.dir.clone(), &self.root)
@@ -3617,6 +3629,45 @@ mod tests {
             assert_eq!(server.dir(), by_file.dir());
         }
         assert!(backup::Store::for_project(Path::new("/does/not/exist")).is_err());
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_fix_keeps_its_backups_pinned() {
+        let (dir, bridge, session, script, verify) = fix_past_sources(json!({"fix":true})).await;
+        let backup = next_command(&bridge, &session).await;
+        answer_backup(&bridge, &session, &backup, &[&script.id]).await;
+        let resync = next_command(&bridge, &session).await;
+        assert_eq!(resync["action"], "resync");
+        // Studio has the batch, and the caller gives up: the request is
+        // dropped while the batch may still be writing.
+        verify.abort();
+        let _ = verify.await;
+        let backups = dir.path().join("backups");
+        let saved = backup::Store::in_dir(&backups).list().unwrap();
+        assert_eq!(saved.len(), 1);
+        assert!(
+            backups.join(format!("{}.pin", saved[0].id)).exists(),
+            "the pin stays until it expires"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_fix_studio_reports_failed_keeps_its_backups_pinned() {
+        let (dir, bridge, session, script, verify) = fix_past_sources(json!({"fix":true})).await;
+        let backup = next_command(&bridge, &session).await;
+        answer_backup(&bridge, &session, &backup, &[&script.id]).await;
+        let resync = next_command(&bridge, &session).await;
+        plugin(
+            &bridge,
+            "/api/studio/result",
+            json!({"requestId":resync["requestId"],"sessionId":session,"result":{"ok":true,"value":{"updated":0,"failed":1,"skipped":0}}}),
+        )
+        .await;
+        let (status, _) = into_value(verify.await.unwrap()).await;
+        assert_eq!(status, StatusCode::OK);
+        let backups = dir.path().join("backups");
+        let saved = backup::Store::in_dir(&backups).list().unwrap();
+        assert!(backups.join(format!("{}.pin", saved[0].id)).exists());
     }
 
     #[tokio::test]
