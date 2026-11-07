@@ -1442,6 +1442,36 @@ return function()
 			expect(warnings[1].args[2]).to.equal("game/ReplicatedStorage/__RojoSyncBackupSpec/BeingEdited")
 		end)
 
+		it("does not apply the patch when the session stops while checking for later edits", function()
+			Settings:set("autoBackupBeforeSync", true)
+			local StudioBackup = require(script.Parent.StudioBackup)
+			local nativeChanged = StudioBackup.changedSince
+			local nativeRead = ServeSession.readEditorText
+			ServeSession.readEditorText = function(instance)
+				return instance.Source
+			end
+			StudioBackup.changedSince = function()
+				-- The user disconnects while the scan yields.
+				session:stop()
+				return {}
+			end
+			StudioBridge.requestAsync = function()
+				return {
+					Success = true,
+					StatusCode = 200,
+					Body = HttpService:JSONEncode({ backup = { id = "20261107-000000-auto-sync" } }),
+				}
+			end
+			local removed = Instance.new("ModuleScript")
+			removed.Name = "StillHere"
+			removed.Parent = fixture
+			local events = syncRemoving(removed, { rootInstanceId = "ROOT", studioBridge = pairing })
+			StudioBackup.changedSince = nativeChanged
+			ServeSession.readEditorText = nativeRead
+			expect(#events).to.equal(0)
+			expect(removed.Parent).to.equal(fixture)
+		end)
+
 		it("takes no backup when it is turned off", function()
 			Settings:set("autoBackupBeforeSync", false)
 			local removed = Instance.new("Folder")

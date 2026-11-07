@@ -2021,11 +2021,16 @@ function ServeSession:__initialSync(serverInfo)
 			return self.__apiContext:write(inversePatch)
 		elseif userDecision == "Accept" then
 			local captured = self:__backUpBeforeCatchUp(catchUpPatch, serverInfo)
-			-- The backup can yield while the user disconnects.
+			-- The backup, and the check for edits made during it, both yield,
+			-- and the user may disconnect meanwhile. The patch holds the very
+			-- instances it removes, so a stopped session must not apply it.
 			if self.__status == Status.Disconnected then
 				return
 			end
 			self:__warnAboutEditsSinceBackup(captured)
+			if self.__status == Status.Disconnected then
+				return
+			end
 			self:__applyPatch(catchUpPatch)
 			return Promise.resolve()
 		else

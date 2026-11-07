@@ -243,6 +243,20 @@ function StudioBackup.serialize(roots, readEditor)
 	local captured = {}
 	local drafts
 	local counter = { n = 0 }
+	-- `scriptsWithin` counted saved sources, but an editor can hold far more
+	-- unsaved text, which the backup holds too as a draft. So what is read is
+	-- counted again here, against the same budget, before serializing.
+	local capturedBytes = 0
+	local function capture(bytes)
+		capturedBytes += bytes
+		assert(
+			capturedBytes <= StudioBackup.MAX_SOURCE_BYTES,
+			string.format(
+				"its scripts hold more than %d MiB of source and unsaved editor text, over what a backup reads",
+				StudioBackup.MAX_SOURCE_BYTES // (1024 * 1024)
+			)
+		)
+	end
 	local ok, result = pcall(function()
 		for _, root in roots do
 			table.insert(instances, root.instance)
@@ -260,8 +274,14 @@ function StudioBackup.serialize(roots, readEditor)
 				end)
 				if editor == nil or not read or type(saved) ~= "string" then
 					table.insert(unreadable, (StudioBridge.pathOf(script)))
+					if read and type(saved) == "string" then
+						capture(#saved)
+					end
 					continue
 				end
+				-- The saved source is in the model, and a different editor text
+				-- is a draft beside it, so both count.
+				capture(if editor == saved then #saved else #saved + #editor)
 				table.insert(captured, {
 					instance = script,
 					path = (StudioBridge.pathOf(script)),
@@ -289,6 +309,17 @@ function StudioBackup.serialize(roots, readEditor)
 			table.insert(instances, drafts)
 			table.insert(described, { path = StudioBackup.DRAFTS_FOLDER, className = "Folder" })
 		end
+		-- Reading yielded, and the roots may have grown meanwhile, so they are
+		-- counted again: a backup over the limit could never be restored.
+		local now = StudioBackup.countInstances(roots) + (if drafts then #drafts:GetChildren() + 1 else 0)
+		assert(
+			now <= StudioBackup.MAX_INSTANCES,
+			string.format(
+				"it would hold %d instances, over the %d a backup can restore",
+				now,
+				StudioBackup.MAX_INSTANCES
+			)
+		)
 		return serializeChecked(instances)
 	end)
 	if drafts then

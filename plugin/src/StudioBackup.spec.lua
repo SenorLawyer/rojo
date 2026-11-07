@@ -240,6 +240,28 @@ return function()
 			expect(fine).to.equal(true)
 		end)
 
+		it("counts unsaved editor text against the source budget before serializing", function()
+			local removed = make("Folder", "Removed", fixture)
+			make("ModuleScript", "Small", removed).Source = "x"
+			local previous = StudioBackup.MAX_SOURCE_BYTES
+			local nativeSerialize = StudioBackup.serializeInstances
+			local serialized = 0
+			StudioBackup.serializeInstances = function(instances)
+				serialized += 1
+				return nativeSerialize(instances)
+			end
+			StudioBackup.MAX_SOURCE_BYTES = 10
+			-- One saved byte, but 100 unsaved in the editor.
+			local ok, err = pcall(StudioBackup.serialize, { { instance = removed } }, function()
+				return string.rep("y", 100)
+			end)
+			StudioBackup.MAX_SOURCE_BYTES = previous
+			StudioBackup.serializeInstances = nativeSerialize
+			expect(ok).to.equal(false)
+			expect(tostring(err):find("unsaved editor text", 1, true)).to.be.ok()
+			expect(serialized).to.equal(0)
+		end)
+
 		it("keeps instance count, serialized size and source volume as separate limits", function()
 			local removed = make("Folder", "Removed", fixture)
 			make("ModuleScript", "Module", removed).Source = string.rep("x", 1000)

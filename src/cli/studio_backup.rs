@@ -506,8 +506,14 @@ impl Store {
                 return Err(error.context("Could not pin the backup"));
             }
         }
+        // A store that cannot be brought back within its limits, such as when
+        // Windows will not let an old model be deleted, must not keep growing,
+        // so the new backup is refused rather than saved over them.
         if let Err(error) = self.prune_locked(limits, now, Some(&record.id)) {
-            log::warn!("Could not remove old automatic backups: {error:#}");
+            let _ = self.remove_locked(&record.id);
+            return Err(error.context(
+                "The backup was not kept, because old automatic backups could not be removed to make room",
+            ));
         }
         Ok(record)
     }
@@ -578,16 +584,34 @@ impl Store {
         now: u64,
         saved: Option<&str>,
     ) -> anyhow::Result<Vec<String>> {
+        let mut removed = Vec::new();
+        let mut failures = Vec::new();
+        let mut count = 0;
+        let mut bytes: u64 = 0;
+        // What removals that failed part way left behind is removed again
+        // first. Until a leftover model goes, it still takes up its room.
+        for (id, model_bytes) in self.leftovers_locked()? {
+            match self.remove_locked(&id) {
+                Ok(()) => removed.push(id),
+                Err(error) => {
+                    failures.push(format!("{id}: {error:#}"));
+                    if let Some(len) = model_bytes {
+                        count += 1;
+                        bytes = bytes.saturating_add(len);
+                    }
+                }
+            }
+        }
         let (kept, others): (Vec<Record>, Vec<Record>) = self
             .list()?
             .into_iter()
             .filter(|record| record.automatic)
             .partition(|record| Some(record.id.as_str()) == saved || self.pinned(&record.id, now));
-        let mut count = kept.len();
-        let mut bytes = kept
+        count += kept.len();
+        bytes = kept
             .iter()
-            .fold(0u64, |total, record| total.saturating_add(record.bytes));
-        let removed: Vec<String> = others
+            .fold(bytes, |total, record| total.saturating_add(record.bytes));
+        let doomed: Vec<Record> = others
             .into_iter()
             .filter(|record| {
                 let old = record.created_at.saturating_add(limits.grace_millis) <= now;
@@ -600,12 +624,59 @@ impl Store {
                 }
                 !fits
             })
-            .map(|record| record.id)
             .collect();
-        for id in &removed {
-            self.remove_locked(id)?;
+        for record in doomed {
+            match self.remove_locked(&record.id) {
+                Ok(()) => removed.push(record.id),
+                Err(error) => failures.push(format!("{}: {error:#}", record.id)),
+            }
         }
+        anyhow::ensure!(
+            failures.is_empty(),
+            "Could not remove {} old automatic backups ({})",
+            failures.len(),
+            failures.join("; ")
+        );
         Ok(removed)
+    }
+
+    /// Parts of automatic backups that a failed removal left behind: records
+    /// whose model is gone, and models whose record is gone, with the size
+    /// of each model.
+    fn leftovers_locked(&self) -> anyhow::Result<Vec<(String, Option<u64>)>> {
+        let entries = match fs::read_dir(&self.dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error).context("Could not read the backup folder"),
+        };
+        let mut leftovers = Vec::new();
+        for entry in entries {
+            let path = entry?.path();
+            let Some(id) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            if !valid_id(id) {
+                continue;
+            }
+            match path.extension().and_then(|e| e.to_str()) {
+                Some("json") if !self.model_path(id).exists() => {
+                    let automatic = entry_len(&path).is_some_and(|len| len <= MAX_RECORD_BYTES)
+                        && fs::read(&path)
+                            .ok()
+                            .and_then(|bytes| serde_json::from_slice::<Record>(&bytes).ok())
+                            .is_some_and(|record| record.automatic);
+                    if automatic {
+                        leftovers.push((id.to_owned(), None));
+                    }
+                }
+                Some("rbxm") if !self.record_path(id).exists() && automatic_id(id) => {
+                    leftovers.push((id.to_owned(), entry_len(&path)));
+                }
+                _ => {}
+            }
+        }
+        leftovers.sort();
+        Ok(leftovers)
     }
 
     pub fn remove(&self, id: &str) -> anyhow::Result<()> {
@@ -614,25 +685,63 @@ impl Store {
     }
 
     fn remove_locked(&self, id: &str) -> anyhow::Result<()> {
-        if valid_id(id) && !self.record_path(id).exists() && self.model_path(id).is_file() {
-            fs::remove_file(self.model_path(id))?;
-            return Ok(());
-        }
         anyhow::ensure!(
-            valid_id(id) && self.record_path(id).exists() && self.model_path(id).is_file(),
+            valid_id(id) && (self.record_path(id).exists() || self.model_path(id).is_file()),
             "Unknown backup '{id}'. Run `rojo studio backup list` for backup IDs."
         );
-        let model = self.model_path(id);
-        // The record goes first, so a half-removed backup is not listed.
-        fs::remove_file(self.record_path(id))?;
-        fs::remove_file(model)?;
-        let _ = fs::remove_file(self.pin_path(id));
+        // The model goes first. If it cannot be deleted, the record stays, so
+        // the backup is still listed and counted and the next prune tries
+        // again. A record left without its model is not listed, and pruning
+        // removes it too.
+        remove_file(&self.model_path(id)).context("Could not delete the backup model")?;
+        remove_file(&self.record_path(id)).context("Could not delete the backup record")?;
+        let _ = remove_file(&self.pin_path(id));
         Ok(())
     }
 }
 
-/// Records with a root list can be large (up to 10,000 roots); `list`
-/// skips anything larger than this.
+/// Whether `id` names an automatic backup's files, `<time>-auto-sync-<8 hex>`
+/// or `<time>-auto-verify-fix-<8 hex>`, maybe with a `-<n>` suffix, so a
+/// model whose record is gone can still be told apart from a manual one.
+fn automatic_id(id: &str) -> bool {
+    // `YYYYMMDD-HHMMSS-` comes first.
+    let Some(rest) = id.get(16..) else {
+        return false;
+    };
+    ["auto-sync-", "auto-verify-fix-"].iter().any(|name| {
+        rest.strip_prefix(name).is_some_and(|tail| {
+            let (hex, suffix) = tail.split_at(tail.len().min(8));
+            hex.len() == 8
+                && hex.bytes().all(|b| b.is_ascii_hexdigit())
+                && (suffix.is_empty()
+                    || suffix
+                        .strip_prefix('-')
+                        .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())))
+        })
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Paths whose deletion fails, for tests of failed removals.
+    static FAILING_REMOVALS: std::cell::RefCell<Vec<PathBuf>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Deletes `path`, which may already be gone.
+fn remove_file(path: &Path) -> std::io::Result<()> {
+    #[cfg(test)]
+    if FAILING_REMOVALS.with(|failing| failing.borrow().iter().any(|failing| failing == path)) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "The process cannot access the file because it is being used by another process",
+        ));
+    }
+    match fs::remove_file(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        result => result,
+    }
+}
+
 const MAX_RECORD_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_NOTE_BYTES: usize = 4096;
 /// The note of an automatic backup is a short summary; `roots` has them all.
@@ -1133,6 +1242,109 @@ mod tests {
         assert_eq!(left.len(), 3);
         assert!(left.contains(&theirs));
         assert!(left.contains(&own[4]) && left.contains(&own[3]));
+    }
+
+    fn fail_removing(path: PathBuf) {
+        FAILING_REMOVALS.with(|failing| failing.borrow_mut().push(path));
+    }
+
+    fn stop_failing() {
+        FAILING_REMOVALS.with(|failing| failing.borrow_mut().clear());
+    }
+
+    #[test]
+    fn automatic_ids_are_told_apart_from_manual_ones() {
+        assert!(automatic_id("20261107-000000-auto-sync-0123abcd"));
+        assert!(automatic_id("20261107-000000-auto-verify-fix-0123abcd"));
+        assert!(automatic_id("20261107-000000-auto-sync-0123abcd-2"));
+        assert!(!automatic_id("20261107-000000-Map"));
+        assert!(!automatic_id("20261107-000000-auto-sync"));
+        assert!(!automatic_id("20261107-000000-auto-syncs-0123abcd"));
+    }
+
+    #[test]
+    fn a_model_that_cannot_be_deleted_keeps_its_record_and_refuses_the_next_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::in_dir(dir.path());
+        let now = now_millis();
+        let limits = PruneLimits {
+            keep: 1,
+            grace_millis: 0,
+            max_count: 100,
+            max_bytes: u64::MAX,
+        };
+        let old = fill(&store, "old", hours_ago(3));
+        fail_removing(store.model_path(&old));
+        let refused = store.save_automatic_with(record("new", now), b"new", None, &[], limits, now);
+        assert!(refused.is_err());
+        let left = automatic_ids(&store);
+        assert_eq!(
+            left,
+            vec![old.clone()],
+            "the new one was not kept, and the old one is still counted"
+        );
+        // Once the model can be deleted, the next save removes it.
+        stop_failing();
+        let saved = store
+            .save_automatic_with(record("new", now), b"new", None, &[], limits, now)
+            .unwrap();
+        assert_eq!(automatic_ids(&store), vec![saved.id]);
+        assert!(!store.model_path(&old).exists() && !store.record_path(&old).exists());
+    }
+
+    #[test]
+    fn leftovers_of_failed_removals_are_counted_and_removed_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::in_dir(dir.path());
+        let now = now_millis();
+        let limits = PruneLimits {
+            keep: 1,
+            grace_millis: AUTOMATIC_GRACE_MILLIS,
+            max_count: 100,
+            max_bytes: 64,
+        };
+        // An automatic model whose record is gone, and a record whose model
+        // is gone.
+        let orphan = "20261107-000000-auto-sync-0123abcd";
+        fs::write(store.model_path(orphan), [0u8; 100]).unwrap();
+        let mut stray = record("auto-verify-fix", 1);
+        stray.automatic = true;
+        let stray = store.save(stray, b"x").unwrap().id;
+        fs::remove_file(store.model_path(&stray)).unwrap();
+        // A manual model without a record is left alone.
+        let manual = "20261107-000000-Map";
+        fs::write(store.model_path(manual), b"manual").unwrap();
+
+        // While the orphan cannot be deleted, its 100 bytes still count, so a
+        // save that would go over 64 bytes is refused.
+        fail_removing(store.model_path(orphan));
+        assert!(store
+            .save_automatic_with(record("new", now), b"new", None, &[], limits, now)
+            .is_err());
+        assert!(!store.record_path(&stray).exists(), "the stray record went");
+        stop_failing();
+        store
+            .save_automatic_with(record("new", now), b"new", None, &[], limits, now)
+            .unwrap();
+        assert!(!store.model_path(orphan).exists());
+        assert!(store.model_path(manual).exists());
+    }
+
+    #[test]
+    fn a_record_left_without_its_model_can_still_be_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::in_dir(dir.path());
+        let saved = store.save(record("Map", 1), b"model").unwrap();
+        fail_removing(store.record_path(&saved.id));
+        assert!(store.remove(&saved.id).is_err());
+        stop_failing();
+        assert!(
+            !store.model_path(&saved.id).exists(),
+            "the model went first"
+        );
+        assert!(store.list().unwrap().is_empty());
+        store.remove(&saved.id).unwrap();
+        assert!(!store.record_path(&saved.id).exists());
     }
 
     #[test]
