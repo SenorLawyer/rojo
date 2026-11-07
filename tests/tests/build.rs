@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     fs,
     io::Read,
     path::Path,
@@ -9,6 +10,10 @@ use std::{
 };
 
 use insta::assert_snapshot;
+use rbx_dom_weak::{
+    types::{Attributes, Ref, Variant},
+    ustr, InstanceBuilder, WeakDom,
+};
 use tempfile::tempdir;
 
 use crate::rojo_test::io_util::{get_working_dir_path, KillOnDrop, BUILD_TESTS_PATH, ROJO_PATH};
@@ -308,4 +313,389 @@ fn watch_keeps_running_after_failed_initial_build() {
     wait_until("build after fix", || output_contains(&output, "FixedBuild"));
 
     watch.stop();
+}
+
+/// Builds the base place for the `into_place` tests: a map, a lighting tweak,
+/// extra ReplicatedStorage content, a `Shared` folder the project replaces
+/// and refs that cross between kept, paired and replaced instances.
+fn into_place_base() -> WeakDom {
+    let mut dom = WeakDom::new(InstanceBuilder::new("DataModel"));
+    let root = dom.root_ref();
+
+    let workspace = dom.insert(
+        root,
+        InstanceBuilder::new("Workspace")
+            .with_property("Gravity", 196.2f32)
+            .with_property("FallenPartsDestroyHeight", -1000.0f32),
+    );
+    let map = dom.insert(workspace, InstanceBuilder::new("Model").with_name("Map"));
+    dom.insert(map, InstanceBuilder::new("Part").with_name("Baseplate"));
+    dom.insert(
+        map,
+        InstanceBuilder::new("Part")
+            .with_name("Spawn")
+            .with_property("Attributes", Attributes::new().with("Rojo_Id", "BaseSpawn")),
+    );
+    let map_ref = dom.insert(
+        workspace,
+        InstanceBuilder::new("ObjectValue").with_name("MapRef"),
+    );
+    let config_ref = dom.insert(
+        workspace,
+        InstanceBuilder::new("ObjectValue").with_name("ConfigRef"),
+    );
+    let old_ref = dom.insert(
+        workspace,
+        InstanceBuilder::new("ObjectValue").with_name("OldRef"),
+    );
+
+    dom.insert(
+        root,
+        InstanceBuilder::new("Lighting").with_property("Brightness", 3.0f32),
+    );
+
+    let storage = dom.insert(root, InstanceBuilder::new("ReplicatedStorage"));
+    let shared = dom.insert(
+        storage,
+        InstanceBuilder::new("Folder")
+            .with_name("Shared")
+            .with_property("Attributes", Attributes::new().with("Owner", "map-team")),
+    );
+    let config = dom.insert(
+        shared,
+        InstanceBuilder::new("StringValue")
+            .with_name("Config")
+            .with_property("Value", "base value")
+            .with_property("Attributes", Attributes::new().with("Note", "from base")),
+    );
+    let old_module = dom.insert(
+        shared,
+        InstanceBuilder::new("ModuleScript")
+            .with_name("OldModule")
+            .with_property("Source", "return 'old'"),
+    );
+    let assets = dom.insert(
+        storage,
+        InstanceBuilder::new("Folder").with_name("BaseAssets"),
+    );
+    dom.insert(assets, InstanceBuilder::new("Model").with_name("Tree"));
+    dom.insert(storage, InstanceBuilder::new("Model").with_name("Remotes"));
+    let pointers = dom.insert(
+        storage,
+        InstanceBuilder::new("Folder").with_name("Pointers"),
+    );
+    dom.insert(
+        pointers,
+        InstanceBuilder::new("ObjectValue").with_name("ToShared"),
+    );
+    let base_pointer = dom.insert(
+        pointers,
+        InstanceBuilder::new("ObjectValue").with_name("BasePointer"),
+    );
+
+    let scripts = dom.insert(root, InstanceBuilder::new("ServerScriptService"));
+    dom.insert(
+        scripts,
+        InstanceBuilder::new("Script")
+            .with_name("LegacyScript")
+            .with_property("Source", "print('legacy')"),
+    );
+    dom.insert(
+        scripts,
+        InstanceBuilder::new("Script")
+            .with_name("Main")
+            .with_property("Source", "print('main from base')"),
+    );
+
+    for (holder, target) in [
+        (map_ref, map),
+        (config_ref, config),
+        (old_ref, old_module),
+        (base_pointer, map),
+    ] {
+        dom.get_by_ref_mut(holder)
+            .unwrap()
+            .properties
+            .insert(ustr("Value"), Variant::Ref(target));
+    }
+
+    dom
+}
+
+fn write_place(dom: &WeakDom, path: &Path) {
+    let file = fs::File::create(path).unwrap();
+    let children = dom.root().children();
+    if path.extension().unwrap() == "rbxl" {
+        rbx_binary::to_writer(file, dom, children).unwrap();
+    } else {
+        rbx_xml::to_writer_default(file, dom, children).unwrap();
+    }
+}
+
+fn read_place(path: &Path) -> WeakDom {
+    let file = fs::File::open(path).unwrap();
+    if path.extension().unwrap() == "rbxl" {
+        rbx_binary::from_reader(file).unwrap()
+    } else {
+        rbx_xml::from_reader_default(file).unwrap()
+    }
+}
+
+fn instance_path(dom: &WeakDom, id: Ref) -> String {
+    let mut names = Vec::new();
+    let mut current = id;
+    while current != dom.root_ref() {
+        let instance = dom.get_by_ref(current).unwrap();
+        names.push(instance.name.as_str());
+        current = instance.parent();
+    }
+    names.reverse();
+    names.join("/")
+}
+
+/// Describes the parts of a place the `into_place` tests check, in a form
+/// that is the same for binary and XML files: binary files carry every
+/// property of a class, so only the properties the tests are about are
+/// listed, and refs are shown as the path of their target.
+fn describe_place(dom: &WeakDom) -> String {
+    const SHOWN: &[&str] = &[
+        "Attributes",
+        "Brightness",
+        "FallenPartsDestroyHeight",
+        "Gravity",
+        "Source",
+        "Value",
+    ];
+
+    fn describe(dom: &WeakDom, id: Ref, depth: usize, out: &mut String) {
+        let instance = dom.get_by_ref(id).unwrap();
+        let indent = "  ".repeat(depth);
+        out.push_str(&format!("{indent}{} ({})\n", instance.name, instance.class));
+        let mut properties: Vec<_> = instance
+            .properties
+            .iter()
+            .filter(|(name, _)| SHOWN.contains(&name.as_str()))
+            .collect();
+        properties.sort_by_key(|(name, _)| name.as_str());
+        for (name, value) in properties {
+            let value = match value {
+                Variant::Ref(target) if target.is_none() => "nil".to_owned(),
+                Variant::Ref(target) if dom.get_by_ref(*target).is_none() => {
+                    "<dangling>".to_owned()
+                }
+                Variant::Ref(target) => format!("-> {}", instance_path(dom, *target)),
+                Variant::String(value) => format!("{value:?}"),
+                Variant::Float32(value) => value.to_string(),
+                Variant::Attributes(attributes) => {
+                    if attributes.is_empty() {
+                        continue;
+                    }
+                    let mut entries: Vec<_> = attributes
+                        .iter()
+                        .map(|(key, value)| match value {
+                            Variant::String(value) => format!("{key}={value:?}"),
+                            // Attributes read from a file hold their strings
+                            // as BinaryString.
+                            Variant::BinaryString(value) => {
+                                format!("{key}={:?}", String::from_utf8_lossy(value.as_ref()))
+                            }
+                            other => format!("{key}={other:?}"),
+                        })
+                        .collect();
+                    entries.sort();
+                    entries.join(", ")
+                }
+                other => format!("{other:?}"),
+            };
+            out.push_str(&format!("{indent}  .{name} = {value}\n"));
+        }
+        for &child in instance.children() {
+            describe(dom, child, depth + 1, out);
+        }
+    }
+
+    let mut out = String::new();
+    for &child in dom.root().children() {
+        describe(dom, child, 0, &mut out);
+    }
+    out
+}
+
+fn build_into(base: &Path, output: &Path) -> std::process::Output {
+    Command::new(ROJO_PATH)
+        .current_dir(get_working_dir_path())
+        .arg("build")
+        .arg(Path::new(BUILD_TESTS_PATH).join("into_place"))
+        .arg("--into")
+        .arg(base)
+        .arg("-o")
+        .arg(output)
+        .env("RUST_LOG", "error")
+        .output()
+        .expect("Couldn't start Rojo")
+}
+
+fn assert_success(output: &std::process::Output) {
+    assert!(
+        output.status.success(),
+        "Rojo did not exit successfully: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// `--into` keeps what only the base place has (the map, a lighting tweak,
+/// a ReplicatedStorage sibling, service properties the project does not set),
+/// replaces the subtree a `$path` folder owns and resolves refs across both,
+/// for XML and binary base and output files alike.
+#[test]
+fn build_into_place_keeps_base_content() {
+    let temp = tempdir().unwrap();
+    let base = into_place_base();
+
+    let mut descriptions = Vec::new();
+    for (base_name, output_name) in [
+        ("base.rbxlx", "out.rbxlx"),
+        ("base.rbxl", "out.rbxl"),
+        ("base2.rbxl", "out2.rbxlx"),
+        ("base2.rbxlx", "out2.rbxl"),
+    ] {
+        let base_path = temp.path().join(base_name);
+        let output_path = temp.path().join(output_name);
+        write_place(&base, &base_path);
+        let before = fs::read(&base_path).unwrap();
+
+        assert_success(&build_into(&base_path, &output_path));
+        assert_eq!(
+            fs::read(&base_path).unwrap(),
+            before,
+            "the base place was modified"
+        );
+
+        descriptions.push((output_name, describe_place(&read_place(&output_path))));
+    }
+
+    for (name, description) in &descriptions[1..] {
+        pretty_assertions::assert_eq!(
+            &descriptions[0].1,
+            description,
+            "{} differs from out.rbxlx",
+            name
+        );
+    }
+
+    let xml = fs::read_to_string(temp.path().join("out.rbxlx")).unwrap();
+    // A ref to a removed base instance must be written as nil rather than as
+    // a referent that names no item in the file.
+    let referents: HashSet<&str> = xml
+        .split("referent=\"")
+        .skip(1)
+        .map(|rest| rest.split('"').next().unwrap())
+        .collect();
+    for value in xml.split("<Ref name=\"").skip(1) {
+        let target = value.split('>').nth(1).unwrap().split('<').next().unwrap();
+        assert!(
+            target == "null" || referents.contains(target),
+            "dangling ref {target} in output"
+        );
+    }
+    let mut settings = insta::Settings::new();
+    settings.set_snapshot_path(
+        Path::new(BUILD_TESTS_PATH)
+            .parent()
+            .unwrap()
+            .join("build-test-snapshots"),
+    );
+    settings.bind(|| {
+        assert_snapshot!("into_place", descriptions[0].1);
+        assert_snapshot!("into_place_xml", xml);
+    });
+}
+
+/// Applying the project onto the place it is written to goes through the
+/// same staged write as any build, and applying it again changes nothing.
+#[test]
+fn build_into_place_in_place() {
+    let temp = tempdir().unwrap();
+    let place = temp.path().join("place.rbxl");
+    write_place(&into_place_base(), &place);
+
+    assert_success(&build_into(&place, &place));
+    let first = describe_place(&read_place(&place));
+    assert!(first.contains("LegacyScript (Script)"), "{first}");
+    assert!(first.contains("Util (ModuleScript)"), "{first}");
+    assert!(!first.contains("OldModule"), "{first}");
+
+    assert_success(&build_into(&place, &place));
+    pretty_assertions::assert_eq!(first, describe_place(&read_place(&place)));
+}
+
+#[test]
+fn build_into_refuses_non_place_inputs_and_outputs() {
+    let temp = tempdir().unwrap();
+    let base = temp.path().join("base.rbxl");
+    write_place(&into_place_base(), &base);
+    let stderr =
+        |output: &std::process::Output| String::from_utf8_lossy(&output.stderr).into_owned();
+
+    // A model project cannot be applied onto a place, and the output is left
+    // as it was.
+    let output = temp.path().join("existing.rbxl");
+    fs::write(&output, "keep").unwrap();
+    let result = Command::new(ROJO_PATH)
+        .current_dir(get_working_dir_path())
+        .arg("build")
+        .arg(Path::new(BUILD_TESTS_PATH).join("module_init"))
+        .arg("--into")
+        .arg(&base)
+        .arg("-o")
+        .arg(&output)
+        .output()
+        .unwrap();
+    assert!(!result.status.success());
+    assert!(
+        stderr(&result).contains("as a place"),
+        "{}",
+        stderr(&result)
+    );
+    assert_eq!(fs::read(&output).unwrap(), b"keep");
+
+    // The output must be a place.
+    let result = build_into(&base, &temp.path().join("out.rbxm"));
+    assert!(!result.status.success());
+    assert!(
+        stderr(&result).contains("must end in .rbxl or .rbxlx"),
+        "{}",
+        stderr(&result)
+    );
+
+    // So must the base.
+    let model = temp.path().join("base.rbxm");
+    fs::write(&model, "not a place").unwrap();
+    let result = build_into(&model, &temp.path().join("out.rbxl"));
+    assert!(!result.status.success());
+    assert!(
+        stderr(&result).contains("must be a place file"),
+        "{}",
+        stderr(&result)
+    );
+    assert!(!temp.path().join("out.rbxl").exists());
+
+    // A watched build cannot keep applying the project onto its own output.
+    let result = Command::new(ROJO_PATH)
+        .current_dir(get_working_dir_path())
+        .arg("build")
+        .arg(Path::new(BUILD_TESTS_PATH).join("into_place"))
+        .arg("--into")
+        .arg(&base)
+        .arg("-o")
+        .arg(&base)
+        .arg("--watch")
+        .output()
+        .unwrap();
+    assert!(!result.status.success());
+    assert!(
+        stderr(&result).contains("--watch cannot write over"),
+        "{}",
+        stderr(&result)
+    );
 }

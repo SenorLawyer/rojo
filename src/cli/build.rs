@@ -12,7 +12,7 @@ use tokio::runtime::Runtime;
 
 use crate::serve_session::ServeSession;
 
-use super::resolve_path;
+use super::{build_into, resolve_path};
 
 const UNKNOWN_OUTPUT_KIND_ERR: &str = "Could not detect what kind of file to build. \
                                        Expected output file to end in .rbxl, .rbxlx, .rbxm, or .rbxmx.";
@@ -45,6 +45,15 @@ pub struct BuildCommand {
     /// Whether to automatically rebuild when any input files change.
     #[clap(long)]
     pub watch: bool,
+
+    /// Apply the project onto this existing place (.rbxl or .rbxlx) instead
+    /// of building a new one.
+    ///
+    /// Instances, properties and services the project does not define keep
+    /// what the base place has, such as the map, terrain and lighting. The
+    /// output may be the base place itself. See docs/build-into.md.
+    #[clap(long, value_name = "BASE", requires = "output")]
+    pub into: Option<PathBuf>,
 }
 
 impl BuildCommand {
@@ -81,6 +90,17 @@ impl BuildCommand {
         if self.compress.is_some() && matches!(output_kind, OutputKind::Rbxlx | OutputKind::Rbxmx) {
             bail!("--compress requires a binary output (.rbxl or .rbxm)");
         }
+        if let Some(base) = &self.into {
+            if !matches!(output_kind, OutputKind::Rbxl | OutputKind::Rbxlx) {
+                bail!("--into builds a place, so the output must end in .rbxl or .rbxlx");
+            }
+            // Each rebuild would apply the project onto the previous output,
+            // so instances removed from the project would never leave it.
+            if self.watch && is_same_file(base, &output_path) {
+                bail!("--watch cannot write over its own --into base place; choose a different --output");
+            }
+        }
+        let into = self.into.as_deref();
         let project_path = resolve_path(&self.project)?;
 
         log::trace!("Constructing in-memory filesystem");
@@ -93,7 +113,7 @@ impl BuildCommand {
         let session = ServeSession::new(vfs, project_path)?;
         let mut cursor = session.message_queue().cursor();
 
-        let initial_build = write_model(&session, &output_path, output_kind, self.compress);
+        let initial_build = write_model(&session, &output_path, output_kind, self.compress, into);
 
         if self.watch {
             // The first build can fail for the same transient reasons as a
@@ -123,7 +143,8 @@ impl BuildCommand {
                 // Keep watching so that the next change can fix the build;
                 // write_model validates before touching the output, so the
                 // last good build stays in place.
-                if let Err(error) = write_model(&session, &output_path, output_kind, self.compress)
+                if let Err(error) =
+                    write_model(&session, &output_path, output_kind, self.compress, into)
                 {
                     log::error!("Failed to rebuild project: {error:?}");
                 }
@@ -209,16 +230,30 @@ fn write_model(
     output: &Path,
     output_kind: OutputKind,
     compression: Option<Compression>,
+    into: Option<&Path>,
 ) -> anyhow::Result<()> {
     println!("Building project '{}'", session.project_name());
 
-    let tree = session.tree();
-    let root_id = tree.get_root_id();
+    let project_tree = session.tree();
+    let root_id = project_tree.get_root_id();
 
-    let class = tree.get_instance(root_id).unwrap().class_name();
+    let class = project_tree.get_instance(root_id).unwrap().class_name();
     if matches!(output_kind, OutputKind::Rbxl | OutputKind::Rbxlx) && class != "DataModel" {
         bail!("Cannot build a {} root as a place. Use .rbxm or .rbxmx, or set the root class to DataModel.", class);
     }
+
+    // The base is read on every build so a watched build picks up a newly
+    // saved base place, and the merge never mutates the session's own tree.
+    let merged;
+    let tree = match into {
+        Some(base) => {
+            let base_dom = build_into::read_base_place(base)?;
+            merged = build_into::merge_into_place(&project_tree, base_dom);
+            &merged
+        }
+        None => &*project_tree,
+    };
+    let root_id = tree.get_root_id();
     log::trace!("Serializing to a staged output file");
     write_file_atomically(output, |file| {
         match output_kind {
@@ -263,6 +298,14 @@ fn write_model(
     println!("Built project to {}", filename);
 
     Ok(())
+}
+
+/// Whether `left` and `right` name the same existing file, following links.
+fn is_same_file(left: &Path, right: &Path) -> bool {
+    match (dunce::canonicalize(left), dunce::canonicalize(right)) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
+    }
 }
 
 /// Replaces `destination` with the bytes produced by `write`, leaving the

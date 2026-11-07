@@ -1,0 +1,48 @@
+---
+source: tests/tests/build.rs
+expression: "descriptions[0].1"
+---
+Workspace (Workspace)
+  .FallenPartsDestroyHeight = -1000
+  .Gravity = 50
+  Map (Model)
+    Baseplate (Part)
+    Spawn (Part)
+      .Attributes = Rojo_Id="BaseSpawn"
+  MapRef (ObjectValue)
+    .Value = -> Workspace/Map
+  ConfigRef (ObjectValue)
+    .Value = -> ReplicatedStorage/Shared/Config
+  OldRef (ObjectValue)
+    .Value = nil
+Lighting (Lighting)
+  .Brightness = 3
+ReplicatedStorage (ReplicatedStorage)
+  Shared (Folder)
+    .Attributes = Owner="map-team"
+    Config (StringValue)
+      .Attributes = Note="from base"
+      .Value = "project value"
+    Util (ModuleScript)
+      .Source = "return \"util\"\n"
+  BaseAssets (Folder)
+    Tree (Model)
+  Pointers (Folder)
+    ToShared (ObjectValue)
+      .Attributes = Rojo_Target_Value="Shared"
+      .Value = -> ReplicatedStorage/Shared
+    BasePointer (ObjectValue)
+      .Value = -> Workspace/Map
+    ToRemotes (ObjectValue)
+      .Attributes = Rojo_Target_Value="Remotes"
+      .Value = -> ReplicatedStorage/Remotes
+    ToSpawn (ObjectValue)
+      .Attributes = Rojo_Target_Value="BaseSpawn"
+      .Value = -> Workspace/Map/Spawn
+  Remotes (Folder)
+    Ping (RemoteEvent)
+ServerScriptService (ServerScriptService)
+  LegacyScript (Script)
+    .Source = "print('legacy')"
+  Main (Script)
+    .Source = "print(\"main from project\")\n"
