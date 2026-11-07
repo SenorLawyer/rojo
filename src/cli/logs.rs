@@ -46,9 +46,13 @@ const MAX_REQUESTS_PER_MINUTE: u32 = 100;
 /// Needs an API key with the `universe:read` scope for the experience. Roblox
 /// keeps only server Error and Warning logs so far (not Output, Info or
 /// client logs), and entries take about three minutes to appear. The key
-/// owner's requests are limited to 100 a minute across all of their keys, so
-/// this paces every request, retries included, and reads at most
-/// --max-servers servers per round.
+/// owner's requests are limited to 100 a minute across all of their keys and
+/// every program using them, including other `rojo logs` runs, so this paces
+/// every request, retries included, and reads at most --max-servers servers
+/// and 10 pages of 100 entries per server per round. A server with more is
+/// reported as behind and read further in the next rounds. A server that
+/// cannot be read is skipped with a warning (exit status 1 without --follow);
+/// only a rejected key, a refused filter or an unknown --job-id stops it.
 ///
 /// Assumptions from Roblox's beta docs, not checked against the live API:
 /// logs come newest first when asked for `message_timestamp desc`, so reading
@@ -104,8 +108,9 @@ pub struct LogsCommand {
     #[clap(long, default_value = "20")]
     pub max_servers: usize,
     /// Open Cloud requests this command may send per minute, at most 100,
-    /// counting each retry. Other uses of the key owner's keys count against
-    /// the same 100.
+    /// counting each retry. Roblox's limit is per API key owner, not per key
+    /// or per process: several `rojo logs` running at once, and any other use
+    /// of the owner's keys, share the same 100, so give each a share.
     #[clap(long, default_value = "60")]
     pub requests_per_minute: u32,
     /// The environment variable that holds the API key.
@@ -159,6 +164,7 @@ impl LogsCommand {
                 "serversRead": batch.servers_read,
                 "truncated": batch.truncated,
                 "incomplete": batch.incomplete,
+                "failedServers": batch.failed_servers,
             });
             if let Some(error) = &batch.error {
                 value["error"] = json!(error.to_string());
@@ -178,6 +184,12 @@ impl LogsCommand {
         }
         match batch.error {
             Some(error) => Err(self.explain(error)),
+            // The entries were printed, but the read was not whole.
+            None if !batch.failed_servers.is_empty() => Err(anyhow::anyhow!(
+                "Could not read {} of the servers: {}",
+                batch.failed_servers.len(),
+                batch.failed_servers.join(", ")
+            )),
             None => Ok(()),
         }
     }
@@ -349,9 +361,21 @@ struct Batch {
     /// Whether Roblox said it could not list every server, so servers may
     /// have been missed.
     incomplete: bool,
+    /// Whether listing servers stopped at Rojo's own page cap.
+    listing_capped: bool,
+    /// Servers that could not be read this round and will be tried again.
+    failed_servers: Vec<String>,
     /// Why the round stopped early. `entries` still holds what the servers
     /// read before it returned, and the reader counts those as shown.
     error: Option<OpenCloudError>,
+}
+
+impl Batch {
+    /// Whether the listing covered every server, so a server missing from
+    /// it is really gone.
+    fn listing_complete(&self) -> bool {
+        !self.incomplete && !self.listing_capped
+    }
 }
 
 /// A server to read, with the place version its logs are filed under.
@@ -375,6 +399,45 @@ struct ServerState {
     seen: HashMap<[u8; 32], u64>,
     /// When it was last among the listed servers.
     last_listed_ms: u64,
+    /// Older entries a read could not reach within [`MAX_PAGES`], read
+    /// before anything newer in the next rounds.
+    gap: Option<Gap>,
+}
+
+/// Where a read that hit the page cap stopped.
+#[derive(Debug, Clone)]
+struct Gap {
+    /// Continues the read; `None` reads again from the newest entry, which
+    /// the seen entries make safe.
+    token: Option<String>,
+    /// How far back the read goes.
+    cutoff: u64,
+    /// The oldest timestamp read so far.
+    boundary: Option<u64>,
+    /// Occurrence counts of the entries at `boundary`, whose identical
+    /// copies may continue on the next page.
+    counts: HashMap<[u8; 32], u64>,
+}
+
+/// Pages of one server's logs read in one go.
+struct Read {
+    logs: Vec<GameServerLog>,
+    cutoff: u64,
+    /// Occurrence counts the read continues from.
+    counts: HashMap<[u8; 32], u64>,
+    pages: usize,
+    /// Set when the page budget ran out with entries left.
+    next_token: Option<String>,
+}
+
+/// Why one server could not be read, and what that means.
+enum ServerFailure {
+    /// The command cannot work as given; stop.
+    Fatal(OpenCloudError),
+    /// Roblox no longer has the server.
+    Gone,
+    /// Worth trying again next round.
+    Transient(OpenCloudError),
 }
 
 struct Reader<'a, S> {
@@ -388,8 +451,9 @@ struct Reader<'a, S> {
     filter: String,
     max_servers: usize,
     servers: HashMap<String, ServerState>,
-    /// Shut-down servers read after their last entries became readable,
-    /// with when they shut down, so later rounds skip them.
+    /// Servers not to read again while Roblox lists them, with when they
+    /// shut down: those read after their last entries became readable, and
+    /// those Roblox answered 404 for.
     finished: HashMap<String, u64>,
     /// `now - --since` at the first round: how far back servers are read
     /// that have shown nothing yet.
@@ -416,8 +480,9 @@ impl<'a, S: LogSource> Reader<'a, S> {
 
     /// Reads every selected server once and returns the entries not returned
     /// by an earlier round. A server's state only changes once all of its
-    /// pages were read, together with adding its entries to the batch, so a
-    /// failure leaves the servers after it to be read in full next time.
+    /// reads this round succeeded, together with adding its entries to the
+    /// batch. One server failing does not stop the others, unless the error
+    /// means the command cannot work at all.
     fn round(&mut self, now_ms: u64) -> Batch {
         // Fixed at the first round: a moving bound would pass entries by
         // before Roblox makes them readable, minutes after they were logged.
@@ -435,71 +500,83 @@ impl<'a, S: LogSource> Reader<'a, S> {
         };
 
         for target in targets {
-            let cutoff = self
-                .servers
-                .get(&target.job)
-                .map_or(since_ms, |state| read_cutoff(state, since_ms));
-            let (logs, truncated) = match self.read_server(&target, cutoff) {
-                Ok(read) => read,
-                Err(error) => {
+            let reads = match self.read_target(&target, since_ms, &mut batch) {
+                Ok(reads) => reads,
+                Err(ServerFailure::Fatal(error)) => {
                     batch.error = Some(error);
                     break;
                 }
+                Err(ServerFailure::Gone) => {
+                    // Its logs expired or it never existed: skip it from now
+                    // on, without a word, as Roblox's listing may lag.
+                    self.servers.remove(&target.job);
+                    self.finished.insert(target.job.clone(), now_ms);
+                    continue;
+                }
+                Err(ServerFailure::Transient(error)) => {
+                    batch.notices.push(format!(
+                        "Warning: could not read server {}, trying again next round: {error}",
+                        target.job
+                    ));
+                    batch.failed_servers.push(target.job.clone());
+                    continue;
+                }
             };
             batch.servers_read += 1;
-            if truncated {
-                batch.truncated = true;
-                batch.notices.push(format!(
-                    "Server {} has more than {} entries since the cutoff; only the newest were read.",
-                    target.job,
-                    MAX_PAGES * 100
-                ));
-            }
-
             let state = self.servers.entry(target.job.clone()).or_default();
             state.last_listed_ms = now_ms;
-            // Identical entries within one read are separate occurrences;
-            // numbering them tells a repeat apart from a re-read.
-            let mut occurrences: HashMap<[u8; 32], u64> = HashMap::new();
-            for log in logs {
-                if let Some(ms) = log.timestamp_ms {
-                    if ms < cutoff {
-                        continue;
-                    }
-                    state.newest = Some(state.newest.map_or(ms, |newest| newest.max(ms)));
-                }
-                let base = entry_key(&log);
-                let index = occurrences.entry(base).or_insert(0);
-                let key = occurrence_key(&base, *index);
-                *index += 1;
-                let shown = state
-                    .seen
-                    .insert(key, log.timestamp_ms.unwrap_or(now_ms))
-                    .is_some();
-                let wanted =
-                    self.levels.is_empty() || self.levels.iter().any(|l| l.matches(&log.severity));
-                if !shown && wanted {
-                    batch.entries.push(log);
+            let mut gap = None;
+            for read in reads {
+                let counts = absorb(
+                    state,
+                    &self.levels,
+                    read.logs,
+                    read.cutoff,
+                    read.counts,
+                    now_ms,
+                    &mut batch.entries,
+                );
+                if let Some(token) = read.next_token {
+                    let (boundary, counts) = counts;
+                    gap = Some(Gap {
+                        token: Some(token),
+                        cutoff: read.cutoff,
+                        boundary,
+                        counts,
+                    });
                 }
             }
-            // Entries behind the next cutoff are never read again.
-            let next_cutoff = read_cutoff(state, since_ms);
-            state.seen.retain(|_, ms| *ms >= next_cutoff);
+            state.gap = gap;
+            if let Some(gap) = &state.gap {
+                batch.truncated = true;
+                batch.notices.push(format!(
+                    "Server {} is behind: it has more entries than {} pages a round; read back to {}, older ones are read next round.",
+                    target.job,
+                    MAX_PAGES,
+                    timestamp(gap.boundary)
+                ));
+            }
+            // Entries behind every cutoff still to be read are never read again.
+            let keep_from = match &state.gap {
+                Some(gap) => gap.cutoff.min(read_cutoff(state, since_ms)),
+                None => read_cutoff(state, since_ms),
+            };
+            state.seen.retain(|_, ms| *ms >= keep_from);
 
-            // Its last entries are readable by now, so later rounds can skip it.
-            if let Some(terminated) = target
-                .terminated_ms
-                .filter(|ms| target.shut_down && ms.saturating_add(overlap_ms) < now_ms)
-            {
+            // Its last entries are readable by now and nothing older is left
+            // to read, so later rounds can skip it.
+            if let Some(terminated) = target.terminated_ms.filter(|ms| {
+                target.shut_down && state.gap.is_none() && ms.saturating_add(overlap_ms) < now_ms
+            }) {
                 self.servers.remove(&target.job);
                 self.finished.insert(target.job.clone(), terminated);
             }
         }
 
-        // Servers that left the listing are not coming back. A listing that
-        // Roblox says is partial does not show that, and servers named with
+        // Servers that left the listing are not coming back. Only a listing
+        // that covered every server shows that, and servers named with
         // --job-id are always read again.
-        if !batch.incomplete {
+        if batch.listing_complete() {
             let jobs = &self.jobs;
             self.servers.retain(|job, state| {
                 jobs.contains(job) || state.last_listed_ms.saturating_add(overlap_ms) >= now_ms
@@ -509,6 +586,59 @@ impl<'a, S: LogSource> Reader<'a, S> {
             .entries
             .sort_by_key(|entry| entry.timestamp_ms.unwrap_or(now_ms));
         batch
+    }
+
+    /// This round's reads of one server: what is left of an earlier capped
+    /// read first, then, if the page budget allows, the newest entries.
+    fn read_target(
+        &self,
+        target: &Target,
+        since_ms: u64,
+        batch: &mut Batch,
+    ) -> Result<Vec<Read>, ServerFailure> {
+        let state = self.servers.get(&target.job);
+        let mut reads = Vec::new();
+        let mut budget = MAX_PAGES;
+        if let Some(gap) = state.and_then(|state| state.gap.clone()) {
+            let read = match self.read_pages(target, gap.token.clone(), gap.cutoff, gap.counts.clone(), budget) {
+                // Roblox may let page tokens expire; reading from the newest
+                // entry again finds the same entries, already seen.
+                Err(error) if gap.token.is_some() && status_of(&error) == Some(400) => {
+                    batch.notices.push(format!(
+                        "Roblox refused to continue reading server {}; reading it again from its newest entry.",
+                        target.job
+                    ));
+                    self.read_pages(target, None, gap.cutoff, HashMap::new(), budget)
+                }
+                read => read,
+            }
+            .map_err(|error| self.classify(target, error))?;
+            budget -= read.pages;
+            let behind = read.next_token.is_some();
+            reads.push(read);
+            if behind {
+                return Ok(reads);
+            }
+        }
+        if budget > 0 {
+            let cutoff = state.map_or(since_ms, |state| read_cutoff(state, since_ms));
+            let read = self
+                .read_pages(target, None, cutoff, HashMap::new(), budget)
+                .map_err(|error| self.classify(target, error))?;
+            reads.push(read);
+        }
+        Ok(reads)
+    }
+
+    fn classify(&self, target: &Target, error: OpenCloudError) -> ServerFailure {
+        match status_of(&error) {
+            Some(400 | 401 | 403) => ServerFailure::Fatal(error),
+            // A server named with --job-id that Roblox does not know is a
+            // mistake in the arguments; a listed one has gone since.
+            Some(404) if self.jobs.contains(&target.job) => ServerFailure::Fatal(error),
+            Some(404) => ServerFailure::Gone,
+            _ => ServerFailure::Transient(error),
+        }
     }
 
     /// The servers to read this round.
@@ -584,6 +714,7 @@ impl<'a, S: LogSource> Reader<'a, S> {
             for page in 0.. {
                 if page == MAX_PAGES {
                     batch.truncated = true;
+                    batch.listing_capped = true;
                     batch.notices.push(format!(
                         "Place version {version} has more than {} servers; only the first were considered.",
                         MAX_PAGES * 100
@@ -615,9 +746,9 @@ impl<'a, S: LogSource> Reader<'a, S> {
             }
         }
 
-        // A finished server stays skipped while Roblox lists it; one it no
-        // longer lists in a complete listing can be forgotten.
-        if !batch.incomplete {
+        // A finished server stays skipped while Roblox lists it; one that a
+        // listing covering every server leaves out can be forgotten.
+        if batch.listing_complete() {
             let listed: HashSet<&str> = servers.iter().map(|(_, s)| s.job_id.as_str()).collect();
             self.finished.retain(|job, _| listed.contains(job.as_str()));
         }
@@ -635,16 +766,18 @@ impl<'a, S: LogSource> Reader<'a, S> {
         Ok(targets)
     }
 
-    /// Reads a server's entries back to `cutoff`, newest first, and whether
-    /// the page cap stopped it early.
-    fn read_server(
+    /// Reads pages of a server's entries, newest first, from `token` (or the
+    /// newest entry) back to `cutoff`, at most `budget` pages.
+    fn read_pages(
         &self,
         target: &Target,
+        mut token: Option<String>,
         cutoff: u64,
-    ) -> Result<(Vec<GameServerLog>, bool), OpenCloudError> {
+        counts: HashMap<[u8; 32], u64>,
+        budget: usize,
+    ) -> Result<Read, OpenCloudError> {
         let mut logs = Vec::new();
-        let mut token: Option<String> = None;
-        for _ in 0..MAX_PAGES {
+        for pages in 1..=budget {
             let page = self.source.logs(
                 self.universe,
                 self.place,
@@ -661,10 +794,80 @@ impl<'a, S: LogSource> Reader<'a, S> {
             logs.extend(page.logs);
             match page.next_page_token {
                 Some(next) if !reached_cutoff => token = Some(next),
-                _ => return Ok((logs, false)),
+                _ => {
+                    return Ok(Read {
+                        logs,
+                        cutoff,
+                        counts,
+                        pages,
+                        next_token: None,
+                    })
+                }
             }
         }
-        Ok((logs, true))
+        Ok(Read {
+            logs,
+            cutoff,
+            counts,
+            pages: budget,
+            next_token: token,
+        })
+    }
+}
+
+/// Adds one read's entries to a server's state and the new ones to `out`,
+/// and returns the oldest timestamp read with the occurrence counts of the
+/// entries at it, for a read that continues on the next page.
+fn absorb(
+    state: &mut ServerState,
+    levels: &[Level],
+    logs: Vec<GameServerLog>,
+    cutoff: u64,
+    counts: HashMap<[u8; 32], u64>,
+    now_ms: u64,
+    out: &mut Vec<GameServerLog>,
+) -> (Option<u64>, HashMap<[u8; 32], u64>) {
+    // Identical entries within one read are separate occurrences; numbering
+    // them tells a repeat apart from a re-read.
+    let mut occurrences: HashMap<[u8; 32], (u64, Option<u64>)> = counts
+        .into_iter()
+        .map(|(key, count)| (key, (count, None)))
+        .collect();
+    let mut oldest = None;
+    for log in logs {
+        if let Some(ms) = log.timestamp_ms {
+            if ms < cutoff {
+                continue;
+            }
+            state.newest = Some(state.newest.map_or(ms, |newest| newest.max(ms)));
+        }
+        oldest = log.timestamp_ms.or(oldest);
+        let base = entry_key(&log);
+        let entry = occurrences.entry(base).or_insert((0, None));
+        let key = occurrence_key(&base, entry.0);
+        entry.0 += 1;
+        entry.1 = log.timestamp_ms;
+        let shown = state
+            .seen
+            .insert(key, log.timestamp_ms.unwrap_or(now_ms))
+            .is_some();
+        let wanted = levels.is_empty() || levels.iter().any(|l| l.matches(&log.severity));
+        if !shown && wanted {
+            out.push(log);
+        }
+    }
+    let at_oldest = occurrences
+        .into_iter()
+        .filter(|(_, (_, ms))| ms.is_some() && *ms == oldest)
+        .map(|(key, (count, _))| (key, count))
+        .collect();
+    (oldest, at_oldest)
+}
+
+fn status_of(error: &OpenCloudError) -> Option<u16> {
+    match error {
+        OpenCloudError::Status { status, .. } => Some(status.as_u16()),
+        _ => None,
     }
 }
 
@@ -989,6 +1192,14 @@ mod tests {
                 }));
         }
 
+        fn status_logs(&self, job: &str, code: u16) {
+            self.logs
+                .borrow_mut()
+                .entry(job.to_owned())
+                .or_default()
+                .push_back(Err(status_error(code)));
+        }
+
         fn failing_logs(&self, job: &str) {
             self.logs
                 .borrow_mut()
@@ -1058,6 +1269,186 @@ mod tests {
         batch.entries.iter().map(|e| e.message.as_str()).collect()
     }
 
+    fn status_error(code: u16) -> OpenCloudError {
+        OpenCloudError::Status {
+            status: StatusCode::from_u16(code).unwrap(),
+            request: "GET /server-management/v1/...".into(),
+            body: String::new(),
+        }
+    }
+
+    /// The page tokens of the log requests for `job`, in order.
+    fn log_tokens(fake: &Fake, job: &str) -> Vec<Option<String>> {
+        fake.calls
+            .borrow()
+            .iter()
+            .filter_map(|call| match call {
+                Call::Logs(_, j, _, token) if j == job => Some(token.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Queues `pages` pages of one entry each for `job`, newest first, each
+    /// but the last pointing to the next.
+    fn queue_pages(fake: &Fake, job: &str, pages: u64, newest: u64) {
+        for i in 0..pages {
+            let next = (i + 1 < pages).then(|| format!("t{i}"));
+            fake.logs(
+                job,
+                vec![log(
+                    job,
+                    newest - i * 1000,
+                    LogSeverity::Error,
+                    &format!("e{i}"),
+                )],
+                next.as_deref(),
+            );
+        }
+    }
+
+    #[test]
+    fn a_server_past_the_page_cap_is_drained_in_later_rounds() {
+        let fake = Fake::default();
+        let command = parse(&["--place-version", "45"]);
+        let mut reader = reader(&fake, &command);
+        // Shut down long enough ago that it would be retired at once.
+        let ended = || vec![server("a", true, Some("2026-11-07T11:50:00Z"))];
+
+        fake.servers(ended(), None);
+        queue_pages(&fake, "a", MAX_PAGES as u64 + 2, NOW - MINUTE);
+        let first = reader.round(NOW);
+        assert_eq!(first.entries.len(), MAX_PAGES);
+        assert!(first.truncated);
+        assert!(
+            first.notices.iter().any(|n| n.contains("is behind")),
+            "{:?}",
+            first.notices
+        );
+        // Not retired while entries are left.
+        assert!(!reader.finished.contains_key("a"));
+        assert!(reader.servers["a"].gap.is_some());
+
+        fake.servers(ended(), None);
+        let second = reader.round(NOW + MINUTE);
+        assert_eq!(messages(&second), ["e11", "e10"]);
+        assert!(!second.truncated);
+        // The drain continued from the saved token.
+        let tokens = log_tokens(&fake, "a");
+        assert_eq!(tokens[MAX_PAGES], Some(format!("t{}", MAX_PAGES - 1)));
+        assert!(reader.finished.contains_key("a"));
+    }
+
+    #[test]
+    fn a_refused_page_token_reads_the_server_again_from_the_top() {
+        let fake = Fake::default();
+        let command = parse(&["--place-version", "45", "--job-id", "a"]);
+        let mut reader = reader(&fake, &command);
+        queue_pages(&fake, "a", MAX_PAGES as u64 + 1, NOW - MINUTE);
+        reader.round(NOW);
+        // The saved token has expired; the next read from the top finds
+        // what was shown and the entry that was left.
+        let mut drained = fake.logs.borrow_mut();
+        let queue = drained.get_mut("a").unwrap();
+        let left = queue.pop_front().unwrap().unwrap();
+        queue.push_back(Err(status_error(400)));
+        queue.push_back(Ok(GameServerLogPage {
+            logs: [
+                vec![log("a", NOW - MINUTE, LogSeverity::Error, "e0")],
+                left.logs,
+            ]
+            .concat(),
+            next_page_token: None,
+        }));
+        drop(drained);
+        let second = reader.round(NOW + MINUTE);
+        assert!(second.error.is_none());
+        assert_eq!(messages(&second), [format!("e{MAX_PAGES}")]);
+        assert!(second.notices[0].contains("Roblox refused to continue"));
+    }
+
+    #[test]
+    fn a_listed_server_that_is_gone_is_forgotten_quietly() {
+        let fake = Fake::default();
+        let command = parse(&["--place-version", "45"]);
+        let mut reader = reader(&fake, &command);
+        let both = || vec![server("gone", false, None), server("b", false, None)];
+        fake.servers(both(), None);
+        fake.status_logs("gone", 404);
+        fake.logs(
+            "b",
+            vec![log("b", NOW - MINUTE, LogSeverity::Error, "b")],
+            None,
+        );
+        let batch = reader.round(NOW);
+        assert!(batch.error.is_none());
+        assert!(batch.failed_servers.is_empty());
+        assert!(batch.notices.is_empty(), "{:?}", batch.notices);
+        assert_eq!(messages(&batch), ["b"]);
+
+        fake.servers(both(), None);
+        reader.round(NOW + MINUTE);
+        assert_eq!(log_tokens(&fake, "gone").len(), 1);
+    }
+
+    #[test]
+    fn auth_errors_and_unknown_named_jobs_stop_the_round() {
+        let fake = Fake::default();
+        let command = parse(&["--place-version", "45", "--job-id", "a"]);
+        let mut reader = reader(&fake, &command);
+        fake.status_logs("a", 404);
+        let batch = reader.round(NOW);
+        assert_eq!(status_of(batch.error.as_ref().unwrap()), Some(404));
+        assert!(command.explain(batch.error.unwrap()).is::<UsageError>());
+
+        let fake = Fake::default();
+        let command = parse(&["--place-version", "45"]);
+        let mut reader = Reader::new(&fake, &command);
+        fake.servers(
+            vec![server("a", false, None), server("b", false, None)],
+            None,
+        );
+        fake.status_logs("a", 403);
+        let batch = reader.round(NOW);
+        assert_eq!(status_of(batch.error.as_ref().unwrap()), Some(403));
+        assert!(log_tokens(&fake, "b").is_empty());
+    }
+
+    #[test]
+    fn servers_are_only_forgotten_after_a_listing_that_was_not_capped() {
+        let fake = Fake::default();
+        let command = parse(&["--place-version", "45"]);
+        let mut reader = reader(&fake, &command);
+        let listed = || {
+            vec![
+                server("a", false, None),
+                server("fin", true, Some("2026-11-07T11:30:00Z")),
+            ]
+        };
+        let old = || vec![log("a", NOW - MINUTE, LogSeverity::Error, "old")];
+        fake.servers(listed(), None);
+        fake.logs("a", old(), None);
+        assert_eq!(messages(&reader.round(NOW)), ["old"]);
+        assert!(reader.finished.contains_key("fin"));
+
+        // Listings that stop at Rojo's own page cap, before reaching either.
+        for minute in 1..=7 {
+            for _ in 0..MAX_PAGES {
+                fake.servers(Vec::new(), Some("more"));
+            }
+            let batch = reader.round(NOW + minute * MINUTE);
+            assert!(batch.listing_capped && !batch.incomplete);
+        }
+        assert!(reader.servers.contains_key("a"));
+        assert!(reader.finished.contains_key("fin"));
+
+        fake.servers(listed(), None);
+        fake.logs("a", old(), None);
+        let batch = reader.round(NOW + 8 * MINUTE);
+        assert!(batch.entries.is_empty(), "{:?}", messages(&batch));
+        assert!(log_tokens(&fake, "fin").len() == 1);
+    }
+
     #[test]
     fn a_failing_server_keeps_the_entries_of_servers_read_before_it() {
         let fake = Fake::default();
@@ -1074,7 +1465,9 @@ mod tests {
         fake.failing_logs("b");
         let first = reader.round(NOW);
         assert_eq!(messages(&first), ["from a"]);
-        assert!(matches!(first.error, Some(OpenCloudError::Unconfirmed(_))));
+        assert!(first.error.is_none());
+        assert_eq!(first.failed_servers, ["b"]);
+        assert!(first.notices[0].starts_with("Warning: could not read server b"));
         assert_eq!(first.servers_read, 1);
 
         // Next round, a's entry is not shown again and b's are shown, since
@@ -1230,7 +1623,7 @@ mod tests {
         // Ten minutes of failed reads, then the same entry again.
         for minute in 1..=10 {
             fake.failing_logs("a");
-            assert!(reader.round(NOW + minute * MINUTE).error.is_some());
+            assert_eq!(reader.round(NOW + minute * MINUTE).failed_servers, ["a"]);
         }
         fake.logs("a", old(), None);
         let batch = reader.round(NOW + 11 * MINUTE);

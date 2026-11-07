@@ -455,15 +455,15 @@ impl OpenCloud {
         let Some(spacing) = &self.spacing else {
             return;
         };
-        let wait = {
-            let mut next = spacing.next.lock().unwrap_or_else(|e| e.into_inner());
-            let now = Instant::now();
-            let slot = next.filter(|slot| *slot > now).unwrap_or(now);
-            *next = Some(slot + spacing.spacing);
-            slot - now
-        };
-        if !wait.is_zero() {
-            sleep(wait);
+        loop {
+            let wait = {
+                let mut next = spacing.next.lock().unwrap_or_else(|e| e.into_inner());
+                admit(&mut next, Instant::now(), spacing.spacing)
+            };
+            match wait {
+                Some(wait) => sleep(wait),
+                None => return,
+            }
         }
     }
 
@@ -1335,6 +1335,20 @@ fn parse_timestamp_ms(value: &Value) -> Option<u64> {
             })
         }
         _ => None,
+    }
+}
+
+/// Admits a request at `now` if the slot `next` has come, booking the next
+/// slot `spacing` after the actual admission, and otherwise says how long to
+/// wait before asking again. Booking from `now` rather than from the slot
+/// keeps a late wakeup from letting two requests through back to back.
+fn admit(next: &mut Option<Instant>, now: Instant, spacing: Duration) -> Option<Duration> {
+    match *next {
+        Some(slot) if slot > now => Some(slot - now),
+        _ => {
+            *next = Some(now + spacing);
+            None
+        }
     }
 }
 
@@ -2476,6 +2490,48 @@ mod tests {
             // A little slack for when the server thread records arrival.
             assert!(gap >= spacing - Duration::from_millis(20), "{gap:?}");
         }
+    }
+
+    #[test]
+    fn late_wakeups_never_let_requests_through_closer_than_the_spacing() {
+        let spacing = Duration::from_millis(600);
+        let start = Instant::now();
+        let mut clock = start;
+        let mut next = None;
+        let mut admitted = Vec::new();
+        // A simple generator of oversleeps from 0 to 499 ms.
+        let mut seed: u64 = 7;
+        for _ in 0..300 {
+            while let Some(wait) = admit(&mut next, clock, spacing) {
+                seed = seed
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                clock += wait + Duration::from_millis((seed >> 33) % 500);
+            }
+            admitted.push(clock);
+        }
+        for pair in admitted.windows(2) {
+            assert!(pair[1] - pair[0] >= spacing, "{:?}", pair[1] - pair[0]);
+        }
+        // So no minute holds more than 100 of them.
+        for (i, first) in admitted.iter().enumerate() {
+            let in_minute = admitted[i..]
+                .iter()
+                .take_while(|at| **at - *first < Duration::from_secs(60))
+                .count();
+            assert!(in_minute <= 100, "{in_minute}");
+        }
+
+        // The case that used to slip through: woken 300 ms late, the next
+        // slot is 600 ms after that, not 300 ms.
+        let mut next = Some(start + spacing);
+        assert_eq!(admit(&mut next, start, spacing), Some(spacing));
+        let late = start + spacing + Duration::from_millis(300);
+        assert_eq!(admit(&mut next, late, spacing), None);
+        assert_eq!(
+            admit(&mut next, late + Duration::from_millis(300), spacing),
+            Some(Duration::from_millis(300))
+        );
     }
 
     #[test]
