@@ -31,9 +31,9 @@ Making a new release? Simply add the new header with the version and date undern
 
 ## Unreleased
 
-* Added `rojo doctor`, which checks the project (loaded as `rojo serve` loads it), `servePlaceIds`, packages, the installed Studio plugin and its version, a running `rojo serve` and Git in one read-only report with a fix for each problem. `--json` prints a versioned report, and it exits with 1 when a check is an error. `rojo doc --agent doctor` describes it. ([fork#TBD])
+* Added `rojo doctor`, which checks the project (loaded as `rojo serve` loads it), `servePlaceIds`, packages, the installed Studio plugin and its version, a running `rojo serve` and Git in one read-only report with a fix for each problem. `--json` prints a versioned report, and it exits with 1 when a check is an error. `rojo doc --agent doctor` describes it. ([fork#12])
 
-[fork#TBD]: https://github.com/SenorLawyer/rojo/pulls
+[fork#12]: https://github.com/SenorLawyer/rojo/pull/12
 
 ## [8.1.0] (November 5th, 2026)
 
