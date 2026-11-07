@@ -10,7 +10,7 @@ use roblox_install::RobloxStudio;
 use crate::serve_session::ServeSession;
 
 static PLUGIN_BINCODE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/plugin.bincode"));
-static PLUGIN_FILE_NAME: &str = "RojoManagedPlugin.rbxm";
+pub(super) static PLUGIN_FILE_NAME: &str = "RojoManagedPlugin.rbxm";
 
 /// Install Rojo's plugin.
 #[derive(Debug, Parser)]
@@ -98,7 +98,7 @@ fn initialize_plugin() -> anyhow::Result<ServeSession> {
     Ok(ServeSession::new(vfs, "/plugin")?)
 }
 
-fn install_plugin(plugins_dir: &Path, side_by_side: bool) -> anyhow::Result<()> {
+pub(super) fn install_plugin(plugins_dir: &Path, side_by_side: bool) -> anyhow::Result<()> {
     let session = initialize_plugin()?;
     let tree = session.tree();
     fs::create_dir_all(plugins_dir)?;
@@ -124,7 +124,7 @@ fn side_by_side_file_name() -> String {
 
 /// Whether `name` is exactly a file name `install --side-by-side` creates for
 /// some version, so other plugins that happen to start with "Rojo-" are kept.
-fn is_side_by_side_file_name(name: &str) -> bool {
+pub(super) fn is_side_by_side_file_name(name: &str) -> bool {
     name.strip_prefix("Rojo-")
         .and_then(|rest| rest.strip_suffix(".rbxm"))
         .is_some_and(is_version)

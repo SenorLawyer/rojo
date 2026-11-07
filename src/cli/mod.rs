@@ -3,6 +3,7 @@
 mod assets;
 mod build;
 mod doc;
+mod doctor;
 mod fmt_project;
 mod init;
 mod lifecycle;
@@ -33,6 +34,7 @@ use thiserror::Error;
 pub use self::assets::AssetsCommand;
 pub use self::build::BuildCommand;
 pub use self::doc::DocCommand;
+pub use self::doctor::DoctorCommand;
 pub use self::fmt_project::FmtProjectCommand;
 pub use self::init::{InitCommand, InitKind};
 pub use self::lifecycle::{CheckpointCommand, ReleaseCommand, WorkspaceCommand};
@@ -72,6 +74,7 @@ impl Options {
             Subcommand::Typecheck(subcommand) => subcommand.run(),
             Subcommand::FmtProject(subcommand) => subcommand.run(),
             Subcommand::Doc(subcommand) => subcommand.run(),
+            Subcommand::Doctor(subcommand) => subcommand.run(),
             Subcommand::Plugin(subcommand) => subcommand.run(),
             Subcommand::Syncback(subcommand) => subcommand.run(self.global),
             Subcommand::Checkpoint(subcommand) => subcommand.run(),
@@ -157,6 +160,7 @@ pub enum Subcommand {
     Typecheck(TypecheckCommand),
     FmtProject(FmtProjectCommand),
     Doc(DocCommand),
+    Doctor(DoctorCommand),
     Plugin(PluginCommand),
     Syncback(SyncbackCommand),
     Checkpoint(CheckpointCommand),
