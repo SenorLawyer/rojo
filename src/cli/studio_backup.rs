@@ -612,6 +612,13 @@ const MAX_NOTE_BYTES: usize = 4096;
 /// The note of an automatic backup is a short summary; `roots` has them all.
 const AUTOMATIC_NOTE_BYTES: usize = 512;
 
+/// Whether `record` is small enough to save, which a record with very many
+/// or very long root paths may not be. Root paths are never shortened, since
+/// two deep instances could then be recorded with the same path.
+pub(crate) fn record_fits(record: &Record) -> bool {
+    serde_json::to_vec_pretty(record).is_ok_and(|json| json.len() as u64 <= MAX_RECORD_BYTES)
+}
+
 /// `text` cut to at most `max` bytes on a character boundary.
 pub(crate) fn clip(text: &str, max: usize) -> &str {
     if text.len() <= max {

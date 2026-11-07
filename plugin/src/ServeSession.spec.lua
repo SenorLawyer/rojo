@@ -1464,7 +1464,12 @@ return function()
 			session.__instanceMap:insert("FIXED", fixed)
 			session.__status = ServeSession.Status.Connected
 			local hashSource = require(script.Parent.hashSource)
-			local exported = session:exportForBackup({ "FIXED", "GONE" }, { FIXED = (hashSource("return 1")) })
+			session:__rememberVerified("VERIFY", { FIXED = "return 1" })
+			local exported = session:exportForBackup(
+				{ "FIXED", "GONE" },
+				{ FIXED = (hashSource("return 1")) },
+				"VERIFY"
+			)
 			expect(exported.missing).to.equal(1)
 			expect(#exported.ids).to.equal(1)
 			expect(exported.ids[1]).to.equal("FIXED")
@@ -1529,6 +1534,31 @@ return function()
 			expect(#warnings).to.equal(1)
 			expect(warnings[1].template:find("Unsaved editor text could not be backed up", 1, true)).to.be.ok()
 			expect(warnings[1].args[2]).to.equal("game/ReplicatedStorage/__RojoSyncBackupSpec/OpenInEditor")
+		end)
+
+		it("leaves out a script whose source differs from what verify saw though the hashes match", function()
+			local hashSource = require(script.Parent.hashSource)
+			-- Two sources known to share a hash and length.
+			local checked, current = "return '07ilh49'", "return '0v3kbm8'"
+			expect((hashSource(checked))).to.equal((hashSource(current)))
+			local collided = Instance.new("ModuleScript")
+			collided.Name = "Collided"
+			collided.Source = current
+			collided.Parent = fixture
+			session.__instanceMap:insert("COLLIDED", collided)
+			session.__status = ServeSession.Status.Connected
+			session:__rememberVerified("VERIFY", { COLLIDED = checked })
+			local exported = session:exportForBackup({ "COLLIDED" }, { COLLIDED = (hashSource(checked)) }, "VERIFY")
+			expect(exported.missing).to.equal(1)
+			expect(#exported.ids).to.equal(0)
+			-- Without a record of what the verify saw, nothing is exported.
+			collided.Source = checked
+			expect(#session:exportForBackup({ "COLLIDED" }, { COLLIDED = (hashSource(checked)) }, "OTHER").ids).to.equal(
+				0
+			)
+			expect(#session:exportForBackup({ "COLLIDED" }, { COLLIDED = (hashSource(checked)) }, "VERIFY").ids).to.equal(
+				1
+			)
 		end)
 
 		it("leaves out a script whose source changed since verify hashed it", function()

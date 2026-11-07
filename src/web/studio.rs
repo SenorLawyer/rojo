@@ -1395,7 +1395,10 @@ impl StudioBridge {
             // Holds the pins on this verify's backups until it returns.
             let mut _pins = None;
             let (backups, backed_up) = if backing_up {
-                match self.back_up_fixes(session_id, &id, &fixes, started).await {
+                match self
+                    .back_up_fixes(session_id, &id, &fixes, started, &verify_id)
+                    .await
+                {
                     Ok(done) => {
                         _pins = Some(done.pins);
                         (done.summaries, done.scripts)
@@ -1537,6 +1540,7 @@ impl StudioBridge {
         id: &str,
         fixes: &[&verify::Different],
         started: Instant,
+        verify_id: &str,
     ) -> Result<FixBackups, String> {
         let mut pins = BackupPins {
             dir: self.backup_dir.get().cloned(),
@@ -1576,7 +1580,10 @@ impl StudioBridge {
                     session_id,
                     child,
                     "backup",
-                    json!({ "ids": ids, "hashes": hashes }),
+                    // The plugin compares each script with the exact source
+                    // this verify saw, as the fix itself does, not only its
+                    // hash, which two sources can share.
+                    json!({ "ids": ids, "hashes": hashes, "verifyId": verify_id }),
                 )
                 .await;
             let (status, value) = response_value(response).await;
@@ -1618,6 +1625,9 @@ impl StudioBridge {
                 exported["placeId"].as_u64(),
                 exported["placeName"].as_str(),
             );
+            if !backup::record_fits(&record) {
+                return Err(RECORD_TOO_LARGE.to_owned());
+            }
             let until = backup::now_millis() + BACKUP_PIN.as_millis() as u64;
             let (record, store_dir) = self
                 .save_backup(record, model, Some((until, pins.ids.clone())))
@@ -1698,6 +1708,9 @@ impl StudioBridge {
             value["placeId"].as_u64(),
             value["placeName"].as_str(),
         );
+        if !backup::record_fits(&record) {
+            return failure(StatusCode::PAYLOAD_TOO_LARGE, RECORD_TOO_LARGE);
+        }
         match self.save_backup(record, model, None).await {
             Ok((record, store_dir)) => reply(
                 StatusCode::OK,
@@ -2036,6 +2049,9 @@ fn import_model_bytes(args: &Value) -> anyhow::Result<Vec<u8>> {
         .context("Import model is not valid base64")
 }
 
+const RECORD_TOO_LARGE: &str =
+    "the backup lists too many or too long instance paths for its record, so it was not saved";
+
 /// What `verify --fix` saved, with the scripts the backups hold.
 struct FixBackups {
     /// A bounded summary of each backup, for the report.
@@ -2125,7 +2141,12 @@ fn backup_contents(value: &Value) -> Result<Vec<(String, String)>, String> {
                     .and_then(Value::as_str)
                     .map(|text| backup::clip(text, max).to_owned())
             };
-            Some((text("path", 1024)?, text("className", 128)?))
+            // Paths stay whole: shortened, two deep instances could be
+            // recorded as the same path. A record too large is refused.
+            Some((
+                item.get("path").and_then(Value::as_str)?.to_owned(),
+                text("className", 128)?,
+            ))
         })
         .collect::<Option<Vec<_>>>()
         .ok_or_else(|| "A backup lists an instance without a path or class".to_owned())
@@ -3355,8 +3376,10 @@ mod tests {
         let backup = next_command(&bridge, &session).await;
         assert_eq!(backup["action"], "backup");
         assert_eq!(backup["args"]["ids"], json!([script.id]));
-        // Studio's hash from the check, which `fix_past_sources` reports as 1.
+        // Studio's hash from the check, which `fix_past_sources` reports as 1,
+        // and the verify whose exact sources the plugin compares with.
         assert_eq!(backup["args"]["hashes"][&script.id], 1);
+        assert!(backup["args"]["verifyId"].is_string());
         // The fix waits for the backup: nothing else is queued yet.
         assert_eq!(bridge.state().pending.len(), 1);
         plugin(
@@ -4043,6 +4066,68 @@ mod tests {
             .as_deref()
             .unwrap()
             .starts_with("auto: before Rojo synced Studio"));
+    }
+
+    #[tokio::test]
+    async fn backups_keep_long_root_paths_whole_and_refuse_records_too_large() {
+        let (dir, bridge) = fixture();
+        let store = backup::Store::in_dir(&dir.path().join("backups"));
+        let deep = "Nested/".repeat(200);
+        let first = format!("game/Workspace/{deep}A");
+        let second = format!("game/Workspace/{deep}B");
+        assert!(first.len() > 1024);
+        let (status, value) = plugin(
+            &bridge,
+            "/api/studio/backup",
+            json!({"model": model(&["Part"]), "instances": [
+                {"path": first, "className": "Part"},
+                {"path": second, "className": "Part"},
+            ]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{value}");
+        let (record, _) = store.get(value["backup"]["id"].as_str().unwrap()).unwrap();
+        assert_eq!(record.roots[0].path, first);
+        assert_eq!(record.roots[1].path, second);
+
+        // 10,000 roots with long paths make a record over the 4 MiB limit.
+        let long = "x".repeat(500);
+        let instances: Vec<Value> = (0..10_000)
+            .map(|index| json!({"path": format!("game/Workspace/{long}{index}"), "className": "Part"}))
+            .collect();
+        let (status, value) = plugin(
+            &bridge,
+            "/api/studio/backup",
+            json!({"model": model(&["Part"]), "instances": instances.clone()}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{value}");
+        assert_eq!(store.list().unwrap().len(), 1, "nothing more was saved");
+
+        // verify --fix changes nothing when its backup's record is too large.
+        let (dir, bridge, session, script, verify) = fix_past_sources(json!({"fix":true})).await;
+        let command = next_command(&bridge, &session).await;
+        answer_export(
+            &bridge,
+            &session,
+            &command,
+            json!({"model": model(&["ModuleScript"]), "ids": [script.id], "instances": instances}),
+        )
+        .await;
+        let (status, value) = into_value(verify.await.unwrap()).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{value}");
+        assert!(
+            value["error"]
+                .as_str()
+                .unwrap()
+                .contains("too many or too long"),
+            "{value}"
+        );
+        assert!(bridge.state().pending.is_empty(), "no resync was sent");
+        assert!(backup::Store::in_dir(&dir.path().join("backups"))
+            .list()
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]

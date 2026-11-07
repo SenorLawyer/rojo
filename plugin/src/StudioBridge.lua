@@ -899,7 +899,7 @@ function StudioBridge:execute(command)
 		-- Only `verify --fix` sends this, with the IDs of the scripts it is
 		-- about to overwrite; the server saves what comes back.
 		assert(self.sync and self.sync.exportForBackup, "This bridge is not attached to a sync session")
-		local exported = self.sync.exportForBackup(args.ids, args.hashes)
+		local exported = self.sync.exportForBackup(args.ids, args.hashes, args.verifyId)
 		self:ensureActive(command)
 		return exported
 	elseif command.action == "selection" then

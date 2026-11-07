@@ -358,8 +358,8 @@ function ServeSession:restartStudioBridge()
 		applyResync = function(patch, expect, includeHeld, expiresAt, isActive, verifyId)
 			return self:applyResync(patch, expect, includeHeld, expiresAt, isActive, verifyId)
 		end,
-		exportForBackup = function(ids, hashes)
-			return self:exportForBackup(ids, hashes)
+		exportForBackup = function(ids, hashes, verifyId)
+			return self:exportForBackup(ids, hashes, verifyId)
 		end,
 	})
 	self.__studioBridge = bridge
@@ -690,10 +690,14 @@ end
 	`ids` in the result lists the scripts exported, and the server only fixes
 	those. Scripts left out, or no longer in the place, count in `missing`.
 ]=]
-function ServeSession:exportForBackup(ids, hashes)
+function ServeSession:exportForBackup(ids, hashes, verifyId)
 	assert(self.__status == Status.Connected, "Rojo is not syncing this place. Connect it first.")
 	assert(type(ids) == "table" and #ids <= StudioBackup.MAX_INSTANCES, "Back up at most 10,000 scripts at once")
 	assert(type(hashes) == "table", "A backup for verify --fix needs the hash verify saw for each script")
+	-- The exact sources this verify saw, which the fix compares with before
+	-- writing. A matching hash alone is not enough: two sources can share
+	-- one, and the backup must hold the very text the fix replaces.
+	local seen = self:__verifiedSourcesFor(verifyId) or {}
 	local entries = {}
 	local exported = {}
 	local missing = 0
@@ -709,6 +713,7 @@ function ServeSession:exportForBackup(ids, hashes)
 			and instance:IsDescendantOf(game)
 			and hashes[id] ~= nil
 			and (hashSource(source)) == hashes[id]
+			and source == seen[id]
 		then
 			table.insert(entries, { instance = instance, source = source })
 			table.insert(exported, id)
