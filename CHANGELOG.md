@@ -31,6 +31,12 @@ Making a new release? Simply add the new header with the version and date undern
 
 ## Unreleased
 
+* `rojo studio verify --fix` now saves Studio's copies of the scripts it is about to overwrite as a backup first, and prints its ID, so `rojo studio backup restore` can put them back. When that backup cannot be saved, it changes nothing and says why; `--no-backup` fixes without one. Updating the plugin is required, since an older plugin cannot export the scripts. ([fork#TBD])
+* The plugin now backs up what its first sync after connecting would change or remove in Studio, such as after the server's branch changed or it was restarted, through the server's Studio bridge (`rojo serve --studio-token-file`). Removed instances are saved whole and changed ones without their children. When no backup can be saved, for example without a bridge or over the 5 MiB model limit, the plugin warns and syncs anyway. Back Up Before Resync in Rojo's settings turns this off; agent control can turn it off only when Agent Can Skip Confirmation is on. ([fork#TBD])
+* Automatic backups are marked `automatic` and only the 20 newest are kept; backups made with `rojo studio backup create` are never removed. `rojo studio backup list` marks them `[automatic]`. ([fork#TBD])
+
+[fork#TBD]: https://github.com/SenorLawyer/rojo/pulls
+
 ## [8.1.0] (November 5th, 2026)
 
 * Added `rojo studio verify`, which checks that every script Rojo syncs has the same source in a connected Studio as in its file, and lists, with each script's file, those that differ, are missing from Studio or were removed there. It exits with 1 when something does not match. `--fix` sets the scripts that differ back to their files' contents, one undo step named `Rojo: Resync` per batch of up to 2 MiB of source, without overwriting a script that changed in Studio since the check. `--all` lists every script that differs instead of the first 200 of each kind. The plugin sends hashes rather than sources, and line endings are ignored. `rojo mcp` offers it as `studio_verify`. See [docs/sync-health.md](docs/sync-health.md). ([fork#9])

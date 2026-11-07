@@ -1242,6 +1242,128 @@ return function()
 		end)
 	end)
 
+	describe("backups before the first sync", function()
+		local Settings = require(script.Parent.Settings)
+		local HttpService = game:GetService("HttpService")
+		local nativeBridgeRequest = StudioBridge.requestAsync
+		local pairing = { protocolVersion = 1, pluginToken = "plugin-token", identity = { digest = "d" } }
+		local fixture
+		local previousSetting
+
+		beforeEach(function()
+			previousSetting = Settings:get("autoBackupBeforeSync")
+			fixture = Instance.new("Folder")
+			fixture.Name = "__RojoSyncBackupSpec"
+			fixture.Parent = game:GetService("ReplicatedStorage")
+			api.__baseUrl = "http://127.0.0.1:34872"
+		end)
+
+		afterEach(function()
+			Settings:set("autoBackupBeforeSync", previousSetting)
+			StudioBridge.requestAsync = nativeBridgeRequest
+			fixture:Destroy()
+		end)
+
+		-- Runs the first sync with a catch-up patch that removes `removed`,
+		-- and records the order in which the backup and the patch happen.
+		local function syncRemoving(removed, serverInfo, events)
+			events = events or {}
+			local patch = PatchSet.newEmpty()
+			table.insert(patch.removed, removed)
+			session.__reconciler = {
+				hydrate = function() end,
+				diff = function()
+					return true, patch
+				end,
+			}
+			session.__applyPatch = function(_, applied)
+				expect(applied).to.equal(patch)
+				table.insert(events, "patch")
+			end
+			local pending = session:__initialSync(serverInfo)
+			readResolve({ messageCursor = 0, instances = {} })
+			pending:await()
+			return events
+		end
+
+		it("saves what the catch-up patch removes before applying it", function()
+			Settings:set("autoBackupBeforeSync", true)
+			local removed = Instance.new("ModuleScript")
+			removed.Name = "OnlyInStudio"
+			removed.Parent = fixture
+			local body
+			local events
+			StudioBridge.requestAsync = function(options)
+				table.insert(events, "backup")
+				body = HttpService:JSONDecode(options.Body)
+				return {
+					Success = true,
+					StatusCode = 200,
+					Body = HttpService:JSONEncode({ backup = { id = "20261107-000000-auto-sync" } }),
+				}
+			end
+			events = {}
+			syncRemoving(removed, { rootInstanceId = "ROOT", studioBridge = pairing }, events)
+			expect(#events).to.equal(2)
+			expect(events[1]).to.equal("backup")
+			expect(events[2]).to.equal("patch")
+			expect(body.instances[1].path).to.equal("game/ReplicatedStorage/__RojoSyncBackupSpec/OnlyInStudio")
+			expect(body.instances[1].className).to.equal("ModuleScript")
+			expect(type(body.model)).to.equal("string")
+			expect(body.identity.digest).to.equal("d")
+		end)
+
+		it("still syncs when the backup cannot be saved", function()
+			Settings:set("autoBackupBeforeSync", true)
+			local removed = Instance.new("Folder")
+			removed.Parent = fixture
+			local calls = 0
+			StudioBridge.requestAsync = function()
+				calls += 1
+				error("simulated server failure")
+			end
+			local refused = syncRemoving(removed, { rootInstanceId = "ROOT", studioBridge = pairing })
+			expect(calls).to.equal(1)
+			expect(refused[1]).to.equal("patch")
+			-- A server without a Studio bridge cannot save one at all.
+			local unpaired = syncRemoving(removed, { rootInstanceId = "ROOT" })
+			expect(calls).to.equal(1)
+			expect(unpaired[1]).to.equal("patch")
+		end)
+
+		it("takes no backup when it is turned off", function()
+			Settings:set("autoBackupBeforeSync", false)
+			local removed = Instance.new("Folder")
+			removed.Parent = fixture
+			local calls = 0
+			StudioBridge.requestAsync = function()
+				calls += 1
+				error("no request expected")
+			end
+			local events = syncRemoving(removed, { rootInstanceId = "ROOT", studioBridge = pairing })
+			expect(calls).to.equal(0)
+			expect(events[1]).to.equal("patch")
+		end)
+
+		it("exports the scripts verify --fix overwrites, leaving out those not in the place", function()
+			local script = Instance.new("ModuleScript")
+			script.Name = "Fixed"
+			script.Source = "return 1"
+			script.Parent = fixture
+			session.__instanceMap:insert("FIXED", script)
+			session.__status = ServeSession.Status.Connected
+			local exported = session:exportForBackup({ "FIXED", "GONE" })
+			expect(exported.missing).to.equal(1)
+			expect(#exported.instances).to.equal(1)
+			expect(exported.instances[1].path).to.equal("game/ReplicatedStorage/__RojoSyncBackupSpec/Fixed")
+			expect(type(exported.model)).to.equal("string")
+			expect(exported.bytes > 0).to.equal(true)
+			local none = session:exportForBackup({ "GONE" })
+			expect(none.model).to.equal(nil)
+			expect(#none.instances).to.equal(0)
+		end)
+	end)
+
 	describe("versionMismatchWarning", function()
 		local Config = require(script.Parent.Config)
 		local Version = require(script.Parent.Version)

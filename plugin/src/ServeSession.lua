@@ -21,6 +21,7 @@ local strict = require(script.Parent.strict)
 local Settings = require(script.Parent.Settings)
 local orderSwaps = require(script.Parent.orderSwaps)
 local StudioBridge = require(script.Parent.StudioBridge)
+local StudioBackup = require(script.Parent.StudioBackup)
 local hashSource = require(script.Parent.hashSource)
 local Config = require(script.Parent.Config)
 local Version = require(script.Parent.Version)
@@ -343,6 +344,9 @@ function ServeSession:restartStudioBridge()
 		applyResync = function(patch, expect, includeHeld, expiresAt, isActive, verifyId)
 			return self:applyResync(patch, expect, includeHeld, expiresAt, isActive, verifyId)
 		end,
+		exportForBackup = function(ids)
+			return self:exportForBackup(ids)
+		end,
 	})
 	self.__studioBridge = bridge
 	bridge:start()
@@ -660,6 +664,85 @@ function ServeSession:getSourceHashes(verifyId, expiresAt, isActive)
 	end
 	self:__rememberVerified(verifyId, seen, generations)
 	return { scripts = scripts, detached = detached, held = held }
+end
+
+--[=[
+	Exports the scripts with the given IDs as they are in Studio, without
+	their children, for the backup `rojo studio verify --fix` saves before it
+	overwrites them. Scripts that are no longer in the place are left out,
+	since the fix cannot change them either.
+]=]
+function ServeSession:exportForBackup(ids)
+	assert(self.__status == Status.Connected, "Rojo is not syncing this place. Connect it first.")
+	assert(type(ids) == "table" and #ids <= StudioBackup.MAX_INSTANCES, "Back up at most 10,000 scripts at once")
+	local entries = {}
+	local missing = 0
+	for _, id in ids do
+		local instance = self.__instanceMap.fromIds[id]
+		if instance and instance:IsDescendantOf(game) then
+			table.insert(entries, { instance = instance, deep = false })
+		else
+			missing += 1
+		end
+	end
+	local result = { instances = {}, missing = missing, placeId = game.PlaceId, placeName = game.Name }
+	if #entries == 0 then
+		return result
+	end
+	local model, described = StudioBackup.serialize(entries, readSource)
+	result.instances = described
+	result.model = StudioBridge.encodeModel(model)
+	result.bytes = buffer.len(model)
+	return result
+end
+
+--[=[
+	Before the first sync after connecting changes or removes instances in
+	Studio, sends copies of them to the server, which saves them where
+	`rojo studio backup list` finds them. This is the sync that follows a
+	branch switch or a restart of the server, and it can remove code that
+	only Studio had. Syncing never waits on more than this request: when no
+	backup can be saved, it warns and goes ahead.
+]=]
+function ServeSession:__backUpBeforeCatchUp(patch, serverInfo)
+	if not Settings:get("autoBackupBeforeSync") then
+		return
+	end
+	local entries, skipped = StudioBackup.collect(patch, self.__instanceMap)
+	if skipped > 0 then
+		Log.debug("{} services or other instances Rojo is about to change cannot be backed up", skipped)
+	end
+	if #entries == 0 then
+		return
+	end
+	local ok, result = pcall(function()
+		assert(
+			serverInfo.studioBridge ~= nil,
+			"the server was not started with --studio-token-file, so it cannot save backups"
+		)
+		local model, described = StudioBackup.serialize(entries, readSource)
+		return StudioBackup.send(self.__apiContext.__baseUrl, serverInfo.studioBridge, {
+			model = StudioBridge.encodeModel(model),
+			instances = described,
+			placeId = game.PlaceId,
+			placeName = game.Name,
+		})
+	end)
+	if ok then
+		local id = tostring(result.backup.id)
+		Log.info(
+			"Saved Studio's copies of {} instances this sync changes or removes as backup {}. `rojo studio backup restore {} --parent <instance> --allow-scripts` puts them back.",
+			#entries,
+			id,
+			id
+		)
+	else
+		Log.warn(
+			"No backup was taken of the {} instances this sync changes or removes in Studio: {}. Syncing goes ahead without one. Turn off 'Back Up Before Resync' in Rojo's settings to skip backups.",
+			#entries,
+			tostring(result)
+		)
+	end
 end
 
 --[=[
@@ -1832,6 +1915,11 @@ function ServeSession:__initialSync(serverInfo)
 
 			return self.__apiContext:write(inversePatch)
 		elseif userDecision == "Accept" then
+			self:__backUpBeforeCatchUp(catchUpPatch, serverInfo)
+			-- The backup can yield while the user disconnects.
+			if self.__status == Status.Disconnected then
+				return
+			end
 			self:__applyPatch(catchUpPatch)
 			return Promise.resolve()
 		else

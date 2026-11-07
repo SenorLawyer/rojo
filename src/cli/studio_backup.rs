@@ -34,7 +34,17 @@ pub struct Record {
     pub bytes: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+    /// Taken by Rojo itself before it overwrote or removed instances, such as
+    /// before `verify --fix`. Only these are pruned; a backup someone made on
+    /// purpose stays until they remove it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub automatic: bool,
 }
+
+/// How many automatic backups are kept. Each is at most 5 MiB, and every
+/// reconnect that changes Studio takes one, so without a bound they would
+/// fill the disk.
+pub const KEEP_AUTOMATIC: usize = 20;
 
 pub struct Store {
     dir: PathBuf,
@@ -140,8 +150,8 @@ impl Store {
         })
     }
 
-    #[cfg(test)]
-    fn in_dir(dir: &Path) -> Store {
+    /// A store in `dir`, for tests that must not touch the per-user folder.
+    pub(crate) fn in_dir(dir: &Path) -> Store {
         Store {
             dir: dir.to_owned(),
             workdir: dir.to_owned(),
@@ -317,8 +327,41 @@ impl Store {
         Ok(orphans)
     }
 
+    /// Saves `model` as an automatic backup, then removes the oldest
+    /// automatic backups beyond [`KEEP_AUTOMATIC`]. A failure to prune is
+    /// only logged, because the new backup is saved by then.
+    pub fn save_automatic(&self, mut record: Record, model: &[u8]) -> anyhow::Result<Record> {
+        record.automatic = true;
+        let record = self.save(record, model)?;
+        if let Err(error) = self.prune_automatic(KEEP_AUTOMATIC) {
+            log::warn!("Could not remove old automatic backups: {error:#}");
+        }
+        Ok(record)
+    }
+
+    /// Removes automatic backups other than the `keep` newest, and returns
+    /// their IDs. Backups made on purpose are never removed.
+    pub fn prune_automatic(&self, keep: usize) -> anyhow::Result<Vec<String>> {
+        let _lock = self.lock()?;
+        let removed: Vec<String> = self
+            .list()?
+            .into_iter()
+            .filter(|record| record.automatic)
+            .skip(keep)
+            .map(|record| record.id)
+            .collect();
+        for id in &removed {
+            self.remove_locked(id)?;
+        }
+        Ok(removed)
+    }
+
     pub fn remove(&self, id: &str) -> anyhow::Result<()> {
         let _lock = self.lock()?;
+        self.remove_locked(id)
+    }
+
+    fn remove_locked(&self, id: &str) -> anyhow::Result<()> {
         if valid_id(id) && !self.record_path(id).exists() && self.model_path(id).is_file() {
             fs::remove_file(self.model_path(id))?;
             return Ok(());
@@ -336,6 +379,64 @@ impl Store {
 }
 
 const MAX_RECORD_BYTES: u64 = 64 * 1024;
+const MAX_NOTE_BYTES: usize = 4096;
+
+/// `text` cut to at most `max` bytes on a character boundary.
+pub(crate) fn clip(text: &str, max: usize) -> &str {
+    if text.len() <= max {
+        return text;
+    }
+    let mut cut = max;
+    while !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    &text[..cut]
+}
+
+/// The record of an automatic backup holding `contents`, the path and class
+/// of each instance in its model. The note starts with `reason` and lists as
+/// many of the paths as fit, so `backup list` says what is in it.
+pub(crate) fn automatic_record(
+    name: &str,
+    reason: &str,
+    contents: &[(String, String)],
+    place_id: Option<u64>,
+    place_name: Option<&str>,
+) -> Record {
+    let instance = match contents {
+        [] => String::new(),
+        [(path, _)] => path.clone(),
+        [(path, _), rest @ ..] => format!("{path} and {} more", rest.len()),
+    };
+    let class_name = match contents.split_first() {
+        Some(((_, first), rest)) if rest.iter().all(|(_, class)| class == first) => first.clone(),
+        _ => "Instances".to_owned(),
+    };
+    let mut note = format!("{reason}; {} instances:", contents.len());
+    for (index, (path, _)) in contents.iter().enumerate() {
+        let more = format!(" (and {} more)", contents.len() - index);
+        if note.len() + 1 + path.len() + more.len() > MAX_NOTE_BYTES {
+            note.push_str(&more);
+            break;
+        }
+        note.push(' ');
+        note.push_str(path);
+    }
+    Record {
+        id: String::new(),
+        name: clip(name, 64).to_owned(),
+        instance,
+        class_name,
+        place_id,
+        place_name: place_name.map(|name| clip(name, 256).to_owned()),
+        git_head: None,
+        git_branch: None,
+        created_at: now_millis(),
+        bytes: 0,
+        note: Some(clip(&note, MAX_NOTE_BYTES).to_owned()),
+        automatic: true,
+    }
+}
 
 fn entry_len(path: &Path) -> Option<u64> {
     fs::metadata(path).ok().map(|metadata| metadata.len())
@@ -362,8 +463,9 @@ pub fn print_list(store: &Store, records: &[Record]) {
         let commit = record.git_head.as_deref().map_or_else(String::new, |head| {
             format!(" @ {}", &head[..head.len().min(8)])
         });
+        let automatic = if record.automatic { " [automatic]" } else { "" };
         println!(
-            "{}  {} ({}, {size}) from {place}{commit}",
+            "{}  {} ({}, {size}) from {place}{commit}{automatic}",
             record.id,
             super::escape_controls(&record.instance),
             super::escape_controls(&record.class_name)
@@ -391,6 +493,7 @@ mod tests {
             created_at,
             bytes: 0,
             note: None,
+            automatic: false,
         }
     }
 
@@ -459,6 +562,121 @@ mod tests {
         assert_eq!(store.orphans().unwrap(), vec![saved.id.clone()]);
         store.remove(&saved.id).unwrap();
         assert!(store.orphans().unwrap().is_empty());
+    }
+
+    #[test]
+    fn pruning_keeps_the_newest_automatic_backups_and_every_manual_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::in_dir(dir.path());
+        let manual_old = store.save(record("Map", 500), b"manual").unwrap();
+        let mut automatic = Vec::new();
+        for index in 0..5 {
+            let saved = store
+                .save_automatic(record("auto", 1_000 + index * 1_000), b"auto")
+                .unwrap();
+            assert!(saved.automatic);
+            automatic.push(saved.id);
+        }
+        let manual_new = store.save(record("Lobby", 100_000), b"manual").unwrap();
+        let removed = store.prune_automatic(2).unwrap();
+        assert_eq!(
+            removed,
+            vec![
+                automatic[2].clone(),
+                automatic[1].clone(),
+                automatic[0].clone()
+            ]
+        );
+        let left: Vec<String> = store.list().unwrap().into_iter().map(|r| r.id).collect();
+        assert_eq!(
+            left,
+            vec![
+                manual_new.id,
+                automatic[4].clone(),
+                automatic[3].clone(),
+                manual_old.id
+            ],
+            "manual backups stay however old they are"
+        );
+        for id in &removed {
+            assert!(!store.model_path(id).exists() && !store.record_path(id).exists());
+        }
+    }
+
+    #[test]
+    fn saving_an_automatic_backup_prunes_beyond_the_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::in_dir(dir.path());
+        let manual = store.save(record("Map", 1), b"manual").unwrap();
+        for index in 0..KEEP_AUTOMATIC as u64 + 3 {
+            store
+                .save_automatic(record("auto", 1_000 + index * 1_000), b"auto")
+                .unwrap();
+        }
+        let listed = store.list().unwrap();
+        assert_eq!(
+            listed.iter().filter(|r| r.automatic).count(),
+            KEEP_AUTOMATIC
+        );
+        assert!(listed.iter().any(|r| r.id == manual.id));
+        assert_eq!(listed.len(), KEEP_AUTOMATIC + 1);
+    }
+
+    #[test]
+    fn records_from_before_automatic_backups_read_as_manual() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::in_dir(dir.path());
+        let saved = store.save(record("Map", 1_000), b"model").unwrap();
+        let text = fs::read_to_string(store.record_path(&saved.id)).unwrap();
+        assert!(
+            !text.contains("automatic"),
+            "manual records keep the old format"
+        );
+        assert!(!store.get(&saved.id).unwrap().0.automatic);
+        assert_eq!(store.prune_automatic(0).unwrap(), Vec::<String>::new());
+        let auto = store
+            .save_automatic(record("auto", 2_000), b"model")
+            .unwrap();
+        let text = fs::read_to_string(store.record_path(&auto.id)).unwrap();
+        assert!(text.contains("\"automatic\": true"));
+    }
+
+    #[test]
+    fn automatic_records_describe_their_contents_within_the_limits() {
+        let one = automatic_record(
+            "auto-verify-fix",
+            "auto: before verify --fix",
+            &[(
+                "game/ReplicatedStorage/A".to_owned(),
+                "ModuleScript".to_owned(),
+            )],
+            Some(7),
+            Some("Place"),
+        );
+        assert!(one.automatic);
+        assert_eq!(one.instance, "game/ReplicatedStorage/A");
+        assert_eq!(one.class_name, "ModuleScript");
+        assert_eq!(
+            one.note.as_deref(),
+            Some("auto: before verify --fix; 1 instances: game/ReplicatedStorage/A")
+        );
+        let many: Vec<(String, String)> = (0..2_000)
+            .map(|index| {
+                (
+                    format!("game/Workspace/Part{index}"),
+                    if index == 0 { "Script" } else { "Part" }.to_owned(),
+                )
+            })
+            .collect();
+        let record = automatic_record("auto-sync", "auto: before sync", &many, None, None);
+        assert_eq!(record.instance, "game/Workspace/Part0 and 1999 more");
+        assert_eq!(record.class_name, "Instances");
+        let note = record.note.clone().unwrap();
+        assert!(note.len() <= 4096 && note.ends_with("more)"), "{note}");
+        // A record this large still saves, so `list` shows it.
+        let dir = tempfile::tempdir().unwrap();
+        assert!(Store::in_dir(dir.path()).save(record, b"model").is_ok());
+        assert_eq!(clip("aé", 2), "a");
     }
 
     #[test]

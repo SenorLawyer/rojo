@@ -249,6 +249,14 @@ function SettingsPage:render()
 				layoutOrder = layoutIncrement(),
 			}),
 
+			AutoBackupBeforeSync = e(Setting, {
+				id = "autoBackupBeforeSync",
+				name = "Back Up Before Resync",
+				description = "Before connecting changes or removes instances in Studio, save copies of them in the project's backups, which rojo studio backup list shows. Needs a server started with --studio-token-file; syncing goes ahead without a backup if one cannot be saved.",
+				transparency = self.props.transparency,
+				layoutOrder = layoutIncrement(),
+			}),
+
 			AgentControlEnabled = e(Setting, {
 				id = "agentControlEnabled",
 				name = "Agent Control",

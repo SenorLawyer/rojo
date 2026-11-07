@@ -19,7 +19,7 @@ use tokio::sync::{oneshot, Notify, Semaphore};
 use uuid::Uuid;
 
 use super::{model_check, origin::canonical, untrusted_model, util::json as json_response, verify};
-use crate::serve_session::ServeSession;
+use crate::{cli::studio_backup as backup, serve_session::ServeSession};
 
 pub(super) const MAX_BODY: usize = 8 * 1024 * 1024;
 const SESSION_TTL: Duration = Duration::from_secs(30);
@@ -706,6 +706,9 @@ pub struct StudioBridge {
     state: Mutex<State>,
     changed: Notify,
     decodes: Arc<Semaphore>,
+    /// Where automatic backups go instead of the repository's backup folder.
+    /// Only tests set it, so they do not write to the user's own folder.
+    backup_dir: OnceLock<PathBuf>,
 }
 
 fn reply(status: StatusCode, value: Value) -> Response<Body> {
@@ -835,6 +838,7 @@ impl StudioBridge {
             state: Mutex::new(State::default()),
             changed: Notify::new(),
             decodes: Arc::new(Semaphore::new(MAX_CONCURRENT_DECODES)),
+            backup_dir: OnceLock::new(),
         }))
     }
 
@@ -965,6 +969,7 @@ impl StudioBridge {
                 | "/api/studio/result"
                 | "/api/studio/disconnect"
                 | "/api/studio/validate"
+                | "/api/studio/backup"
         );
         if !self.authorized(&request, plugin) {
             return failure(StatusCode::UNAUTHORIZED, "Invalid Studio control token");
@@ -1022,6 +1027,7 @@ impl StudioBridge {
             }
             "/api/studio/poll" => self.poll(value).await,
             "/api/studio/result" => self.result(value),
+            "/api/studio/backup" => self.plugin_backup(value).await,
             "/api/studio/validate" => {
                 let mut state = self.state();
                 Self::prune(&mut state);
@@ -1379,6 +1385,27 @@ impl StudioBridge {
         let mut report = comparison.report(list_limit, list_bytes);
         if fix {
             let fixes = comparison.fixable(include_held);
+            // Studio's copies of the scripts are saved before any is
+            // overwritten, so a wrong fix can be put back. Without that
+            // backup nothing is changed, unless the caller opted out.
+            let backups = if args.get("backup") != Some(&json!(false)) && !fixes.is_empty() {
+                match self.back_up_fixes(session_id, &id, &fixes, started).await {
+                    Ok(backups) => backups,
+                    Err(error) => {
+                        return failure(
+                            StatusCode::BAD_GATEWAY,
+                            format!(
+                                "Changed nothing: could not back up the {} scripts verify --fix would overwrite: {error}. \
+                                 Run it again, or pass --no-backup to fix them without a backup.",
+                                fixes.len()
+                            ),
+                        )
+                    }
+                }
+            } else {
+                Vec::new()
+            };
+            report["backups"] = json!(backups);
             let batches = {
                 let tree = self.serve.tree();
                 verify::resync_batches(&tree, &fixes)
@@ -1453,6 +1480,132 @@ impl StudioBridge {
             StatusCode::OK,
             json!({"sessionId":session_id,"requestId":id,"result":{"ok":true,"value":report}}),
         )
+    }
+
+    /// Has Studio export the scripts in `fixes` as they are now and saves
+    /// them as automatic backups, one per group from
+    /// [`verify::backup_groups`]. Fails on the first group that cannot be
+    /// exported or saved.
+    async fn back_up_fixes(
+        &self,
+        session_id: &str,
+        id: &str,
+        fixes: &[&verify::Different],
+        started: Instant,
+    ) -> Result<Vec<backup::Record>, String> {
+        let mut saved = Vec::new();
+        for group in verify::backup_groups(fixes) {
+            if started.elapsed() > VERIFY_FIX_BUDGET {
+                return Err(format!(
+                    "it took longer than {} seconds",
+                    VERIFY_FIX_BUDGET.as_secs()
+                ));
+            }
+            let child = Uuid::new_v4().to_string();
+            // Registered like a fix batch, so cancelling the verify stops it.
+            if !self.begin_child(id, session_id, &child) {
+                return Err("the verify was cancelled".to_owned());
+            }
+            let _child_record = ChildRecord {
+                bridge: self,
+                id: id.to_owned(),
+                child: child.clone(),
+            };
+            let ids: Vec<&str> = group.iter().map(|fix| fix.script.id.as_str()).collect();
+            let response = self
+                .dispatch(session_id, child, "backup", json!({ "ids": ids }))
+                .await;
+            let (status, value) = response_value(response).await;
+            let result = &value["result"];
+            if status != StatusCode::OK || result["ok"] != json!(true) {
+                let error = result["error"]
+                    .as_str()
+                    .or(value["error"].as_str())
+                    .unwrap_or("Studio did not export the scripts");
+                return Err(if error.contains("Unsupported Studio action") {
+                    "the connected Rojo plugin cannot export them; run `rojo plugin install` and restart Studio"
+                        .to_owned()
+                } else {
+                    error.to_owned()
+                });
+            }
+            let exported = &result["value"];
+            let contents = backup_contents(exported)?;
+            // Scripts no longer in Studio have nothing to overwrite.
+            if contents.is_empty() {
+                continue;
+            }
+            let model = backup_model_bytes(exported).map_err(|error| format!("{error:#}"))?;
+            let record = backup::automatic_record(
+                "auto-verify-fix",
+                "auto: before verify --fix",
+                &contents,
+                exported["placeId"].as_u64(),
+                exported["placeName"].as_str(),
+            );
+            saved.push(
+                self.save_backup(record, model)
+                    .await
+                    .map_err(|error| format!("{error:#}"))?,
+            );
+        }
+        Ok(saved)
+    }
+
+    /// Saves a backup the plugin took before its first sync after connecting
+    /// changed or removed instances in Studio, such as after the server's
+    /// branch changed. It comes with the plugin token like the plugin's other
+    /// requests, and only ever adds to the backup folder.
+    async fn plugin_backup(&self, value: Value) -> Response<Body> {
+        let model = match backup_model_bytes(&value) {
+            Ok(model) => model,
+            Err(error) => return failure(StatusCode::BAD_REQUEST, format!("{error:#}")),
+        };
+        let contents = match backup_contents(&value) {
+            Ok(contents) if !contents.is_empty() => contents,
+            Ok(_) => {
+                return failure(
+                    StatusCode::BAD_REQUEST,
+                    "A backup must hold at least one instance",
+                )
+            }
+            Err(error) => return failure(StatusCode::BAD_REQUEST, error),
+        };
+        let record = backup::automatic_record(
+            "auto-sync",
+            "auto: before Rojo synced Studio with the files on connecting",
+            &contents,
+            value["placeId"].as_u64(),
+            value["placeName"].as_str(),
+        );
+        match self.save_backup(record, model).await {
+            Ok(record) => reply(StatusCode::OK, json!({ "backup": record })),
+            Err(error) => failure(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Could not save the backup: {error:#}"),
+            ),
+        }
+    }
+
+    /// Saves an automatic backup in the backup folder of the project's
+    /// repository, which `rojo studio backup list` reads from any of its
+    /// worktrees, and prunes old automatic ones.
+    async fn save_backup(
+        &self,
+        record: backup::Record,
+        model: Vec<u8>,
+    ) -> anyhow::Result<backup::Record> {
+        let dir = self.backup_dir.get().cloned();
+        let root = self.serve.root_dir().to_owned();
+        tokio::task::spawn_blocking(move || {
+            let store = match dir {
+                Some(dir) => backup::Store::in_dir(&dir),
+                None => backup::Store::at_workdir(&root)?,
+            };
+            store.save_automatic(record, &model)
+        })
+        .await
+        .context("The backup stopped before it was saved")?
     }
 
     /// Registers `child` as the batch the verify `id` waits on, unless a
@@ -1711,6 +1864,57 @@ fn import_model_bytes(args: &Value) -> anyhow::Result<Vec<u8>> {
         .context("Import model is not valid base64")
 }
 
+/// The model bytes of a backup the plugin sent, within the model limit.
+fn backup_model_bytes(value: &Value) -> anyhow::Result<Vec<u8>> {
+    let model = value
+        .get("model")
+        .and_then(Value::as_str)
+        .context("A backup requires base64 model bytes")?;
+    anyhow::ensure!(
+        model.len() <= MAX_MODEL_BYTES.div_ceil(3) * 4,
+        "Backup exceeds the 5MiB model limit"
+    );
+    let bytes = data_encoding::BASE64
+        .decode(model.as_bytes())
+        .context("Backup model is not valid base64")?;
+    anyhow::ensure!(
+        bytes.len() <= MAX_MODEL_BYTES,
+        "Backup exceeds the 5MiB model limit"
+    );
+    // `backup restore` checks the whole model; this only keeps out anything
+    // that is plainly not one.
+    anyhow::ensure!(
+        bytes.starts_with(b"<roblox!"),
+        "Backup is not a binary Roblox model"
+    );
+    Ok(bytes)
+}
+
+/// The path and class of each instance the plugin says a backup holds.
+fn backup_contents(value: &Value) -> Result<Vec<(String, String)>, String> {
+    let items = value
+        .get("instances")
+        .and_then(Value::as_array)
+        .ok_or("A backup must list its instances")?;
+    if items.len() > MAX_MODEL_INSTANCES {
+        return Err(format!(
+            "A backup holds at most {MAX_MODEL_INSTANCES} instances"
+        ));
+    }
+    items
+        .iter()
+        .map(|item| {
+            let text = |key: &str, max: usize| {
+                item.get(key)
+                    .and_then(Value::as_str)
+                    .map(|text| backup::clip(text, max).to_owned())
+            };
+            Some((text("path", 1024)?, text("className", 128)?))
+        })
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(|| "A backup lists an instance without a path or class".to_owned())
+}
+
 async fn read_json(mut body: Body) -> Result<Value, Box<Response<Body>>> {
     let read = async {
         let mut bytes = Vec::new();
@@ -1761,7 +1965,10 @@ mod tests {
 
     fn bridge_for(dir: &Path, lock_wait: Duration) -> Arc<StudioBridge> {
         let session = Arc::new(ServeSession::new(Vfs::new_default().unwrap(), dir).unwrap());
-        StudioBridge::with_lock_wait(&session, &dir.join("token"), lock_wait).unwrap()
+        let bridge = StudioBridge::with_lock_wait(&session, &dir.join("token"), lock_wait).unwrap();
+        // Never the user's own backup folder.
+        bridge.backup_dir.set(dir.join("backups")).unwrap();
+        bridge
     }
 
     fn fixture() -> (tempfile::TempDir, Arc<StudioBridge>) {
@@ -2764,7 +2971,9 @@ mod tests {
             "POST",
             "/api/studio/command",
             &bridge.token,
-            Some(json!({"sessionId":session,"action":"verify","requestId":id,"args":{"fix":true}})),
+            Some(
+                json!({"sessionId":session,"action":"verify","requestId":id,"args":{"fix":true,"backup":false}}),
+            ),
         );
         let verify = tokio::spawn(bridge.clone().call(PEER.parse().unwrap(), request));
 
@@ -2821,6 +3030,220 @@ mod tests {
         assert_eq!(status, StatusCode::GONE);
         assert!(bridge.state().verify_children.is_empty());
         assert!(bridge.state().active_verifies.is_empty());
+    }
+
+    /// A project with one script, and a verify --fix with `args` that has
+    /// got past its `sources` step, where Studio's copy of the script differs.
+    async fn fix_past_sources(
+        args: Value,
+    ) -> (
+        tempfile::TempDir,
+        Arc<StudioBridge>,
+        String,
+        verify::TreeScript,
+        tokio::task::JoinHandle<Response<Body>>,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(
+            dir.path().join("default.project.json"),
+            r#"{"name":"v","tree":{"$className":"DataModel","ReplicatedStorage":{"Shared":{"$path":"src"}}}}"#,
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("src/Main.luau"), "return 'disk'\n").unwrap();
+        std::fs::write(dir.path().join("token"), "0123456789abcdef0123456789abcdef").unwrap();
+        let bridge = bridge_for(dir.path(), GIT_LOCK_WAIT);
+        let session = register(&bridge).await;
+        let request = request(
+            "POST",
+            "/api/studio/command",
+            &bridge.token,
+            Some(
+                json!({"sessionId":session,"action":"verify","requestId":Uuid::new_v4().to_string(),"args":args}),
+            ),
+        );
+        let verify = tokio::spawn(bridge.clone().call(PEER.parse().unwrap(), request));
+        let sources = next_command(&bridge, &session).await;
+        assert_eq!(sources["action"], "sources");
+        let script = {
+            let tree = bridge.serve.tree();
+            verify::tree_scripts(&tree, bridge.serve.root_dir())
+                .into_iter()
+                .next()
+                .unwrap()
+        };
+        plugin(
+            &bridge,
+            "/api/studio/result",
+            json!({"requestId":sources["requestId"],"sessionId":session,"result":{"ok":true,"value":{
+                "scripts":[{"id":script.id,"hash":1,"length":1}],"detached":[],"held":[]}}}),
+        )
+        .await;
+        (dir, bridge, session, script, verify)
+    }
+
+    #[tokio::test]
+    async fn verify_fix_backs_up_studio_scripts_before_overwriting_them() {
+        let (dir, bridge, session, script, verify) = fix_past_sources(json!({"fix":true})).await;
+        let backup = next_command(&bridge, &session).await;
+        assert_eq!(backup["action"], "backup");
+        assert_eq!(backup["args"]["ids"], json!([script.id]));
+        // The fix waits for the backup: nothing else is queued yet.
+        assert_eq!(bridge.state().pending.len(), 1);
+        plugin(
+            &bridge,
+            "/api/studio/result",
+            json!({"requestId":backup["requestId"],"sessionId":session,"result":{"ok":true,"value":{
+                "model":model(&["ModuleScript"]),
+                "instances":[{"path":"game/ReplicatedStorage/Shared/Main","className":"ModuleScript"}],
+                "placeId":5,"placeName":"Place"}}}),
+        )
+        .await;
+        let resync = next_command(&bridge, &session).await;
+        assert_eq!(resync["action"], "resync");
+        plugin(
+            &bridge,
+            "/api/studio/result",
+            json!({"requestId":resync["requestId"],"sessionId":session,"result":{"ok":true,"value":{"updated":1,"failed":0,"skipped":0}}}),
+        )
+        .await;
+        let (status, value) = into_value(verify.await.unwrap()).await;
+        assert_eq!(status, StatusCode::OK, "{value}");
+        let report = &value["result"]["value"];
+        assert_eq!(report["fixed"]["updated"], 1);
+        let saved = &report["backups"][0];
+        assert_eq!(saved["automatic"], true);
+        let listed = backup::Store::in_dir(&dir.path().join("backups"))
+            .list()
+            .unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(json!(listed[0].id), saved["id"]);
+        assert_eq!(listed[0].instance, "game/ReplicatedStorage/Shared/Main");
+        assert_eq!(listed[0].place_id, Some(5));
+        assert!(listed[0]
+            .note
+            .as_deref()
+            .unwrap()
+            .starts_with("auto: before verify --fix"));
+    }
+
+    #[tokio::test]
+    async fn verify_fix_changes_nothing_when_the_backup_fails() {
+        for (error, expected) in [
+            ("Export exceeds 5MiB", "Export exceeds 5MiB"),
+            (
+                "StudioBridge:1070: Unsupported Studio action. Inspect capabilities for the precise availability contract.",
+                "rojo plugin install",
+            ),
+        ] {
+            let (dir, bridge, session, _, verify) = fix_past_sources(json!({"fix":true})).await;
+            let backup = next_command(&bridge, &session).await;
+            assert_eq!(backup["action"], "backup");
+            plugin(
+                &bridge,
+                "/api/studio/result",
+                json!({"requestId":backup["requestId"],"sessionId":session,"result":{"ok":false,"error":error}}),
+            )
+            .await;
+            let (status, value) = into_value(verify.await.unwrap()).await;
+            assert_eq!(status, StatusCode::BAD_GATEWAY, "{value}");
+            let message = value["error"].as_str().unwrap();
+            assert!(message.starts_with("Changed nothing"), "{message}");
+            assert!(message.contains(expected), "{message}");
+            assert!(message.contains("--no-backup"), "{message}");
+            // No resync was ever queued, and nothing was saved.
+            let state = bridge.state();
+            assert!(state.pending.is_empty());
+            assert!(state.sessions[&session].queue.is_empty());
+            assert!(state.verify_children.is_empty());
+            drop(state);
+            assert!(backup::Store::in_dir(&dir.path().join("backups"))
+                .list()
+                .unwrap()
+                .is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn verify_fix_with_a_model_that_is_not_one_changes_nothing() {
+        let (_dir, bridge, session, _, verify) = fix_past_sources(json!({"fix":true})).await;
+        let backup = next_command(&bridge, &session).await;
+        plugin(
+            &bridge,
+            "/api/studio/result",
+            json!({"requestId":backup["requestId"],"sessionId":session,"result":{"ok":true,"value":{
+                "model":data_encoding::BASE64.encode(b"not a model"),
+                "instances":[{"path":"game/ReplicatedStorage/Shared/Main","className":"ModuleScript"}]}}}),
+        )
+        .await;
+        let (status, value) = into_value(verify.await.unwrap()).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{value}");
+        assert!(bridge.state().pending.is_empty());
+    }
+
+    #[tokio::test]
+    async fn plugin_backups_are_saved_as_automatic_with_the_plugin_token_only() {
+        let (dir, bridge) = fixture();
+        let body = json!({
+            "model": model(&["Part"]),
+            "instances": [{"path":"game/Workspace/Folder","className":"Folder"}],
+            "placeId": 9,
+            "placeName": "Place",
+        });
+        // The CLI's token is not the plugin's.
+        let (status, _) = cli(&bridge, "/api/studio/backup", body.clone()).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        // Nor is a plugin paired with another server.
+        let mut foreign = body.clone();
+        foreign["identity"] = json!({"serverSession":"other","digest":"other"});
+        let request = request(
+            "POST",
+            "/api/studio/backup",
+            &bridge.plugin_token,
+            Some(foreign),
+        );
+        let (status, _) =
+            into_value(bridge.clone().call(PEER.parse().unwrap(), request).await).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        let store = backup::Store::in_dir(&dir.path().join("backups"));
+        assert!(store.list().unwrap().is_empty());
+
+        // The bridge does not have to be registered: the backup is taken
+        // before the plugin starts it.
+        let (status, value) = plugin(&bridge, "/api/studio/backup", body).await;
+        assert_eq!(status, StatusCode::OK, "{value}");
+        assert_eq!(value["backup"]["automatic"], true);
+        let listed = store.list().unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].instance, "game/Workspace/Folder");
+        assert_eq!(listed[0].place_name.as_deref(), Some("Place"));
+        assert!(listed[0]
+            .note
+            .as_deref()
+            .unwrap()
+            .starts_with("auto: before Rojo synced Studio"));
+    }
+
+    #[tokio::test]
+    async fn plugin_backups_outside_the_limits_are_refused() {
+        let (dir, bridge) = fixture();
+        let instances = json!([{"path":"game/Workspace/Folder","className":"Folder"}]);
+        let too_large = "A".repeat(MAX_MODEL_BYTES.div_ceil(3) * 4 + 4);
+        for body in [
+            json!({"instances": instances}),
+            json!({"model": "not base64!", "instances": instances}),
+            json!({"model": data_encoding::BASE64.encode(b"hello"), "instances": instances}),
+            json!({"model": too_large, "instances": instances}),
+            json!({"model": model(&[]), "instances": []}),
+            json!({"model": model(&[]), "instances": [{"path": "game/Workspace"}]}),
+        ] {
+            let (status, value) = plugin(&bridge, "/api/studio/backup", body).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        }
+        assert!(backup::Store::in_dir(&dir.path().join("backups"))
+            .list()
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]

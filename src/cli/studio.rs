@@ -13,7 +13,7 @@ use reqwest::{blocking::Client, Url};
 use serde_json::{json, Value};
 
 #[path = "studio_backup.rs"]
-mod backup;
+pub(crate) mod backup;
 
 use std::io::IsTerminal;
 
@@ -144,6 +144,11 @@ pub enum StudioSubcommand {
         /// because their file became empty.
         #[clap(long, requires = "fix")]
         include_held: bool,
+        /// With --fix, do not save the Studio copies of the scripts it
+        /// overwrites first. Without this, --fix changes nothing when that
+        /// backup cannot be saved.
+        #[clap(long, requires = "fix")]
+        no_backup: bool,
         /// List every script that differs, not just the first 200 of each kind
         /// (up to 10,000).
         #[clap(long, conflicts_with = "limit")]
@@ -314,12 +319,13 @@ impl StudioCommand {
             target,
             fix,
             include_held,
+            no_backup,
             all,
             limit,
             max_bytes,
         } = &self.command
         {
-            let mut args = json!({"fix": fix, "includeHeld": include_held});
+            let mut args = json!({"fix": fix, "includeHeld": include_held, "backup": !no_backup});
             if *all {
                 args["listLimit"] = json!(crate::web::verify::MAX_LISTED);
             } else if let Some(limit) = limit {
@@ -418,6 +424,7 @@ impl StudioCommand {
                             created_at: backup::now_millis(),
                             bytes: 0,
                             note: note.clone(),
+                            automatic: false,
                         },
                         &model,
                     )?;
@@ -684,6 +691,13 @@ fn describe_verify(report: &Value) -> String {
         );
     }
     let fixed = &report["fixed"];
+    for backup in report["backups"].as_array().into_iter().flatten() {
+        let id = escape_controls(backup["id"].as_str().unwrap_or("?"));
+        let _ = writeln!(
+            out,
+            "Saved the Studio copies of the scripts it overwrites as backup {id};              `rojo studio backup restore {id} --parent <instance> --allow-scripts` puts them back."
+        );
+    }
     if fixed.is_object() {
         let _ = writeln!(
             out,
@@ -1462,6 +1476,46 @@ mod tests {
             {"path":format!("game/A{esc}[31m"),"file":"src/A.luau","held":false}]});
         let text = describe_verify(&report);
         assert!(!text.contains(esc), "{text:?}");
+    }
+
+    #[test]
+    fn verify_fix_backs_up_unless_told_not_to() {
+        use crate::cli::{Options, Subcommand};
+        let session = "00000000-0000-4000-8000-000000000000";
+        let parse = |extra: &[&str]| {
+            let mut args = vec!["rojo", "studio", "verify", "--session", session];
+            args.extend_from_slice(extra);
+            Options::try_parse_from(args).map(|options| match options.subcommand {
+                Subcommand::Studio(studio) => studio.command,
+                _ => panic!("expected a studio command"),
+            })
+        };
+        assert!(matches!(
+            parse(&["--fix"]).unwrap(),
+            StudioSubcommand::Verify {
+                no_backup: false,
+                ..
+            }
+        ));
+        assert!(matches!(
+            parse(&["--fix", "--no-backup"]).unwrap(),
+            StudioSubcommand::Verify {
+                no_backup: true,
+                ..
+            }
+        ));
+        // Without --fix nothing is overwritten, so there is nothing to opt out of.
+        assert!(parse(&["--no-backup"]).is_err());
+
+        let report = json!({"checked":1,"matching":0,"differentCount":1,"different":[],
+            "backups":[{"id":"20261107-000000-auto-verify-fix"}],
+            "fixed":{"attempted":1,"updated":1,"failed":0,"skippedChanged":0,"skippedHeld":0,"errors":[]}});
+        let text = describe_verify(&report);
+        assert!(
+            text.contains("backup 20261107-000000-auto-verify-fix")
+                && text.contains("rojo studio backup restore 20261107-000000-auto-verify-fix"),
+            "{text}"
+        );
     }
 
     #[test]

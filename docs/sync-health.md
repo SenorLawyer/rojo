@@ -82,6 +82,15 @@ rojo studio backup remove <backup-id>
 
 A backup is the instance's native `.rbxm` export, the same as `rojo studio export`, saved with a record of the place, the instance's path and the Git commit. They live in a per-user folder (`%LOCALAPPDATA%\Rojo\projects\<id>\backups` on Windows), chosen by the repository's common Git directory so every worktree shares it, or by the current directory outside Git. It is never inside the project, so `rojo serve` never syncs them. `list` and `remove` do not need the bridge.
 
+### Automatic backups
+
+Rojo also takes a backup on its own before two things that overwrite or remove Studio content:
+
+* `verify --fix` exports the scripts it is about to overwrite, without their children and with the source their editor shows, and saves them before writing any (one backup per 4 MiB of source). The report lists them under `backups`, and the summary prints each ID. If the export or the save fails, `--fix` changes nothing and says why. `--no-backup` fixes without a backup; `studio_verify` in `rojo mcp` always takes one.
+* The plugin's first sync after connecting, which follows a branch switch or a restart of `rojo serve`, can remove instances that only Studio had and change others. Before applying it, the plugin saves the instances it removes, with everything inside them, and those it changes, without their children (services cannot be saved). It sends them to the server over the Studio bridge with the bridge's plugin token, and the server saves them in the folder `backup list` reads. Syncing never depends on it: without a bridge, when the copy is over 10,000 instances or 5 MiB, or when the server refuses it (for example because its checkout changed), the plugin warns in Studio's output that no backup was taken and syncs anyway. Turn this off with Back Up Before Resync in Rojo's settings. Changes that arrive while connected are not backed up.
+
+Automatic backups are named `auto-verify-fix` or `auto-sync`, their note lists what they hold, and `list` marks them `[automatic]` (`"automatic": true` in JSON). Only the 20 newest automatic backups are kept; saving another removes the oldest. Backups made with `backup create` are never removed automatically. A backup with several instances restores them all under the given parent.
+
 Restoring inserts the copy under the given parent next to what is there now; it does not replace anything, so remove or rename the current instance first if needed. Restoring scripts needs `--allow-scripts`, and restored Script and LocalScript instances stay disabled, like any [import](studio-bridge.md). The export limits apply: services cannot be backed up directly (back up their children instead), and a backup holds at most 10,000 instances and 5 MiB.
 
 ## MCP tools

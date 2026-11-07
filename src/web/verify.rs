@@ -34,6 +34,12 @@ pub(crate) const MAX_LISTED: usize = 10_000;
 /// for JSON escaping, which can double the size of some sources.
 pub(crate) const MAX_RESYNC_BYTES: usize = 2 * 1024 * 1024;
 
+/// How many bytes of Studio source one backup taken before `--fix` may hold.
+/// The plugin refuses a model over 5 MiB, and a script's copy is a little
+/// larger than its source, so this leaves room for that and for its
+/// properties.
+pub(crate) const MAX_BACKUP_SOURCE_BYTES: usize = 4 * 1024 * 1024;
+
 /// 32-bit FNV-1a of `source` with CRLF line endings turned into LF, and the
 /// length of that normalized text. Must match `plugin/src/hashSource.lua`.
 pub(crate) fn hash_source(source: &str) -> (u32, usize) {
@@ -391,6 +397,28 @@ impl Comparison {
     }
 }
 
+/// Splits the scripts `--fix` overwrites into groups whose Studio sources
+/// add up to at most [`MAX_BACKUP_SOURCE_BYTES`], one backup each. A script
+/// larger than that gets a group of its own, which the plugin refuses if its
+/// copy does not fit the model limit.
+pub(crate) fn backup_groups<'a>(fixes: &[&'a Different]) -> Vec<Vec<&'a Different>> {
+    let mut groups = Vec::new();
+    let mut group = Vec::new();
+    let mut bytes = 0;
+    for &fix in fixes {
+        if !group.is_empty() && bytes + fix.studio_length > MAX_BACKUP_SOURCE_BYTES {
+            groups.push(std::mem::take(&mut group));
+            bytes = 0;
+        }
+        bytes += fix.studio_length;
+        group.push(fix);
+    }
+    if !group.is_empty() {
+        groups.push(group);
+    }
+    groups
+}
+
 /// One batch of `resync`: a sync message that sets each script's `Source` to
 /// the server's, and for each script the hash Studio must still have for the
 /// update to apply (`from`) and the hash it must have afterwards (`to`).
@@ -661,6 +689,42 @@ mod test {
             &json!({"scripts": [{"id": "x", "hash": 4_294_967_296_u64, "length": 1}]})
         )
         .is_err());
+    }
+
+    #[test]
+    fn backups_before_a_fix_are_split_by_studio_source_size() {
+        let tree = tree();
+        let scripts = tree_scripts(&tree, Path::new("/"));
+        let sized = |lengths: &[usize]| -> Vec<Different> {
+            lengths
+                .iter()
+                .zip(scripts.iter().cycle())
+                .map(|(&studio_length, script)| Different {
+                    script: script.clone(),
+                    studio_hash: 1,
+                    studio_length,
+                })
+                .collect()
+        };
+        assert!(backup_groups(&[]).is_empty());
+        let half = MAX_BACKUP_SOURCE_BYTES / 2;
+        let fixes = sized(&[half, half, 1, MAX_BACKUP_SOURCE_BYTES * 2, 10]);
+        let refs: Vec<&Different> = fixes.iter().collect();
+        let groups = backup_groups(&refs);
+        let lengths: Vec<Vec<usize>> = groups
+            .iter()
+            .map(|group| group.iter().map(|fix| fix.studio_length).collect())
+            .collect();
+        assert_eq!(
+            lengths,
+            vec![
+                vec![half, half],
+                vec![1],
+                vec![MAX_BACKUP_SOURCE_BYTES * 2],
+                vec![10]
+            ],
+            "every script is in exactly one group, in order, and an oversized one alone"
+        );
     }
 
     #[test]
