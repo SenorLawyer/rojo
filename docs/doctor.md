@@ -50,8 +50,13 @@ attention has a one-line fix.
   project's name. It reads both this fork's MessagePack answer and the JSON
   that released upstream Rojo sends, so an upstream or older server is
   reported as a version or protocol mismatch. No server is information, not a
-  problem. Doctor waits at most 1.5 seconds and reads at most 1 MiB of the
-  answer.
+  problem, but only a refused connection counts as no server: a connection
+  that times out or fails otherwise is a `probe-inconclusive` warning,
+  because something may be listening behind it. Doctor waits up to 3 seconds
+  to connect (Windows takes about 2 to refuse a loopback connection) and 1.5
+  more for the answer, does not follow redirects (a redirect means something
+  else answers on the port), reads at most 1 MiB, and rejects answers nested
+  more than 32 levels deep before decoding them.
 
   The API names the served project but not its folder, so a matching name
   does not show that the server runs this checkout rather than another

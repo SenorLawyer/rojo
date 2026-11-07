@@ -82,6 +82,47 @@ fn doctor_exits_with_1_and_still_reports_when_the_project_is_missing() {
 }
 
 #[test]
+fn doctor_survives_a_deeply_nested_server_answer() {
+    use std::io::{Read, Write};
+    // A 564-byte MessagePack answer with valid fields whose studioBridge is
+    // 512 nested single-element arrays. Decoding it recursively overflowed
+    // the main thread's stack and killed doctor before it printed anything.
+    let mut body = vec![0x83];
+    body.push(0xa0 | 13);
+    body.extend_from_slice(b"serverVersion");
+    body.extend_from_slice(b"\xa58.1.0");
+    body.push(0xa0 | 15);
+    body.extend_from_slice(b"protocolVersion");
+    body.push(0x05);
+    body.push(0xa0 | 12);
+    body.extend_from_slice(b"studioBridge");
+    body.extend(std::iter::repeat_n(0x91, 512));
+    body.push(0xc0);
+    assert_eq!(body.len(), 564);
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port().to_string();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut buffer = [0; 1024];
+        let _ = stream.read(&mut buffer);
+        let head = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/msgpack\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        let _ = stream.write_all(head.as_bytes());
+        let _ = stream.write_all(&body);
+    });
+    let dir = tempdir().unwrap();
+    let (_, report) = doctor(&[dir.path().to_str().unwrap(), "--port", &port]);
+    server.join().unwrap();
+    assert_eq!(
+        statuses(&report, "server"),
+        [("not-rojo".to_owned(), "warning".to_owned())]
+    );
+}
+
+#[test]
 fn doctor_reports_a_corrupted_plugin_without_crashing() {
     let plugins = tempdir().unwrap();
     let status = Command::new(ROJO_PATH)

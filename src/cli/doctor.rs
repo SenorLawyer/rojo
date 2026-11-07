@@ -34,8 +34,14 @@ const CLI_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// How long the server check waits. Doctor only asks for `/api/rojo`, which a
 /// healthy server answers at once, so a slow answer is itself worth reporting
 /// and must not make doctor hang.
-const CONNECT_TIMEOUT: Duration = Duration::from_millis(500);
-const REQUEST_TIMEOUT: Duration = Duration::from_millis(1500);
+///
+/// The connect timeout is longer than a healthy server needs because only a
+/// refused connection shows that nothing listens, and Windows retries a
+/// refused loopback connection for about two seconds before reporting it.
+/// A shorter timeout would turn every "no server" into "inconclusive" there.
+const CONNECT_TIMEOUT: Duration = Duration::from_millis(3000);
+/// Covers connecting and the answer: 1.5 seconds once connected.
+const REQUEST_TIMEOUT: Duration = Duration::from_millis(4500);
 /// `/api/rojo` answers with well under a kilobyte. Whatever listens on the
 /// port may not be Rojo, so doctor reads no more than this of its answer.
 const MAX_INFO_BYTES: usize = 1024 * 1024;
@@ -647,8 +653,11 @@ fn server_address(
 
 /// What the server check found at the address.
 enum Probe {
-    /// Nothing accepted the connection.
+    /// The connection was refused, so nothing listens there.
     NotRunning,
+    /// The connection failed in a way that does not show whether anything
+    /// listens, such as a connect timeout against a full backlog.
+    Inconclusive(String),
     /// Something accepted the connection but did not answer in time, such as
     /// a server that is stuck.
     NoAnswer,
@@ -674,22 +683,172 @@ struct ServerInfo {
     studio_bridge: Option<IgnoredAny>,
 }
 
+/// The deepest nesting accepted in a `/api/rojo` answer. Real answers nest
+/// three or four levels. The decoders recurse once per level, even through
+/// values doctor ignores, so a small body nested thousands of levels deep
+/// would overflow the main thread's stack, which no error handling catches.
+const MAX_INFO_DEPTH: usize = 32;
+
 /// Decodes `/api/rojo` as this fork's MessagePack, or as the JSON that
 /// released upstream Rojo sends. The content type picks which to try first.
-fn parse_server_info(content_type: Option<&str>, bytes: &[u8]) -> Option<ServerInfo> {
-    let json = || serde_json::from_slice::<ServerInfo>(bytes).ok();
-    let msgpack = || deserialize_msgpack::<ServerInfo>(bytes).ok();
-    if content_type.is_some_and(|value| value.contains("json")) {
-        json().or_else(msgpack)
-    } else {
-        msgpack().or_else(json)
+/// Each format is only decoded after an iterative scan shows it is nested at
+/// most [`MAX_INFO_DEPTH`] levels deep.
+fn parse_server_info(content_type: Option<&str>, bytes: &[u8]) -> Result<ServerInfo, String> {
+    let json = || -> Result<ServerInfo, String> {
+        json_depth(bytes, MAX_INFO_DEPTH)?;
+        serde_json::from_slice(bytes).map_err(|err| err.to_string())
+    };
+    let msgpack = || -> Result<ServerInfo, String> {
+        msgpack_depth(bytes, MAX_INFO_DEPTH)?;
+        deserialize_msgpack(bytes).map_err(|err| err.to_string())
+    };
+    let (first, second): (&dyn Fn() -> _, &dyn Fn() -> _) =
+        if content_type.is_some_and(|value| value.contains("json")) {
+            (&json, &msgpack)
+        } else {
+            (&msgpack, &json)
+        };
+    // The first format's reason is the one worth reporting.
+    first().or_else(|reason| second().map_err(|_| reason))
+}
+
+/// Checks that a JSON document nests at most `limit` arrays and objects,
+/// without recursing. Strings are skipped, so brackets in them do not count.
+fn json_depth(bytes: &[u8], limit: usize) -> Result<(), String> {
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    for &byte in bytes {
+        if in_string {
+            match byte {
+                _ if escaped => escaped = false,
+                b'\\' => escaped = true,
+                b'"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+        match byte {
+            b'"' => in_string = true,
+            b'[' | b'{' => {
+                depth += 1;
+                if depth > limit {
+                    return Err(format!("it is nested more than {limit} levels deep"));
+                }
+            }
+            b']' | b'}' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
     }
+    Ok(())
+}
+
+/// Checks that the first MessagePack value in `bytes` nests at most `limit`
+/// arrays and maps, without recursing: an explicit stack holds how many
+/// values each open container still has. Every value takes at least one
+/// byte, so the walk ends within `bytes.len()` steps.
+fn msgpack_depth(bytes: &[u8], limit: usize) -> Result<(), String> {
+    let truncated = || "it is not complete MessagePack".to_owned();
+    let mut position = 0usize;
+    // Values left in each open container; the bottom entry is the top-level
+    // value itself.
+    let mut remaining: Vec<u64> = vec![1];
+    let read_uint = |position: &mut usize, size: usize| -> Result<u64, String> {
+        let end = position.checked_add(size).ok_or_else(truncated)?;
+        let slice = bytes.get(*position..end).ok_or_else(truncated)?;
+        *position = end;
+        Ok(slice
+            .iter()
+            .fold(0u64, |value, byte| (value << 8) | u64::from(*byte)))
+    };
+    while let Some(left) = remaining.last_mut() {
+        if *left == 0 {
+            remaining.pop();
+            continue;
+        }
+        *left -= 1;
+        let marker = *bytes.get(position).ok_or_else(truncated)?;
+        position += 1;
+        // A container's item count, or the number of bytes to skip.
+        let (items, skip): (u64, u64) = match marker {
+            0x00..=0x7f | 0xe0..=0xff | 0xc0 | 0xc2 | 0xc3 => (0, 0),
+            0x80..=0x8f => (u64::from(marker & 0x0f) * 2, 0),
+            0x90..=0x9f => (u64::from(marker & 0x0f), 0),
+            0xa0..=0xbf => (0, u64::from(marker & 0x1f)),
+            0xc4 | 0xd9 => (0, read_uint(&mut position, 1)?),
+            0xc5 | 0xda => (0, read_uint(&mut position, 2)?),
+            0xc6 | 0xdb => (0, read_uint(&mut position, 4)?),
+            0xc7 => (0, read_uint(&mut position, 1)? + 1),
+            0xc8 => (0, read_uint(&mut position, 2)? + 1),
+            0xc9 => (0, read_uint(&mut position, 4)? + 1),
+            0xca => (0, 4),
+            0xcb => (0, 8),
+            0xcc | 0xd0 => (0, 1),
+            0xcd | 0xd1 => (0, 2),
+            0xce | 0xd2 => (0, 4),
+            0xcf | 0xd3 => (0, 8),
+            0xd4 => (0, 2),
+            0xd5 => (0, 3),
+            0xd6 => (0, 5),
+            0xd7 => (0, 9),
+            0xd8 => (0, 17),
+            0xdc => (read_uint(&mut position, 2)?, 0),
+            0xdd => (read_uint(&mut position, 4)?, 0),
+            0xde => (read_uint(&mut position, 2)? * 2, 0),
+            0xdf => (read_uint(&mut position, 4)? * 2, 0),
+            0xc1 => return Err("it is not MessagePack".to_owned()),
+        };
+        position = usize::try_from(skip)
+            .ok()
+            .and_then(|skip| position.checked_add(skip))
+            .filter(|end| *end <= bytes.len())
+            .ok_or_else(truncated)?;
+        if items > 0 {
+            // The bottom entry is not a container.
+            if remaining.len() > limit {
+                return Err(format!("it is nested more than {limit} levels deep"));
+            }
+            remaining.push(items);
+        }
+    }
+    Ok(())
+}
+
+/// Sorts a failed request into what it shows about the port. Only a refused
+/// connection shows that nothing listens; a connect timeout (which reqwest
+/// also counts as a connect error) can be a full backlog or a firewall.
+fn classify_send_error(timeout: bool, connect: bool, refused: bool, reason: String) -> Probe {
+    match (timeout, connect, refused) {
+        (true, true, _) => Probe::Inconclusive(format!("connecting timed out ({reason})")),
+        (true, false, _) => Probe::NoAnswer,
+        (false, true, true) => Probe::NotRunning,
+        (false, true, false) => Probe::Inconclusive(reason),
+        (false, false, _) => Probe::NotRojo(reason),
+    }
+}
+
+/// Whether an io `ConnectionRefused` error is anywhere in `err`'s sources.
+fn connection_refused(err: &(dyn std::error::Error + 'static)) -> bool {
+    let mut source = Some(err);
+    while let Some(err) = source {
+        if err
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|err| err.kind() == std::io::ErrorKind::ConnectionRefused)
+        {
+            return true;
+        }
+        source = err.source();
+    }
+    false
 }
 
 fn fetch_server_info(address: SocketAddr) -> Probe {
     let client = match reqwest::blocking::Client::builder()
         .connect_timeout(CONNECT_TIMEOUT)
         .timeout(REQUEST_TIMEOUT)
+        // A redirect means something other than rojo serve answers on this
+        // port; following it would report whatever answers elsewhere.
+        .redirect(reqwest::redirect::Policy::none())
         .no_proxy()
         .build()
     {
@@ -698,9 +857,15 @@ fn fetch_server_info(address: SocketAddr) -> Probe {
     };
     let response = match client.get(format!("http://{address}/api/rojo")).send() {
         Ok(response) => response,
-        Err(err) if err.is_connect() => return Probe::NotRunning,
-        Err(err) if err.is_timeout() => return Probe::NoAnswer,
-        Err(err) => return Probe::NotRojo(err.to_string()),
+        Err(err) => {
+            let refused = connection_refused(&err);
+            return classify_send_error(
+                err.is_timeout(),
+                err.is_connect(),
+                refused,
+                err.to_string(),
+            );
+        }
     };
     let status = response.status();
     let content_type = response
@@ -708,6 +873,14 @@ fn fetch_server_info(address: SocketAddr) -> Probe {
         .get(reqwest::header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
         .map(str::to_owned);
+    if status.is_redirection() {
+        let location = response
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("nowhere");
+        return Probe::NotRojo(format!("answered {status}, redirecting to {location}"));
+    }
     if !status.is_success() {
         return Probe::NotRojo(format!("answered {status}"));
     }
@@ -728,8 +901,10 @@ fn fetch_server_info(address: SocketAddr) -> Probe {
         ));
     }
     match parse_server_info(content_type.as_deref(), &bytes) {
-        Some(info) => Probe::Rojo(info),
-        None => Probe::NotRojo(format!("answered {status} without Rojo's server info")),
+        Ok(info) => Probe::Rojo(info),
+        Err(reason) => Probe::NotRojo(format!(
+            "answered {status} without Rojo's server info: {reason}"
+        )),
     }
 }
 
@@ -743,6 +918,17 @@ fn check_server(address: SocketAddr, probe: Probe, project_name: Option<&str>) -
                 Status::Info,
                 format!("No rojo serve is listening on {address}."),
                 Some("Start one with `rojo serve` to sync, or pass --address/--port to check another."),
+            )]
+        }
+        Probe::Inconclusive(reason) => {
+            return vec![check(
+                category,
+                "probe-inconclusive",
+                Status::Warning,
+                format!(
+                    "Could not tell whether a rojo serve is on {address}: {reason}."
+                ),
+                Some("Check that nothing else holds the port and that a firewall allows local connections, then run doctor again."),
             )]
         }
         Probe::NoAnswer => {
@@ -1418,9 +1604,172 @@ mod tests {
             Some("application/json"),
             &msgpack_info(CLI_VERSION, PROTOCOL_VERSION, false)
         )
-        .is_some());
-        assert!(parse_server_info(Some("application/json"), b"{\"hello\":1}").is_none());
-        assert!(parse_server_info(None, b"hello").is_none());
+        .is_ok());
+        assert!(parse_server_info(Some("application/json"), b"{\"hello\":1}").is_err());
+        assert!(parse_server_info(None, b"hello").is_err());
+    }
+
+    /// A MessagePack `/api/rojo` answer with valid fields whose `studioBridge`
+    /// is `depth` nested single-element arrays, which a recursive decoder
+    /// walks even though doctor ignores the value.
+    fn deep_msgpack_info(depth: usize) -> Vec<u8> {
+        let mut bytes = vec![0x83];
+        for (key, value) in [
+            ("serverVersion", &b"\xa58.1.0"[..]),
+            ("protocolVersion", &[0x05]),
+        ] {
+            bytes.push(0xa0 | key.len() as u8);
+            bytes.extend_from_slice(key.as_bytes());
+            bytes.extend_from_slice(value);
+        }
+        bytes.push(0xa0 | "studioBridge".len() as u8);
+        bytes.extend_from_slice(b"studioBridge");
+        bytes.extend(std::iter::repeat_n(0x91, depth));
+        bytes.push(0xc0);
+        bytes
+    }
+
+    #[test]
+    fn deeply_nested_answers_are_rejected_before_decoding() {
+        // Within the limit the same shape still decodes.
+        let shallow = deep_msgpack_info(MAX_INFO_DEPTH - 2);
+        assert!(parse_server_info(Some("application/msgpack"), &shallow).is_ok());
+
+        // Decoding this one on a test thread's stack would overflow it.
+        let deep = deep_msgpack_info(100_000);
+        let reason = parse_server_info(Some("application/msgpack"), &deep)
+            .err()
+            .unwrap();
+        assert!(reason.contains("nested more than"), "{reason}");
+        assert!(parse_server_info(None, &deep).is_err());
+
+        let deep_json = format!(
+            "{{\"serverVersion\":\"8.1.0\",\"protocolVersion\":5,\"studioBridge\":{}null{}}}",
+            "[".repeat(100_000),
+            "]".repeat(100_000)
+        );
+        let reason = parse_server_info(Some("application/json"), deep_json.as_bytes())
+            .err()
+            .unwrap();
+        assert!(reason.contains("nested more than"), "{reason}");
+    }
+
+    #[test]
+    fn depth_scans_count_only_real_nesting() {
+        // Brackets inside strings, including after escaped quotes, do not count.
+        let quoted = format!(r#"{{"a":"{}\"{}"}}"#, "[".repeat(100), "{".repeat(100));
+        assert!(json_depth(quoted.as_bytes(), 2).is_ok());
+        assert!(json_depth(b"[[[]]]", 3).is_ok());
+        assert!(json_depth(b"[[[[]]]]", 3).is_err());
+
+        // Scalars of every size, strings, binary and extensions are skipped.
+        let flat = [
+            0x9b, 0x01, 0xe0, 0xc0, 0xcc, 0xff, 0xcd, 0, 1, 0xa3, b'a', b'b', b'c', 0xc4, 2, 0, 0,
+            0xd6, 1, 0, 0, 0, 0, 0xcb, 0, 0, 0, 0, 0, 0, 0, 0, 0x80, 0x90,
+        ];
+        assert_eq!(msgpack_depth(&flat, 1), Ok(()));
+        assert!(msgpack_depth(&[0x91, 0x91, 0xc0], 2).is_ok());
+        assert!(msgpack_depth(&[0x91, 0x91, 0x91, 0xc0], 2).is_err());
+        // Maps hold two values per entry.
+        assert!(msgpack_depth(&[0x81, 0xc0, 0x91, 0xc0], 2).is_ok());
+        assert!(msgpack_depth(&[0x81, 0xc0], 2).is_err());
+        // Truncated or invalid input, and huge declared counts, fail cleanly.
+        assert!(msgpack_depth(&[0xdd, 0xff, 0xff, 0xff, 0xff], 4).is_err());
+        assert!(msgpack_depth(&[0xdb, 0xff, 0xff, 0xff, 0xff], 4).is_err());
+        assert!(msgpack_depth(&[0xc1], 4).is_err());
+        assert!(msgpack_depth(&[], 4).is_err());
+        // The fork's real answer passes.
+        assert!(msgpack_depth(&msgpack_info(CLI_VERSION, PROTOCOL_VERSION, true), 4).is_ok());
+    }
+
+    #[test]
+    fn only_a_refused_connection_means_nothing_is_running() {
+        let reason = || "error".to_owned();
+        assert!(matches!(
+            classify_send_error(false, true, true, reason()),
+            Probe::NotRunning
+        ));
+        // A connect timeout is also a connect error; it must not claim absence.
+        assert!(matches!(
+            classify_send_error(true, true, false, reason()),
+            Probe::Inconclusive(_)
+        ));
+        assert!(matches!(
+            classify_send_error(false, true, false, reason()),
+            Probe::Inconclusive(_)
+        ));
+        assert!(matches!(
+            classify_send_error(true, false, false, reason()),
+            Probe::NoAnswer
+        ));
+        assert!(matches!(
+            classify_send_error(false, false, false, reason()),
+            Probe::NotRojo(_)
+        ));
+        let address: SocketAddr = "127.0.0.1:34872".parse().unwrap();
+        assert_eq!(
+            codes(&check_server(
+                address,
+                Probe::Inconclusive("timed out".into()),
+                None
+            )),
+            [("probe-inconclusive", Status::Warning)]
+        );
+    }
+
+    #[test]
+    fn redirects_are_not_followed() {
+        use std::io::{Read, Write};
+        // Port B answers with real server info; port A redirects to it.
+        let target = TcpListener::bind("127.0.0.1:0").unwrap();
+        let target_address = target.local_addr().unwrap();
+        let body = msgpack_info(CLI_VERSION, PROTOCOL_VERSION, false);
+        let target_thread = std::thread::spawn(move || {
+            target.set_nonblocking(true).unwrap();
+            // Answer only if doctor wrongly follows the redirect.
+            let start = std::time::Instant::now();
+            while start.elapsed() < Duration::from_secs(3) {
+                if let Ok((mut stream, _)) = target.accept() {
+                    stream.set_nonblocking(false).unwrap();
+                    let mut buffer = [0; 1024];
+                    let _ = stream.read(&mut buffer);
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/msgpack\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = stream.write_all(head.as_bytes());
+                    let _ = stream.write_all(&body);
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            false
+        });
+        let redirect = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = redirect.local_addr().unwrap();
+        let redirect_thread = std::thread::spawn(move || {
+            let (mut stream, _) = redirect.accept().unwrap();
+            let mut buffer = [0; 1024];
+            let _ = stream.read(&mut buffer);
+            let response = format!(
+                "HTTP/1.1 302 Found\r\nLocation: http://{target_address}/api/rojo\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            let _ = stream.write_all(response.as_bytes());
+        });
+        let probe = fetch_server_info(address);
+        redirect_thread.join().unwrap();
+        match &probe {
+            Probe::NotRojo(reason) => assert!(reason.contains("302"), "{reason}"),
+            _ => panic!("expected not-rojo"),
+        }
+        assert_eq!(
+            codes(&check_server(address, probe, None)),
+            [("not-rojo", Status::Warning)]
+        );
+        assert!(
+            !target_thread.join().unwrap(),
+            "doctor followed the redirect"
+        );
     }
 
     #[test]
