@@ -1,0 +1,45 @@
+---
+source: tests/tests/build.rs
+expression: kept
+---
+Workspace (Workspace)
+  .FallenPartsDestroyHeight = -1000
+  .Gravity = 196.2
+  Map (Model)
+    Baseplate (Part)
+    Spawn (Part)
+      .Attributes = Rojo_Id="BaseSpawn"
+  MapRef (ObjectValue)
+    .Value = -> Workspace/Map
+  ConfigRef (ObjectValue)
+    .Value = -> ReplicatedStorage/Shared/Config
+  OldRef (ObjectValue)
+    .Value = -> ReplicatedStorage/Shared/OldModule
+  Terrain (Terrain)
+  Spawner (Script)
+    .Source = "print(\"spawner from project\")\n"
+Lighting (Lighting)
+  .Brightness = 3
+ReplicatedStorage (ReplicatedStorage)
+  Shared (Folder)
+    .Attributes = Owner="map-team", Rojo_Id="OldShared"
+    Link (ObjectValue)
+      .Value = -> Workspace/Map
+    Config (StringValue)
+      .Attributes = Note="from base"
+      .Value = "base value"
+    OldModule (ModuleScript)
+      .Source = "return 'old'"
+  BaseAssets (Folder)
+    Tree (Model)
+  Remotes (Model)
+  Pointers (Folder)
+    ToShared (ObjectValue)
+      .Value = nil
+    BasePointer (ObjectValue)
+      .Value = -> Workspace/Map
+ServerScriptService (ServerScriptService)
+  LegacyScript (Script)
+    .Source = "print('legacy')"
+  Main (Script)
+    .Source = "print('main from base')"

@@ -15,13 +15,17 @@ use std::{
     path::Path,
 };
 
-use anyhow::Context;
+use anyhow::{bail, Context};
 use rbx_dom_weak::{
     types::{Ref, Variant},
-    WeakDom,
+    ustr, Ustr, WeakDom,
 };
+use rbx_reflection::ClassTag;
 
-use crate::snapshot::{apply_patch_set, compute_patch_set, InstanceSnapshot, PatchSet, RojoTree};
+use crate::{
+    snapshot::{apply_patch_set, compute_patch_set, InstanceSnapshot, PatchSet, RojoTree},
+    RojoRef, REF_ID_ATTRIBUTE_NAME,
+};
 
 /// Reads the place that `rojo build --into` starts from.
 pub fn read_base_place(path: &Path) -> anyhow::Result<WeakDom> {
@@ -48,17 +52,164 @@ pub fn read_base_place(path: &Path) -> anyhow::Result<WeakDom> {
 /// Applies the project in `project` onto `base`, returning the merged tree.
 ///
 /// `project` is expected to have a DataModel root, matching `base`'s root.
-pub fn merge_into_place(project: &RojoTree, base: WeakDom) -> RojoTree {
+pub fn merge_into_place(project: &RojoTree, base: WeakDom) -> anyhow::Result<RojoTree> {
     let mut tree = RojoTree::from_dom(base);
     let root_id = tree.get_root_id();
 
     let snapshot = snapshot_from_tree(project, project.get_root_id());
     let mut patch_set = compute_patch_set(Some(snapshot), &tree, root_id);
+
     keep_unclaimed_base_content(&tree, &mut patch_set);
+    replace_base_ids(&tree, &mut patch_set);
+    let null_refs = take_null_ref_assignments(&mut patch_set);
     apply_patch_set(&mut tree, patch_set);
+
+    for (id, name) in null_refs {
+        tree.get_instance_mut(id)
+            .unwrap()
+            .properties_mut()
+            .insert(name, Variant::Ref(Ref::none()));
+    }
+
+    check_base_id_collisions(project, &tree)?;
     clear_dangling_refs(&mut tree);
 
-    tree
+    Ok(tree)
+}
+
+/// Makes the project's ID win over a base `Rojo_Id` attribute on a paired
+/// instance.
+///
+/// The project's ID only lives in metadata unless the project sets
+/// attributes, so a paired instance keeps the base's attributes, and patch
+/// application reads the specified ID back from a `Rojo_Id` among them. The
+/// base's old ID would replace the project's, and `Rojo_Target_*` pointers at
+/// the project's ID would not resolve.
+fn replace_base_ids(tree: &RojoTree, patch_set: &mut PatchSet) {
+    let attributes_key = ustr("Attributes");
+
+    for update in &mut patch_set.updated_instances {
+        let Some(specified) = update
+            .changed_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.specified_id.clone())
+        else {
+            continue;
+        };
+        if update.changed_properties.contains_key(&attributes_key) {
+            // The project's attributes replace the base's entirely.
+            continue;
+        }
+        let Some(Variant::Attributes(attributes)) = tree
+            .get_instance(update.id)
+            .and_then(|instance| instance.properties().get(&attributes_key))
+        else {
+            continue;
+        };
+        if attributes.get(REF_ID_ATTRIBUTE_NAME).is_none() {
+            continue;
+        }
+
+        let mut attributes = attributes.clone();
+        attributes.insert(
+            REF_ID_ATTRIBUTE_NAME.to_owned(),
+            Variant::String(specified.as_str().to_owned()),
+        );
+        update
+            .changed_properties
+            .insert(attributes_key, Some(Variant::Attributes(attributes)));
+    }
+}
+
+/// Takes the assignments of nil to Ref properties out of `patch_set`.
+///
+/// Patch application skips nil refs in updates, which would keep the base's
+/// target where the project explicitly has none. They are assigned after the
+/// patch is applied instead.
+fn take_null_ref_assignments(patch_set: &mut PatchSet) -> Vec<(Ref, Ustr)> {
+    let mut assignments = Vec::new();
+    for update in &mut patch_set.updated_instances {
+        update.changed_properties.retain(|name, value| match value {
+            Some(Variant::Ref(target)) if target.is_none() => {
+                assignments.push((update.id, *name));
+                false
+            }
+            _ => true,
+        });
+    }
+    assignments
+}
+
+/// Fails when an instance carries a `Rojo_Id` from the base place that the
+/// project also gives one of its instances.
+///
+/// Neither ID would resolve, so every `Rojo_Target_*` pointing at it would
+/// silently be left unset.
+fn check_base_id_collisions(project: &RojoTree, tree: &RojoTree) -> anyhow::Result<()> {
+    fn count_ids(tree: &RojoTree) -> HashMap<&RojoRef, Vec<Ref>> {
+        let mut counts: HashMap<&RojoRef, Vec<Ref>> = HashMap::new();
+        for instance in tree.descendants(tree.get_root_id()) {
+            if let Some(specified) = &instance.metadata().specified_id {
+                counts.entry(specified).or_default().push(instance.id());
+            }
+        }
+        counts
+    }
+
+    // Comparing counts leaves duplicate IDs within the project itself to the
+    // usual warning, as in any build, and only catches the ones the base
+    // place adds: kept base-only instances, and paired instances that keep a
+    // base Rojo_Id the project uses elsewhere.
+    let project_counts = count_ids(project);
+    let merged_counts = count_ids(tree);
+    let mut collisions = Vec::new();
+    for (specified, project_instances) in &project_counts {
+        let merged = merged_counts.get(specified).map_or(&[][..], Vec::as_slice);
+        if merged.len() > project_instances.len() {
+            let paths: Vec<String> = merged.iter().map(|&id| instance_path(tree, id)).collect();
+            collisions.push(format!(
+                "\"{}\" at {}",
+                specified.as_str(),
+                paths.join(" and ")
+            ));
+        }
+    }
+    collisions.sort();
+
+    if !collisions.is_empty() {
+        bail!(
+            "The base place has instances whose Rojo_Id is also an ID in the project, \
+             so references to those IDs could not be resolved: {}. \
+             Remove or rename the Rojo_Id attribute in the base place, or change the project's ID.",
+            collisions.join(", ")
+        );
+    }
+    Ok(())
+}
+
+fn instance_path(tree: &RojoTree, id: Ref) -> String {
+    let mut names = Vec::new();
+    let mut current = id;
+    while current != tree.get_root_id() {
+        let instance = tree.get_instance(current).unwrap();
+        names.push(instance.name().to_owned());
+        current = instance.parent();
+    }
+    names.reverse();
+    names.join("/")
+}
+
+/// Whether a top-level instance of this class is a service. A class the
+/// reflection database does not know is assumed to be a service newer than
+/// it, since keeping one by mistake is harmless and removing one is not.
+fn is_service(class_name: &str) -> bool {
+    match rbx_reflection_database::get()
+        .ok()
+        .and_then(|database| database.classes.get(class_name))
+    {
+        Some(descriptor) => descriptor.tags.contains(&ClassTag::Service),
+        None => true,
+    }
 }
 
 /// Sets refs to instances that are no longer in the tree to nil.
@@ -116,7 +267,8 @@ fn snapshot_from_tree(tree: &RojoTree, id: Ref) -> InstanceSnapshot {
 ///   removed when its parent ignores no unknown instances, or when the
 ///   project defines a child with the same name there, which replaces it.
 /// - Services are never removed for lacking a project node, whatever the
-///   root's `$ignoreUnknownInstances`, since a place needs them.
+///   root's `$ignoreUnknownInstances`, since a place needs them. Other
+///   top-level instances follow the root's setting like any child.
 fn keep_unclaimed_base_content(tree: &RojoTree, patch_set: &mut PatchSet) {
     let root_id = tree.get_root_id();
 
@@ -175,7 +327,8 @@ fn keep_unclaimed_base_content(tree: &RojoTree, patch_set: &mut PatchSet) {
             let replaced = project_names
                 .get(&parent)
                 .is_some_and(|names| names.contains(instance.name()));
-            let unclaimed = parent == root_id || ignores_unknown(parent);
+            let is_unclaimed_service = parent == root_id && is_service(&instance.class_name());
+            let unclaimed = is_unclaimed_service || ignores_unknown(parent);
             unclaimed && !replaced
         })
         .collect();

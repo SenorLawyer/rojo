@@ -15,11 +15,15 @@ Workspace (Workspace)
     .Value = -> ReplicatedStorage/Shared/Config
   OldRef (ObjectValue)
     .Value = nil
+  Terrain (Terrain)
 Lighting (Lighting)
   .Brightness = 3
+LooseFolder (Folder)
 ReplicatedStorage (ReplicatedStorage)
   Shared (Folder)
-    .Attributes = Owner="map-team"
+    .Attributes = Owner="map-team", Rojo_Id="Shared"
+    Link (ObjectValue)
+      .Value = nil
     Config (StringValue)
       .Attributes = Note="from base"
       .Value = "project value"

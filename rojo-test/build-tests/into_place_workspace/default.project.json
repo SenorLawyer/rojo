@@ -1,0 +1,11 @@
+{
+  "name": "into_place_workspace",
+  "tree": {
+    "$className": "DataModel",
+    "$ignoreUnknownInstances": false,
+    "Workspace": {
+      "$className": "Workspace",
+      "$path": "src/workspace"
+    }
+  }
+}

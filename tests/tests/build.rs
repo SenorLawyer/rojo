@@ -16,7 +16,9 @@ use rbx_dom_weak::{
 };
 use tempfile::tempdir;
 
-use crate::rojo_test::io_util::{get_working_dir_path, KillOnDrop, BUILD_TESTS_PATH, ROJO_PATH};
+use crate::rojo_test::io_util::{
+    copy_recursive, get_working_dir_path, KillOnDrop, BUILD_TESTS_PATH, ROJO_PATH,
+};
 
 macro_rules! gen_build_tests {
     ( $($test_name: ident,)* ) => {
@@ -197,6 +199,10 @@ struct WatchBuild {
 
 impl WatchBuild {
     fn spawn(project_path: &Path, output: &Path) -> Self {
+        Self::spawn_with(project_path, output, &[])
+    }
+
+    fn spawn_with(project_path: &Path, output: &Path, extra: &[&std::ffi::OsStr]) -> Self {
         // Killed on drop so a failed assertion doesn't leave the watcher running.
         let mut child = KillOnDrop(
             Command::new(ROJO_PATH)
@@ -205,6 +211,7 @@ impl WatchBuild {
                 .arg("-o")
                 .arg(output)
                 .arg("--watch")
+                .args(extra)
                 .stdout(Stdio::null())
                 .stderr(Stdio::piped())
                 .spawn()
@@ -348,10 +355,19 @@ fn into_place_base() -> WeakDom {
         workspace,
         InstanceBuilder::new("ObjectValue").with_name("OldRef"),
     );
+    dom.insert(
+        workspace,
+        InstanceBuilder::new("Terrain").with_name("Terrain"),
+    );
 
     dom.insert(
         root,
         InstanceBuilder::new("Lighting").with_property("Brightness", 3.0f32),
+    );
+    // Not a service, so it follows the root's $ignoreUnknownInstances.
+    dom.insert(
+        root,
+        InstanceBuilder::new("Folder").with_name("LooseFolder"),
     );
 
     let storage = dom.insert(root, InstanceBuilder::new("ReplicatedStorage"));
@@ -359,7 +375,18 @@ fn into_place_base() -> WeakDom {
         storage,
         InstanceBuilder::new("Folder")
             .with_name("Shared")
-            .with_property("Attributes", Attributes::new().with("Owner", "map-team")),
+            // The project's $id for Shared must replace this ID.
+            .with_property(
+                "Attributes",
+                Attributes::new()
+                    .with("Owner", "map-team")
+                    .with("Rojo_Id", "OldShared"),
+            ),
+    );
+    // The project's Link.rbxmx has no value, which must clear this one.
+    let link = dom.insert(
+        shared,
+        InstanceBuilder::new("ObjectValue").with_name("Link"),
     );
     let config = dom.insert(
         shared,
@@ -412,6 +439,7 @@ fn into_place_base() -> WeakDom {
         (config_ref, config),
         (old_ref, old_module),
         (base_pointer, map),
+        (link, map),
     ] {
         dom.get_by_ref_mut(holder)
             .unwrap()
@@ -522,10 +550,18 @@ fn describe_place(dom: &WeakDom) -> String {
 }
 
 fn build_into(base: &Path, output: &Path) -> std::process::Output {
+    build_project_into(
+        &Path::new(BUILD_TESTS_PATH).join("into_place"),
+        base,
+        output,
+    )
+}
+
+fn build_project_into(project: &Path, base: &Path, output: &Path) -> std::process::Output {
     Command::new(ROJO_PATH)
         .current_dir(get_working_dir_path())
         .arg("build")
-        .arg(Path::new(BUILD_TESTS_PATH).join("into_place"))
+        .arg(project)
         .arg("--into")
         .arg(base)
         .arg("-o")
@@ -698,4 +734,128 @@ fn build_into_refuses_non_place_inputs_and_outputs() {
         "{}",
         stderr(&result)
     );
+}
+
+/// A Workspace built from a `$path` folder keeps the base's map and Terrain
+/// when the folder's `init.meta.json` says `ignoreUnknownInstances`, and
+/// loses them without it. The root of this project does not ignore unknown
+/// instances, so a top-level folder that is not a service is removed while
+/// the services the project does not mention stay.
+#[test]
+fn build_into_workspace_path_with_meta_file() {
+    let temp = tempdir().unwrap();
+    let base = temp.path().join("base.rbxl");
+    write_place(&into_place_base(), &base);
+
+    let fixture = Path::new(BUILD_TESTS_PATH).join("into_place_workspace");
+    let project = temp.path().join("project");
+    copy_recursive(&fixture, &project).unwrap();
+
+    let output = temp.path().join("kept.rbxl");
+    assert_success(&build_project_into(&project, &base, &output));
+    let kept = describe_place(&read_place(&output));
+
+    fs::remove_file(project.join("src/workspace/init.meta.json")).unwrap();
+    let output = temp.path().join("replaced.rbxl");
+    assert_success(&build_project_into(&project, &base, &output));
+    let replaced = describe_place(&read_place(&output));
+
+    let mut settings = insta::Settings::new();
+    settings.set_snapshot_path(
+        Path::new(BUILD_TESTS_PATH)
+            .parent()
+            .unwrap()
+            .join("build-test-snapshots"),
+    );
+    settings.bind(|| {
+        assert_snapshot!("into_place_workspace_meta", kept);
+        assert_snapshot!("into_place_workspace_no_meta", replaced);
+    });
+
+    for description in [&kept, &replaced] {
+        assert!(description.contains("Spawner (Script)"), "{description}");
+        assert!(description.contains("Lighting (Lighting)"), "{description}");
+        assert!(
+            description.contains("ServerScriptService (ServerScriptService)"),
+            "{description}"
+        );
+        assert!(!description.contains("LooseFolder"), "{description}");
+    }
+    assert!(kept.contains("Map (Model)"), "{kept}");
+    assert!(kept.contains("Terrain (Terrain)"), "{kept}");
+    assert!(!replaced.contains("Map (Model)"), "{replaced}");
+    assert!(!replaced.contains("Terrain (Terrain)"), "{replaced}");
+}
+
+/// A `Rojo_Id` that a kept base instance shares with a project ID would leave
+/// both unresolvable, so the build fails before writing.
+#[test]
+fn build_into_refuses_base_ids_that_collide_with_project_ids() {
+    let temp = tempdir().unwrap();
+    let mut dom = into_place_base();
+    let lighting = dom.root().children()[1];
+    assert_eq!(dom.get_by_ref(lighting).unwrap().class, "Lighting");
+    dom.insert(
+        lighting,
+        InstanceBuilder::new("Folder")
+            .with_name("Sky")
+            .with_property("Attributes", Attributes::new().with("Rojo_Id", "Remotes")),
+    );
+    let base = temp.path().join("base.rbxlx");
+    write_place(&dom, &base);
+
+    let output = temp.path().join("out.rbxlx");
+    let result = build_into(&base, &output);
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(!result.status.success());
+    assert!(stderr.contains("\"Remotes\""), "{stderr}");
+    assert!(stderr.contains("Lighting/Sky"), "{stderr}");
+    assert!(stderr.contains("ReplicatedStorage/Remotes"), "{stderr}");
+    assert!(!output.exists());
+}
+
+/// `--watch --into` rebuilds when only the base place changes, and recovers
+/// once a base that could not be read is saved again.
+#[test]
+fn watch_into_rebuilds_when_the_base_changes() {
+    let temp = tempdir().unwrap();
+    let base = temp.path().join("base.rbxlx");
+    let output = temp.path().join("out.rbxlx");
+    let mut dom = into_place_base();
+    write_place(&dom, &base);
+
+    let project = Path::new(BUILD_TESTS_PATH).join("into_place");
+    let mut watch = WatchBuild::spawn_with(&project, &output, &["--into".as_ref(), base.as_ref()]);
+    wait_until("initial build", || output_contains(&output, "Baseplate"));
+
+    let workspace = dom.root().children()[0];
+    dom.insert(
+        workspace,
+        InstanceBuilder::new("Model").with_name("SavedInStudio"),
+    );
+    write_place(&dom, &base);
+    wait_until("rebuild after the base changed", || {
+        output_contains(&output, "SavedInStudio")
+    });
+
+    fs::write(&base, "not a place").unwrap();
+    wait_until("rebuild error", || {
+        watch.stderr_contains("Failed to rebuild project")
+    });
+    assert!(watch.is_running(), "watch mode exited after a bad base");
+    assert!(
+        output_contains(&output, "SavedInStudio"),
+        "a failed rebuild replaced the last good output"
+    );
+
+    dom.insert(
+        workspace,
+        InstanceBuilder::new("Model").with_name("Recovered"),
+    );
+    write_place(&dom, &base);
+    wait_until("rebuild after the base was fixed", || {
+        output_contains(&output, "Recovered")
+    });
+
+    watch.stop();
 }

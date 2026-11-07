@@ -1,0 +1,1 @@
+print("spawner from project")

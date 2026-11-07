@@ -2,6 +2,7 @@ use std::{
     io::{BufWriter, Write},
     mem::forget,
     path::{Path, PathBuf},
+    time::{Duration, SystemTime},
 };
 
 use anyhow::{anyhow, bail, Context};
@@ -113,6 +114,10 @@ impl BuildCommand {
         let session = ServeSession::new(vfs, project_path)?;
         let mut cursor = session.message_queue().cursor();
 
+        // Taken before the first build reads the base, so a base saved while
+        // that build runs still triggers a rebuild.
+        let mut base_state = into.map(BaseState::read);
+
         let initial_build = write_model(&session, &output_path, output_kind, self.compress, into);
 
         if self.watch {
@@ -128,14 +133,50 @@ impl BuildCommand {
             loop {
                 // A rebuild always reads the whole tree, so missing trimmed
                 // history only means rebuilding from the current state now.
-                match session.message_queue().subscribe(cursor) {
-                    Ok(receiver) => match rt.block_on(receiver) {
-                        Ok((new_cursor, _patch_set)) => cursor = new_cursor,
-                        // The message queue was dropped, so there is nothing
-                        // left to watch. Stop watching gracefully.
-                        Err(_) => break,
+                let mut changed = match session.message_queue().subscribe(cursor) {
+                    Ok(receiver) => match &into {
+                        // The base place is outside the project, so the
+                        // project's watcher never reports it. Its file is
+                        // polled instead, waking up between project changes.
+                        Some(_) => {
+                            match rt.block_on(async {
+                                tokio::time::timeout(BASE_POLL_INTERVAL, receiver).await
+                            }) {
+                                Ok(Ok((new_cursor, _patch_set))) => {
+                                    cursor = new_cursor;
+                                    true
+                                }
+                                Ok(Err(_)) => break,
+                                Err(_elapsed) => false,
+                            }
+                        }
+                        None => match rt.block_on(receiver) {
+                            Ok((new_cursor, _patch_set)) => {
+                                cursor = new_cursor;
+                                true
+                            }
+                            // The message queue was dropped, so there is
+                            // nothing left to watch. Stop watching gracefully.
+                            Err(_) => break,
+                        },
                     },
-                    Err(_) => cursor = session.message_queue().cursor(),
+                    Err(_) => {
+                        cursor = session.message_queue().cursor();
+                        true
+                    }
+                };
+
+                // A base that was missing, unreadable or mid-save failed the
+                // last build; saving it again changes its state and retries.
+                if let Some(base) = into {
+                    let current = BaseState::read(base);
+                    if base_state.as_ref() != Some(&current) {
+                        base_state = Some(current);
+                        changed = true;
+                    }
+                }
+                if !changed {
+                    continue;
                 }
 
                 // A rebuild can fail because of an in-progress edit (for
@@ -248,7 +289,7 @@ fn write_model(
     let tree = match into {
         Some(base) => {
             let base_dom = build_into::read_base_place(base)?;
-            merged = build_into::merge_into_place(&project_tree, base_dom);
+            merged = build_into::merge_into_place(&project_tree, base_dom)?;
             &merged
         }
         None => &*project_tree,
@@ -298,6 +339,23 @@ fn write_model(
     println!("Built project to {}", filename);
 
     Ok(())
+}
+
+/// How often `--watch --into` checks the base place for changes.
+const BASE_POLL_INTERVAL: Duration = Duration::from_millis(500);
+
+/// What `--watch --into` compares to notice that the base place changed.
+#[derive(Debug, PartialEq, Eq)]
+struct BaseState(Option<(Option<SystemTime>, u64)>);
+
+impl BaseState {
+    fn read(path: &Path) -> Self {
+        Self(
+            std::fs::metadata(path)
+                .ok()
+                .map(|metadata| (metadata.modified().ok(), metadata.len())),
+        )
+    }
 }
 
 /// Whether `left` and `right` name the same existing file, following links.
