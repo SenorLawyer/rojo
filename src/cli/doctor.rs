@@ -487,7 +487,7 @@ fn check_plugin(plugins_dir: Result<PathBuf, String>, explicit: bool) -> Vec<Che
         }
     };
     let flag = if explicit {
-        format!(" --plugins-dir \"{}\"", plugins_dir.display())
+        format!(" --plugins-dir {}", shell_quote(&plugins_dir))
     } else {
         String::new()
     };
@@ -551,18 +551,82 @@ fn check_plugin(plugins_dir: Result<PathBuf, String>, explicit: bool) -> Vec<Che
         )),
     }
 
-    let mut copies: Vec<String> = fs::read_dir(&plugins_dir)
-        .into_iter()
-        .flatten()
-        .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
-        .filter(|name| plugin::is_side_by_side_file_name(name))
-        .filter(|name| plugins_dir.join(name).is_file())
-        .collect();
+    checks.extend(side_by_side_checks(
+        &plugins_dir,
+        list_side_by_side(&plugins_dir),
+        &flag,
+        &install,
+    ));
+    checks
+}
+
+/// Quotes `path` for the shell a user on this platform pastes commands into,
+/// so a `$`, space, backtick or quote in it is taken literally: PowerShell's
+/// single quotes on Windows (where only `'` is special, written twice) and
+/// POSIX single quotes elsewhere (where `'` ends the quote, so it is written
+/// as `'\''`). Double quotes would let PowerShell or sh expand `$name` and
+/// point the command at another folder.
+fn shell_quote(path: &Path) -> String {
+    let text = path.display().to_string();
+    if cfg!(windows) {
+        format!("'{}'", text.replace('\'', "''"))
+    } else {
+        format!("'{}'", text.replace('\'', r"'\''"))
+    }
+}
+
+/// The side-by-side copies in `plugins_dir`, sorted. A folder that does not
+/// exist has none; any other failure to list it, or to read one of its
+/// entries, is an error, because then copies may be there unseen.
+fn list_side_by_side(plugins_dir: &Path) -> Result<Vec<String>, String> {
+    let entries = match fs::read_dir(plugins_dir) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => return Err(err.to_string()),
+    };
+    let mut copies = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|err| err.to_string())?;
+        // A name that is not UTF-8 cannot be a versioned copy's name.
+        let Ok(name) = entry.file_name().into_string() else {
+            continue;
+        };
+        if plugin::is_side_by_side_file_name(&name) && plugins_dir.join(&name).is_file() {
+            copies.push(name);
+        }
+    }
     copies.sort();
+    Ok(copies)
+}
+
+fn side_by_side_checks(
+    plugins_dir: &Path,
+    listing: Result<Vec<String>, String>,
+    flag: &str,
+    install: &str,
+) -> Vec<Check> {
+    let category = Category::Plugin;
+    let mut checks = Vec::new();
+    let copies = match listing {
+        Ok(copies) => copies,
+        Err(err) => {
+            checks.push(check(
+                category,
+                "side-by-side-unchecked",
+                Status::Warning,
+                format!(
+                    "Could not list {} to look for side-by-side copies: {err}",
+                    plugins_dir.display()
+                ),
+                Some("Check that you can list the plugins folder, then run doctor again."),
+            ));
+            return checks;
+        }
+    };
     if !copies.is_empty() {
         let paths: Vec<String> = copies
             .iter()
-            .map(|name| format!("\"{}\"", plugins_dir.join(name).display()))
+            .map(|name| shell_quote(&plugins_dir.join(name)))
             .collect();
         checks.push(check(
             category,
@@ -1688,10 +1752,81 @@ mod tests {
         assert_eq!(codes(&checks), [("plugin-unreadable", Status::Warning)]);
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn hint_paths_are_quoted_for_powershell() {
+        // Inside PowerShell's single quotes only ' is special, written twice.
+        assert_eq!(
+            shell_quote(Path::new(r"C:\Roblox\$Dev\My Plugins")),
+            r"'C:\Roblox\$Dev\My Plugins'"
+        );
+        assert_eq!(shell_quote(Path::new(r"C:\a`b\c")), r"'C:\a`b\c'");
+        assert_eq!(shell_quote(Path::new(r"C:\Lars's\x")), r"'C:\Lars''s\x'");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hint_paths_are_quoted_for_posix_shells() {
+        // Inside POSIX single quotes nothing is special, and ' ends the quote.
+        assert_eq!(
+            shell_quote(Path::new("/home/me/$Dev/My Plugins")),
+            "'/home/me/$Dev/My Plugins'"
+        );
+        assert_eq!(shell_quote(Path::new("/a`b`/c")), "'/a`b`/c'");
+        assert_eq!(shell_quote(Path::new("/me's/x")), r"'/me'\''s/x'");
+    }
+
+    #[test]
+    fn hints_quote_plugins_dirs_with_shell_characters() {
+        let parent = tempdir().unwrap();
+        let dir = parent.path().join("$Dev `x` 'q'");
+        fs::create_dir(&dir).unwrap();
+        fs::write(dir.join("Rojo-7.7.1.rbxm"), b"copy").unwrap();
+        let checks = check_plugin(Ok(dir.clone()), true);
+        let quoted = shell_quote(&dir);
+        for check in &checks {
+            let hint = check.hint.as_deref().unwrap();
+            assert!(hint.contains(&format!("--plugins-dir {quoted}")), "{hint}");
+            // No path is put inside double quotes anywhere.
+            assert!(!hint.contains('"'), "{hint}");
+        }
+        let copy = shell_quote(&dir.join("Rojo-7.7.1.rbxm"));
+        assert!(checks[1].hint.as_deref().unwrap().contains(&copy));
+    }
+
+    #[test]
+    fn a_folder_that_cannot_be_listed_is_not_reported_as_clean() {
+        let dir = Path::new("plugins");
+        let checks = side_by_side_checks(
+            dir,
+            Err("Access is denied.".into()),
+            "",
+            "`rojo plugin install`",
+        );
+        assert_eq!(
+            codes(&checks),
+            [("side-by-side-unchecked", Status::Warning)]
+        );
+        assert!(checks[0].message.contains("Access is denied."));
+        assert!(side_by_side_checks(dir, Ok(Vec::new()), "", "").is_empty());
+
+        // Listing a missing folder is not an error; reading the managed plugin
+        // already reports it as missing.
+        let parent = tempdir().unwrap();
+        assert_eq!(
+            list_side_by_side(&parent.path().join("missing")),
+            Ok(Vec::new())
+        );
+        // A file where the folder should be cannot be listed.
+        let file = parent.path().join("file");
+        fs::write(&file, b"").unwrap();
+        assert!(list_side_by_side(&file).is_err());
+    }
+
     #[test]
     fn repair_hints_name_an_explicit_plugins_dir() {
         let dir = tempdir().unwrap();
-        let flag = format!("--plugins-dir \"{}\"", dir.path().display());
+        let flag = format!("--plugins-dir {}", shell_quote(dir.path()));
         let hints = |checks: Vec<Check>| -> Vec<String> {
             checks.into_iter().filter_map(|check| check.hint).collect()
         };
@@ -1708,7 +1843,7 @@ mod tests {
         assert_eq!(unreadable.len(), 2);
         // The side-by-side hint names the stray file, and offers --all only
         // together with the reinstall, both naming the folder.
-        let copy = format!("\"{}\"", dir.path().join("Rojo-7.7.1.rbxm").display());
+        let copy = shell_quote(&dir.path().join("Rojo-7.7.1.rbxm"));
         assert!(unreadable[1].contains(&copy), "{}", unreadable[1]);
         assert!(
             !unreadable[1].contains("--side-by-side"),

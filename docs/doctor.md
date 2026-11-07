@@ -44,7 +44,11 @@ attention has a one-line fix.
   is not a regular file (a directory, named pipe or FIFO is never opened).
   For side-by-side copies doctor lists the files to delete, or the complete
   `rojo plugin uninstall --all` then `rojo plugin install` sequence. With
-  `--plugins-dir`, the suggested commands name that folder too.
+  `--plugins-dir`, the suggested commands name that folder too. Paths in
+  suggested commands are single-quoted for PowerShell on Windows and for a
+  POSIX shell elsewhere, so `$` and backticks in them are not expanded. If
+  the plugins folder cannot be listed, doctor warns that it could not look
+  for side-by-side copies (`side-by-side-unchecked`).
 * rojo serve: whether a server answers on the address and port serve would use
   (`--address` and `--port`, then the project's `serveAddress` and
   `servePort`, then `127.0.0.1:34872`). Its version against this CLI's, its
