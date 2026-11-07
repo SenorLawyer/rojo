@@ -98,6 +98,7 @@
 
 use std::{
     fmt,
+    sync::Mutex,
     thread::sleep,
     time::{Duration, Instant},
 };
@@ -380,6 +381,13 @@ pub struct OpenCloud {
     key: HeaderValue,
     base_url: String,
     timing: Timing,
+    spacing: Option<Spacing>,
+}
+
+/// The minimum time between two HTTP attempts and when the next may start.
+struct Spacing {
+    spacing: Duration,
+    next: Mutex<Option<Instant>>,
 }
 
 impl fmt::Debug for OpenCloud {
@@ -427,7 +435,36 @@ impl OpenCloud {
             key,
             base_url: base_url.trim_end_matches('/').to_owned(),
             timing: Timing::default(),
+            spacing: None,
         })
+    }
+
+    /// Spaces every HTTP attempt this client sends, retries included, at
+    /// least `spacing` apart, for endpoints whose per-minute limit a caller
+    /// must stay under.
+    pub fn with_request_spacing(mut self, spacing: Duration) -> OpenCloud {
+        self.spacing = Some(Spacing {
+            spacing,
+            next: Mutex::new(None),
+        });
+        self
+    }
+
+    /// Waits for the next request slot when requests are spaced.
+    fn pace(&self) {
+        let Some(spacing) = &self.spacing else {
+            return;
+        };
+        let wait = {
+            let mut next = spacing.next.lock().unwrap_or_else(|e| e.into_inner());
+            let now = Instant::now();
+            let slot = next.filter(|slot| *slot > now).unwrap_or(now);
+            *next = Some(slot + spacing.spacing);
+            slot - now
+        };
+        if !wait.is_zero() {
+            sleep(wait);
+        }
     }
 
     /// Retries and polls within milliseconds and gives Luau tasks no extra
@@ -896,6 +933,8 @@ impl OpenCloud {
                     .body(bytes.to_vec());
             }
             let can_retry = attempt < self.timing.max_attempts;
+            // Each attempt counts against Roblox's limits, retries too.
+            self.pace();
             let response = match request.send() {
                 Ok(response) => response,
                 Err(error) => {
@@ -1407,6 +1446,8 @@ mod tests {
         target: String,
         headers: String,
         body: Vec<u8>,
+        /// When the request arrived.
+        at: Instant,
     }
 
     struct Reply {
@@ -1468,6 +1509,7 @@ mod tests {
                     target: request_line.next().unwrap().to_owned(),
                     headers: head.to_ascii_lowercase(),
                     body: data[head_end..head_end + length].to_vec(),
+                    at: Instant::now(),
                 });
                 write!(
                     stream,
@@ -2361,6 +2403,32 @@ mod tests {
             Some(1500)
         );
         assert_eq!(parse_timestamp_ms(&json!("soon")), None);
+    }
+
+    #[test]
+    fn spaced_clients_pace_every_attempt_including_retries() {
+        let spacing = Duration::from_millis(150);
+        let (base, recorded) = serve(vec![
+            reply("503 Service Unavailable", ""),
+            reply("200 OK", "{}"),
+            reply("200 OK", "{}"),
+        ]);
+        let client = client(&base).with_request_spacing(spacing);
+        // The first call is retried once after the 503; the retry's own
+        // backoff (10 ms) is far shorter than the spacing.
+        client
+            .list_game_server_logs(1, 2, "3", "job", "", None)
+            .unwrap();
+        client
+            .list_game_server_logs(1, 2, "3", "job", "", None)
+            .unwrap();
+        let requests = received(&recorded);
+        assert_eq!(requests.len(), 3);
+        for pair in requests.windows(2) {
+            let gap = pair[1].at - pair[0].at;
+            // A little slack for when the server thread records arrival.
+            assert!(gap >= spacing - Duration::from_millis(20), "{gap:?}");
+        }
     }
 
     #[test]

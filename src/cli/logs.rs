@@ -47,7 +47,16 @@ const MAX_REQUESTS_PER_MINUTE: u32 = 100;
 /// keeps only server Error and Warning logs so far (not Output, Info or
 /// client logs), and entries take about three minutes to appear. The key
 /// owner's requests are limited to 100 a minute across all of their keys, so
-/// this paces itself and reads at most --max-servers servers per round.
+/// this paces every request, retries included, and reads at most
+/// --max-servers servers per round.
+///
+/// Assumptions from Roblox's beta docs, not checked against the live API:
+/// logs come newest first when asked for `message_timestamp desc`, so reading
+/// a server stops at the first page that reaches --since; and an entry
+/// becomes readable about three minutes after it was logged. --follow
+/// therefore reads each server again from 5 minutes before the newest entry
+/// it showed, and keeps reading a server for 5 minutes after it shut down.
+/// An entry that turns up later than that is missed.
 #[derive(Debug, Parser)]
 pub struct LogsCommand {
     /// The universe (experience) to read logs of.
@@ -92,8 +101,9 @@ pub struct LogsCommand {
     /// most recently shut down.
     #[clap(long, default_value = "20")]
     pub max_servers: usize,
-    /// Open Cloud requests this command may send per minute, at most 100.
-    /// Other uses of the key owner's keys count against the same 100.
+    /// Open Cloud requests this command may send per minute, at most 100,
+    /// counting each retry. Other uses of the key owner's keys count against
+    /// the same 100.
     #[clap(long, default_value = "60")]
     pub requests_per_minute: u32,
     /// The environment variable that holds the API key.
@@ -127,39 +137,46 @@ impl Level {
 impl LogsCommand {
     pub fn run(self) -> anyhow::Result<()> {
         self.validate().map_err(UsageError)?;
-        let client = OpenCloud::from_env(&self.api_key_env).map_err(UsageError)?;
+        let client = OpenCloud::from_env(&self.api_key_env)
+            .map_err(UsageError)?
+            .with_request_spacing(Duration::from_secs(60) / self.requests_per_minute);
         let mut reader = Reader::new(&client, &self);
         let mut out = std::io::stdout();
         if self.follow {
             return self.follow(&mut reader, &mut out);
         }
-        let batch = reader
-            .round(now_ms())
-            .map_err(|error| self.explain(error))?;
+        let batch = reader.round(now_ms());
         for notice in &batch.notices {
             eprintln!("{notice}");
         }
         let entries = newest(batch.entries, self.limit);
+        // Entries from the servers read before a failure are still printed.
         if self.json {
-            let value = json!({
+            let mut value = json!({
                 "entries": entries.iter().map(entry_json).collect::<Vec<_>>(),
                 "serversRead": batch.servers_read,
                 "truncated": batch.truncated,
             });
+            if let Some(error) = &batch.error {
+                value["error"] = json!(error.to_string());
+            }
             writeln!(
                 out,
                 "{}",
                 json_escape_controls(serde_json::to_string(&value)?)
             )?;
         } else {
-            if entries.is_empty() {
+            if entries.is_empty() && batch.error.is_none() {
                 eprintln!("No matching log entries in the last {}.", self.since);
             }
             for entry in &entries {
                 writeln!(out, "{}", entry_text(entry))?;
             }
         }
-        Ok(())
+        match batch.error {
+            Some(error) => Err(self.explain(error)),
+            None => Ok(()),
+        }
     }
 
     fn validate(&self) -> anyhow::Result<()> {
@@ -187,37 +204,36 @@ impl LogsCommand {
         let mut failures = 0;
         loop {
             let started = Instant::now();
-            match reader.round(now_ms()) {
-                Ok(batch) => {
-                    failures = 0;
-                    for notice in &batch.notices {
-                        eprintln!("{notice}");
-                    }
-                    // Like `tail -f`, start with the newest entries only.
-                    let entries = if first {
-                        newest(batch.entries, self.limit)
-                    } else {
-                        batch.entries
-                    };
-                    first = false;
-                    for entry in &entries {
-                        let line = if self.json {
-                            json_escape_controls(serde_json::to_string(&entry_json(entry))?)
-                        } else {
-                            entry_text(entry)
-                        };
-                        // A reader that stops early, such as `head`, ends
-                        // following like Ctrl+C does.
-                        match writeln!(out, "{line}") {
-                            Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => {
-                                return Ok(())
-                            }
-                            result => result?,
-                        }
-                    }
+            let batch = reader.round(now_ms());
+            for notice in &batch.notices {
+                eprintln!("{notice}");
+            }
+            // Like `tail -f`, start with the newest entries only.
+            let entries = if first {
+                newest(batch.entries, self.limit)
+            } else {
+                batch.entries
+            };
+            first = false;
+            // The reader counts these as shown, so they are printed even
+            // when a later server in the round failed.
+            for entry in &entries {
+                let line = if self.json {
+                    json_escape_controls(serde_json::to_string(&entry_json(entry))?)
+                } else {
+                    entry_text(entry)
+                };
+                // A reader that stops early, such as `head`, ends following
+                // like Ctrl+C does.
+                match writeln!(out, "{line}") {
+                    Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => return Ok(()),
+                    result => result?,
                 }
-                Err(error) if is_usage_problem(&error) => return Err(self.explain(error)),
-                Err(error) => {
+            }
+            match batch.error {
+                None => failures = 0,
+                Some(error) if is_usage_problem(&error) => return Err(self.explain(error)),
+                Some(error) => {
                     failures += 1;
                     if failures >= MAX_FOLLOW_FAILURES {
                         return Err(
@@ -319,29 +335,6 @@ impl LogSource for OpenCloud {
     }
 }
 
-/// Spaces requests evenly so a round stays under the per-minute limit.
-struct Pacer {
-    spacing: Duration,
-    next: Option<Instant>,
-}
-
-impl Pacer {
-    fn new(per_minute: u32) -> Pacer {
-        Pacer {
-            spacing: Duration::from_secs(60) / per_minute.max(1),
-            next: None,
-        }
-    }
-
-    fn wait(&mut self) {
-        let now = Instant::now();
-        if let Some(next) = self.next.filter(|next| *next > now) {
-            sleep(next - now);
-        }
-        self.next = Some(Instant::now() + self.spacing);
-    }
-}
-
 /// The result of one round: entries not shown before, oldest first.
 #[derive(Debug, Default)]
 struct Batch {
@@ -350,6 +343,9 @@ struct Batch {
     servers_read: usize,
     /// Whether some servers or entries were left out by the caps.
     truncated: bool,
+    /// Why the round stopped early. `entries` still holds what the servers
+    /// read before it returned, and the reader counts those as shown.
+    error: Option<OpenCloudError>,
 }
 
 /// A server to read, with the place version its logs are filed under.
@@ -363,6 +359,18 @@ struct Target {
     shut_down: bool,
 }
 
+/// What following remembers about one server.
+#[derive(Debug, Default)]
+struct ServerState {
+    /// The newest entry timestamp read from it.
+    newest: Option<u64>,
+    /// Entries already shown, by [`occurrence_key`], with their timestamps
+    /// so the set can be pruned once they fall behind the server's cutoff.
+    seen: HashMap<[u8; 32], u64>,
+    /// When it was last among the listed servers.
+    last_listed_ms: u64,
+}
+
 struct Reader<'a, S> {
     source: &'a S,
     universe: u64,
@@ -373,14 +381,10 @@ struct Reader<'a, S> {
     since: Duration,
     filter: String,
     max_servers: usize,
-    pacer: Pacer,
-    /// Entries already shown, by [`entry_key`], with their timestamps so the
-    /// set can be pruned.
-    seen: HashMap<[u8; 32], u64>,
-    /// The newest timestamp shown per server.
-    newest: HashMap<String, u64>,
-    /// Shut-down servers read since their last entries became readable.
-    finished: HashSet<String>,
+    servers: HashMap<String, ServerState>,
+    /// Shut-down servers read after their last entries became readable,
+    /// with when they shut down, so later rounds skip them.
+    finished: HashMap<String, u64>,
 }
 
 impl<'a, S: LogSource> Reader<'a, S> {
@@ -395,26 +399,39 @@ impl<'a, S: LogSource> Reader<'a, S> {
             since: command.since.into(),
             filter: cel_filter(command.filter.as_deref(), command.search.as_deref()),
             max_servers: command.max_servers,
-            pacer: Pacer::new(command.requests_per_minute),
-            seen: HashMap::new(),
-            newest: HashMap::new(),
-            finished: HashSet::new(),
+            servers: HashMap::new(),
+            finished: HashMap::new(),
         }
     }
 
     /// Reads every selected server once and returns the entries not returned
-    /// by an earlier round.
-    fn round(&mut self, now_ms: u64) -> Result<Batch, OpenCloudError> {
+    /// by an earlier round. A server's state only changes once all of its
+    /// pages were read, together with adding its entries to the batch, so a
+    /// failure leaves the servers after it to be read in full next time.
+    fn round(&mut self, now_ms: u64) -> Batch {
         let since_ms = now_ms.saturating_sub(self.since.as_millis() as u64);
         let overlap_ms = OVERLAP.as_millis() as u64;
         let mut batch = Batch::default();
-        let targets = self.targets(since_ms, &mut batch)?;
+        let targets = match self.targets(since_ms, now_ms, &mut batch) {
+            Ok(targets) => targets,
+            Err(error) => {
+                batch.error = Some(error);
+                return batch;
+            }
+        };
 
         for target in targets {
-            let cutoff = self.newest.get(&target.job).map_or(since_ms, |newest| {
-                newest.saturating_sub(overlap_ms).max(since_ms)
-            });
-            let (logs, truncated) = self.read_server(&target, cutoff)?;
+            let cutoff = self
+                .servers
+                .get(&target.job)
+                .map_or(since_ms, |state| read_cutoff(state, since_ms));
+            let (logs, truncated) = match self.read_server(&target, cutoff) {
+                Ok(read) => read,
+                Err(error) => {
+                    batch.error = Some(error);
+                    break;
+                }
+            };
             batch.servers_read += 1;
             if truncated {
                 batch.truncated = true;
@@ -424,56 +441,67 @@ impl<'a, S: LogSource> Reader<'a, S> {
                     MAX_PAGES * 100
                 ));
             }
+
+            let state = self.servers.entry(target.job.clone()).or_default();
+            state.last_listed_ms = now_ms;
+            // Identical entries within one read are separate occurrences;
+            // numbering them tells a repeat apart from a re-read.
+            let mut occurrences: HashMap<[u8; 32], u64> = HashMap::new();
             for log in logs {
                 if let Some(ms) = log.timestamp_ms {
                     if ms < cutoff {
                         continue;
                     }
-                    let newest = self.newest.entry(target.job.clone()).or_insert(ms);
-                    *newest = (*newest).max(ms);
+                    state.newest = Some(state.newest.map_or(ms, |newest| newest.max(ms)));
                 }
-                if !self.levels.is_empty() && !self.levels.iter().any(|l| l.matches(&log.severity))
-                {
-                    continue;
-                }
-                let key = entry_key(&log);
-                if self
+                let base = entry_key(&log);
+                let index = occurrences.entry(base).or_insert(0);
+                let key = occurrence_key(&base, *index);
+                *index += 1;
+                let shown = state
                     .seen
                     .insert(key, log.timestamp_ms.unwrap_or(now_ms))
-                    .is_none()
-                {
+                    .is_some();
+                let wanted =
+                    self.levels.is_empty() || self.levels.iter().any(|l| l.matches(&log.severity));
+                if !shown && wanted {
                     batch.entries.push(log);
                 }
             }
+            // Entries behind the next cutoff are never read again.
+            let next_cutoff = read_cutoff(state, since_ms);
+            state.seen.retain(|_, ms| *ms >= next_cutoff);
+
             // Its last entries are readable by now, so later rounds can skip it.
-            if target.shut_down
-                && target
-                    .terminated_ms
-                    .is_some_and(|ms| ms.saturating_add(overlap_ms) < now_ms)
+            if let Some(terminated) = target
+                .terminated_ms
+                .filter(|ms| target.shut_down && ms.saturating_add(overlap_ms) < now_ms)
             {
-                self.finished.insert(target.job.clone());
+                self.servers.remove(&target.job);
+                self.finished.insert(target.job.clone(), terminated);
             }
         }
 
-        // Entries older than every cutoff cannot come back.
-        let keep_after = self
-            .newest
-            .values()
-            .copied()
-            .min()
-            .unwrap_or(now_ms)
-            .min(now_ms)
-            .saturating_sub(2 * overlap_ms)
-            .min(since_ms);
-        self.seen.retain(|_, ms| *ms >= keep_after);
+        // Servers that left the listing are not coming back, and finished
+        // servers that shut down before --since are no longer listed as
+        // worth reading, so neither needs remembering.
+        self.servers
+            .retain(|_, state| state.last_listed_ms.saturating_add(overlap_ms) >= now_ms);
+        self.finished
+            .retain(|_, terminated| *terminated >= since_ms);
         batch
             .entries
             .sort_by_key(|entry| entry.timestamp_ms.unwrap_or(now_ms));
-        Ok(batch)
+        batch
     }
 
     /// The servers to read this round.
-    fn targets(&mut self, since_ms: u64, batch: &mut Batch) -> Result<Vec<Target>, OpenCloudError> {
+    fn targets(
+        &mut self,
+        since_ms: u64,
+        now_ms: u64,
+        batch: &mut Batch,
+    ) -> Result<Vec<Target>, OpenCloudError> {
         // A server named together with its one version can be read directly.
         if !self.jobs.is_empty() && self.versions.len() == 1 {
             return Ok(self
@@ -489,7 +517,6 @@ impl<'a, S: LogSource> Reader<'a, S> {
         }
 
         let versions = if self.versions.is_empty() {
-            self.pacer.wait();
             let all = self.source.place_versions(self.universe, self.place)?;
             let chosen = newest_versions(&all, DEFAULT_VERSIONS);
             if all.len() > chosen.len() {
@@ -517,7 +544,6 @@ impl<'a, S: LogSource> Reader<'a, S> {
                     ));
                     break;
                 }
-                self.pacer.wait();
                 let result = self.source.game_servers(
                     self.universe,
                     self.place,
@@ -538,6 +564,13 @@ impl<'a, S: LogSource> Reader<'a, S> {
         }
 
         let mut targets = select_servers(servers, since_ms, &self.jobs, &self.finished);
+        // Servers left out by the cap below are still listed, so what was
+        // shown from them is kept.
+        for target in &targets {
+            if let Some(state) = self.servers.get_mut(&target.job) {
+                state.last_listed_ms = now_ms;
+            }
+        }
         if !self.jobs.is_empty() {
             let found: HashSet<&str> = targets.iter().map(|t| t.job.as_str()).collect();
             for job in self.jobs.iter().filter(|job| !found.contains(job.as_str())) {
@@ -564,14 +597,13 @@ impl<'a, S: LogSource> Reader<'a, S> {
     /// Reads a server's entries back to `cutoff`, newest first, and whether
     /// the page cap stopped it early.
     fn read_server(
-        &mut self,
+        &self,
         target: &Target,
         cutoff: u64,
     ) -> Result<(Vec<GameServerLog>, bool), OpenCloudError> {
         let mut logs = Vec::new();
         let mut token: Option<String> = None;
         for _ in 0..MAX_PAGES {
-            self.pacer.wait();
             let page = self.source.logs(
                 self.universe,
                 self.place,
@@ -595,19 +627,29 @@ impl<'a, S: LogSource> Reader<'a, S> {
     }
 }
 
+/// How far back a server is read: to --since, or to the overlap before its
+/// newest entry, whichever is later.
+fn read_cutoff(state: &ServerState, since_ms: u64) -> u64 {
+    state.newest.map_or(since_ms, |newest| {
+        newest
+            .saturating_sub(OVERLAP.as_millis() as u64)
+            .max(since_ms)
+    })
+}
+
 /// The servers worth reading: those still running, then those that shut
 /// down after `since_ms`, newest first. With `jobs`, only those servers.
 fn select_servers(
     servers: Vec<(String, GameServer)>,
     since_ms: u64,
     jobs: &[String],
-    finished: &HashSet<String>,
+    finished: &HashMap<String, u64>,
 ) -> Vec<Target> {
     let mut seen = HashSet::new();
     let mut targets: Vec<Target> = servers
         .into_iter()
         .filter(|(_, server)| jobs.is_empty() || jobs.contains(&server.job_id))
-        .filter(|(_, server)| !finished.contains(&server.job_id))
+        .filter(|(_, server)| !finished.contains_key(&server.job_id))
         .map(|(version, server)| Target {
             terminated_ms: server
                 .termination_time
@@ -684,22 +726,48 @@ fn cel_string(text: &str) -> String {
     out
 }
 
-/// Identifies an entry across rounds. The counts are left out because
-/// Roblox may raise them on an entry it already returned.
+/// Every field that tells two entries apart. The counts are left out
+/// because Roblox may raise them on an entry it already returned.
 fn entry_key(log: &GameServerLog) -> [u8; 32] {
     let mut hasher = blake3::Hasher::new();
+    let timestamp = log.timestamp_ms.map(|ms| ms.to_string());
+    let structured =
+        (!log.structured_stack_trace.is_null()).then(|| log.structured_stack_trace.to_string());
     for part in [
-        log.job_id.as_str(),
-        &log.timestamp_ms
-            .map(|ms| ms.to_string())
-            .unwrap_or_default(),
-        log.severity.as_str(),
-        &log.message,
-        &log.stack_trace,
+        Some(log.job_id.as_str()),
+        Some(log.place_version.as_str()),
+        timestamp.as_deref(),
+        Some(log.severity.as_str()),
+        Some(&log.message),
+        Some(&log.stack_trace),
+        log.message_template.as_deref(),
+        log.context.as_deref(),
+        log.logger_full_path.as_deref(),
+        structured.as_deref(),
     ] {
-        hasher.update(&(part.len() as u64).to_le_bytes());
-        hasher.update(part.as_bytes());
+        // Length-prefixed, with absent fields distinct from empty ones, so
+        // no two different entries hash the same parts.
+        match part {
+            Some(part) => {
+                hasher.update(&[1]);
+                hasher.update(&(part.len() as u64).to_le_bytes());
+                hasher.update(part.as_bytes());
+            }
+            None => {
+                hasher.update(&[0]);
+            }
+        }
     }
+    *hasher.finalize().as_bytes()
+}
+
+/// The key of the `index`th entry with key `base` in one read of a server.
+/// Identical entries share a timestamp, so a read either covers all of them
+/// or none, and the numbering is the same in every round that reads them.
+fn occurrence_key(base: &[u8; 32], index: u64) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(base);
+    hasher.update(&index.to_le_bytes());
     *hasher.finalize().as_bytes()
 }
 
@@ -847,7 +915,7 @@ mod tests {
     struct Fake {
         versions: Vec<String>,
         servers: RefCell<VecDeque<Result<GameServerPage, OpenCloudError>>>,
-        logs: RefCell<HashMap<String, VecDeque<GameServerLogPage>>>,
+        logs: RefCell<HashMap<String, VecDeque<Result<GameServerLogPage, OpenCloudError>>>>,
         calls: RefCell<Vec<Call>>,
     }
 
@@ -864,10 +932,18 @@ mod tests {
                 .borrow_mut()
                 .entry(job.to_owned())
                 .or_default()
-                .push_back(GameServerLogPage {
+                .push_back(Ok(GameServerLogPage {
                     logs,
                     next_page_token: next.map(str::to_owned),
-                });
+                }));
+        }
+
+        fn failing_logs(&self, job: &str) {
+            self.logs
+                .borrow_mut()
+                .entry(job.to_owned())
+                .or_default()
+                .push_back(Err(OpenCloudError::Unconfirmed("connection reset".into())));
         }
     }
 
@@ -911,12 +987,11 @@ mod tests {
                 filter.into(),
                 token.map(str::to_owned),
             ));
-            Ok(self
-                .logs
+            self.logs
                 .borrow_mut()
                 .get_mut(job)
                 .and_then(VecDeque::pop_front)
-                .unwrap_or(GameServerLogPage {
+                .unwrap_or(Ok(GameServerLogPage {
                     logs: Vec::new(),
                     next_page_token: None,
                 }))
@@ -924,12 +999,138 @@ mod tests {
     }
 
     fn reader<'a>(fake: &'a Fake, command: &LogsCommand) -> Reader<'a, Fake> {
-        let mut reader = Reader::new(fake, command);
-        reader.pacer = Pacer {
-            spacing: Duration::ZERO,
-            next: None,
+        Reader::new(fake, command)
+    }
+
+    fn messages(batch: &Batch) -> Vec<&str> {
+        batch.entries.iter().map(|e| e.message.as_str()).collect()
+    }
+
+    #[test]
+    fn a_failing_server_keeps_the_entries_of_servers_read_before_it() {
+        let fake = Fake::default();
+        let command = parse(&["--place-version", "45"]);
+        let mut reader = reader(&fake, &command);
+        let both = || vec![server("a", false, None), server("b", false, None)];
+
+        fake.servers(both(), None);
+        fake.logs(
+            "a",
+            vec![log("a", NOW - MINUTE, LogSeverity::Error, "from a")],
+            None,
+        );
+        fake.failing_logs("b");
+        let first = reader.round(NOW);
+        assert_eq!(messages(&first), ["from a"]);
+        assert!(matches!(first.error, Some(OpenCloudError::Unconfirmed(_))));
+        assert_eq!(first.servers_read, 1);
+
+        // Next round, a's entry is not shown again and b's are shown, since
+        // b's failed read changed nothing.
+        fake.servers(both(), None);
+        fake.logs(
+            "a",
+            vec![log("a", NOW - MINUTE, LogSeverity::Error, "from a")],
+            None,
+        );
+        fake.logs(
+            "b",
+            vec![log("b", NOW - MINUTE, LogSeverity::Error, "from b")],
+            None,
+        );
+        let second = reader.round(NOW + MINUTE);
+        assert!(second.error.is_none());
+        assert_eq!(messages(&second), ["from b"]);
+    }
+
+    #[test]
+    fn identical_entries_in_one_read_are_all_shown_once() {
+        let fake = Fake::default();
+        let command = parse(&["--place-version", "45", "--job-id", "a"]);
+        let mut reader = reader(&fake, &command);
+        let twice = || {
+            vec![
+                log("a", NOW - MINUTE, LogSeverity::Error, "same"),
+                log("a", NOW - MINUTE, LogSeverity::Error, "same"),
+            ]
         };
-        reader
+
+        fake.logs("a", twice(), None);
+        assert_eq!(messages(&reader.round(NOW)), ["same", "same"]);
+        // The same page read again shows nothing.
+        fake.logs("a", twice(), None);
+        assert!(reader.round(NOW + MINUTE).entries.is_empty());
+        // A third occurrence is new.
+        let mut three = twice();
+        three.push(log("a", NOW - MINUTE, LogSeverity::Error, "same"));
+        fake.logs("a", three, None);
+        assert_eq!(messages(&reader.round(NOW + 2 * MINUTE)), ["same"]);
+
+        // Entries that differ only in a structured logging field are
+        // different entries.
+        let mut with_context = log("a", NOW, LogSeverity::Error, "same");
+        with_context.context = Some("{\"id\":1}".into());
+        let mut other_logger = log("a", NOW, LogSeverity::Error, "same");
+        other_logger.logger_full_path = Some("Game.Logger".into());
+        fake.logs(
+            "a",
+            vec![
+                log("a", NOW, LogSeverity::Error, "same"),
+                with_context,
+                other_logger,
+            ],
+            None,
+        );
+        assert_eq!(reader.round(NOW + 3 * MINUTE).entries.len(), 3);
+    }
+
+    #[test]
+    fn following_state_stays_bounded() {
+        let fake = Fake::default();
+        let command = parse(&["--place-version", "45", "--since", "10m"]);
+        let mut reader = reader(&fake, &command);
+
+        for round in 0..60u64 {
+            let now = NOW + round * MINUTE;
+            let mut servers = vec![server("busy", false, None)];
+            // "quiet" logs once, then stays listed but silent, then leaves.
+            if round < 20 {
+                servers.push(server("quiet", false, None));
+            }
+            // "ended" shut down at the first round.
+            servers.push(server("ended", true, Some("2026-11-07T12:00:00Z")));
+            fake.servers(servers, None);
+            fake.logs(
+                "busy",
+                vec![log("busy", now - 1000, LogSeverity::Error, "tick")],
+                None,
+            );
+            if round == 0 {
+                fake.logs(
+                    "quiet",
+                    vec![log("quiet", now, LogSeverity::Error, "once")],
+                    None,
+                );
+            }
+            let batch = reader.round(now);
+            assert!(batch.error.is_none());
+            assert_eq!(
+                batch.entries.len(),
+                if round == 0 { 2 } else { 1 },
+                "round {round}"
+            );
+
+            // Only entries inside the overlap window are remembered.
+            let busy = &reader.servers["busy"];
+            assert!(busy.seen.len() <= 6, "round {round}: {}", busy.seen.len());
+            if let Some(quiet) = reader.servers.get("quiet") {
+                assert!(quiet.seen.len() <= 1);
+            }
+        }
+        // The quiet server left the listing long ago, and the ended server
+        // shut down before --since.
+        assert_eq!(reader.servers.keys().collect::<Vec<_>>(), ["busy"]);
+        assert!(reader.finished.is_empty());
     }
 
     #[test]
@@ -997,7 +1198,7 @@ mod tests {
 
         let command = parse(&["--search", "x"]);
         let mut reader = reader(&fake, &command);
-        let batch = reader.round(NOW).unwrap();
+        let batch = reader.round(NOW);
 
         let messages: Vec<_> = batch.entries.iter().map(|e| e.message.as_str()).collect();
         assert_eq!(messages, ["b", "careful", "boom"]);
@@ -1044,7 +1245,7 @@ mod tests {
             vec![log("a", NOW - MINUTE, LogSeverity::Error, "first")],
             None,
         );
-        let first = reader.round(NOW).unwrap();
+        let first = reader.round(NOW);
         assert_eq!(first.entries.len(), 1);
         assert_eq!(first.servers_read, 2);
 
@@ -1065,7 +1266,7 @@ mod tests {
             ],
             None,
         );
-        let second = reader.round(NOW + 2 * MINUTE).unwrap();
+        let second = reader.round(NOW + 2 * MINUTE);
         let messages: Vec<_> = second.entries.iter().map(|e| e.message.as_str()).collect();
         assert_eq!(messages, ["late", "second"]);
         // "gone" shut down more than the overlap ago and was read already.
@@ -1092,7 +1293,7 @@ mod tests {
             ],
             None,
         );
-        let batch = reader.round(NOW).unwrap();
+        let batch = reader.round(NOW);
         assert_eq!(batch.entries.len(), 1);
         assert_eq!(batch.entries[0].message, "w");
         // A job with its single version is read without listing servers.
@@ -1114,7 +1315,7 @@ mod tests {
             ],
             None,
         );
-        let batch = reader.round(NOW).unwrap();
+        let batch = reader.round(NOW);
         assert!(batch.truncated);
         assert_eq!(batch.servers_read, 1);
         // Active servers come first.
@@ -1139,7 +1340,7 @@ mod tests {
         ]);
         let mut reader = reader(&fake, &command);
         fake.servers(vec![server("a", false, None)], None);
-        let batch = reader.round(NOW).unwrap();
+        let batch = reader.round(NOW);
         assert_eq!(batch.servers_read, 0);
         assert!(
             batch.notices[0].contains("Server x is not among"),
@@ -1168,7 +1369,7 @@ mod tests {
             ("44".into(), server("live", false, None)),
             ("44".into(), server("live", false, None)),
         ];
-        let jobs: Vec<_> = select_servers(servers, since, &[], &HashSet::new())
+        let jobs: Vec<_> = select_servers(servers, since, &[], &HashMap::new())
             .into_iter()
             .map(|t| t.job)
             .collect();
