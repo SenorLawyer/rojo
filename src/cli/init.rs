@@ -411,9 +411,10 @@ fn should_git_init(path: &Path) -> bool {
         .status();
 
     match result {
-        // If the command ran, but returned a non-zero exit code, we are not in
-        // a Git repo and we should initialize one.
-        Ok(status) => !status.success(),
+        // A non-zero exit means no repository, unless a checkout marker says
+        // Git refused one, in which case nesting a repository would leave the
+        // workflow, placed at that checkout's root, outside it.
+        Ok(status) => !status.success() && find_git_marker(path).is_none(),
 
         // If the command failed to run, we probably don't have Git installed.
         Err(_) => false,
@@ -815,6 +816,8 @@ fn a_checkout_git_refuses_still_puts_the_workflow_at_its_root() {
         git_toplevel(&project).map(|root| dunce::canonicalize(root).unwrap()),
         Some(dunce::canonicalize(&checkout).unwrap())
     );
+    // The same checkout must also stop init from nesting a new repository.
+    assert!(!should_git_init(&project));
 }
 
 #[test]
