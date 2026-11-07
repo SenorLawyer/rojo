@@ -136,12 +136,14 @@ end
 	the backup are not kept. Nothing in the place is copied, and the size is
 	counted first, so a backup over the import limit fails before any work.
 
-	`readSource`, when given, reads a script's source the way sync does. The
-	model only holds `Source`, so a script whose open editor shows other text
-	also gets a draft copy with that text, in a folder named DRAFTS_FOLDER.
-	Returns the model and the paths and classes of its roots.
+	`readEditor`, when given, reads the text a script's editor holds, or
+	returns nil when it cannot. The model only holds `Source`, so a script
+	whose editor shows other text also gets a draft copy with that text, in a
+	folder named DRAFTS_FOLDER. Returns the model, the paths and classes of
+	its roots, and the paths of scripts whose editor text or source could not
+	be read, whose unsaved text the backup may therefore miss.
 ]]
-function StudioBackup.serialize(roots, readSource)
+function StudioBackup.serialize(roots, readEditor)
 	local count = StudioBackup.countInstances(roots)
 	assert(
 		count <= StudioBackup.MAX_INSTANCES,
@@ -149,6 +151,7 @@ function StudioBackup.serialize(roots, readSource)
 	)
 	local instances = {}
 	local described = {}
+	local unreadable = {}
 	local drafts
 	local ok, result = pcall(function()
 		for _, root in roots do
@@ -157,7 +160,7 @@ function StudioBackup.serialize(roots, readSource)
 				path = root.path or (StudioBridge.pathOf(root.instance)),
 				className = root.instance.ClassName,
 			})
-			if not readSource then
+			if not readEditor then
 				continue
 			end
 			local scripts = root.instance:GetDescendants()
@@ -166,11 +169,15 @@ function StudioBackup.serialize(roots, readSource)
 				if not script:IsA("LuaSourceContainer") then
 					continue
 				end
-				local editor = readSource(script)
+				local editor = readEditor(script)
 				local read, saved = pcall(function()
 					return (script :: any).Source
 				end)
-				if editor == nil or not read or editor == saved then
+				if editor == nil or not read or type(saved) ~= "string" then
+					table.insert(unreadable, (StudioBridge.pathOf(script)))
+					continue
+				end
+				if editor == saved then
 					continue
 				end
 				if drafts == nil then
@@ -200,7 +207,7 @@ function StudioBackup.serialize(roots, readSource)
 	if not ok then
 		error(result, 0)
 	end
-	return result, described
+	return result, described, unreadable
 end
 
 --[[

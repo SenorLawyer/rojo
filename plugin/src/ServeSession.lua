@@ -115,6 +115,20 @@ ServeSession.__index = ServeSession
 
 ServeSession.Status = Status
 
+-- The text a script's editor holds, which is its `Source` unless it has
+-- unsaved changes, or nil when Studio cannot say. Unlike readSource it never
+-- falls back to `Source`, so a backup can tell that it may miss unsaved text.
+-- Replaced by tests.
+function ServeSession.readEditorText(instance): string?
+	local ok, source = pcall(function()
+		return ScriptEditorService:GetEditorSource(instance)
+	end)
+	if ok and type(source) == "string" then
+		return source
+	end
+	return nil
+end
+
 local validateServeOptions = t.strictInterface({
 	apiContext = t.table,
 	twoWaySync = t.boolean,
@@ -685,7 +699,11 @@ function ServeSession:exportForBackup(ids, hashes)
 	local missing = 0
 	for _, id in ids do
 		local instance = self.__instanceMap.fromIds[id]
-		local source = if instance and instance:IsA("LuaSourceContainer") then readSource(instance) else nil
+		-- From the editor only: a script whose editor text cannot be read is
+		-- left out rather than backed up from a `Source` that may be older.
+		local source = if instance and instance:IsA("LuaSourceContainer")
+			then ServeSession.readEditorText(instance)
+			else nil
 		if
 			source ~= nil
 			and instance:IsDescendantOf(game)
@@ -756,7 +774,15 @@ function ServeSession:__backUpBeforeCatchUp(patch, serverInfo)
 			serverInfo.studioBridge ~= nil,
 			"the server was not started with --studio-token-file, so it cannot save backups"
 		)
-		local model, described = StudioBackup.serialize(roots, readSource)
+		local model, described, unreadable = StudioBackup.serialize(roots, ServeSession.readEditorText)
+		if #unreadable > 0 then
+			-- The backup still goes ahead with what was saved.
+			Log.warn(
+				"Unsaved editor text could not be backed up for {} scripts this sync changes or removes, so their backup holds only their saved source: {}",
+				#unreadable,
+				listPaths(unreadable)
+			)
+		end
 		return StudioBackup.send(self.__apiContext.__baseUrl, serverInfo.studioBridge, {
 			model = StudioBridge.encodeModel(model),
 			instances = described,

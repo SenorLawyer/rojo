@@ -83,6 +83,19 @@ pub fn run_child(allow_scripts: bool, encode: bool) -> anyhow::Result<()> {
     }
 }
 
+/// What `rojo studio import` and `rojo studio backup restore` do to a model
+/// before sending it to Studio: the isolated check, then re-encoding it as a
+/// binary model, which must fit the 5 MiB limit too. The server runs this on
+/// an automatic backup before saving it, so it only saves backups that
+/// restore would accept. Returns the re-encoded model.
+pub(crate) fn prepare_restore(
+    bytes: Vec<u8>,
+    allow_scripts: bool,
+    timeout: Duration,
+) -> anyhow::Result<Vec<u8>> {
+    check_untrusted_model(bytes, allow_scripts, true, timeout)
+}
+
 /// Validates an untrusted model without risking the calling process, and
 /// returns it as a binary model when `encode` is set. Blocks for at most
 /// about `timeout`.

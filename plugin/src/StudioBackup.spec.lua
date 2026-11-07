@@ -146,6 +146,29 @@ return function()
 			end
 		end)
 
+		it("reports scripts whose editor text could not be read", function()
+			local removed = make("Folder", "Removed", fixture)
+			local unknown = make("ModuleScript", "Unknown", removed)
+			unknown.Source = "return 'saved'"
+			local known = make("ModuleScript", "Known", removed)
+			known.Source = "return 'same'"
+			local model, _, unreadable = StudioBackup.serialize({ { instance = removed } }, function(instance)
+				if instance == unknown then
+					return nil
+				end
+				return instance.Source
+			end)
+			expect(#unreadable).to.equal(1)
+			expect(unreadable[1]).to.equal("game/ReplicatedStorage/__RojoBackupSpec/Removed/Unknown")
+			-- The backup still holds the saved source, and no draft.
+			local roots = byName(SerializationService:DeserializeInstancesAsync(model))
+			expect(roots.Removed.Unknown.Source).to.equal("return 'saved'")
+			expect(roots[StudioBackup.DRAFTS_FOLDER]).to.equal(nil)
+			for _, copy in roots do
+				copy:Destroy()
+			end
+		end)
+
 		it("refuses a backup over the instance limit before serializing", function()
 			local removed = make("Folder", "Removed", fixture)
 			make("Part", "One", removed)

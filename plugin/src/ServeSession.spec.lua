@@ -1405,6 +1405,59 @@ return function()
 			expect(#none.instances).to.equal(0)
 		end)
 
+		it("leaves out a script whose editor text cannot be read rather than export its saved source", function()
+			local unreadable = Instance.new("ModuleScript")
+			unreadable.Name = "Unreadable"
+			unreadable.Source = "return 1"
+			unreadable.Parent = fixture
+			session.__instanceMap:insert("UNREADABLE", unreadable)
+			session.__status = ServeSession.Status.Connected
+			local hashSource = require(script.Parent.hashSource)
+			local nativeRead = ServeSession.readEditorText
+			ServeSession.readEditorText = function()
+				return nil
+			end
+			local exported = session:exportForBackup({ "UNREADABLE" }, { UNREADABLE = (hashSource("return 1")) })
+			ServeSession.readEditorText = nativeRead
+			expect(exported.missing).to.equal(1)
+			expect(#exported.ids).to.equal(0)
+			expect(exported.model).to.equal(nil)
+		end)
+
+		it("warns about scripts whose unsaved editor text it could not back up", function()
+			Settings:set("autoBackupBeforeSync", true)
+			local Log = require(script.Parent.Parent.Packages.Log)
+			local nativeWarn = Log.warn
+			local nativeRead = ServeSession.readEditorText
+			local warnings = {}
+			Log.warn = function(template, ...)
+				table.insert(warnings, { template = template, args = { ... } })
+			end
+			ServeSession.readEditorText = function()
+				return nil
+			end
+			local sent = 0
+			StudioBridge.requestAsync = function()
+				sent += 1
+				return {
+					Success = true,
+					StatusCode = 200,
+					Body = HttpService:JSONEncode({ backup = { id = "20261107-000000-auto-sync" } }),
+				}
+			end
+			local removed = Instance.new("ModuleScript")
+			removed.Name = "OpenInEditor"
+			removed.Parent = fixture
+			local events = syncRemoving(removed, { rootInstanceId = "ROOT", studioBridge = pairing })
+			Log.warn = nativeWarn
+			ServeSession.readEditorText = nativeRead
+			expect(sent).to.equal(1)
+			expect(events[1]).to.equal("patch")
+			expect(#warnings).to.equal(1)
+			expect(warnings[1].template:find("Unsaved editor text could not be backed up", 1, true)).to.be.ok()
+			expect(warnings[1].args[2]).to.equal("game/ReplicatedStorage/__RojoSyncBackupSpec/OpenInEditor")
+		end)
+
 		it("leaves out a script whose source changed since verify hashed it", function()
 			local edited = Instance.new("ModuleScript")
 			edited.Name = "Edited"

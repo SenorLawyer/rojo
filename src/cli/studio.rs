@@ -1266,7 +1266,7 @@ fn read_model(path: &Path, allow_scripts: bool) -> anyhow::Result<Vec<u8>> {
     let bytes = fs::read(path)?;
     // The same isolated check the server runs, so a model that crashes the
     // decoder is reported as invalid instead of ending this command.
-    model_check::check_untrusted_model(bytes, allow_scripts, true, IMPORT_CHECK_LIMIT)
+    model_check::prepare_restore(bytes, allow_scripts, IMPORT_CHECK_LIMIT)
 }
 
 #[cfg(test)]

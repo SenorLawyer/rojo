@@ -1660,19 +1660,13 @@ impl StudioBridge {
     /// Runs the isolated check `backup restore` runs on `model`, so a backup
     /// that could never be restored is not saved as if it could.
     async fn check_restorable(&self, model: &[u8]) -> Result<(), String> {
-        let args = json!({
-            "model": data_encoding::BASE64.encode(model),
-            "allowScripts": true,
-        });
-        let Err(response) = self.check_import(&args).await else {
-            return Ok(());
-        };
-        let (_, value) = response_value(*response).await;
-        let message = value
-            .get("error")
-            .and_then(Value::as_str)
-            .unwrap_or("the model could not be checked");
-        Err(format!("the backup would not be restorable: {message}"))
+        // Exactly what restore runs, re-encoding and its size limit included.
+        self.in_check_slot(model.to_vec(), |bytes, remaining| {
+            model_check::prepare_restore(bytes, true, remaining)
+        })
+        .await
+        .map(|_| ())
+        .map_err(|(_, message)| format!("the backup would not be restorable: {message}"))
     }
 
     /// Saves a backup the plugin took before its first sync after connecting
@@ -1972,6 +1966,22 @@ impl StudioBridge {
         let bad_request = |message: String| Box::new(failure(StatusCode::BAD_REQUEST, message));
         let bytes = import_model_bytes(args).map_err(|error| bad_request(format!("{error:#}")))?;
         let allow_scripts = args.get("allowScripts") == Some(&json!(true));
+        self.in_check_slot(bytes, move |bytes, remaining| {
+            model_check::check_untrusted_model(bytes, allow_scripts, false, remaining)
+        })
+        .await
+        .map(|_| ())
+        .map_err(|(status, message)| Box::new(failure(status, message)))
+    }
+
+    /// Runs `check` on `bytes` in a model check slot, within
+    /// [`IMPORT_CHECK_LIMIT`] including the wait for the slot, which `check`
+    /// is given the rest of.
+    async fn in_check_slot(
+        &self,
+        bytes: Vec<u8>,
+        check: impl FnOnce(Vec<u8>, Duration) -> anyhow::Result<Vec<u8>> + Send + 'static,
+    ) -> Result<Vec<u8>, (StatusCode, String)> {
         let started = Instant::now();
         let slot = match tokio::time::timeout(
             IMPORT_CHECK_LIMIT,
@@ -1981,16 +1991,16 @@ impl StudioBridge {
         {
             Ok(Ok(slot)) => slot,
             Ok(Err(_)) => {
-                return Err(Box::new(failure(
+                return Err((
                     StatusCode::SERVICE_UNAVAILABLE,
-                    "Import validation stopped",
-                )))
+                    "Import validation stopped".to_owned(),
+                ))
             }
             Err(_) => {
-                return Err(Box::new(failure(
+                return Err((
                     StatusCode::SERVICE_UNAVAILABLE,
-                    "Other imports are still being checked. Retry shortly.",
-                )))
+                    "Other imports are still being checked. Retry shortly.".to_owned(),
+                ))
             }
         };
         let remaining = IMPORT_CHECK_LIMIT.saturating_sub(started.elapsed());
@@ -1998,13 +2008,16 @@ impl StudioBridge {
         // bounds even if this request is abandoned first.
         let checked = tokio::task::spawn_blocking(move || {
             let _slot = slot;
-            model_check::check_untrusted_model(bytes, allow_scripts, false, remaining)
+            check(bytes, remaining)
         })
         .await;
         match checked {
-            Ok(Ok(_)) => Ok(()),
-            Ok(Err(error)) => Err(bad_request(format!("{error:#}"))),
-            Err(_) => Err(bad_request("Import model could not be decoded".to_owned())),
+            Ok(Ok(output)) => Ok(output),
+            Ok(Err(error)) => Err((StatusCode::BAD_REQUEST, format!("{error:#}"))),
+            Err(_) => Err((
+                StatusCode::BAD_REQUEST,
+                "Import model could not be decoded".to_owned(),
+            )),
         }
     }
 }
@@ -3678,6 +3691,93 @@ mod tests {
                 .unwrap()
                 .contains("not be restorable"),
             "{value}"
+        );
+        assert!(bridge.state().pending.is_empty(), "no resync was sent");
+        assert!(backup::Store::in_dir(&dir.path().join("backups"))
+            .list()
+            .unwrap()
+            .is_empty());
+    }
+
+    /// A small zstd model of 100 scripts with long repeated sources, which
+    /// passes the import check but grows past 5 MiB when restore re-encodes
+    /// it.
+    fn too_large_once_reencoded() -> String {
+        let mut dom = WeakDom::new(InstanceBuilder::new("DataModel"));
+        let root = dom.root_ref();
+        let folder = dom.insert(root, InstanceBuilder::new("Folder"));
+        // The same 100 KB of hexadecimal noise in every script: zstd's long
+        // window sees the repeats, while LZ4's 64 KB window, which re-encoding
+        // uses, does not.
+        let mut state: u32 = 0x1234_5678;
+        let noise: String = (0..100 * 1024)
+            .map(|_| {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                char::from_digit((state >> 28) & 0xf, 16).unwrap()
+            })
+            .collect();
+        for index in 0..100 {
+            dom.insert(
+                folder,
+                InstanceBuilder::new("ModuleScript")
+                    .with_name(format!("Module{index}"))
+                    .with_property("Source", format!("-- {index}\n{noise}")),
+            );
+        }
+        let mut bytes = Vec::new();
+        rbx_binary::Serializer::new()
+            .compression_type(rbx_binary::CompressionType::Zstd)
+            .serialize(&mut bytes, &dom, &[folder])
+            .unwrap();
+        assert!(bytes.len() < 256 * 1024, "{} bytes", bytes.len());
+        // It passes the check that does not re-encode, and fails the one
+        // restore runs.
+        assert!(
+            model_check::check_untrusted_model(bytes.clone(), true, false, IMPORT_CHECK_LIMIT)
+                .is_ok()
+        );
+        let error =
+            model_check::prepare_restore(bytes.clone(), true, IMPORT_CHECK_LIMIT).unwrap_err();
+        assert!(format!("{error:#}").contains("exceeds 5MiB"), "{error:#}");
+        data_encoding::BASE64.encode(&bytes)
+    }
+
+    #[tokio::test]
+    async fn backups_that_restore_would_refuse_after_reencoding_are_not_saved() {
+        let model = too_large_once_reencoded();
+        let (dir, bridge) = fixture();
+        let (status, value) = plugin(
+            &bridge,
+            "/api/studio/backup",
+            json!({"model": model, "instances": [{"path":"game/Workspace/Folder","className":"Folder"}]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{value}");
+        assert!(
+            value["error"].as_str().unwrap().contains("exceeds 5MiB"),
+            "{value}"
+        );
+        assert!(backup::Store::in_dir(&dir.path().join("backups"))
+            .list()
+            .unwrap()
+            .is_empty());
+
+        let (dir, bridge, session, script, verify) = fix_past_sources(json!({"fix":true})).await;
+        let command = next_command(&bridge, &session).await;
+        answer_export(
+            &bridge,
+            &session,
+            &command,
+            json!({"model": model, "ids": [script.id],
+                "instances": [{"path":"game/ReplicatedStorage/Shared/Main","className":"Folder"}]}),
+        )
+        .await;
+        let (status, value) = into_value(verify.await.unwrap()).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{value}");
+        let error = value["error"].as_str().unwrap();
+        assert!(
+            error.starts_with("Changed nothing") && error.contains("exceeds 5MiB"),
+            "{error}"
         );
         assert!(bridge.state().pending.is_empty(), "no resync was sent");
         assert!(backup::Store::in_dir(&dir.path().join("backups"))
