@@ -10,9 +10,10 @@ this version's guide and creates AGENTS.md if the project has none.
 `rojo init` also creates a GitHub Actions workflow,
 `.github/workflows/rojo.yml`, unless it is given `--no-ci` or the file
 already exists. A project created inside an existing Git repository gets it
-at the repository root instead, as `.github/workflows/rojo-<project path>.yml`,
-with its jobs set to run in the project's folder; `rojo init` prints the path
-it wrote. It runs `rojo packages doctor` and `rojo typecheck` on every
+at the repository root instead, as
+`.github/workflows/rojo-<project path>-<hash>.yml`, with its jobs set to run
+in the project's folder; `rojo init` prints the path it wrote, or that it
+left an existing file alone. It runs `rojo packages doctor` and `rojo typecheck` on every
 push and pull request. For places, it also runs `rojo test --cloud` on pushes
 once the repository has the `ROBLOX_API_KEY` secret and the
 `TEST_UNIVERSE_ID` and `TEST_PLACE_ID` variables; until then that job is

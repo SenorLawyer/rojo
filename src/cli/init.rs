@@ -35,7 +35,7 @@ static TEMPLATE_BINCODE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/templ
 /// It also adds a GitHub Actions workflow at .github/workflows/rojo.yml that
 /// runs `rojo packages doctor`, `rojo typecheck` and, for places once its
 /// secrets are set, `rojo test --cloud`. Inside an existing Git repository it
-/// goes at the repository root, as .github/workflows/rojo-<project path>.yml,
+/// goes at the repository root, as .github/workflows/rojo-<project path>-<hash>.yml,
 /// and runs in the project's folder. To leave it out, pass `--no-ci`.
 #[derive(Debug, Parser)]
 pub struct InitCommand {
@@ -86,8 +86,7 @@ impl InitCommand {
             queue.push_back(entry?.path().to_path_buf())
         }
 
-        let workflow_target = WorkflowTarget::for_project(&base_path)?;
-        let mut created_workflow = None;
+        let mut workflow_template = None;
         while let Some(mut path) = queue.pop_front() {
             let metadata = vfs.metadata(&path)?;
             if metadata.is_dir() {
@@ -105,15 +104,8 @@ impl InitCommand {
                             path.set_file_name(".gitignore");
                         }
                     } else if file_stem == CI_WORKFLOW_PLACEHOLDER {
-                        if self.no_ci {
-                            continue;
-                        }
-                        let rendered = project_params.render_template(&content);
-                        let workflow = workflow_target.adapt(&rendered);
-                        let file = workflow_target.file();
-                        fs::create_dir_all(file.parent().unwrap())?;
-                        if write_if_not_exists(&file, &workflow)? {
-                            created_workflow = Some(workflow_target.display_path());
+                        if !self.no_ci {
+                            workflow_template = Some(project_params.render_template(&content));
                         }
                         continue;
                     }
@@ -124,6 +116,26 @@ impl InitCommand {
                 )?;
             }
         }
+
+        // Where the workflow goes is only worked out when it is wanted, so
+        // that --no-ci never depends on Git or on the project's path.
+        let workflow_note = match workflow_template {
+            Some(workflow) => {
+                let target = WorkflowTarget::for_project(&base_path)?;
+                let file = target.file();
+                fs::create_dir_all(file.parent().unwrap())?;
+                let path = target.display_path();
+                Some(if write_if_not_exists(&file, &target.adapt(&workflow))? {
+                    format!(
+                        "Added the GitHub Actions workflow {path}. The comments at its top list \
+                         the secrets it needs, if any."
+                    )
+                } else {
+                    format!("Left the existing GitHub Actions workflow {path} untouched.")
+                })
+            }
+            None => None,
+        };
 
         write_if_not_exists(&base_path.join("ROJO_AGENT.md"), super::doc::AGENT_GUIDE)?;
         write_if_not_exists(&base_path.join("AGENTS.md"), super::doc::AGENTS_POINTER)?;
@@ -142,11 +154,8 @@ impl InitCommand {
         }
 
         println!("Created project successfully.");
-        if let Some(path) = created_workflow {
-            println!(
-                "Added the GitHub Actions workflow {path}. The comments at its top list the \
-                 secrets it needs, if any."
-            );
+        if let Some(note) = workflow_note {
+            println!("{note}");
         }
 
         Ok(())
@@ -208,7 +217,9 @@ impl WorkflowTarget {
         match &self.project_dir {
             None => CI_WORKFLOW_PATH.to_owned(),
             // The whole path, not only the folder's name, so that projects
-            // such as games/racer and tools/racer do not share a file.
+            // such as games/racer and tools/racer do not share a file. The
+            // hash of the exact path keeps apart paths that sanitize to the
+            // same name, such as games/racer and games-racer.
             Some(dir) => {
                 let name: String = dir
                     .chars()
@@ -218,7 +229,8 @@ impl WorkflowTarget {
                         _ => '-',
                     })
                     .collect();
-                format!(".github/workflows/rojo-{name}.yml")
+                let hash = blake3::hash(dir.as_bytes()).to_hex();
+                format!(".github/workflows/rojo-{name}-{}.yml", &hash[..8])
             }
         }
     }
@@ -536,6 +548,16 @@ fn init_creates_a_ci_workflow_that_runs_the_fork_checks() {
                         "${{ secrets.ROBLOX_API_KEY != '' && vars.TEST_UNIVERSE_ID != '' && vars.TEST_PLACE_ID != '' }}"
                     )
                 );
+                // Per workflow, so several projects' workflows in one
+                // repository do not replace each other's waiting runs.
+                assert_eq!(
+                    test_job["concurrency"]["group"].as_str(),
+                    Some("rojo-cloud-tests-${{ github.workflow }}")
+                );
+                assert_eq!(
+                    test_job["concurrency"]["cancel-in-progress"].as_bool(),
+                    Some(false)
+                );
                 let run = step_named(test_job, "Run specs");
                 assert_eq!(
                     run["run"].as_str(),
@@ -616,6 +638,13 @@ fn git_init_for_test(path: &Path) {
     assert!(status.success());
 }
 
+/// The file name a project at `dir` (relative to the repository root) gets.
+#[cfg(test)]
+fn subdirectory_workflow_name(sanitized: &str, dir: &str) -> String {
+    let hash = blake3::hash(dir.as_bytes()).to_hex();
+    format!("rojo-{sanitized}-{}.yml", &hash[..8])
+}
+
 #[test]
 fn init_inside_a_repository_puts_the_workflow_at_its_root() {
     for kind in [InitKind::Place, InitKind::Model, InitKind::Plugin] {
@@ -627,12 +656,9 @@ fn init_inside_a_repository_puts_the_workflow_at_its_root() {
         // GitHub only reads workflows at the repository root.
         assert!(!project.join(".github").exists(), "{kind:?}");
         assert!(!repo.path().join(CI_WORKFLOW_PATH).exists(), "{kind:?}");
-        let workflow = fs::read_to_string(
-            repo.path()
-                .join(".github")
-                .join("workflows")
-                .join("rojo-games-racer-game.yml"),
-        )
+        let workflow = fs::read_to_string(repo.path().join(".github").join("workflows").join(
+            subdirectory_workflow_name("games-racer-game", "games/Racer Game"),
+        ))
         .unwrap();
         assert!(
             workflow.contains("Checks Racer Game on GitHub Actions"),
@@ -675,14 +701,49 @@ fn init_inside_a_repository_keeps_an_existing_root_workflow() {
     git_init_for_test(repo.path());
     let workflows = repo.path().join(".github").join("workflows");
     fs::create_dir_all(&workflows).unwrap();
-    fs::write(workflows.join("rojo-racer.yml"), "name: Mine\n").unwrap();
+    let existing = workflows.join(subdirectory_workflow_name("racer", "racer"));
+    fs::write(&existing, "name: Mine\n").unwrap();
 
     init_for_test(&repo.path().join("racer"), InitKind::Place, false);
 
-    assert_eq!(
-        fs::read_to_string(workflows.join("rojo-racer.yml")).unwrap(),
-        "name: Mine\n"
+    assert_eq!(fs::read_to_string(&existing).unwrap(), "name: Mine\n");
+    assert_eq!(fs::read_dir(&workflows).unwrap().count(), 1);
+    assert!(!repo.path().join("racer").join(".github").exists());
+}
+
+#[test]
+fn init_gives_paths_that_sanitize_alike_their_own_workflows() {
+    let repo = tempfile::tempdir().unwrap();
+    git_init_for_test(repo.path());
+    init_for_test(
+        &repo.path().join("games").join("racer"),
+        InitKind::Place,
+        false,
     );
+    init_for_test(&repo.path().join("games-racer"), InitKind::Place, false);
+
+    let workflows = repo.path().join(".github").join("workflows");
+    let first = subdirectory_workflow_name("games-racer", "games/racer");
+    let second = subdirectory_workflow_name("games-racer", "games-racer");
+    assert_ne!(first, second);
+    for (file, dir) in [(first, "games/racer"), (second, "games-racer")] {
+        let workflow = fs::read_to_string(workflows.join(&file)).unwrap();
+        let yaml: serde_yaml::Value = serde_yaml::from_str(&workflow).unwrap();
+        assert_eq!(
+            yaml["jobs"]["check"]["defaults"]["run"]["working-directory"].as_str(),
+            Some(dir),
+            "{file}"
+        );
+    }
+    assert_eq!(fs::read_dir(&workflows).unwrap().count(), 2);
+}
+
+#[test]
+fn init_no_ci_inside_a_repository_writes_no_workflow() {
+    let repo = tempfile::tempdir().unwrap();
+    git_init_for_test(repo.path());
+    init_for_test(&repo.path().join("racer"), InitKind::Place, true);
+    assert!(!repo.path().join(".github").exists());
     assert!(!repo.path().join("racer").join(".github").exists());
 }
 

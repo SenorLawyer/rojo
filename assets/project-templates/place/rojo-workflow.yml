@@ -88,9 +88,13 @@ jobs:
     if: needs.check.outputs.cloud-tests == 'true' && github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     # Luau Execution limits how many tasks run at once, and each run saves a
-    # version of the same place, so runs take turns.
+    # version of the same place, so this workflow's test runs do not overlap.
+    # GitHub keeps at most one waiting run per group: a newer push replaces
+    # an older run that has not started yet. The group is named after the
+    # workflow, so other projects' workflows in the repository do not
+    # replace this one's runs.
     concurrency:
-      group: rojo-cloud-tests
+      group: rojo-cloud-tests-${{ github.workflow }}
       cancel-in-progress: false
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

@@ -172,7 +172,7 @@ While the place is open in Team Create, Roblox refuses to save new versions (HTT
 
 ### GitHub Actions
 
-`rojo init` creates `.github/workflows/rojo.yml` for new place projects (pass `--no-ci` to leave it out). Inside an existing Git repository, it goes at the repository root as `.github/workflows/rojo-<project path>.yml` and runs in the project's folder. Its test job runs `rojo test --cloud` on pushes, and is skipped until the repository has the `ROBLOX_API_KEY` secret and the `TEST_UNIVERSE_ID` and `TEST_PLACE_ID` variables. Model and plugin projects get the workflow without the test job, since `--cloud` needs a place.
+`rojo init` creates `.github/workflows/rojo.yml` for new place projects (pass `--no-ci` to leave it out). Inside an existing Git repository, it goes at the repository root as `.github/workflows/rojo-<project path>-<hash>.yml` and runs in the project's folder. Its test job runs `rojo test --cloud` on pushes, and is skipped until the repository has the `ROBLOX_API_KEY` secret and the `TEST_UNIVERSE_ID` and `TEST_PLACE_ID` variables. Model and plugin projects get the workflow without the test job, since `--cloud` needs a place.
 
 To write a workflow yourself, store the API key as a repository secret, here `ROBLOX_API_KEY`, and the IDs as repository variables:
 
