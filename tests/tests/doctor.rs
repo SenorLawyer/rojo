@@ -6,11 +6,15 @@ use crate::rojo_test::{io_util::ROJO_PATH, serve_util::run_serve_test};
 
 fn doctor(args: &[&str]) -> (bool, serde_json::Value) {
     let plugins = tempdir().unwrap();
+    doctor_with_plugins(args, plugins.path())
+}
+
+fn doctor_with_plugins(args: &[&str], plugins: &std::path::Path) -> (bool, serde_json::Value) {
     let output = Command::new(ROJO_PATH)
         .arg("doctor")
         .args(args)
         .arg("--plugins-dir")
-        .arg(plugins.path())
+        .arg(plugins)
         .arg("--json")
         .output()
         .unwrap();
@@ -74,5 +78,37 @@ fn doctor_exits_with_1_and_still_reports_when_the_project_is_missing() {
     assert_eq!(
         statuses(&report, "server"),
         [("not-running".to_owned(), "info".to_owned())]
+    );
+}
+
+#[test]
+fn doctor_reports_a_corrupted_plugin_without_crashing() {
+    let plugins = tempdir().unwrap();
+    let status = Command::new(ROJO_PATH)
+        .args(["plugin", "install", "--plugins-dir"])
+        .arg(plugins.path())
+        .output()
+        .unwrap()
+        .status;
+    assert!(status.success());
+    let path = plugins.path().join("RojoManagedPlugin.rbxm");
+
+    // The installed plugin passes the untrusted-model check in the child
+    // process that the real binary runs.
+    let (_, report) = doctor_with_plugins(&["--port", "1"], plugins.path());
+    assert_eq!(
+        statuses(&report, "plugin"),
+        [("plugin-current".to_owned(), "ok".to_owned())]
+    );
+
+    // A header that declares about four billion instances would make
+    // rbx_binary try to reserve memory for all of them.
+    let mut bytes = std::fs::read(&path).unwrap();
+    bytes[20..24].copy_from_slice(&u32::MAX.to_le_bytes());
+    std::fs::write(&path, &bytes).unwrap();
+    let (_, report) = doctor_with_plugins(&["--port", "1"], plugins.path());
+    assert_eq!(
+        statuses(&report, "plugin"),
+        [("plugin-unreadable".to_owned(), "warning".to_owned())]
     );
 }

@@ -19,9 +19,12 @@ with `default.project.json`, defaulting to the current directory.
 Each check is `ok`, `info`, `warning` or `error`, and anything that needs
 attention has a one-line fix.
 
-* Project: loads the project and its first snapshot exactly as `rojo serve`
-  does, so a missing `$path` or invalid field fails here the same way, and
-  reports the root's class and name.
+* Project: parses the project file and builds its first snapshot exactly as
+  `rojo serve` does, so a missing `$path` or invalid field fails here the same
+  way, and reports the root's class and name. A file that does not parse is
+  `project-invalid`; one that parses but whose instances cannot be built is
+  `snapshot-failed`, and its settings (`servePort`, `servePlaceIds`, the
+  name) are still used by the other checks.
 * servePlaceIds: absent is a warning, because any place open in Studio can
   connect and be synced. An empty list is an error, because the plugin then
   refuses every place. Listed IDs are shown, and 0 means unpublished places are
@@ -34,7 +37,12 @@ attention has a one-line fix.
   folder (or `--plugins-dir`), its version read from the installed model
   against this CLI's, and any side-by-side `Rojo-<version>.rbxm` copies, which
   Studio loads as separate plugins. A plugin that is not installed is a
-  warning, since it may be installed another way.
+  warning, since it may be installed another way. The installed file is read
+  as an untrusted model, with the checks `rojo studio import` uses: at most
+  5 MiB, structural checks, and decoding in a child process with a memory cap,
+  so a corrupted file is reported as `plugin-unreadable`. With
+  `--plugins-dir`, the suggested install and uninstall commands name that
+  folder too.
 * rojo serve: whether a server answers on the address and port serve would use
   (`--address` and `--port`, then the project's `serveAddress` and
   `servePort`, then `127.0.0.1:34872`). Its version against this CLI's, its
@@ -42,7 +50,8 @@ attention has a one-line fix.
   project's name. It reads both this fork's MessagePack answer and the JSON
   that released upstream Rojo sends, so an upstream or older server is
   reported as a version or protocol mismatch. No server is information, not a
-  problem. Doctor waits at most 1.5 seconds.
+  problem. Doctor waits at most 1.5 seconds and reads at most 1 MiB of the
+  answer.
 
   The API names the served project but not its folder, so a matching name
   does not show that the server runs this checkout rather than another
@@ -53,8 +62,10 @@ attention has a one-line fix.
   health needs the bridge's token, so doctor points to `rojo studio sessions
   --token-file` instead.
 * Git: whether Git runs, whether it is at least 2.31, which checkpoints,
-  workspaces and releases need, and whether the project is in a repository.
-  Git problems are warnings, because serving and building do not need Git.
+  workspaces and releases need, and whether the project is in a repository
+  Git can read. It does not report the working tree's state, such as
+  uncommitted changes or conflicts; use `git status` for that. Git problems
+  are warnings, because serving and building do not need Git.
 
 ## Output and exit status
 

@@ -4,6 +4,7 @@
 
 use std::{
     fs,
+    io::Read,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     path::{Path, PathBuf},
     time::Duration,
@@ -17,7 +18,12 @@ use serde::{de::IgnoredAny, Deserialize, Serialize};
 
 use crate::{
     serve_session::ServeSession,
-    web::{interface::PROTOCOL_VERSION, util::deserialize_msgpack},
+    web::{
+        interface::PROTOCOL_VERSION,
+        model_check,
+        studio::{IMPORT_CHECK_LIMIT, MAX_MODEL_BYTES},
+        util::deserialize_msgpack,
+    },
     Project,
 };
 
@@ -30,6 +36,9 @@ const CLI_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// and must not make doctor hang.
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(500);
 const REQUEST_TIMEOUT: Duration = Duration::from_millis(1500);
+/// `/api/rojo` answers with well under a kilobyte. Whatever listens on the
+/// port may not be Rojo, so doctor reads no more than this of its answer.
+const MAX_INFO_BYTES: usize = 1024 * 1024;
 
 /// The first Git release with `rev-parse --path-format`, which the lifecycle
 /// commands need (see `lifecycle::git_common_dir`).
@@ -219,8 +228,8 @@ impl Report {
 
 fn build_report(inputs: &Inputs) -> Report {
     let mut checks = Vec::new();
-    let session = check_project(&inputs.project_path, &mut checks);
-    let project = session.as_ref().map(ServeSession::root_project);
+    let project = check_project(&inputs.project_path, &mut checks);
+    let project = project.as_ref();
 
     match project {
         Some(project) => checks.extend(check_place_ids(project)),
@@ -246,7 +255,7 @@ fn build_report(inputs: &Inputs) -> Report {
             .map(|studio| studio.plugins_path().to_path_buf())
             .map_err(|err| err.to_string()),
     };
-    checks.extend(check_plugin(plugins_dir));
+    checks.extend(check_plugin(plugins_dir, inputs.plugins_dir.is_some()));
 
     let address = server_address(inputs.address, inputs.port, project);
     checks.extend(check_server(
@@ -263,31 +272,19 @@ fn build_report(inputs: &Inputs) -> Report {
     Report::new(checks, project.map(|project| project.file_location.clone()))
 }
 
-/// Loads the project exactly as `rojo serve` does, including the first
-/// snapshot, so a broken `$path` fails here the same way it would there.
-fn check_project(path: &Path, checks: &mut Vec<Check>) -> Option<ServeSession> {
-    match ServeSession::new(Vfs::new_default_without_watch(), path) {
-        Ok(session) => {
-            let class_name = {
-                let tree = session.tree();
-                tree.get_instance(tree.get_root_id())
-                    .map(|root| root.class_name().to_string())
-                    .unwrap_or_else(|| "unknown".to_owned())
-            };
-            let project = session.root_project();
-            checks.push(check(
-                Category::Project,
-                "project-loaded",
-                Status::Ok,
-                format!(
-                    "{} loads; its root is a {class_name} named {}.",
-                    project.file_location.display(),
-                    session.project_name(),
-                ),
-                None,
-            ));
-            Some(session)
-        }
+/// Parses the project file with the loader `rojo serve` uses, then builds the
+/// first snapshot as serve does, so a broken `$path` fails here the same way
+/// it would there. The parsed project is returned even when the snapshot
+/// fails: its settings (servePort, servePlaceIds, the name) are still what a
+/// fixed project would be served with, so the other checks keep using them.
+fn check_project(path: &Path, checks: &mut Vec<Check>) -> Option<Project> {
+    let vfs = Vfs::new_default_without_watch();
+    // ServeSession canonicalizes too; doing it first keeps reported paths in
+    // one form. A path that does not exist is left alone and fails below.
+    let canonical = dunce::canonicalize(path).unwrap_or_else(|_| path.to_owned());
+    let path = canonical.as_path();
+    let project = match Project::load_initial_project(&vfs, path) {
+        Ok(project) => project,
         Err(err) => {
             let err = anyhow::Error::from(err);
             checks.push(check(
@@ -300,9 +297,44 @@ fn check_project(path: &Path, checks: &mut Vec<Check>) -> Option<ServeSession> {
                     "Run doctor in the project's folder, pass its .project.json path, or create one with `rojo init`. `rojo serve` fails the same way.",
                 ),
             ));
-            None
+            return None;
+        }
+    };
+    let name = project.name.as_deref().unwrap_or("unnamed");
+    match ServeSession::new(vfs, path) {
+        Ok(session) => {
+            let class_name = {
+                let tree = session.tree();
+                tree.get_instance(tree.get_root_id())
+                    .map(|root| root.class_name().to_string())
+                    .unwrap_or_else(|| "unknown".to_owned())
+            };
+            checks.push(check(
+                Category::Project,
+                "project-loaded",
+                Status::Ok,
+                format!(
+                    "{} loads; its root is a {class_name} named {name}.",
+                    project.file_location.display(),
+                ),
+                None,
+            ));
+        }
+        Err(err) => {
+            let err = anyhow::Error::from(err);
+            checks.push(check(
+                Category::Project,
+                "snapshot-failed",
+                Status::Error,
+                format!(
+                    "{} parses, but its instances cannot be built: {err:#}",
+                    project.file_location.display()
+                ),
+                Some("Fix or create the files its $path entries name. `rojo serve` fails the same way."),
+            ));
         }
     }
+    Some(project)
 }
 
 /// Mirrors how the plugin uses `servePlaceIds`: when present, Studio refuses
@@ -426,7 +458,10 @@ fn check_packages(path: &Path) -> Vec<Check> {
     checks
 }
 
-fn check_plugin(plugins_dir: Result<PathBuf, String>) -> Vec<Check> {
+/// `explicit` is whether the folder came from `--plugins-dir`, in which case
+/// every repair command has to name it too, or it would act on Studio's own
+/// folder instead.
+fn check_plugin(plugins_dir: Result<PathBuf, String>, explicit: bool) -> Vec<Check> {
     let category = Category::Plugin;
     let plugins_dir = match plugins_dir {
         Ok(dir) => dir,
@@ -440,11 +475,17 @@ fn check_plugin(plugins_dir: Result<PathBuf, String>) -> Vec<Check> {
             )]
         }
     };
+    let flag = if explicit {
+        format!(" --plugins-dir \"{}\"", plugins_dir.display())
+    } else {
+        String::new()
+    };
+    let install = format!("`rojo plugin install{flag}`");
     let mut checks = Vec::new();
     let managed = plugins_dir.join(plugin::PLUGIN_FILE_NAME);
-    match fs::read(&managed) {
-        Ok(bytes) => match plugin_version(&bytes) {
-            Some(version) if version == CLI_VERSION => checks.push(check(
+    match read_plugin(&managed) {
+        Ok(Some(bytes)) => match plugin_version(bytes) {
+            Ok(version) if version == CLI_VERSION => checks.push(check(
                 category,
                 "plugin-current",
                 Status::Ok,
@@ -454,7 +495,7 @@ fn check_plugin(plugins_dir: Result<PathBuf, String>) -> Vec<Check> {
                 ),
                 None,
             )),
-            Some(version) => checks.push(check(
+            Ok(version) => checks.push(check(
                 category,
                 "plugin-version-mismatch",
                 Status::Warning,
@@ -462,32 +503,40 @@ fn check_plugin(plugins_dir: Result<PathBuf, String>) -> Vec<Check> {
                     "{} is version {version}, but this CLI is {CLI_VERSION}.",
                     managed.display()
                 ),
-                Some("Run `rojo plugin install` with this CLI, then restart Studio."),
+                Some(&format!(
+                    "Run {install} with this CLI, then restart Studio."
+                )),
             )),
-            None => checks.push(check(
+            Err(reason) => checks.push(check(
                 category,
                 "plugin-unreadable",
                 Status::Warning,
                 format!(
-                    "{} is not a Rojo plugin model doctor can read.",
+                    "{} is not a Rojo plugin model doctor can read: {reason}",
                     managed.display()
                 ),
-                Some("Run `rojo plugin install` to replace it, then restart Studio."),
+                Some(&format!(
+                    "Run {install} to replace it, then restart Studio."
+                )),
             )),
         },
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => checks.push(check(
+        Ok(None) => checks.push(check(
             category,
             "plugin-missing",
             Status::Warning,
             format!("{} is not installed.", managed.display()),
-            Some("Run `rojo plugin install`, unless you installed Rojo's plugin another way."),
+            Some(&format!(
+                "Run {install}, unless you installed Rojo's plugin another way."
+            )),
         )),
-        Err(err) => checks.push(check(
+        Err(reason) => checks.push(check(
             category,
             "plugin-unreadable",
             Status::Warning,
-            format!("Could not read {}: {err}", managed.display()),
-            None,
+            format!("Could not read {}: {reason}", managed.display()),
+            Some(&format!(
+                "Run {install} to replace it, then restart Studio."
+            )),
         )),
     }
 
@@ -508,33 +557,70 @@ fn check_plugin(plugins_dir: Result<PathBuf, String>) -> Vec<Check> {
                 plugins_dir.display(),
                 copies.join(", ")
             ),
-            Some("Remove the ones you no longer test with `rojo plugin uninstall --side-by-side` (this version) or `rojo plugin uninstall --all`."),
+            Some(&format!(
+                "Remove the ones you no longer test with `rojo plugin uninstall --side-by-side{flag}` (this version) or `rojo plugin uninstall --all{flag}`."
+            )),
         ));
     }
     checks
 }
 
+/// Reads at most the size limit for untrusted models, so a huge file in the
+/// plugins folder is reported instead of read into memory. `None` when the
+/// file does not exist.
+fn read_plugin(path: &Path) -> Result<Option<Vec<u8>>, String> {
+    let file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err.to_string()),
+    };
+    let mut bytes = Vec::new();
+    file.take(MAX_MODEL_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|err| err.to_string())?;
+    if bytes.len() > MAX_MODEL_BYTES {
+        return Err(format!(
+            "it is larger than {} MiB",
+            MAX_MODEL_BYTES / 1024 / 1024
+        ));
+    }
+    Ok(Some(bytes))
+}
+
 /// The plugin's version, from the `Version` StringValue that the plugin's
 /// Config reads at runtime (see plugin.project.json).
-fn plugin_version(bytes: &[u8]) -> Option<String> {
-    let dom = rbx_binary::from_reader(bytes).ok()?;
+///
+/// The file is untrusted: anything can be in the plugins folder, and
+/// `rbx_binary` sizes allocations from counts the file declares, so a
+/// corrupted model could abort doctor in a way no error handling catches.
+/// It goes through the same check as `rojo studio import` instead: structural
+/// checks, then decoding in a child process with a memory cap and a time
+/// limit, which re-encodes it. Only that re-encoded model, written by Rojo's
+/// own encoder from a tree that passed the checks, is decoded here.
+fn plugin_version(bytes: Vec<u8>) -> Result<String, String> {
+    let encoded = model_check::check_untrusted_model(bytes, true, true, IMPORT_CHECK_LIMIT)
+        .map_err(|err| format!("{err:#}"))?;
+    let dom = rbx_binary::from_reader(encoded.as_slice()).map_err(|err| err.to_string())?;
+    let not_rojo = || "it has no Rojo/Version value".to_owned();
     let root = dom
         .root()
         .children()
         .iter()
         .filter_map(|id| dom.get_by_ref(*id))
-        .find(|instance| instance.name == "Rojo")?;
+        .find(|instance| instance.name == "Rojo")
+        .ok_or_else(not_rojo)?;
     let version = root
         .children()
         .iter()
         .filter_map(|id| dom.get_by_ref(*id))
-        .find(|instance| instance.name == "Version")?;
-    match version.properties.get(&Ustr::from("Value"))? {
-        Variant::String(value) => Some(value.trim().to_owned()),
-        Variant::BinaryString(value) => {
-            Some(String::from_utf8_lossy(value.as_ref()).trim().to_owned())
+        .find(|instance| instance.name == "Version")
+        .ok_or_else(not_rojo)?;
+    match version.properties.get(&Ustr::from("Value")) {
+        Some(Variant::String(value)) => Ok(value.trim().to_owned()),
+        Some(Variant::BinaryString(value)) => {
+            Ok(String::from_utf8_lossy(value.as_ref()).trim().to_owned())
         }
-        _ => None,
+        _ => Err(not_rojo()),
     }
 }
 
@@ -622,15 +708,28 @@ fn fetch_server_info(address: SocketAddr) -> Probe {
         .get(reqwest::header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
         .map(str::to_owned);
-    match response.bytes() {
-        Ok(bytes) if status.is_success() => {
-            match parse_server_info(content_type.as_deref(), &bytes) {
-                Some(info) => Probe::Rojo(info),
-                None => Probe::NotRojo(format!("answered {status} without Rojo's server info")),
-            }
-        }
-        Ok(_) => Probe::NotRojo(format!("answered {status}")),
-        Err(err) => Probe::NotRojo(err.to_string()),
+    if !status.is_success() {
+        return Probe::NotRojo(format!("answered {status}"));
+    }
+    let mut bytes = Vec::new();
+    if let Err(err) = response
+        .take(MAX_INFO_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+    {
+        return match err.kind() {
+            std::io::ErrorKind::TimedOut => Probe::NoAnswer,
+            _ => Probe::NotRojo(err.to_string()),
+        };
+    }
+    if bytes.len() > MAX_INFO_BYTES {
+        return Probe::NotRojo(format!(
+            "answered with more than {} MiB",
+            MAX_INFO_BYTES / 1024 / 1024
+        ));
+    }
+    match parse_server_info(content_type.as_deref(), &bytes) {
+        Some(info) => Probe::Rojo(info),
+        None => Probe::NotRojo(format!("answered {status} without Rojo's server info")),
     }
 }
 
@@ -993,14 +1092,17 @@ mod tests {
         assert_eq!(codes(&checks), [("project-loaded", Status::Ok)]);
         assert!(checks[0].message.contains("DataModel"), "{:?}", checks[0]);
 
-        // A missing $path fails here the same way `rojo serve` fails.
+        // A missing $path fails here the same way `rojo serve` fails, but the
+        // parsed settings are still returned for the other checks.
         write_project(
             dir.path(),
-            serde_json::json!({"name": "game", "tree": {"$path": "missing"}}),
+            serde_json::json!({"name": "game", "servePort": 4000, "tree": {"$path": "missing"}}),
         );
         let mut checks = Vec::new();
-        assert!(check_project(dir.path(), &mut checks).is_none());
-        assert_eq!(codes(&checks), [("project-invalid", Status::Error)]);
+        let project = check_project(dir.path(), &mut checks).unwrap();
+        assert_eq!(codes(&checks), [("snapshot-failed", Status::Error)]);
+        assert_eq!(project.serve_port, Some(4000));
+        assert_eq!(project.name.as_deref(), Some("game"));
 
         let empty = tempdir().unwrap();
         let mut checks = Vec::new();
@@ -1102,16 +1204,17 @@ mod tests {
     fn plugin_check_reads_the_installed_version_and_finds_copies() {
         let dir = tempdir().unwrap();
         assert_eq!(
-            codes(&check_plugin(Ok(dir.path().to_owned()))),
+            codes(&check_plugin(Ok(dir.path().to_owned()), false)),
             [("plugin-missing", Status::Warning)]
         );
 
         plugin::install_plugin(dir.path(), false).unwrap();
         let bytes = fs::read(dir.path().join(plugin::PLUGIN_FILE_NAME)).unwrap();
-        // The bundled plugin's Version.txt is released together with the CLI.
-        assert_eq!(plugin_version(&bytes).as_deref(), Some(CLI_VERSION));
+        // The bundled plugin's Version.txt is released together with the CLI,
+        // and the plugin passes the untrusted-model checks.
+        assert_eq!(plugin_version(bytes.clone()).as_deref(), Ok(CLI_VERSION));
         assert_eq!(
-            codes(&check_plugin(Ok(dir.path().to_owned()))),
+            codes(&check_plugin(Ok(dir.path().to_owned()), false)),
             [("plugin-current", Status::Ok)]
         );
 
@@ -1132,7 +1235,7 @@ mod tests {
         let mut old = Vec::new();
         rbx_binary::to_writer(&mut old, &dom, &[rojo]).unwrap();
         fs::write(dir.path().join(plugin::PLUGIN_FILE_NAME), &old).unwrap();
-        let checks = check_plugin(Ok(dir.path().to_owned()));
+        let checks = check_plugin(Ok(dir.path().to_owned()), false);
         assert_eq!(
             codes(&checks),
             [("plugin-version-mismatch", Status::Warning)]
@@ -1142,7 +1245,7 @@ mod tests {
         fs::write(dir.path().join(plugin::PLUGIN_FILE_NAME), b"not a model").unwrap();
         fs::write(dir.path().join("Rojo-7.7.1.rbxm"), b"copy").unwrap();
         fs::write(dir.path().join("Rojo-Helper.rbxm"), b"unrelated").unwrap();
-        let checks = check_plugin(Ok(dir.path().to_owned()));
+        let checks = check_plugin(Ok(dir.path().to_owned()), false);
         assert_eq!(
             codes(&checks),
             [
@@ -1154,9 +1257,93 @@ mod tests {
         assert!(!checks[1].message.contains("Helper"));
 
         assert_eq!(
-            codes(&check_plugin(Err("no Studio".into()))),
+            codes(&check_plugin(Err("no Studio".into()), false)),
             [("studio-not-found", Status::Warning)]
         );
+    }
+
+    #[test]
+    fn corrupted_or_oversized_plugins_are_unreadable_not_fatal() {
+        let dir = tempdir().unwrap();
+        plugin::install_plugin(dir.path(), false).unwrap();
+        let path = dir.path().join(plugin::PLUGIN_FILE_NAME);
+        let mut bytes = fs::read(&path).unwrap();
+        // The header's instance count, which rbx_binary reserves room for
+        // before reading anything else. Unchecked, this asks for gigabytes.
+        bytes[20..24].copy_from_slice(&u32::MAX.to_le_bytes());
+        fs::write(&path, &bytes).unwrap();
+        let checks = check_plugin(Ok(dir.path().to_owned()), false);
+        assert_eq!(codes(&checks), [("plugin-unreadable", Status::Warning)]);
+        assert!(
+            checks[0].message.contains("too many instances"),
+            "{:?}",
+            checks[0]
+        );
+
+        // A truncated model declares more than it holds.
+        let mut truncated = fs::read(dir.path().join(plugin::PLUGIN_FILE_NAME)).unwrap();
+        truncated.truncate(truncated.len() / 2);
+        fs::write(&path, &truncated).unwrap();
+        assert_eq!(
+            codes(&check_plugin(Ok(dir.path().to_owned()), false)),
+            [("plugin-unreadable", Status::Warning)]
+        );
+
+        // Files over the untrusted-model size limit are not read whole.
+        fs::write(&path, vec![0u8; MAX_MODEL_BYTES + 1]).unwrap();
+        let checks = check_plugin(Ok(dir.path().to_owned()), false);
+        assert_eq!(codes(&checks), [("plugin-unreadable", Status::Warning)]);
+        assert!(checks[0].message.contains("larger than"), "{:?}", checks[0]);
+    }
+
+    #[test]
+    fn repair_hints_name_an_explicit_plugins_dir() {
+        let dir = tempdir().unwrap();
+        let flag = format!("--plugins-dir \"{}\"", dir.path().display());
+        let hints = |checks: Vec<Check>| -> Vec<String> {
+            checks.into_iter().filter_map(|check| check.hint).collect()
+        };
+
+        // Missing, then unreadable, each with side-by-side copies.
+        fs::write(dir.path().join("Rojo-7.7.1.rbxm"), b"copy").unwrap();
+        let missing = hints(check_plugin(Ok(dir.path().to_owned()), true));
+        fs::write(dir.path().join(plugin::PLUGIN_FILE_NAME), b"broken").unwrap();
+        let unreadable = hints(check_plugin(Ok(dir.path().to_owned()), true));
+        for hint in missing.iter().chain(&unreadable) {
+            assert!(hint.contains(&flag), "{hint}");
+        }
+        assert_eq!(missing.len(), 2);
+        assert_eq!(unreadable.len(), 2);
+        // Both uninstall commands in the side-by-side hint name it.
+        assert_eq!(unreadable[1].matches(&flag).count(), 2, "{}", unreadable[1]);
+
+        // An outdated plugin's hint too.
+        fs::remove_file(dir.path().join("Rojo-7.7.1.rbxm")).unwrap();
+        let mut dom = rbx_dom_weak::WeakDom::new(rbx_dom_weak::InstanceBuilder::new("Folder"));
+        let rojo = dom.insert(
+            dom.root_ref(),
+            rbx_dom_weak::InstanceBuilder::new("Folder").with_name("Rojo"),
+        );
+        dom.insert(
+            rojo,
+            rbx_dom_weak::InstanceBuilder::new("StringValue")
+                .with_name("Version")
+                .with_property("Value", Variant::String("7.7.1".to_owned())),
+        );
+        let mut old = Vec::new();
+        rbx_binary::to_writer(&mut old, &dom, &[rojo]).unwrap();
+        fs::write(dir.path().join(plugin::PLUGIN_FILE_NAME), &old).unwrap();
+        let checks = check_plugin(Ok(dir.path().to_owned()), true);
+        assert_eq!(
+            codes(&checks),
+            [("plugin-version-mismatch", Status::Warning)]
+        );
+        assert!(hints(checks)[0].contains(&flag));
+
+        // Discovered folders keep the plain commands.
+        for hint in hints(check_plugin(Ok(dir.path().to_owned()), false)) {
+            assert!(!hint.contains("--plugins-dir"), "{hint}");
+        }
     }
 
     #[test]
@@ -1346,6 +1533,116 @@ mod tests {
         let probe = fetch_server_info(address);
         server.join().unwrap();
         (address, probe)
+    }
+
+    /// Serves one request on a fresh port with `body`, without probing it.
+    fn serve_one_response(body: &'static [u8]) -> (SocketAddr, std::thread::JoinHandle<()>) {
+        use std::io::{Read, Write};
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buffer = [0; 1024];
+            let _ = stream.read(&mut buffer);
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = stream.write_all(head.as_bytes());
+            let _ = stream.write_all(body);
+        });
+        (address, server)
+    }
+
+    #[test]
+    fn oversized_server_answers_are_not_read_whole() {
+        use std::io::{Read, Write};
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buffer = [0; 1024];
+            let _ = stream.read(&mut buffer);
+            // Chunked, so the client cannot reject it by its length alone.
+            let _ = stream.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n",
+            );
+            let chunk = vec![b' '; 64 * 1024];
+            // 64 MiB in all; writes fail once doctor stops reading and closes.
+            for _ in 0..1024 {
+                let head = format!("{:x}\r\n", chunk.len());
+                if stream.write_all(head.as_bytes()).is_err()
+                    || stream.write_all(&chunk).is_err()
+                    || stream.write_all(b"\r\n").is_err()
+                {
+                    return;
+                }
+            }
+        });
+        let probe = fetch_server_info(address);
+        match &probe {
+            Probe::NotRojo(reason) => assert!(reason.contains("more than 1 MiB"), "{reason}"),
+            _ => panic!("expected not-rojo"),
+        }
+        assert_eq!(
+            codes(&check_server(address, probe, None)),
+            [("not-rojo", Status::Warning)]
+        );
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn server_check_uses_the_project_settings_when_its_snapshot_fails() {
+        let (address, server) = serve_one_response(UPSTREAM_V7_INFO.as_bytes());
+        let dir = tempdir().unwrap();
+        write_project(
+            dir.path(),
+            serde_json::json!({"name": "game", "servePort": address.port(),
+                "tree": {"$path": "missing"}}),
+        );
+        let plugins = tempdir().unwrap();
+        let report = build_report(&Inputs {
+            project_path: dir.path().to_owned(),
+            address: None,
+            port: None,
+            plugins_dir: Some(plugins.path().to_owned()),
+        });
+        server.join().unwrap();
+        let project: Vec<_> = report
+            .checks
+            .iter()
+            .filter(|check| check.category == Category::Project)
+            .collect();
+        assert_eq!(
+            codes(&project.into_iter().cloned().collect::<Vec<_>>()),
+            [("snapshot-failed", Status::Error)]
+        );
+        let server: Vec<_> = report
+            .checks
+            .iter()
+            .filter(|check| check.category == Category::Server)
+            .cloned()
+            .collect();
+        // It probed the project's servePort and compared the project's name.
+        let server_codes = codes(&server);
+        assert!(
+            server_codes.contains(&("protocol-mismatch", Status::Error)),
+            "{server_codes:?}"
+        );
+        assert!(
+            server_codes.contains(&("same-project-name", Status::Info)),
+            "{server_codes:?}"
+        );
+        assert!(server[0].message.contains(&address.to_string()));
+        // servePlaceIds still came from the parsed project.
+        assert!(report
+            .checks
+            .iter()
+            .any(|check| check.category == Category::ServePlaceIds && check.code == "absent"));
+        assert_eq!(
+            report.project_file,
+            Some(dir.path().join("default.project.json"))
+        );
     }
 
     #[test]
