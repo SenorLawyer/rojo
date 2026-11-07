@@ -31,6 +31,10 @@ Making a new release? Simply add the new header with the version and date undern
 
 ## Unreleased
 
+* Added `rojo doctor`, which checks the project (loaded as `rojo serve` loads it), `servePlaceIds`, packages, the installed Studio plugin and its version, a running `rojo serve` and Git in one read-only report with a fix for each problem. `--json` prints a versioned report, and it exits with 1 when a check is an error. `rojo doc --agent doctor` describes it. ([fork#12])
+
+[fork#12]: https://github.com/SenorLawyer/rojo/pull/12
+
 ## [8.1.0] (November 5th, 2026)
 
 * Added `rojo studio verify`, which checks that every script Rojo syncs has the same source in a connected Studio as in its file, and lists, with each script's file, those that differ, are missing from Studio or were removed there. It exits with 1 when something does not match. `--fix` sets the scripts that differ back to their files' contents, one undo step named `Rojo: Resync` per batch of up to 2 MiB of source, without overwriting a script that changed in Studio since the check. `--all` lists every script that differs instead of the first 200 of each kind. The plugin sends hashes rather than sources, and line endings are ignored. `rojo mcp` offers it as `studio_verify`. See [docs/sync-health.md](docs/sync-health.md). ([fork#9])

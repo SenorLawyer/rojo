@@ -155,7 +155,7 @@ pub enum PackageManager {
 }
 
 impl PackageManager {
-    fn name(self) -> &'static str {
+    pub(super) fn name(self) -> &'static str {
         match self {
             Self::Wally => "wally",
             Self::Pesde => "pesde",
@@ -211,19 +211,19 @@ fn install_command(
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct DoctorReport {
+pub(super) struct DoctorReport {
     schema_version: u32,
     directory: PathBuf,
     project_file: Option<PathBuf>,
-    managers: Vec<ManagerReport>,
-    findings: Vec<Finding>,
+    pub(super) managers: Vec<ManagerReport>,
+    pub(super) findings: Vec<Finding>,
     ok: bool,
 }
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct ManagerReport {
-    manager: PackageManager,
+pub(super) struct ManagerReport {
+    pub(super) manager: PackageManager,
     manifest: PathBuf,
     lockfile: PathBuf,
     lockfile_exists: bool,
@@ -250,10 +250,10 @@ struct Mapping {
 }
 
 #[derive(Debug, Serialize)]
-struct Finding {
-    severity: &'static str,
-    code: &'static str,
-    message: String,
+pub(super) struct Finding {
+    pub(super) severity: &'static str,
+    pub(super) code: &'static str,
+    pub(super) message: String,
 }
 
 impl DoctorReport {
@@ -283,7 +283,7 @@ fn project_directory(path: &Path) -> anyhow::Result<PathBuf> {
     }
 }
 
-fn inspect(path: &Path) -> anyhow::Result<DoctorReport> {
+pub(super) fn inspect(path: &Path) -> anyhow::Result<DoctorReport> {
     let directory = project_directory(path)?;
     let project_path = if Project::is_project_file(path) {
         dunce::canonicalize(path)?
