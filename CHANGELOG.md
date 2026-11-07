@@ -31,8 +31,10 @@ Making a new release? Simply add the new header with the version and date undern
 
 ## Unreleased
 
+* `rojo init` now creates a GitHub Actions workflow, `.github/workflows/rojo.yml`, that runs `rojo packages doctor` and `rojo typecheck` on every push and pull request with pinned releases of Rojo and luau-lsp. For places it also runs `rojo test --cloud` on pushes, skipped until the repository has the `ROBLOX_API_KEY` secret and the `TEST_UNIVERSE_ID` and `TEST_PLACE_ID` variables, so a new repository's checks pass without them. A project created inside an existing Git repository gets its workflow at the repository root instead, where GitHub reads workflows, as `.github/workflows/rojo-<project path>-<hash>.yml` with its jobs set to run in the project's folder. An existing workflow file is left alone, and `--no-ci` leaves the workflow out. ([fork#11])
 * Added `rojo doctor`, which checks the project (loaded as `rojo serve` loads it), `servePlaceIds`, packages, the installed Studio plugin and its version, a running `rojo serve` and Git in one read-only report with a fix for each problem. `--json` prints a versioned report, and it exits with 1 when a check is an error. `rojo doc --agent doctor` describes it. ([fork#12])
 
+[fork#11]: https://github.com/SenorLawyer/rojo/pull/11
 [fork#12]: https://github.com/SenorLawyer/rojo/pull/12
 
 ## [8.1.0] (November 5th, 2026)

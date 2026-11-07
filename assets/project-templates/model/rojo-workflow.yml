@@ -1,0 +1,52 @@
+# Checks {project_name} on GitHub Actions. Created by `rojo init` (Rojo
+# {rojo_version}), which never overwrites this file, so edit it freely.
+#
+# It runs `rojo packages doctor` and `rojo typecheck` on every push and pull
+# request, and needs no secrets. `rojo test --cloud` is not included because it
+# needs a place project, whose root is a DataModel.
+#
+# If the project uses Wally or pesde packages, install them before the type
+# check step so their modules are in the sourcemap.
+
+name: Rojo
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  ROJO_VERSION: "{rojo_version}"
+  LUAU_LSP_VERSION: "1.70.1"
+
+jobs:
+  check:
+    name: Packages and types
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rojo and luau-lsp
+        run: |
+          mkdir -p "$RUNNER_TEMP/tools/bin"
+          cd "$RUNNER_TEMP/tools"
+          curl -fsSLO "https://github.com/SenorLawyer/rojo/releases/download/v$ROJO_VERSION/rojo-$ROJO_VERSION-linux-x86_64.zip"
+          curl -fsSLO "https://github.com/SenorLawyer/rojo/releases/download/v$ROJO_VERSION/SHA256SUMS"
+          sha256sum --check --ignore-missing SHA256SUMS
+          curl -fsSLO "https://github.com/JohnnyMorganz/luau-lsp/releases/download/$LUAU_LSP_VERSION/luau-lsp-linux-x86_64.zip"
+          unzip -o "rojo-$ROJO_VERSION-linux-x86_64.zip" -d bin
+          unzip -o luau-lsp-linux-x86_64.zip -d bin
+          chmod +x bin/rojo bin/luau-lsp
+          curl -fsSL -o globalTypes.d.luau "https://raw.githubusercontent.com/JohnnyMorganz/luau-lsp/$LUAU_LSP_VERSION/scripts/globalTypes.d.luau"
+          echo "$RUNNER_TEMP/tools/bin" >> "$GITHUB_PATH"
+
+      - name: Check packages
+        run: rojo packages doctor
+
+      - name: Type check
+        run: rojo typecheck --definitions "$RUNNER_TEMP/tools/globalTypes.d.luau" -- "--ignore=**/Packages/**" --formatter=gnu
