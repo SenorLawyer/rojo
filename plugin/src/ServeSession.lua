@@ -344,8 +344,8 @@ function ServeSession:restartStudioBridge()
 		applyResync = function(patch, expect, includeHeld, expiresAt, isActive, verifyId)
 			return self:applyResync(patch, expect, includeHeld, expiresAt, isActive, verifyId)
 		end,
-		exportForBackup = function(ids)
-			return self:exportForBackup(ids)
+		exportForBackup = function(ids, hashes)
+			return self:exportForBackup(ids, hashes)
 		end,
 	})
 	self.__studioBridge = bridge
@@ -669,31 +669,40 @@ end
 --[=[
 	Exports the scripts with the given IDs as they are in Studio, each copied
 	without its children and with the text its open editor shows, for the
-	backup `rojo studio verify --fix` saves before it overwrites them. `ids`
-	in the result lists the scripts exported; the server only fixes those.
-	Scripts that are no longer in the place are left out and counted in
-	`missing`.
+	backup `rojo studio verify --fix` saves before it overwrites them.
+	`hashes` maps each ID to the hash verify saw. A script whose text no longer
+	has that hash is left out: the fix is checked against what verify saw, so
+	a backup of a later edit could be all that is left once the fix writes.
+	`ids` in the result lists the scripts exported, and the server only fixes
+	those. Scripts left out, or no longer in the place, count in `missing`.
 ]=]
-function ServeSession:exportForBackup(ids)
+function ServeSession:exportForBackup(ids, hashes)
 	assert(self.__status == Status.Connected, "Rojo is not syncing this place. Connect it first.")
 	assert(type(ids) == "table" and #ids <= StudioBackup.MAX_INSTANCES, "Back up at most 10,000 scripts at once")
-	local scripts = {}
+	assert(type(hashes) == "table", "A backup for verify --fix needs the hash verify saw for each script")
+	local entries = {}
 	local exported = {}
 	local missing = 0
 	for _, id in ids do
 		local instance = self.__instanceMap.fromIds[id]
-		if instance and instance:IsDescendantOf(game) and instance:IsA("LuaSourceContainer") then
-			table.insert(scripts, instance)
+		local source = if instance and instance:IsA("LuaSourceContainer") then readSource(instance) else nil
+		if
+			source ~= nil
+			and instance:IsDescendantOf(game)
+			and hashes[id] ~= nil
+			and (hashSource(source)) == hashes[id]
+		then
+			table.insert(entries, { instance = instance, source = source })
 			table.insert(exported, id)
 		else
 			missing += 1
 		end
 	end
 	local result = { instances = {}, ids = {}, missing = missing, placeId = game.PlaceId, placeName = game.Name }
-	if #scripts == 0 then
+	if #entries == 0 then
 		return result
 	end
-	local model, described = StudioBackup.serializeScripts(scripts, readSource)
+	local model, described = StudioBackup.serializeScripts(entries)
 	result.instances = described
 	result.ids = exported
 	result.model = StudioBridge.encodeModel(model)

@@ -201,22 +201,19 @@ function StudioBackup.serialize(roots, readSource)
 end
 
 --[[
-	Serializes a copy of each script in `scripts`, made with copyScript from
-	the source `readSource` reads (what an open editor shows), without the
-	scripts' children, for the backup `rojo studio verify --fix` takes of the
-	scripts it overwrites.
+	Serializes a copy of each script in `entries`, each `{ instance, source }`,
+	made with copyScript from that exact source and without the script's
+	children, for the backup `rojo studio verify --fix` takes of the scripts
+	it overwrites.
 ]]
-function StudioBackup.serializeScripts(scripts, readSource)
-	assert(#scripts <= StudioBackup.MAX_INSTANCES, "too many scripts for one backup")
+function StudioBackup.serializeScripts(entries)
+	assert(#entries <= StudioBackup.MAX_INSTANCES, "too many scripts for one backup")
 	local copies = {}
 	local described = {}
 	local ok, result = pcall(function()
-		for _, script in scripts do
-			local source = if readSource then readSource(script) else nil
-			if source == nil then
-				source = (script :: any).Source
-			end
-			table.insert(copies, StudioBackup.copyScript(script, source))
+		for _, entry in entries do
+			local script = entry.instance
+			table.insert(copies, StudioBackup.copyScript(script, entry.source))
 			table.insert(described, { path = (StudioBridge.pathOf(script)), className = script.ClassName })
 		end
 		return serializeChecked(copies)

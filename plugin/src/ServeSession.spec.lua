@@ -1384,13 +1384,14 @@ return function()
 		end)
 
 		it("exports the scripts verify --fix overwrites, leaving out those not in the place", function()
-			local script = Instance.new("ModuleScript")
-			script.Name = "Fixed"
-			script.Source = "return 1"
-			script.Parent = fixture
-			session.__instanceMap:insert("FIXED", script)
+			local fixed = Instance.new("ModuleScript")
+			fixed.Name = "Fixed"
+			fixed.Source = "return 1"
+			fixed.Parent = fixture
+			session.__instanceMap:insert("FIXED", fixed)
 			session.__status = ServeSession.Status.Connected
-			local exported = session:exportForBackup({ "FIXED", "GONE" })
+			local hashSource = require(script.Parent.hashSource)
+			local exported = session:exportForBackup({ "FIXED", "GONE" }, { FIXED = (hashSource("return 1")) })
 			expect(exported.missing).to.equal(1)
 			expect(#exported.ids).to.equal(1)
 			expect(exported.ids[1]).to.equal("FIXED")
@@ -1398,10 +1399,27 @@ return function()
 			expect(exported.instances[1].path).to.equal("game/ReplicatedStorage/__RojoSyncBackupSpec/Fixed")
 			expect(type(exported.model)).to.equal("string")
 			expect(exported.bytes > 0).to.equal(true)
-			local none = session:exportForBackup({ "GONE" })
+			local none = session:exportForBackup({ "GONE" }, {})
 			expect(none.model).to.equal(nil)
 			expect(#none.ids).to.equal(0)
 			expect(#none.instances).to.equal(0)
+		end)
+
+		it("leaves out a script whose source changed since verify hashed it", function()
+			local edited = Instance.new("ModuleScript")
+			edited.Name = "Edited"
+			edited.Source = "return 'edited after the check'"
+			edited.Parent = fixture
+			session.__instanceMap:insert("EDITED", edited)
+			session.__status = ServeSession.Status.Connected
+			local hashSource = require(script.Parent.hashSource)
+			-- Verify saw "return 'checked'"; Studio has a newer edit now.
+			local exported = session:exportForBackup({ "EDITED" }, { EDITED = (hashSource("return 'checked'")) })
+			expect(exported.missing).to.equal(1)
+			expect(#exported.ids).to.equal(0)
+			expect(exported.model).to.equal(nil)
+			-- A script without an expected hash is left out too.
+			expect(#session:exportForBackup({ "EDITED" }, {}).ids).to.equal(0)
 		end)
 	end)
 

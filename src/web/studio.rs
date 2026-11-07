@@ -1511,8 +1511,8 @@ impl StudioBridge {
     /// them as automatic backups, one per group from
     /// [`verify::backup_groups`]. Returns the backups and the IDs of the
     /// scripts they hold. Fails on the first group that cannot be exported or
-    /// saved. Old automatic backups are pruned once, after every group is
-    /// saved, keeping all of this verify's own.
+    /// saved. Each save prunes old automatic backups, never young ones, so
+    /// this verify's own stay however many there are.
     async fn back_up_fixes(
         &self,
         session_id: &str,
@@ -1540,8 +1540,21 @@ impl StudioBridge {
                 child: child.clone(),
             };
             let ids: Vec<&str> = group.iter().map(|fix| fix.script.id.as_str()).collect();
+            // The hash each script had when verify checked it. The plugin
+            // leaves out a script whose source no longer matches, which is
+            // then not fixed: the fix would be checked against that same
+            // source, so the backup must hold it, not a later edit.
+            let hashes: serde_json::Map<String, Value> = group
+                .iter()
+                .map(|fix| (fix.script.id.clone(), json!(fix.studio_hash)))
+                .collect();
             let response = self
-                .dispatch(session_id, child, "backup", json!({ "ids": ids }))
+                .dispatch(
+                    session_id,
+                    child,
+                    "backup",
+                    json!({ "ids": ids, "hashes": hashes }),
+                )
                 .await;
             let (status, value) = response_value(response).await;
             let result = &value["result"];
@@ -1588,8 +1601,6 @@ impl StudioBridge {
             );
             backed_up.extend(held);
         }
-        self.prune_backups(saved.iter().map(|record| record.id.clone()).collect())
-            .await;
         Ok((saved, backed_up))
     }
 
@@ -1620,10 +1631,7 @@ impl StudioBridge {
             value["placeName"].as_str(),
         );
         match self.save_backup(record, model).await {
-            Ok(record) => {
-                self.prune_backups([record.id.clone()].into()).await;
-                reply(StatusCode::OK, json!({ "backup": record }))
-            }
+            Ok(record) => reply(StatusCode::OK, json!({ "backup": record })),
             Err(error) => failure(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("Could not save the backup: {error:#}"),
@@ -1640,25 +1648,8 @@ impl StudioBridge {
         })
     }
 
-    /// Removes old automatic backups beyond [`backup::KEEP_AUTOMATIC`],
-    /// never those in `protected`. A failure is only logged, since the
-    /// backups it would remove are already saved.
-    async fn prune_backups(&self, protected: HashSet<String>) {
-        let dir = self.backup_dir.get().cloned();
-        let root = self.serve.root_dir().to_owned();
-        let pruned = tokio::task::spawn_blocking(move || {
-            Self::backup_store(dir, &root)?.prune_automatic(backup::KEEP_AUTOMATIC, &protected)
-        })
-        .await;
-        match pruned {
-            Ok(Ok(_)) => {}
-            Ok(Err(error)) => log::warn!("Could not remove old automatic backups: {error:#}"),
-            Err(error) => log::warn!("Could not remove old automatic backups: {error}"),
-        }
-    }
-
-    /// Saves an automatic backup in the project's backup folder. Callers
-    /// prune with [`Self::prune_backups`] once their operation is done.
+    /// Saves an automatic backup in the project's backup folder, which also
+    /// prunes old automatic ones (see [`backup::Store::save_automatic`]).
     async fn save_backup(
         &self,
         record: backup::Record,
@@ -3204,6 +3195,8 @@ mod tests {
         let backup = next_command(&bridge, &session).await;
         assert_eq!(backup["action"], "backup");
         assert_eq!(backup["args"]["ids"], json!([script.id]));
+        // Studio's hash from the check, which `fix_past_sources` reports as 1.
+        assert_eq!(backup["args"]["hashes"][&script.id], 1);
         // The fix waits for the backup: nothing else is queued yet.
         assert_eq!(bridge.state().pending.len(), 1);
         plugin(
@@ -3332,6 +3325,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn verify_fix_leaves_scripts_whose_source_changed_since_the_check_unfixed() {
+        // Studio has a newer edit than the one verify hashed, so the plugin
+        // refuses to export it, and the script must not be overwritten.
+        let (_dir, bridge, session, scripts, verify) =
+            fix_scripts_past_sources(json!({"fix":true}), 2, 1).await;
+        let backup = next_command(&bridge, &session).await;
+        assert_eq!(backup["args"]["hashes"].as_object().unwrap().len(), 2);
+        answer_backup(&bridge, &session, &backup, &[&scripts[1].id]).await;
+        let resync = next_command(&bridge, &session).await;
+        let updated = resync["args"]["patch"]["updated"].as_array().unwrap();
+        assert_eq!(updated.len(), 1);
+        assert_eq!(updated[0]["id"], json!(scripts[1].id));
+        plugin(
+            &bridge,
+            "/api/studio/result",
+            json!({"requestId":resync["requestId"],"sessionId":session,"result":{"ok":true,"value":{"updated":1,"failed":0,"skipped":0}}}),
+        )
+        .await;
+        let (_, value) = into_value(verify.await.unwrap()).await;
+        let fixed = &value["result"]["value"]["fixed"];
+        assert_eq!(fixed["notBackedUp"], 1);
+        assert_eq!(fixed["notBackedUpScripts"][0]["id"], json!(scripts[0].id));
+    }
+
+    #[tokio::test]
+    async fn a_verify_that_fails_part_way_still_leaves_the_store_pruned() {
+        let (dir, bridge, session, _scripts, verify) =
+            fix_scripts_past_sources(json!({"fix":true}), 2, verify::MAX_BACKUP_SOURCE_BYTES).await;
+        let store = backup::Store::in_dir(&dir.path().join("backups"));
+        // Old automatic backups, more than are kept, left by earlier runs.
+        for index in 0..backup::KEEP_AUTOMATIC as u64 + 5 {
+            let mut record = backup::automatic_record(
+                "auto-sync",
+                "auto: old",
+                &[("game/Old".to_owned(), "Folder".to_owned())],
+                None,
+                None,
+            );
+            record.created_at = 1_000 + index;
+            store.save(record, b"<roblox!old").unwrap();
+        }
+        let first = next_command(&bridge, &session).await;
+        let ids: Vec<String> = first["args"]["ids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|id| id.as_str().unwrap().to_owned())
+            .collect();
+        let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+        answer_backup(&bridge, &session, &first, &refs).await;
+        let second = next_command(&bridge, &session).await;
+        assert_eq!(second["action"], "backup");
+        plugin(
+            &bridge,
+            "/api/studio/result",
+            json!({"requestId":second["requestId"],"sessionId":session,"result":{"ok":false,"error":"Export exceeds 5MiB"}}),
+        )
+        .await;
+        let (status, _) = into_value(verify.await.unwrap()).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        let automatic: Vec<backup::Record> = store
+            .list()
+            .unwrap()
+            .into_iter()
+            .filter(|record| record.automatic)
+            .collect();
+        assert_eq!(automatic.len(), backup::KEEP_AUTOMATIC);
+        assert!(automatic[0].name.starts_with("auto-verify-fix"));
+    }
+
+    #[tokio::test]
     async fn verify_fix_with_an_empty_export_fixes_nothing() {
         let (_dir, bridge, session, _script, verify) = fix_past_sources(json!({"fix":true})).await;
         let backup = next_command(&bridge, &session).await;
@@ -3403,7 +3467,8 @@ mod tests {
         }
         let resync = next_command(&bridge, &session).await;
         assert_eq!(resync["action"], "resync");
-        // Before any fix runs, every backup this verify saved is still there.
+        // Before any fix runs, every backup this verify saved is still there,
+        // though there are more than are kept: they are young.
         let listed = store.list().unwrap();
         assert_eq!(listed.iter().filter(|r| r.automatic).count(), groups);
         assert!(listed.iter().any(|r| r.id == manual.id));

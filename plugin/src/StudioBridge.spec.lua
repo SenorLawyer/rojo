@@ -1320,13 +1320,14 @@ return function()
 				getSummary = function()
 					return {}
 				end,
-				exportForBackup = function(ids)
+				exportForBackup = function(ids, hashes)
 					asked = ids
+					expect(hashes.A).to.equal(7)
 					return { instances = { { path = "game/A", className = "ModuleScript" } }, model = "AAAA" }
 				end,
 			}
 			expect(bridge:capabilities().backup.available).to.equal(true)
-			local result = bridge:execute(command("backup", { ids = { "A", "B" } }))
+			local result = bridge:execute(command("backup", { ids = { "A", "B" }, hashes = { A = 7, B = 8 } }))
 			expect(result.model).to.equal("AAAA")
 			expect(#asked).to.equal(2)
 			bridge.sync = nil

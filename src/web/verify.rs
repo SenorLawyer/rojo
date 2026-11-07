@@ -39,6 +39,9 @@ pub(crate) const MAX_RESYNC_BYTES: usize = 2 * 1024 * 1024;
 /// larger than its source, so this leaves room for that and for its
 /// properties.
 pub(crate) const MAX_BACKUP_SOURCE_BYTES: usize = 4 * 1024 * 1024;
+/// How many scripts one backup before `--fix` may hold, well under the
+/// 10,000 instances the plugin exports and a backup can restore.
+pub(crate) const MAX_BACKUP_SCRIPTS: usize = 2_000;
 
 /// 32-bit FNV-1a of `source` with CRLF line endings turned into LF, and the
 /// length of that normalized text. Must match `plugin/src/hashSource.lua`.
@@ -397,8 +400,9 @@ impl Comparison {
     }
 }
 
-/// Splits the scripts `--fix` overwrites into groups whose Studio sources
-/// add up to at most [`MAX_BACKUP_SOURCE_BYTES`], one backup each. A script
+/// Splits the scripts `--fix` overwrites into groups of at most
+/// [`MAX_BACKUP_SCRIPTS`] whose Studio sources add up to at most
+/// [`MAX_BACKUP_SOURCE_BYTES`], one backup each. A script
 /// larger than that gets a group of its own, which the plugin refuses if its
 /// copy does not fit the model limit.
 pub(crate) fn backup_groups<'a>(fixes: &[&'a Different]) -> Vec<Vec<&'a Different>> {
@@ -406,7 +410,10 @@ pub(crate) fn backup_groups<'a>(fixes: &[&'a Different]) -> Vec<Vec<&'a Differen
     let mut group = Vec::new();
     let mut bytes = 0;
     for &fix in fixes {
-        if !group.is_empty() && bytes + fix.studio_length > MAX_BACKUP_SOURCE_BYTES {
+        if !group.is_empty()
+            && (bytes + fix.studio_length > MAX_BACKUP_SOURCE_BYTES
+                || group.len() >= MAX_BACKUP_SCRIPTS)
+        {
             groups.push(std::mem::take(&mut group));
             bytes = 0;
         }
@@ -724,6 +731,32 @@ mod test {
                 vec![10]
             ],
             "every script is in exactly one group, in order, and an oversized one alone"
+        );
+    }
+
+    #[test]
+    fn backups_before_a_fix_hold_a_bounded_number_of_scripts() {
+        let tree = tree();
+        let script = tree_scripts(&tree, Path::new("/")).remove(0);
+        let fixes: Vec<Different> = (0..MAX_BACKUP_SCRIPTS * 5 + 1)
+            .map(|_| Different {
+                script: script.clone(),
+                studio_hash: 1,
+                studio_length: 10,
+            })
+            .collect();
+        let refs: Vec<&Different> = fixes.iter().collect();
+        let sizes: Vec<usize> = backup_groups(&refs).iter().map(Vec::len).collect();
+        assert_eq!(
+            sizes,
+            vec![
+                MAX_BACKUP_SCRIPTS,
+                MAX_BACKUP_SCRIPTS,
+                MAX_BACKUP_SCRIPTS,
+                MAX_BACKUP_SCRIPTS,
+                MAX_BACKUP_SCRIPTS,
+                1
+            ]
         );
     }
 

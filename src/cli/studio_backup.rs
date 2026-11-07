@@ -8,7 +8,6 @@
 //! so it survives switching worktrees and never ends up in the place.
 
 use std::{
-    collections::HashSet,
     fs,
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
@@ -46,6 +45,13 @@ pub struct Record {
 /// reconnect that changes Studio takes one, so without a bound they would
 /// fill the disk.
 pub const KEEP_AUTOMATIC: usize = 20;
+
+/// An automatic backup younger than this is never pruned, whoever prunes.
+/// The store is shared by every worktree and server of the repository, so
+/// another process may prune while an operation that saved several backups,
+/// such as a `verify --fix`, still relies on them. This is far longer than
+/// any such operation runs (20 seconds for a fix, 30 for a sync's request).
+pub const AUTOMATIC_GRACE_MILLIS: u64 = 60 * 60 * 1000;
 
 pub struct Store {
     dir: PathBuf,
@@ -328,38 +334,36 @@ impl Store {
         Ok(orphans)
     }
 
-    /// Saves `model` as an automatic backup. It does not prune: an operation
-    /// that saves several prunes once afterwards with [`Self::prune_automatic`],
-    /// so it cannot remove its own earlier backups.
+    /// Saves `model` as an automatic backup, then prunes old automatic
+    /// backups with [`Self::prune_automatic`], so every save keeps the store
+    /// bounded, including in operations that fail or are cancelled part way.
+    /// A failure to prune is only logged, because the backup is saved.
     pub fn save_automatic(&self, mut record: Record, model: &[u8]) -> anyhow::Result<Record> {
         record.automatic = true;
-        self.save(record, model)
+        let record = self.save(record, model)?;
+        if let Err(error) = self.prune_automatic() {
+            log::warn!("Could not remove old automatic backups: {error:#}");
+        }
+        Ok(record)
     }
 
-    /// Removes the oldest automatic backups, keeping the `keep` newest, and
-    /// returns their IDs. Backups in `protected`, those the current operation
-    /// just saved, are never removed and count towards `keep`, so the
-    /// operation's own backups all stay even when there are more of them.
-    /// Backups made on purpose are never removed.
-    pub fn prune_automatic(
-        &self,
-        keep: usize,
-        protected: &HashSet<String>,
-    ) -> anyhow::Result<Vec<String>> {
+    /// Removes automatic backups beyond the [`KEEP_AUTOMATIC`] newest that are
+    /// older than [`AUTOMATIC_GRACE_MILLIS`], and returns their IDs. Backups
+    /// made on purpose are never removed.
+    pub fn prune_automatic(&self) -> anyhow::Result<Vec<String>> {
+        self.prune_automatic_at(KEEP_AUTOMATIC, now_millis())
+    }
+
+    /// [`Self::prune_automatic`] keeping `keep` and taking `now` as the
+    /// current time, in Unix milliseconds.
+    pub(crate) fn prune_automatic_at(&self, keep: usize, now: u64) -> anyhow::Result<Vec<String>> {
         let _lock = self.lock()?;
-        let automatic: Vec<Record> = self
+        let removed: Vec<String> = self
             .list()?
             .into_iter()
             .filter(|record| record.automatic)
-            .collect();
-        let kept_protected = automatic
-            .iter()
-            .filter(|record| protected.contains(&record.id))
-            .count();
-        let removed: Vec<String> = automatic
-            .into_iter()
-            .filter(|record| !protected.contains(&record.id))
-            .skip(keep.saturating_sub(kept_protected))
+            .skip(keep)
+            .filter(|record| record.created_at.saturating_add(AUTOMATIC_GRACE_MILLIS) <= now)
             .map(|record| record.id)
             .collect();
         for id in &removed {
@@ -576,21 +580,39 @@ mod tests {
         assert!(store.orphans().unwrap().is_empty());
     }
 
+    /// Unix milliseconds `hours` hours before now.
+    fn hours_ago(hours: u64) -> u64 {
+        now_millis() - hours * 60 * 60 * 1000
+    }
+
+    /// Saves an automatic record without pruning, as a store filled by
+    /// earlier operations would be.
+    fn fill(store: &Store, name: &str, created_at: u64) -> String {
+        let mut record = record(name, created_at);
+        record.automatic = true;
+        store.save(record, b"auto").unwrap().id
+    }
+
+    fn automatic_ids(store: &Store) -> Vec<String> {
+        store
+            .list()
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.automatic)
+            .map(|r| r.id)
+            .collect()
+    }
+
     #[test]
     fn pruning_keeps_the_newest_automatic_backups_and_every_manual_one() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::in_dir(dir.path());
         let manual_old = store.save(record("Map", 500), b"manual").unwrap();
-        let mut automatic = Vec::new();
-        for index in 0..5 {
-            let saved = store
-                .save_automatic(record("auto", 1_000 + index * 1_000), b"auto")
-                .unwrap();
-            assert!(saved.automatic);
-            automatic.push(saved.id);
-        }
+        let automatic: Vec<String> = (0..5)
+            .map(|index| fill(&store, "auto", 1_000 + index * 1_000))
+            .collect();
         let manual_new = store.save(record("Lobby", 100_000), b"manual").unwrap();
-        let removed = store.prune_automatic(2, &HashSet::new()).unwrap();
+        let removed = store.prune_automatic_at(2, now_millis()).unwrap();
         assert_eq!(
             removed,
             vec![
@@ -616,75 +638,92 @@ mod tests {
     }
 
     #[test]
-    fn pruning_beyond_the_limit_keeps_manual_backups() {
+    fn old_automatic_backups_beyond_the_limit_are_pruned_on_save() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::in_dir(dir.path());
         let manual = store.save(record("Map", 1), b"manual").unwrap();
         for index in 0..KEEP_AUTOMATIC as u64 + 3 {
-            store
-                .save_automatic(record("auto", 1_000 + index * 1_000), b"auto")
+            let saved = store
+                .save_automatic(record("auto", hours_ago(2) + index * 1_000), b"auto")
                 .unwrap();
+            assert!(saved.automatic);
         }
-        // Saving alone never prunes.
-        assert_eq!(store.list().unwrap().len(), KEEP_AUTOMATIC + 4);
-        assert_eq!(
-            store
-                .prune_automatic(KEEP_AUTOMATIC, &HashSet::new())
-                .unwrap()
-                .len(),
-            3
-        );
         let listed = store.list().unwrap();
         assert_eq!(
             listed.iter().filter(|r| r.automatic).count(),
             KEEP_AUTOMATIC
         );
         assert!(listed.iter().any(|r| r.id == manual.id));
-        assert_eq!(listed.len(), KEEP_AUTOMATIC + 1);
     }
 
     #[test]
-    fn an_operation_with_more_backups_than_the_limit_keeps_all_of_its_own() {
+    fn young_automatic_backups_beyond_the_limit_are_kept() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::in_dir(dir.path());
-        let older: Vec<String> = (0..5)
-            .map(|index| {
-                store
-                    .save_automatic(record("older", 1_000 + index * 1_000), b"old")
-                    .unwrap()
-                    .id
-            })
-            .collect();
-        let own: HashSet<String> = (0..KEEP_AUTOMATIC as u64 + 5)
-            .map(|index| {
-                store
-                    .save_automatic(record("own", 100_000 + index * 1_000), b"own")
-                    .unwrap()
-                    .id
-            })
-            .collect();
-        let removed = store.prune_automatic(KEEP_AUTOMATIC, &own).unwrap();
-        assert_eq!(removed.len(), older.len(), "every older one goes first");
-        let left: HashSet<String> = store.list().unwrap().into_iter().map(|r| r.id).collect();
-        assert_eq!(left, own);
+        let now = now_millis();
+        for index in 0..KEEP_AUTOMATIC as u64 + 5 {
+            store
+                .save_automatic(record("auto", now - 60_000 + index * 1_000), b"auto")
+                .unwrap();
+        }
+        assert_eq!(automatic_ids(&store).len(), KEEP_AUTOMATIC + 5);
+        // Once they are old, the next prune brings them back to the limit.
+        let later = now + AUTOMATIC_GRACE_MILLIS;
+        assert_eq!(
+            store
+                .prune_automatic_at(KEEP_AUTOMATIC, later)
+                .unwrap()
+                .len(),
+            5
+        );
+        assert_eq!(automatic_ids(&store).len(), KEEP_AUTOMATIC);
+    }
 
-        // With room left, the newest unprotected ones stay beside the
-        // protected ones.
+    #[test]
+    fn a_prune_by_another_process_keeps_an_operations_young_backups() {
         let dir = tempfile::tempdir().unwrap();
+        // Another worktree's server and this one, sharing the folder.
+        let other = Store::in_dir(dir.path());
         let store = Store::in_dir(dir.path());
-        let old: Vec<String> = (0..4)
+        let old: Vec<String> = (0..10)
+            .map(|index| fill(&other, "old", hours_ago(3) + index))
+            .collect();
+        // A verify --fix saving more backups than are kept.
+        let own: Vec<String> = (0..KEEP_AUTOMATIC as u64 + 3)
             .map(|index| {
                 store
-                    .save_automatic(record("old", 1_000 + index * 1_000), b"old")
+                    .save_automatic(record("own", hours_ago(0) - 10_000 + index * 100), b"own")
                     .unwrap()
                     .id
             })
             .collect();
-        // Protected, though older than the rest, as a slow operation's
-        // first backup would be.
-        let protected: HashSet<String> = [old[0].clone()].into();
-        let removed = store.prune_automatic(2, &protected).unwrap();
-        assert_eq!(removed, vec![old[2].clone(), old[1].clone()]);
+        // Meanwhile the other server saves a reconnect backup, which prunes.
+        let theirs = other
+            .save_automatic(record("theirs", now_millis()), b"theirs")
+            .unwrap();
+        let left = automatic_ids(&store);
+        for id in own.iter().chain([&theirs.id]) {
+            assert!(left.contains(id), "{id} was pruned while young");
+        }
+        for id in &old {
+            assert!(!left.contains(id), "{id} is old and beyond the limit");
+        }
+    }
+
+    #[test]
+    fn a_store_left_over_the_limit_is_pruned_by_the_next_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::in_dir(dir.path());
+        // An operation that failed part way, or several, left these behind.
+        for index in 0..KEEP_AUTOMATIC as u64 + 5 {
+            fill(&store, "left", hours_ago(2) + index);
+        }
+        let next = store
+            .save_automatic(record("next", now_millis()), b"next")
+            .unwrap();
+        let left = automatic_ids(&store);
+        assert_eq!(left.len(), KEEP_AUTOMATIC);
+        assert_eq!(left[0], next.id);
     }
 
     #[test]
@@ -699,7 +738,7 @@ mod tests {
         );
         assert!(!store.get(&saved.id).unwrap().0.automatic);
         assert_eq!(
-            store.prune_automatic(0, &HashSet::new()).unwrap(),
+            store.prune_automatic_at(0, now_millis()).unwrap(),
             Vec::<String>::new()
         );
         let auto = store

@@ -176,9 +176,8 @@ return function()
 			script.Enabled = false
 			script:SetAttribute("Owner", "team")
 			make("Folder", "Child", script)
-			local model, described = StudioBackup.serializeScripts({ script }, function()
-				return "print('editor')"
-			end)
+			local model, described =
+				StudioBackup.serializeScripts({ { instance = script, source = "print('editor')" } })
 			expect(described[1].path).to.equal("game/ReplicatedStorage/__RojoBackupSpec/Server")
 			local roots = SerializationService:DeserializeInstancesAsync(model)
 			expect(#roots).to.equal(1)

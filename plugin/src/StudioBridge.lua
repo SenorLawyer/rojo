@@ -285,7 +285,7 @@ end
 
 -- `sync`, when given, connects the bridge to the sync session it runs beside:
 -- `getSummary()` for the health summary sent with every poll,
--- `getSourceHashes()` for `rojo studio verify`, `exportForBackup(ids)` for
+-- `getSourceHashes()` for `rojo studio verify`, `exportForBackup(ids, hashes)` for
 -- the backup `rojo studio verify --fix` takes first and `applyResync(patch)`
 -- for the fix itself.
 function StudioBridge.new(apiContext, pairing, onFailure, sync)
@@ -899,7 +899,7 @@ function StudioBridge:execute(command)
 		-- Only `verify --fix` sends this, with the IDs of the scripts it is
 		-- about to overwrite; the server saves what comes back.
 		assert(self.sync and self.sync.exportForBackup, "This bridge is not attached to a sync session")
-		local exported = self.sync.exportForBackup(args.ids)
+		local exported = self.sync.exportForBackup(args.ids, args.hashes)
 		self:ensureActive(command)
 		return exported
 	elseif command.action == "selection" then
