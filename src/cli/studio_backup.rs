@@ -8,6 +8,7 @@
 //! so it survives switching worktrees and never ends up in the place.
 
 use std::{
+    collections::HashSet,
     fs,
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
@@ -327,27 +328,38 @@ impl Store {
         Ok(orphans)
     }
 
-    /// Saves `model` as an automatic backup, then removes the oldest
-    /// automatic backups beyond [`KEEP_AUTOMATIC`]. A failure to prune is
-    /// only logged, because the new backup is saved by then.
+    /// Saves `model` as an automatic backup. It does not prune: an operation
+    /// that saves several prunes once afterwards with [`Self::prune_automatic`],
+    /// so it cannot remove its own earlier backups.
     pub fn save_automatic(&self, mut record: Record, model: &[u8]) -> anyhow::Result<Record> {
         record.automatic = true;
-        let record = self.save(record, model)?;
-        if let Err(error) = self.prune_automatic(KEEP_AUTOMATIC) {
-            log::warn!("Could not remove old automatic backups: {error:#}");
-        }
-        Ok(record)
+        self.save(record, model)
     }
 
-    /// Removes automatic backups other than the `keep` newest, and returns
-    /// their IDs. Backups made on purpose are never removed.
-    pub fn prune_automatic(&self, keep: usize) -> anyhow::Result<Vec<String>> {
+    /// Removes the oldest automatic backups, keeping the `keep` newest, and
+    /// returns their IDs. Backups in `protected`, those the current operation
+    /// just saved, are never removed and count towards `keep`, so the
+    /// operation's own backups all stay even when there are more of them.
+    /// Backups made on purpose are never removed.
+    pub fn prune_automatic(
+        &self,
+        keep: usize,
+        protected: &HashSet<String>,
+    ) -> anyhow::Result<Vec<String>> {
         let _lock = self.lock()?;
-        let removed: Vec<String> = self
+        let automatic: Vec<Record> = self
             .list()?
             .into_iter()
             .filter(|record| record.automatic)
-            .skip(keep)
+            .collect();
+        let kept_protected = automatic
+            .iter()
+            .filter(|record| protected.contains(&record.id))
+            .count();
+        let removed: Vec<String> = automatic
+            .into_iter()
+            .filter(|record| !protected.contains(&record.id))
+            .skip(keep.saturating_sub(kept_protected))
             .map(|record| record.id)
             .collect();
         for id in &removed {
@@ -578,7 +590,7 @@ mod tests {
             automatic.push(saved.id);
         }
         let manual_new = store.save(record("Lobby", 100_000), b"manual").unwrap();
-        let removed = store.prune_automatic(2).unwrap();
+        let removed = store.prune_automatic(2, &HashSet::new()).unwrap();
         assert_eq!(
             removed,
             vec![
@@ -604,7 +616,7 @@ mod tests {
     }
 
     #[test]
-    fn saving_an_automatic_backup_prunes_beyond_the_limit() {
+    fn pruning_beyond_the_limit_keeps_manual_backups() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::in_dir(dir.path());
         let manual = store.save(record("Map", 1), b"manual").unwrap();
@@ -613,6 +625,15 @@ mod tests {
                 .save_automatic(record("auto", 1_000 + index * 1_000), b"auto")
                 .unwrap();
         }
+        // Saving alone never prunes.
+        assert_eq!(store.list().unwrap().len(), KEEP_AUTOMATIC + 4);
+        assert_eq!(
+            store
+                .prune_automatic(KEEP_AUTOMATIC, &HashSet::new())
+                .unwrap()
+                .len(),
+            3
+        );
         let listed = store.list().unwrap();
         assert_eq!(
             listed.iter().filter(|r| r.automatic).count(),
@@ -620,6 +641,50 @@ mod tests {
         );
         assert!(listed.iter().any(|r| r.id == manual.id));
         assert_eq!(listed.len(), KEEP_AUTOMATIC + 1);
+    }
+
+    #[test]
+    fn an_operation_with_more_backups_than_the_limit_keeps_all_of_its_own() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::in_dir(dir.path());
+        let older: Vec<String> = (0..5)
+            .map(|index| {
+                store
+                    .save_automatic(record("older", 1_000 + index * 1_000), b"old")
+                    .unwrap()
+                    .id
+            })
+            .collect();
+        let own: HashSet<String> = (0..KEEP_AUTOMATIC as u64 + 5)
+            .map(|index| {
+                store
+                    .save_automatic(record("own", 100_000 + index * 1_000), b"own")
+                    .unwrap()
+                    .id
+            })
+            .collect();
+        let removed = store.prune_automatic(KEEP_AUTOMATIC, &own).unwrap();
+        assert_eq!(removed.len(), older.len(), "every older one goes first");
+        let left: HashSet<String> = store.list().unwrap().into_iter().map(|r| r.id).collect();
+        assert_eq!(left, own);
+
+        // With room left, the newest unprotected ones stay beside the
+        // protected ones.
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::in_dir(dir.path());
+        let old: Vec<String> = (0..4)
+            .map(|index| {
+                store
+                    .save_automatic(record("old", 1_000 + index * 1_000), b"old")
+                    .unwrap()
+                    .id
+            })
+            .collect();
+        // Protected, though older than the rest, as a slow operation's
+        // first backup would be.
+        let protected: HashSet<String> = [old[0].clone()].into();
+        let removed = store.prune_automatic(2, &protected).unwrap();
+        assert_eq!(removed, vec![old[2].clone(), old[1].clone()]);
     }
 
     #[test]
@@ -633,7 +698,10 @@ mod tests {
             "manual records keep the old format"
         );
         assert!(!store.get(&saved.id).unwrap().0.automatic);
-        assert_eq!(store.prune_automatic(0).unwrap(), Vec::<String>::new());
+        assert_eq!(
+            store.prune_automatic(0, &HashSet::new()).unwrap(),
+            Vec::<String>::new()
+        );
         let auto = store
             .save_automatic(record("auto", 2_000), b"model")
             .unwrap();

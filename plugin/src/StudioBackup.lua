@@ -17,6 +17,9 @@ StudioBackup.MAX_MODEL_BYTES = 5 * 1024 * 1024
 StudioBackup.MAX_INSTANCES = 10_000
 local MAX_BODY_BYTES = 8 * 1024 * 1024
 
+-- The folder in a backup that holds scripts as their open editors show them.
+StudioBackup.DRAFTS_FOLDER = "Rojo editor drafts"
+
 -- Services and the DataModel cannot be saved as models.
 local function canCopy(instance)
 	return instance ~= game and instance.Parent ~= game
@@ -29,115 +32,194 @@ local function hasChanges(update)
 end
 
 --[[
-	The instances in Studio that applying `patch` would remove or change.
-	Removed instances are copied with everything inside them; changed ones
-	without their children, which a change to a parent leaves alone, so a
-	changed folder does not copy a whole map. Returns the entries, sorted by
-	path, and how many instances cannot be copied, such as services.
+	The instances in Studio that applying `patch` would remove or change, as
+	backup roots sorted by path, leaving out any inside another root, whose
+	copy holds them already. Also returns the sorted paths of those that
+	cannot be backed up, such as services, which the patch changes anyway.
 ]]
 function StudioBackup.collect(patch, instanceMap)
-	local deep = {}
-	local shallow = {}
-	local skipped = 0
-	for _, removed in patch.removed do
-		local instance = if typeof(removed) == "Instance" then removed else instanceMap.fromIds[removed]
-		if instance == nil then
-			continue
+	local candidates = {}
+	local skipped = {}
+	local function consider(instance)
+		if instance == nil or candidates[instance] or skipped[instance] then
+			return
 		end
 		if canCopy(instance) then
-			deep[instance] = true
+			candidates[instance] = true
 		else
-			skipped += 1
+			skipped[instance] = true
 		end
 	end
+	for _, removed in patch.removed do
+		consider(if typeof(removed) == "Instance" then removed else instanceMap.fromIds[removed])
+	end
 	for _, update in patch.updated do
-		local instance = instanceMap.fromIds[update.id]
-		if instance == nil or not hasChanges(update) then
-			continue
-		end
-		if canCopy(instance) then
-			shallow[instance] = true
-		else
-			skipped += 1
+		if hasChanges(update) then
+			consider(instanceMap.fromIds[update.id])
 		end
 	end
 
-	-- An instance inside a removed one is already in that one's copy.
-	local function insideRemoved(instance)
+	local roots = {}
+	for instance in candidates do
+		local inside = false
 		local parent = instance.Parent
 		while parent do
-			if deep[parent] then
-				return true
+			if candidates[parent] then
+				inside = true
+				break
 			end
 			parent = parent.Parent
 		end
-		return false
-	end
-
-	local entries = {}
-	for instance in deep do
-		if not insideRemoved(instance) then
-			table.insert(entries, { instance = instance, deep = true, path = (StudioBridge.pathOf(instance)) })
+		if not inside then
+			table.insert(roots, { instance = instance, path = (StudioBridge.pathOf(instance)) })
 		end
 	end
-	for instance in shallow do
-		if not deep[instance] and not insideRemoved(instance) then
-			table.insert(entries, { instance = instance, deep = false, path = (StudioBridge.pathOf(instance)) })
-		end
-	end
-	table.sort(entries, function(a, b)
+	table.sort(roots, function(a, b)
 		return a.path < b.path
 	end)
-	return entries, skipped
+	local skippedPaths = {}
+	for instance in skipped do
+		table.insert(skippedPaths, (StudioBridge.pathOf(instance)))
+	end
+	table.sort(skippedPaths)
+	return roots, skippedPaths
+end
+
+-- How many instances a backup of `roots` holds, counted before anything is
+-- copied or serialized.
+function StudioBackup.countInstances(roots)
+	local count = 0
+	for _, root in roots do
+		count += #root.instance:GetDescendants() + 1
+	end
+	return count
 end
 
 --[[
-	Serializes `entries` from `collect` as one native model with a root per
-	entry. `readSource`, when given, reads a script's source the way sync does,
-	so a script open in an editor is saved with what the editor shows.
-	Returns the model buffer and the entries' paths and classes. Errors when
-	the model would be over the server's limits.
+	A new script of the same class as `script`, with its name, `source`, the
+	properties that decide how it runs and its attributes, but none of its
+	children. Built with Instance.new rather than Clone, which would copy
+	every descendant.
 ]]
-function StudioBackup.serialize(entries, readSource)
-	local roots = {}
+function StudioBackup.copyScript(script, source)
+	local copy = Instance.new(script.ClassName)
+	copy.Name = script.Name;
+	(copy :: any).Source = source
+	for _, property in { "Enabled", "RunContext" } do
+		pcall(function()
+			(copy :: any)[property] = (script :: any)[property]
+		end)
+	end
+	for name, value in script:GetAttributes() do
+		copy:SetAttribute(name, value)
+	end
+	return copy
+end
+
+local function serializeChecked(instances)
+	local model = SerializationService:SerializeInstancesAsync(instances)
+	assert(
+		buffer.len(model) <= StudioBackup.MAX_MODEL_BYTES,
+		string.format("the copy is %.1f MiB, over the 5 MiB model limit", buffer.len(model) / (1024 * 1024))
+	)
+	return model
+end
+
+--[[
+	Serializes `roots` from `collect` as they are in the place, with
+	everything inside them, in one native model. Serializing them in one call
+	keeps references between instances in the backup, such as an ObjectValue
+	pointing at another backed-up instance; references to instances outside
+	the backup are not kept. Nothing in the place is copied, and the size is
+	counted first, so a backup over the import limit fails before any work.
+
+	`readSource`, when given, reads a script's source the way sync does. The
+	model only holds `Source`, so a script whose open editor shows other text
+	also gets a draft copy with that text, in a folder named DRAFTS_FOLDER.
+	Returns the model and the paths and classes of its roots.
+]]
+function StudioBackup.serialize(roots, readSource)
+	local count = StudioBackup.countInstances(roots)
+	assert(
+		count <= StudioBackup.MAX_INSTANCES,
+		string.format("it would hold %d instances, over the %d a backup can restore", count, StudioBackup.MAX_INSTANCES)
+	)
+	local instances = {}
+	local described = {}
+	local drafts
+	local ok, result = pcall(function()
+		for _, root in roots do
+			table.insert(instances, root.instance)
+			table.insert(described, {
+				path = root.path or (StudioBridge.pathOf(root.instance)),
+				className = root.instance.ClassName,
+			})
+			if not readSource then
+				continue
+			end
+			local scripts = root.instance:GetDescendants()
+			table.insert(scripts, root.instance)
+			for _, script in scripts do
+				if not script:IsA("LuaSourceContainer") then
+					continue
+				end
+				local editor = readSource(script)
+				local read, saved = pcall(function()
+					return (script :: any).Source
+				end)
+				if editor == nil or not read or editor == saved then
+					continue
+				end
+				if drafts == nil then
+					drafts = Instance.new("Folder")
+					drafts.Name = StudioBackup.DRAFTS_FOLDER
+					count += 1
+				end
+				count += 1
+				assert(
+					count <= StudioBackup.MAX_INSTANCES,
+					string.format("it would hold more than %d instances", StudioBackup.MAX_INSTANCES)
+				)
+				local draft = StudioBackup.copyScript(script, editor)
+				draft:SetAttribute("RojoDraftOf", (StudioBridge.pathOf(script)))
+				draft.Parent = drafts
+			end
+		end
+		if drafts then
+			table.insert(instances, drafts)
+			table.insert(described, { path = StudioBackup.DRAFTS_FOLDER, className = "Folder" })
+		end
+		return serializeChecked(instances)
+	end)
+	if drafts then
+		drafts:Destroy()
+	end
+	if not ok then
+		error(result, 0)
+	end
+	return result, described
+end
+
+--[[
+	Serializes a copy of each script in `scripts`, made with copyScript from
+	the source `readSource` reads (what an open editor shows), without the
+	scripts' children, for the backup `rojo studio verify --fix` takes of the
+	scripts it overwrites.
+]]
+function StudioBackup.serializeScripts(scripts, readSource)
+	assert(#scripts <= StudioBackup.MAX_INSTANCES, "too many scripts for one backup")
 	local copies = {}
 	local described = {}
 	local ok, result = pcall(function()
-		local count = 0
-		for _, entry in entries do
-			local instance = entry.instance
-			local root = instance
-			if entry.deep then
-				count += #instance:GetDescendants() + 1
-			else
-				root = instance:Clone()
-				assert(root ~= nil, instance:GetFullName() .. " cannot be copied because it is not Archivable")
-				table.insert(copies, root)
-				root:ClearAllChildren()
-				if readSource and root:IsA("LuaSourceContainer") then
-					local source = readSource(instance)
-					if source ~= nil then
-						(root :: any).Source = source
-					end
-				end
-				count += 1
+		for _, script in scripts do
+			local source = if readSource then readSource(script) else nil
+			if source == nil then
+				source = (script :: any).Source
 			end
-			assert(
-				count <= StudioBackup.MAX_INSTANCES,
-				string.format("the copy would have more than %d instances", StudioBackup.MAX_INSTANCES)
-			)
-			table.insert(roots, root)
-			table.insert(described, {
-				path = entry.path or (StudioBridge.pathOf(instance)),
-				className = instance.ClassName,
-			})
+			table.insert(copies, StudioBackup.copyScript(script, source))
+			table.insert(described, { path = (StudioBridge.pathOf(script)), className = script.ClassName })
 		end
-		local model = SerializationService:SerializeInstancesAsync(roots)
-		assert(
-			buffer.len(model) <= StudioBackup.MAX_MODEL_BYTES,
-			string.format("the copy is %.1f MiB, over the 5 MiB model limit", buffer.len(model) / (1024 * 1024))
-		)
-		return model
+		return serializeChecked(copies)
 	end)
 	for _, copy in copies do
 		copy:Destroy()

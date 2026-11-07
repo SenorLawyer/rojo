@@ -667,33 +667,54 @@ function ServeSession:getSourceHashes(verifyId, expiresAt, isActive)
 end
 
 --[=[
-	Exports the scripts with the given IDs as they are in Studio, without
-	their children, for the backup `rojo studio verify --fix` saves before it
-	overwrites them. Scripts that are no longer in the place are left out,
-	since the fix cannot change them either.
+	Exports the scripts with the given IDs as they are in Studio, each copied
+	without its children and with the text its open editor shows, for the
+	backup `rojo studio verify --fix` saves before it overwrites them. `ids`
+	in the result lists the scripts exported; the server only fixes those.
+	Scripts that are no longer in the place are left out and counted in
+	`missing`.
 ]=]
 function ServeSession:exportForBackup(ids)
 	assert(self.__status == Status.Connected, "Rojo is not syncing this place. Connect it first.")
 	assert(type(ids) == "table" and #ids <= StudioBackup.MAX_INSTANCES, "Back up at most 10,000 scripts at once")
-	local entries = {}
+	local scripts = {}
+	local exported = {}
 	local missing = 0
 	for _, id in ids do
 		local instance = self.__instanceMap.fromIds[id]
-		if instance and instance:IsDescendantOf(game) then
-			table.insert(entries, { instance = instance, deep = false })
+		if instance and instance:IsDescendantOf(game) and instance:IsA("LuaSourceContainer") then
+			table.insert(scripts, instance)
+			table.insert(exported, id)
 		else
 			missing += 1
 		end
 	end
-	local result = { instances = {}, missing = missing, placeId = game.PlaceId, placeName = game.Name }
-	if #entries == 0 then
+	local result = { instances = {}, ids = {}, missing = missing, placeId = game.PlaceId, placeName = game.Name }
+	if #scripts == 0 then
 		return result
 	end
-	local model, described = StudioBackup.serialize(entries, readSource)
+	local model, described = StudioBackup.serializeScripts(scripts, readSource)
 	result.instances = described
+	result.ids = exported
 	result.model = StudioBridge.encodeModel(model)
 	result.bytes = buffer.len(model)
 	return result
+end
+
+-- At most this many paths are named in a warning about instances that were
+-- not backed up.
+local MAX_WARNED_PATHS = 10
+
+local function listPaths(paths)
+	local shown = {}
+	for index = 1, math.min(#paths, MAX_WARNED_PATHS) do
+		table.insert(shown, paths[index])
+	end
+	local text = table.concat(shown, ", ")
+	if #paths > MAX_WARNED_PATHS then
+		text ..= string.format(" and %d more", #paths - MAX_WARNED_PATHS)
+	end
+	return text
 end
 
 --[=[
@@ -708,11 +729,17 @@ function ServeSession:__backUpBeforeCatchUp(patch, serverInfo)
 	if not Settings:get("autoBackupBeforeSync") then
 		return
 	end
-	local entries, skipped = StudioBackup.collect(patch, self.__instanceMap)
-	if skipped > 0 then
-		Log.debug("{} services or other instances Rojo is about to change cannot be backed up", skipped)
+	local roots, skipped = StudioBackup.collect(patch, self.__instanceMap)
+	if #skipped > 0 then
+		-- Services cannot be saved as models, so a sync that changes their
+		-- properties overwrites them with nothing to go back to.
+		Log.warn(
+			"Rojo cannot back up {} instances this sync changes, such as services, so their current properties are not saved: {}",
+			#skipped,
+			listPaths(skipped)
+		)
 	end
-	if #entries == 0 then
+	if #roots == 0 then
 		return
 	end
 	local ok, result = pcall(function()
@@ -720,7 +747,7 @@ function ServeSession:__backUpBeforeCatchUp(patch, serverInfo)
 			serverInfo.studioBridge ~= nil,
 			"the server was not started with --studio-token-file, so it cannot save backups"
 		)
-		local model, described = StudioBackup.serialize(entries, readSource)
+		local model, described = StudioBackup.serialize(roots, readSource)
 		return StudioBackup.send(self.__apiContext.__baseUrl, serverInfo.studioBridge, {
 			model = StudioBridge.encodeModel(model),
 			instances = described,
@@ -732,14 +759,19 @@ function ServeSession:__backUpBeforeCatchUp(patch, serverInfo)
 		local id = tostring(result.backup.id)
 		Log.info(
 			"Saved Studio's copies of {} instances this sync changes or removes as backup {}. `rojo studio backup restore {} --parent <instance> --allow-scripts` puts them back.",
-			#entries,
+			#roots,
 			id,
 			id
 		)
 	else
+		local paths = {}
+		for _, root in roots do
+			table.insert(paths, root.path)
+		end
 		Log.warn(
-			"No backup was taken of the {} instances this sync changes or removes in Studio: {}. Syncing goes ahead without one. Turn off 'Back Up Before Resync' in Rojo's settings to skip backups.",
-			#entries,
+			"No backup was taken of the {} instances this sync changes or removes in Studio ({}): {}. Syncing goes ahead without one. Turn off 'Back Up Before Resync' in Rojo's settings to skip backups.",
+			#roots,
+			listPaths(paths),
 			tostring(result)
 		)
 	end

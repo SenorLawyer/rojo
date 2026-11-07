@@ -1331,6 +1331,44 @@ return function()
 			expect(unpaired[1]).to.equal("patch")
 		end)
 
+		it("warns about changed services it cannot back up and syncs anyway", function()
+			Settings:set("autoBackupBeforeSync", true)
+			local Log = require(script.Parent.Parent.Packages.Log)
+			local nativeWarn = Log.warn
+			local warnings = {}
+			Log.warn = function(template, ...)
+				table.insert(warnings, { template = template, args = { ... } })
+			end
+			local calls = 0
+			StudioBridge.requestAsync = function()
+				calls += 1
+				error("no request expected")
+			end
+			local patch = PatchSet.newEmpty()
+			table.insert(patch.updated, { id = "LIGHTING", changedProperties = { Brightness = { Float32 = 1 } } })
+			session.__instanceMap.fromIds.LIGHTING = game:GetService("Lighting")
+			local applied = false
+			session.__reconciler = {
+				hydrate = function() end,
+				diff = function()
+					return true, patch
+				end,
+			}
+			session.__applyPatch = function()
+				applied = true
+			end
+			local pending = session:__initialSync({ rootInstanceId = "ROOT", studioBridge = pairing })
+			readResolve({ messageCursor = 0, instances = {} })
+			pending:await()
+			Log.warn = nativeWarn
+			session.__instanceMap.fromIds.LIGHTING = nil
+			expect(applied).to.equal(true)
+			expect(calls).to.equal(0)
+			expect(#warnings).to.equal(1)
+			expect(warnings[1].template:find("cannot back up", 1, true)).to.be.ok()
+			expect(warnings[1].args[2]).to.equal("game/Lighting")
+		end)
+
 		it("takes no backup when it is turned off", function()
 			Settings:set("autoBackupBeforeSync", false)
 			local removed = Instance.new("Folder")
@@ -1354,12 +1392,15 @@ return function()
 			session.__status = ServeSession.Status.Connected
 			local exported = session:exportForBackup({ "FIXED", "GONE" })
 			expect(exported.missing).to.equal(1)
+			expect(#exported.ids).to.equal(1)
+			expect(exported.ids[1]).to.equal("FIXED")
 			expect(#exported.instances).to.equal(1)
 			expect(exported.instances[1].path).to.equal("game/ReplicatedStorage/__RojoSyncBackupSpec/Fixed")
 			expect(type(exported.model)).to.equal("string")
 			expect(exported.bytes > 0).to.equal(true)
 			local none = session:exportForBackup({ "GONE" })
 			expect(none.model).to.equal(nil)
+			expect(#none.ids).to.equal(0)
 			expect(#none.instances).to.equal(0)
 		end)
 	end)
