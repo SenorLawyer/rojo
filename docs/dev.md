@@ -73,18 +73,40 @@ says so instead of printing the command.
 ## Commands that find it without flags
 
 `rojo studio`, `rojo test` and `rojo mcp` take `--address` and `--token-file`
-as before. When either is left out, they use the `dev.json` of the worktree
-they run in (`rojo mcp`: the worktree of its `--project`, looked up on every
-tool call, so a restarted `rojo dev` on another port is found), then
-`http://127.0.0.1:34872` and the shared `studio-token` if it exists. Outside
-Git, `dev.json` is found from the project folder or any folder below it.
+as before. When either is given, nothing changes: the other keeps its old
+default (`http://127.0.0.1:34872`, or no token). When both are left out, they
+use the `dev.json` of the worktree they run in (`rojo mcp`: the worktree of
+its `--project`, looked up on every tool call, so a restarted `rojo dev` on
+another port is found), then `http://127.0.0.1:34872` and the shared
+`studio-token` if it exists. Outside Git, `dev.json` is found from the
+project folder or any folder below it.
+
+A record is only used once it is confirmed: the process it names must still
+run, and the server on its address must report, over the token-authenticated
+`/api/studio/sessions` route, the same serve session ID and canonical project
+file that `rojo dev` recorded. The session ID is random for every start, so a
+server that took the port later, even another worktree's `rojo dev` with the
+shared token, does not match. A record that fails is ignored with a warning
+on stderr, and the command uses the defaults.
 
 `dev.json` is removed when `rojo dev` stops on Ctrl+C, Ctrl+Break, closing the
 console window, SIGTERM or SIGHUP. A `rojo dev` that is killed leaves it
-behind, pointing at a port nothing listens on, until the next `rojo dev` in
-that worktree replaces it; commands then fail to connect as they would without
-it. Two `rojo dev` in one worktree share one `dev.json`, and the last one
-started wins.
+behind until the next `rojo dev` in that worktree replaces it, and the check
+above ignores it meanwhile. Two `rojo dev` in one worktree share one
+`dev.json`, and the last one started wins.
+
+## Ports and tokens
+
+Before taking a port, `rojo dev` checks that nothing holds it on the listen
+address, on 127.0.0.1 or ::1, or on either wildcard address, since the plugin
+connects to `localhost`, which can resolve to either. Several worktrees can
+start `rojo dev` for the first time at once: the token is written whole to a
+private temporary file and hard-linked into place, which never replaces an
+existing token, so they all end up with the same one. A token file that is
+not 32-256 letters, digits or hyphens is an error.
+
+A sourcemap write that fails, for example because an editor holds the file,
+is retried every second until it succeeds.
 
 ## Stopping
 

@@ -177,14 +177,78 @@ fn dev_serves_keeps_the_sourcemap_current_and_is_found_by_rojo_studio() {
         "rojo studio sessions failed: {}",
         String::from_utf8_lossy(&sessions.stderr)
     );
+    assert!(
+        !String::from_utf8_lossy(&sessions.stderr).contains("Ignoring"),
+        "the live record was rejected: {}",
+        String::from_utf8_lossy(&sessions.stderr)
+    );
     let sessions: serde_json::Value = serde_json::from_slice(&sessions.stdout).unwrap();
     assert!(sessions["sessions"].is_array(), "{sessions}");
+    assert!(
+        sessions["identity"]["workspacePath"]
+            .as_str()
+            .is_some_and(|path| path.ends_with("project")),
+        "{sessions}"
+    );
+
+    let record: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&dev_state).unwrap()).unwrap();
 
     stop(&mut dev, &output, &dev_state);
     assert!(
         client.get(&url).send().is_err(),
         "the server still answers after rojo dev stopped"
     );
+
+    // A record left by a rojo dev that died, whose port another server with
+    // the shared token has since taken (here a plain rojo serve of another
+    // project), must not send flagless commands to that server. The pid is
+    // set to a live process so the check has to ask the server.
+    let mut stale = record;
+    stale["pid"] = serde_json::json!(std::process::id());
+    fs::write(&dev_state, stale.to_string()).unwrap();
+    let other = dir.path().join("other");
+    fs::create_dir_all(other.join("src")).unwrap();
+    fs::write(
+        other.join("default.project.json"),
+        r#"{"name":"Impostor","tree":{"$path":"src"}}"#,
+    )
+    .unwrap();
+    let mut impostor = Dev(Command::new(env!("CARGO_BIN_EXE_rojo"))
+        .arg("serve")
+        .arg(&other)
+        .args(["--port", &port.to_string(), "--studio-token-file"])
+        .arg(&token)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap());
+    wait_for("the other server", &mut impostor, &output, || {
+        client
+            .get(&url)
+            .send()
+            .is_ok_and(|response| response.status().is_success())
+    });
+    let mut studio = Command::new(env!("CARGO_BIN_EXE_rojo"));
+    studio
+        .args(["studio", "--json", "sessions"])
+        .current_dir(&project)
+        .stdin(Stdio::null());
+    isolate(&mut studio, &state);
+    let result = studio.output().unwrap();
+    let stdout = String::from_utf8_lossy(&result.stdout);
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        stderr.contains("Ignoring the rojo dev recorded")
+            && stderr.contains("not the one rojo dev recorded"),
+        "{stderr}"
+    );
+    // The command falls back to the default address, where nothing or some
+    // unrelated server answers, but never the other project's server.
+    if let Ok(answer) = serde_json::from_str::<serde_json::Value>(&stdout) {
+        let workspace = answer["identity"]["workspacePath"].as_str().unwrap_or("");
+        assert!(!workspace.ends_with("other"), "{stdout}");
+    }
 }
 
 /// Unix gets the Ctrl+C path: SIGINT must stop the server, remove the state

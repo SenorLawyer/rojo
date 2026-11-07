@@ -11,9 +11,10 @@ use std::{
     mem,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener},
     path::{Path, PathBuf},
+    sync::atomic::{AtomicBool, Ordering},
     sync::{Arc, Mutex},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::Context;
@@ -151,20 +152,26 @@ impl DevCommand {
             let writer = Arc::new(SourcemapWriter::new(
                 session.root_dir().join(SOURCEMAP_FILE),
             ));
+            // Take the cursor before the first write, so a change made while
+            // it is generated is still seen by the watcher.
+            let cursor = session.message_queue().cursor();
             if let Err(err) = writer.update(&session) {
                 log::warn!("Could not write {}: {err:#}", writer.path.display());
             }
-            spawn_sourcemap_watcher(Arc::clone(&session), Arc::clone(&writer));
+            spawn_sourcemap_watcher(Arc::clone(&session), Arc::clone(&writer), cursor);
+            spawn_sourcemap_retry(Arc::clone(&session), Arc::clone(&writer));
             Some(writer)
         };
 
         let studio_address = studio_address(ip, port);
         let state_path = checkout.worktree_state.join(STATE_FILE);
+        let project_file = &session.root_project().file_location;
         let state = studio_address.as_ref().map(|address| DevState {
             pid: std::process::id(),
             address: address.clone(),
             token_file: token_file.clone(),
-            project: session.root_project().file_location.clone(),
+            project: dunce::canonicalize(project_file).unwrap_or_else(|_| project_file.clone()),
+            server_session: session.session_id().to_string(),
         });
 
         let mut place_ids: Option<Vec<u64>> = session
@@ -305,7 +312,12 @@ struct DevState {
     /// The loopback URL of the server, as `rojo studio --address` takes it.
     address: String,
     token_file: PathBuf,
+    /// The canonical project file, as the bridge reports it.
     project: PathBuf,
+    /// The serve session's random ID, which the bridge reports only to
+    /// callers holding the token. A server that later takes the port, even
+    /// one serving the same project with the shared token, reports another.
+    server_session: String,
 }
 
 impl DevState {
@@ -329,18 +341,26 @@ impl DevState {
     }
 }
 
-/// The Studio bridge address and token a command should use: the flags when
-/// given, then what a `rojo dev` running in the worktree around `start`
-/// recorded, then the default address and the token `rojo dev` creates.
-/// Nothing here fails: when discovery does not work, the command falls back
-/// to the defaults and reports a connection or token error as before.
+/// The Studio bridge address and token a command should use.
+///
+/// When either flag is given, the command behaves as it did before `rojo
+/// dev` existed: the other one keeps its old default (the default address,
+/// or no token), so an explicit invocation never goes somewhere new. With
+/// neither, a `rojo dev` running in the worktree around `start` is used once
+/// it is confirmed to be live (see [`verify`]), then the default address and
+/// the token `rojo dev` creates. Nothing here fails: when discovery does not
+/// work, the command falls back to the defaults and reports a connection or
+/// token error as before.
 pub(super) fn bridge_target(
     address: Option<&str>,
     token_file: Option<&Path>,
     start: &Path,
 ) -> (String, Option<PathBuf>) {
-    if let (Some(address), Some(token_file)) = (address, token_file) {
-        return (address.to_owned(), Some(token_file.to_owned()));
+    if address.is_some() || token_file.is_some() {
+        return (
+            address.unwrap_or(DEFAULT_STUDIO_ADDRESS).to_owned(),
+            token_file.map(Path::to_owned),
+        );
     }
     // `rojo mcp --project` may name the project file rather than its folder.
     let start = match start.parent() {
@@ -348,34 +368,121 @@ pub(super) fn bridge_target(
         _ => start,
     };
     let checkout = Checkout::discover(start).ok();
-    let running = checkout
+    if let Some((path, state)) = checkout
         .as_ref()
-        .and_then(|checkout| find_running(checkout, start));
-    let address = address
-        .map(str::to_owned)
-        .or_else(|| running.as_ref().map(|state| state.address.clone()))
-        .unwrap_or_else(|| DEFAULT_STUDIO_ADDRESS.to_owned());
-    let token_file = token_file
-        .map(Path::to_owned)
-        .or_else(|| running.map(|state| state.token_file))
-        .or_else(|| {
-            let default = checkout?.shared_state.join(TOKEN_FILE);
-            default.is_file().then_some(default)
-        });
-    (address, token_file)
+        .and_then(|checkout| find_running(checkout, start))
+    {
+        match verify(&state) {
+            Ok(()) => return (state.address, Some(state.token_file)),
+            Err(reason) => log::warn!(
+                "Ignoring the rojo dev recorded in {}: {reason}. Using {DEFAULT_STUDIO_ADDRESS} instead.",
+                path.display()
+            ),
+        }
+    }
+    let token_file = checkout.and_then(|checkout| {
+        let default = checkout.shared_state.join(TOKEN_FILE);
+        default.is_file().then_some(default)
+    });
+    (DEFAULT_STUDIO_ADDRESS.to_owned(), token_file)
 }
 
-/// The state a running `rojo dev` recorded for this worktree. Outside Git it
-/// is keyed by the project folder, so the folders above `start` are tried
+/// The state a `rojo dev` recorded for this worktree, and where. Outside Git
+/// it is keyed by the project folder, so the folders above `start` are tried
 /// too, for commands run in a subfolder of the project.
-fn find_running(checkout: &Checkout, start: &Path) -> Option<DevState> {
+fn find_running(checkout: &Checkout, start: &Path) -> Option<(PathBuf, DevState)> {
+    let read = |path: PathBuf| DevState::read(&path).map(|state| (path, state));
     if checkout.in_git {
-        return DevState::read(&checkout.worktree_state.join(STATE_FILE));
+        return read(checkout.worktree_state.join(STATE_FILE));
     }
     let start = dunce::canonicalize(start).unwrap_or_else(|_| start.to_owned());
     start
         .ancestors()
-        .find_map(|dir| DevState::read(&super::project_state_dir(dir).ok()?.join(STATE_FILE)))
+        .find_map(|dir| read(super::project_state_dir(dir).ok()?.join(STATE_FILE)))
+}
+
+/// Confirms that `state` still describes a live server: its process runs,
+/// and the server on its address reports, over the token-authenticated
+/// sessions route, the same serve session and project. A `rojo dev` that was
+/// killed leaves its record behind, and another server, perhaps another
+/// worktree's with the shared token, may since have taken the port.
+fn verify(state: &DevState) -> Result<(), String> {
+    // Skips the request for a dead process, which matters on Windows,
+    // where a refused loopback connection takes about two seconds.
+    if process_alive(state.pid) == Some(false) {
+        return Err(format!("its process {} is no longer running", state.pid));
+    }
+    let base = studio::local_address(&state.address).map_err(|err| format!("{err:#}"))?;
+    let token =
+        crate::web::studio::read_token_file(&state.token_file).map_err(|err| format!("{err:#}"))?;
+    let client = reqwest::blocking::Client::builder()
+        .connect_timeout(Duration::from_secs(3))
+        .timeout(Duration::from_secs(5))
+        .no_proxy()
+        .build()
+        .map_err(|err| err.to_string())?;
+    let url = base
+        .join("api/studio/sessions")
+        .map_err(|err| err.to_string())?;
+    let response = client
+        .get(url)
+        .header("x-rojo-studio-token", token)
+        .send()
+        .map_err(|_| format!("nothing answered on {}", state.address))?;
+    let identity: serde_json::Value = response
+        .error_for_status()
+        .and_then(|response| response.json())
+        .map_err(|_| format!("the server on {} is not its Studio bridge", state.address))?;
+    let identity = &identity["identity"];
+    let same_session = identity["serverSession"].as_str() == Some(state.server_session.as_str());
+    let same_project = identity["projectPath"]
+        .as_str()
+        .is_some_and(|project| Path::new(project) == state.project);
+    if same_session && same_project {
+        Ok(())
+    } else {
+        Err(format!(
+            "the server on {} is not the one rojo dev recorded",
+            state.address
+        ))
+    }
+}
+
+/// Whether process `pid` runs, or None when that cannot be told.
+fn process_alive(pid: u32) -> Option<bool> {
+    if pid == std::process::id() {
+        return Some(true);
+    }
+    #[cfg(target_os = "linux")]
+    {
+        Some(Path::new(&format!("/proc/{pid}")).exists())
+    }
+    #[cfg(all(unix, not(target_os = "linux")))]
+    {
+        // Another user's process fails too, and is not this user's rojo dev.
+        std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .ok()
+            .map(|status| status.success())
+    }
+    #[cfg(windows)]
+    {
+        let output = std::process::Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
+            .stdin(std::process::Stdio::null())
+            .output()
+            .ok()?;
+        output
+            .status
+            .success()
+            .then(|| String::from_utf8_lossy(&output.stdout).contains(&format!("\"{pid}\"")))
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        None
+    }
 }
 
 /// Why the server listens on the port it does.
@@ -442,16 +549,38 @@ fn pick_port(
         })
 }
 
-/// Whether nothing listens on `port` for `ip`. The wildcard address is tried
-/// too: on Windows, binding 127.0.0.1 can succeed while another server holds
-/// 0.0.0.0 on the same port, and the plugin would then reach that one.
+/// Whether nothing listens on `port` for `ip`, nor on the loopback and
+/// wildcard addresses of either IP version. The plugin connects to
+/// `localhost`, which may resolve to 127.0.0.1 or ::1, so a server on the
+/// other version's loopback would make it reach that server instead. The
+/// wildcards are tried because on Windows, binding 127.0.0.1 can succeed
+/// while another server holds 0.0.0.0 on the same port.
 fn port_is_free(ip: IpAddr, port: u16) -> bool {
-    let wildcard: IpAddr = match ip {
-        IpAddr::V4(_) => Ipv4Addr::UNSPECIFIED.into(),
-        IpAddr::V6(_) => Ipv6Addr::UNSPECIFIED.into(),
-    };
-    TcpListener::bind(SocketAddr::new(ip, port)).is_ok()
-        && (ip == wildcard || TcpListener::bind(SocketAddr::new(wildcard, port)).is_ok())
+    // The listen address must be bindable. Each listener is dropped before
+    // the next bind, so this process never conflicts with itself.
+    if TcpListener::bind(SocketAddr::new(ip, port)).is_err() {
+        return false;
+    }
+    let others: [IpAddr; 4] = [
+        Ipv4Addr::LOCALHOST.into(),
+        Ipv4Addr::UNSPECIFIED.into(),
+        Ipv6Addr::LOCALHOST.into(),
+        Ipv6Addr::UNSPECIFIED.into(),
+    ];
+    others
+        .into_iter()
+        .filter(|other| *other != ip)
+        .all(
+            |other| match TcpListener::bind(SocketAddr::new(other, port)) {
+                Ok(_) => true,
+                // In use, or reserved (Windows reports an excluded port range
+                // as access denied).
+                Err(err) => !matches!(
+                    err.kind(),
+                    std::io::ErrorKind::AddrInUse | std::io::ErrorKind::PermissionDenied
+                ),
+            },
+        )
 }
 
 /// The URL `rojo studio` reaches the server on, which must be loopback. A
@@ -497,16 +626,74 @@ fn plugin_summary(checks: &[doctor::Check]) -> String {
     summary
 }
 
+/// What the Studio bridge accepts as a token.
+fn valid_token(token: &str) -> bool {
+    (32..=256).contains(&token.len())
+        && token
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+}
+
+/// Makes sure `path` holds a valid token, creating one when it does not
+/// exist. Several worktrees may start `rojo dev` at once for the first time,
+/// so the token is written whole, with its permissions set first, to a file
+/// of this process's own, then hard-linked into place: a link appears
+/// complete and never replaces an existing file, so every process ends up
+/// with the same token. A process that loses the race reads the winner's,
+/// waiting briefly in case it was made by something that writes in place.
 fn ensure_token(path: &Path) -> anyhow::Result<()> {
-    if path.is_file() {
+    let read_valid = || {
+        fs::read_to_string(path)
+            .ok()
+            .is_some_and(|token| valid_token(token.trim()))
+    };
+    if read_valid() {
         return Ok(());
     }
-    if let Some(parent) = path.parent() {
+    if !path.exists() {
+        let parent = path.parent().context("Token path has no folder")?;
         fs::create_dir_all(parent)
             .with_context(|| format!("Could not create {}", parent.display()))?;
+        let name = path
+            .file_name()
+            .context("Token path has no file name")?
+            .to_string_lossy();
+        let temporary = path.with_file_name(format!(
+            ".{name}.{}.{}.tmp",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        studio::create_token(&temporary).with_context(|| {
+            format!("Could not create the Studio token {}", temporary.display())
+        })?;
+        let linked = fs::hard_link(&temporary, path);
+        let _ = fs::remove_file(&temporary);
+        match linked {
+            Ok(()) => return Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
+            // A file system without hard links: create the file in place,
+            // which still never overwrites another process's token.
+            Err(_) => {
+                if let Err(err) = studio::create_token(path) {
+                    if !path.exists() {
+                        return Err(err).with_context(|| {
+                            format!("Could not create the Studio token {}", path.display())
+                        });
+                    }
+                }
+            }
+        }
     }
-    studio::create_token(path)
-        .with_context(|| format!("Could not create the Studio token {}", path.display()))
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !read_valid() {
+        anyhow::ensure!(
+            Instant::now() < deadline,
+            "{} is not a valid Studio token (32-256 letters, digits or hyphens). Delete it to have rojo dev create a new one, or pass --studio-token-file.",
+            path.display()
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+    Ok(())
 }
 
 struct StatusBlock {
@@ -598,6 +785,9 @@ struct SourcemapWriter {
     /// The bytes last written or found on disk. Holding the lock also marks a
     /// write in progress.
     last: Mutex<Option<Vec<u8>>>,
+    /// Set when the last attempt failed, so the retry thread tries again
+    /// instead of waiting for the next change that affects the sourcemap.
+    dirty: AtomicBool,
 }
 
 impl SourcemapWriter {
@@ -605,7 +795,33 @@ impl SourcemapWriter {
         SourcemapWriter {
             path,
             last: Mutex::new(None),
+            dirty: AtomicBool::new(false),
         }
+    }
+
+    fn is_dirty(&self) -> bool {
+        self.dirty.load(Ordering::SeqCst)
+    }
+
+    /// When the last attempt failed, regenerates with `generate` and writes
+    /// again. Returns None when nothing was pending.
+    fn retry_if_dirty(
+        &self,
+        generate: impl FnOnce() -> anyhow::Result<Vec<u8>>,
+    ) -> Option<anyhow::Result<bool>> {
+        if !self.is_dirty() {
+            return None;
+        }
+        Some(self.generate_and_write(generate))
+    }
+
+    fn generate_and_write(
+        &self,
+        generate: impl FnOnce() -> anyhow::Result<Vec<u8>>,
+    ) -> anyhow::Result<bool> {
+        let result = generate().and_then(|bytes| self.write_if_changed(bytes));
+        self.dirty.store(result.is_err(), Ordering::SeqCst);
+        result
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Option<Vec<u8>>> {
@@ -617,9 +833,7 @@ impl SourcemapWriter {
     /// Regenerates the sourcemap and writes it when it differs from the last
     /// one. Returns whether the file was written.
     fn update(&self, session: &ServeSession) -> anyhow::Result<bool> {
-        let mut bytes = Vec::new();
-        sourcemap::write_sourcemap_json(session, &mut bytes, false, &HashMap::new())?;
-        self.write_if_changed(bytes)
+        self.generate_and_write(|| generate_sourcemap(session))
     }
 
     fn write_if_changed(&self, bytes: Vec<u8>) -> anyhow::Result<bool> {
@@ -638,11 +852,46 @@ impl SourcemapWriter {
     }
 }
 
-fn spawn_sourcemap_watcher(session: Arc<ServeSession>, writer: Arc<SourcemapWriter>) {
+fn generate_sourcemap(session: &ServeSession) -> anyhow::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    sourcemap::write_sourcemap_json(session, &mut bytes, false, &HashMap::new())?;
+    Ok(bytes)
+}
+
+/// How often a failed sourcemap write is tried again.
+const SOURCEMAP_RETRY: Duration = Duration::from_secs(1);
+
+/// Retries a failed write every [`SOURCEMAP_RETRY`] until one succeeds, for
+/// example once an editor that held the file open lets go. Failures after
+/// the first are only logged at debug level, since the watcher already
+/// warned.
+fn spawn_sourcemap_retry(session: Arc<ServeSession>, writer: Arc<SourcemapWriter>) {
+    thread::Builder::new()
+        .name("rojo dev sourcemap retry".to_owned())
+        .spawn(move || loop {
+            thread::sleep(SOURCEMAP_RETRY);
+            match writer.retry_if_dirty(|| generate_sourcemap(&session)) {
+                Some(Ok(_)) => log::info!("Updated {} after retrying", writer.path.display()),
+                Some(Err(err)) => {
+                    log::debug!("Still cannot update {}: {err:#}", writer.path.display())
+                }
+                None => {}
+            }
+        })
+        .expect("Could not start the sourcemap retry thread");
+}
+
+/// Rewrites the sourcemap after changes that affect it. `cursor` must be
+/// taken before the initial sourcemap is generated, so nothing in between
+/// is missed.
+fn spawn_sourcemap_watcher(
+    session: Arc<ServeSession>,
+    writer: Arc<SourcemapWriter>,
+    mut cursor: u32,
+) {
     thread::Builder::new()
         .name("rojo dev sourcemap".to_owned())
         .spawn(move || {
-            let mut cursor = session.message_queue().cursor();
             loop {
                 let affected = match session.message_queue().subscribe(cursor) {
                     Ok(receiver) => match futures::executor::block_on(receiver) {
@@ -963,6 +1212,7 @@ mod test {
             address: "http://127.0.0.1:34900".to_owned(),
             token_file: PathBuf::from("token"),
             project: PathBuf::from("default.project.json"),
+            server_session: "session".to_owned(),
         };
         state.write(&path).unwrap();
         assert_eq!(DevState::read(&path), Some(state.clone()));
@@ -983,5 +1233,218 @@ mod test {
         );
         assert_eq!(address, "http://127.0.0.1:1");
         assert_eq!(token, Some(PathBuf::from("token")));
+    }
+
+    #[test]
+    fn one_explicit_flag_keeps_the_old_default_for_the_other() {
+        // The current directory is this repository's worktree, where a
+        // `rojo dev` record could exist; neither call may consult it.
+        let here = std::env::current_dir().unwrap();
+        let (address, token) = bridge_target(None, Some(Path::new("token")), &here);
+        assert_eq!(address, DEFAULT_STUDIO_ADDRESS);
+        assert_eq!(token, Some(PathBuf::from("token")));
+        let (address, token) = bridge_target(Some("http://127.0.0.1:1"), None, &here);
+        assert_eq!(address, "http://127.0.0.1:1");
+        assert_eq!(token, None);
+    }
+
+    #[test]
+    fn a_loopback_listener_of_the_other_ip_version_makes_the_port_busy() {
+        let Ok(listener) = TcpListener::bind("[::1]:0") else {
+            // No IPv6 on this machine, so `localhost` cannot be ambiguous.
+            return;
+        };
+        let port = listener.local_addr().unwrap().port();
+        assert!(!port_is_free(Ipv4Addr::LOCALHOST.into(), port));
+        drop(listener);
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        assert!(!port_is_free(Ipv6Addr::LOCALHOST.into(), port));
+    }
+
+    /// Answers one HTTP request with `body` as JSON, and returns the
+    /// address to reach it and the request it got.
+    fn answer_once(body: serde_json::Value) -> (String, thread::JoinHandle<String>) {
+        use std::io::{BufRead, BufReader};
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = format!("http://{}", listener.local_addr().unwrap());
+        let handle = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut request = String::new();
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap() == 0 || line == "\r\n" {
+                    break;
+                }
+                request.push_str(&line);
+            }
+            let body = body.to_string();
+            let mut stream = stream;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+            request
+        });
+        (address, handle)
+    }
+
+    fn recorded(dir: &Path, address: String, pid: u32) -> DevState {
+        let token_file = dir.join(TOKEN_FILE);
+        fs::write(&token_file, "0123456789abcdef0123456789abcdef").unwrap();
+        DevState {
+            pid,
+            address,
+            token_file,
+            project: dir.join("default.project.json"),
+            server_session: "recorded-session".to_owned(),
+        }
+    }
+
+    #[test]
+    fn a_record_whose_process_died_is_ignored_without_asking_the_port() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut child = std::process::Command::new("git")
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        // Nothing listens here; asking would fail differently.
+        let state = recorded(dir.path(), "http://127.0.0.1:9".to_owned(), pid);
+        let reason = verify(&state).unwrap_err();
+        assert!(reason.contains("no longer running"), "{reason}");
+    }
+
+    #[test]
+    fn another_server_on_the_recorded_port_is_not_trusted() {
+        let dir = tempfile::tempdir().unwrap();
+        // Another worktree's rojo dev, serving with the shared token on the
+        // port the dead one used.
+        let (address, request) = answer_once(serde_json::json!({
+            "identity": {
+                "serverSession": "another-session",
+                "projectPath": dir.path().join("default.project.json"),
+            },
+            "sessions": [],
+        }));
+        let state = recorded(dir.path(), address, std::process::id());
+        let reason = verify(&state).unwrap_err();
+        assert!(reason.contains("not the one rojo dev recorded"), "{reason}");
+        let request = request.join().unwrap().to_ascii_lowercase();
+        assert!(request.starts_with("get /api/studio/sessions"), "{request}");
+        assert!(request.contains("x-rojo-studio-token: 0123456789abcdef"));
+    }
+
+    #[test]
+    fn another_project_with_a_matching_session_is_not_trusted() {
+        let dir = tempfile::tempdir().unwrap();
+        let (address, _) = answer_once(serde_json::json!({
+            "identity": {
+                "serverSession": "recorded-session",
+                "projectPath": dir.path().join("other.project.json"),
+            },
+        }));
+        let state = recorded(dir.path(), address, std::process::id());
+        assert!(verify(&state).is_err());
+    }
+
+    #[test]
+    fn the_recorded_server_is_trusted() {
+        let dir = tempfile::tempdir().unwrap();
+        let (address, _) = answer_once(serde_json::json!({
+            "identity": {
+                "serverSession": "recorded-session",
+                "projectPath": dir.path().join("default.project.json"),
+            },
+        }));
+        let state = recorded(dir.path(), address, std::process::id());
+        assert_eq!(verify(&state), Ok(()));
+    }
+
+    #[test]
+    fn concurrent_first_launches_agree_on_one_complete_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = Arc::new(dir.path().join("state").join(TOKEN_FILE));
+        let barrier = Arc::new(std::sync::Barrier::new(8));
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let path = Arc::clone(&path);
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    barrier.wait();
+                    ensure_token(&path).unwrap();
+                    fs::read_to_string(&*path).unwrap()
+                })
+            })
+            .collect();
+        let tokens: HashSet<_> = threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect();
+        assert_eq!(tokens.len(), 1, "{tokens:?}");
+        assert!(valid_token(tokens.iter().next().unwrap().trim()));
+        // Only the token is left, no temporary files.
+        assert_eq!(fs::read_dir(path.parent().unwrap()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn an_existing_token_is_kept_and_an_invalid_one_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(TOKEN_FILE);
+        fs::write(&path, "0123456789abcdef0123456789abcdef\n").unwrap();
+        ensure_token(&path).unwrap();
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "0123456789abcdef0123456789abcdef\n"
+        );
+        fs::write(&path, "short").unwrap();
+        let error = ensure_token(&path).unwrap_err();
+        assert!(
+            error.to_string().contains("not a valid Studio token"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_failed_sourcemap_write_is_retried_until_it_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        // The folder does not exist yet, so writing fails.
+        let folder = dir.path().join("later");
+        let writer = SourcemapWriter::new(folder.join(SOURCEMAP_FILE));
+        assert!(writer.retry_if_dirty(|| unreachable!()).is_none());
+
+        assert!(writer
+            .generate_and_write(|| Ok(b"{\"a\":1}".to_vec()))
+            .is_err());
+        assert!(writer.is_dirty());
+        // Still failing: stays dirty.
+        assert!(writer
+            .retry_if_dirty(|| Ok(b"{\"a\":1}".to_vec()))
+            .unwrap()
+            .is_err());
+        assert!(writer.is_dirty());
+
+        fs::create_dir(&folder).unwrap();
+        let retried = writer.retry_if_dirty(|| Ok(b"{\"a\":2}".to_vec()));
+        assert!(retried.unwrap().unwrap());
+        assert!(!writer.is_dirty());
+        assert_eq!(fs::read(folder.join(SOURCEMAP_FILE)).unwrap(), b"{\"a\":2}");
+        assert!(writer.retry_if_dirty(|| unreachable!()).is_none());
+    }
+
+    #[test]
+    fn a_failed_generation_also_marks_the_sourcemap_for_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let writer = SourcemapWriter::new(dir.path().join(SOURCEMAP_FILE));
+        assert!(writer
+            .generate_and_write(|| anyhow::bail!("tree is busy"))
+            .is_err());
+        assert!(writer.is_dirty());
     }
 }
