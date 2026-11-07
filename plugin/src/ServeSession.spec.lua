@@ -1322,6 +1322,21 @@ return function()
 			expect(#known.ids).to.equal(1)
 		end)
 
+		it("leaves out a script whose text is not valid UTF-8", function()
+			local text = "return '\xFF'"
+			trackedModule("BYTES", text)
+			session:__rememberVerified("VERIFY", { BYTES = text })
+			local nativeRead = ServeSession.readEditorText
+			ServeSession.readEditorText = function()
+				return text
+			end
+			local exported = session:exportForBackup({ "BYTES" }, { BYTES = (hashSource(text)) }, "VERIFY")
+			ServeSession.readEditorText = nativeRead
+			expect(exported.missing).to.equal(1)
+			expect(#exported.ids).to.equal(0)
+			expect(exported.model).to.equal(nil)
+		end)
+
 		it("leaves out a script whose source changed since verify hashed it", function()
 			trackedModule("EDITED", "return 'edited after the check'")
 			session:__rememberVerified("VERIFY", { EDITED = "return 'checked'" })

@@ -714,8 +714,11 @@ function ServeSession:exportForBackup(ids, hashes, verifyId)
 		local source = if instance and instance:IsA("LuaSourceContainer")
 			then ServeSession.readEditorText(instance)
 			else nil
+		-- A model holds text as UTF-8, so other bytes would not come back
+		-- as they are once restored.
 		if
 			source ~= nil
+			and utf8.len(source) ~= nil
 			and instance:IsDescendantOf(game)
 			and hashes[id] ~= nil
 			and (hashSource(source)) == hashes[id]

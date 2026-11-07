@@ -67,6 +67,13 @@ pub const KEEP_AUTOMATIC: usize = 20;
 /// any such operation runs (a fix stops starting batches after 20 seconds).
 pub const AUTOMATIC_GRACE_MILLIS: u64 = 60 * 60 * 1000;
 
+/// The start of the names of temporary files an automatic save writes.
+const AUTOMATIC_TEMP_PREFIX: &str = ".tmp-auto-";
+/// A temporary file of an automatic save older than this was left by a save
+/// that stopped, since saves hold the store lock for far less, and pruning
+/// removes it.
+const STALE_TEMP_MILLIS: u64 = 10 * 60 * 1000;
+
 /// The most automatic backups kept, however young, so a burst of them (many
 /// fixes within the grace period) cannot fill the disk. The oldest go
 /// first.
@@ -263,6 +270,19 @@ impl Store {
         self.save_locked(record, model)
     }
 
+    /// A temporary file in the store for writing one of `record`'s files.
+    /// An automatic backup's are named so that pruning can remove those an
+    /// interrupted save left behind; a manual backup's are not.
+    fn temp_file(&self, record: &Record) -> std::io::Result<tempfile::NamedTempFile> {
+        if record.automatic {
+            tempfile::Builder::new()
+                .prefix(&format!("{AUTOMATIC_TEMP_PREFIX}{}-", record.id))
+                .tempfile_in(&self.dir)
+        } else {
+            tempfile::NamedTempFile::new_in(&self.dir)
+        }
+    }
+
     fn save_locked(&self, mut record: Record, model: &[u8]) -> anyhow::Result<Record> {
         // `list` skips records over this size, so a larger one would vanish.
         anyhow::ensure!(
@@ -313,7 +333,7 @@ impl Store {
                 .context("Could not mark the backup as automatic")?;
         }
         let saved_model = (|| -> anyhow::Result<()> {
-            let mut model_file = tempfile::NamedTempFile::new_in(&self.dir)?;
+            let mut model_file = self.temp_file(&record)?;
             std::io::Write::write_all(&mut model_file, model)?;
             model_file
                 .persist_noclobber(self.model_path(&id))
@@ -327,7 +347,7 @@ impl Store {
         // The record is written last, so a backup that `list` shows always
         // has its model.
         let written = (|| -> anyhow::Result<()> {
-            let mut record_file = tempfile::NamedTempFile::new_in(&self.dir)?;
+            let mut record_file = self.temp_file(&record)?;
             std::io::Write::write_all(
                 &mut record_file,
                 serde_json::to_string_pretty(&record)?.as_bytes(),
@@ -452,43 +472,37 @@ impl Store {
     /// bounded, including in operations that fail or are cancelled part way.
     /// A failure to prune is only logged, because the backup is saved.
     pub fn save_automatic(&self, record: Record, model: &[u8]) -> anyhow::Result<Record> {
-        self.save_automatic_with(record, model, None, &[], PruneLimits::DEFAULT, now_millis())
+        self.save_automatic_with(record, model, None, PruneLimits::DEFAULT, now_millis())
     }
 
     /// [`Self::save_automatic`], and pins the backup until `until` (Unix
     /// milliseconds), so no prune removes it while the operation that saved
     /// it still relies on it. The operation removes the pin with
-    /// [`Self::unpin`] when it ends; the expiry covers a crash. `own` are the
-    /// backups the same operation pinned before, which do not count against
-    /// it when deciding whether pinned backups fill the limits: one operation
-    /// may go over them with its own pins, but not because of others'.
+    /// [`Self::unpin`] when it ends; the expiry covers a crash.
     pub fn save_automatic_pinned(
         &self,
         record: Record,
         model: &[u8],
         until: u64,
-        own: &[String],
     ) -> anyhow::Result<Record> {
         self.save_automatic_with(
             record,
             model,
             Some(until),
-            own,
             PruneLimits::DEFAULT,
             now_millis(),
         )
     }
 
     /// [`Self::save_automatic`] with other limits, a pin and `now`. Refuses
-    /// the backup, saving nothing, when backups pinned by other operations
-    /// already fill the limits, since none of them can be removed to make
-    /// room.
+    /// the backup, saving nothing, when pinned backups, the caller's own
+    /// included, already fill the limits, since none of them can be removed
+    /// to make room: an operation never goes over them.
     pub(crate) fn save_automatic_with(
         &self,
         mut record: Record,
         model: &[u8],
         pin: Option<u64>,
-        own: &[String],
         limits: PruneLimits,
         now: u64,
     ) -> anyhow::Result<Record> {
@@ -497,9 +511,7 @@ impl Store {
         let (pinned_count, pinned_bytes) = self
             .list()?
             .into_iter()
-            .filter(|record| {
-                record.automatic && !own.contains(&record.id) && self.pinned(&record.id, now)
-            })
+            .filter(|record| record.automatic && self.pinned(&record.id, now))
             .fold((0usize, 0u64), |(count, bytes), record| {
                 (count + 1, bytes.saturating_add(record.bytes))
             });
@@ -518,7 +530,7 @@ impl Store {
         // backup as kept, and when what it must remove cannot be removed,
         // such as when Windows will not let an old model be deleted, the
         // backup is refused, so the folder never grows past its limits.
-        self.prune_locked(limits, now, Some(model.len() as u64))
+        self.prune_locked(limits, now, Some(model.len() as u64), &[])
             .context("The backup was not saved, because old automatic backups could not be removed to make room")?;
         let record = self.save_locked(record, model)?;
         if let Some(until) = pin {
@@ -542,16 +554,19 @@ impl Store {
         if FAILING_PINS.with(std::cell::Cell::get) {
             anyhow::bail!("Simulated failure to write a pin");
         }
-        let mut file = tempfile::NamedTempFile::new_in(&self.dir)?;
+        let mut file = tempfile::Builder::new()
+            .prefix(&format!("{AUTOMATIC_TEMP_PREFIX}{id}-"))
+            .tempfile_in(&self.dir)?;
         std::io::Write::write_all(&mut file, until.to_string().as_bytes())?;
         file.persist(self.pin_path(id))
             .map_err(|error| error.error)?;
         Ok(())
     }
 
-    /// Removes the pins of `ids`, then prunes, so an operation that went over
-    /// the limits with its own pins does not leave the folder over them.
-    /// Other operations' unexpired pins still protect theirs.
+    /// Removes the pins of `ids`, then prunes what else is over the limits.
+    /// That prune never removes `ids` themselves, the backups of the
+    /// operation that just ended, and other operations' unexpired pins still
+    /// protect theirs.
     pub fn unpin(&self, ids: &[String]) -> anyhow::Result<()> {
         self.unpin_with(ids, PruneLimits::DEFAULT, now_millis())
     }
@@ -572,7 +587,7 @@ impl Store {
                 }
             }
         }
-        self.prune_locked(limits, now, None)?;
+        self.prune_locked(limits, now, None, ids)?;
         Ok(())
     }
 
@@ -601,7 +616,7 @@ impl Store {
         now: u64,
     ) -> anyhow::Result<Vec<String>> {
         let _lock = self.lock()?;
-        self.prune_locked(limits, now, None)
+        self.prune_locked(limits, now, None, &[])
     }
 
     /// Prunes, never removing a pinned backup, nor taking the room of one
@@ -615,6 +630,7 @@ impl Store {
         limits: PruneLimits,
         now: u64,
         incoming: Option<u64>,
+        protected: &[String],
     ) -> anyhow::Result<Vec<String>> {
         let mut removed = Vec::new();
         let mut failures = Vec::new();
@@ -622,6 +638,10 @@ impl Store {
         // and newest, so room is made for it.
         let mut count = usize::from(incoming.is_some());
         let mut bytes: u64 = incoming.unwrap_or(0);
+        // Temporary files an interrupted automatic save left behind go when
+        // stale; younger ones may belong to a save in progress elsewhere and
+        // take up their room meanwhile.
+        bytes = bytes.saturating_add(self.clear_stale_temps_locked(now, &mut failures)?);
         // What removals that failed part way left behind is removed again
         // first. Until a leftover model goes, it still takes up its room.
         for (id, model_bytes) in self.leftovers_locked()? {
@@ -640,7 +660,7 @@ impl Store {
             .list()?
             .into_iter()
             .filter(|record| record.automatic)
-            .partition(|record| self.pinned(&record.id, now));
+            .partition(|record| protected.contains(&record.id) || self.pinned(&record.id, now));
         count += kept.len();
         bytes = kept
             .iter()
@@ -672,6 +692,45 @@ impl Store {
             failures.join("; ")
         );
         Ok(removed)
+    }
+
+    /// Removes the temporary files of automatic saves that are older than
+    /// [`STALE_TEMP_MILLIS`], and returns the bytes of the younger ones.
+    fn clear_stale_temps_locked(
+        &self,
+        now: u64,
+        failures: &mut Vec<String>,
+    ) -> anyhow::Result<u64> {
+        let entries = match fs::read_dir(&self.dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(error) => return Err(error).context("Could not read the backup folder"),
+        };
+        let mut young = 0u64;
+        for entry in entries {
+            let entry = entry?;
+            let name = entry.file_name();
+            if !name.to_string_lossy().starts_with(AUTOMATIC_TEMP_PREFIX) {
+                continue;
+            }
+            let Ok(metadata) = entry.metadata() else {
+                continue;
+            };
+            let modified = metadata
+                .modified()
+                .ok()
+                .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+                .map_or(0, |since| since.as_millis() as u64);
+            if modified.saturating_add(STALE_TEMP_MILLIS) <= now {
+                if let Err(error) = remove_file(&entry.path()) {
+                    failures.push(format!("{}: {error}", name.to_string_lossy()));
+                    young = young.saturating_add(metadata.len());
+                }
+            } else {
+                young = young.saturating_add(metadata.len());
+            }
+        }
+        Ok(young)
     }
 
     /// Parts of automatic backups that a failed removal or an interrupted
@@ -1155,7 +1214,6 @@ mod tests {
                         record("pinned", hours_ago(5) + index),
                         b"pin",
                         Some(now + 600_000),
-                        &[],
                         limits,
                         now,
                     )
@@ -1168,7 +1226,6 @@ mod tests {
                 record("expired", hours_ago(4)),
                 b"exp",
                 Some(now - 1),
-                &[],
                 limits,
                 now,
             )
@@ -1206,7 +1263,7 @@ mod tests {
             .map(|index| fill(&store, "future", now + 86_400_000 + index))
             .collect();
         let saved = store
-            .save_automatic_with(record("now", now), b"new", None, &[], limits, now)
+            .save_automatic_with(record("now", now), b"new", None, limits, now)
             .unwrap();
         let left = automatic_ids(&store);
         assert!(
@@ -1227,14 +1284,14 @@ mod tests {
     }
 
     #[test]
-    fn releasing_pins_brings_the_folder_back_within_the_limits() {
+    fn releasing_pins_prunes_others_but_never_the_released_backups() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::in_dir(dir.path());
         let now = now_millis();
         let limits = PruneLimits {
             keep: 1,
             grace_millis: AUTOMATIC_GRACE_MILLIS,
-            max_count: 3,
+            max_count: 4,
             max_bytes: u64::MAX,
         };
         // Another operation's pin, which still protects its backup.
@@ -1243,36 +1300,112 @@ mod tests {
                 record("theirs", now - 1_000),
                 b"theirs",
                 Some(now + 60_000),
-                &[],
                 limits,
                 now,
             )
             .unwrap()
             .id;
-        let mut own = Vec::new();
-        for index in 0..5 {
-            let saved = store
+        let own: Vec<String> = (0..2)
+            .map(|index| {
+                store
+                    .save_automatic_with(
+                        record("own", now - 500 + index),
+                        b"own",
+                        Some(now + 60_000),
+                        limits,
+                        now,
+                    )
+                    .unwrap()
+                    .id
+            })
+            .collect();
+        // Newer unpinned ones, as another server might have left.
+        let newer: Vec<String> = (0..3)
+            .map(|index| fill(&store, "newer", now - 10 + index))
+            .collect();
+        assert_eq!(automatic_ids(&store).len(), 6);
+        store.unpin_with(&own, limits, now).unwrap();
+        let left = automatic_ids(&store);
+        assert_eq!(left.len(), 4, "back within the limit");
+        assert!(left.contains(&theirs));
+        assert!(
+            own.iter().all(|id| left.contains(id)),
+            "the released ones are never pruned by their release"
+        );
+        assert_eq!(newer.iter().filter(|id| left.contains(id)).count(), 1);
+        // A save over the limit with only pinned backups is refused, the
+        // caller's own included.
+        let limits = PruneLimits {
+            max_count: 2,
+            ..limits
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::in_dir(dir.path());
+        for index in 0..2 {
+            store
                 .save_automatic_with(
-                    record("own", now - 100 + index),
+                    record("own", now + index),
                     b"own",
                     Some(now + 60_000),
-                    &own,
                     limits,
                     now,
                 )
                 .unwrap();
-            own.push(saved.id);
         }
-        assert_eq!(
-            automatic_ids(&store).len(),
-            6,
-            "pins keep all of them for now"
+        assert!(store
+            .save_automatic_with(
+                record("own", now + 5),
+                b"own",
+                Some(now + 60_000),
+                limits,
+                now
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn stale_temporary_files_of_automatic_saves_are_removed_and_young_ones_counted() {
+        let now = now_millis();
+        let limits = PruneLimits {
+            keep: 0,
+            grace_millis: AUTOMATIC_GRACE_MILLIS,
+            max_count: 100,
+            max_bytes: 64,
+        };
+        let setup = || {
+            let dir = tempfile::tempdir().unwrap();
+            let store = Store::in_dir(dir.path());
+            let mut older = record("older", now - 1_000);
+            older.automatic = true;
+            let older = store.save(older, &[0u8; 30]).unwrap().id;
+            let temp = dir
+                .path()
+                .join(".tmp-auto-20261107-000000-auto-verify-fix-0123abcd-x1");
+            fs::write(&temp, [0u8; 50]).unwrap();
+            let manual = dir.path().join(".tmpABC123");
+            fs::write(&manual, b"manual").unwrap();
+            (dir, store, older, temp, manual)
+        };
+        // A young one may be a save in progress: its 50 bytes count, so the
+        // older backup makes room for the new one.
+        let (_dir, store, older, temp, _) = setup();
+        store
+            .save_automatic_with(record("new", now), &[0u8; 20], None, limits, now)
+            .unwrap();
+        assert!(temp.exists());
+        assert!(!store.exists(&older));
+        // Ten minutes later it is stale: removed, and nothing else has to go.
+        let (_dir, store, older, temp, manual) = setup();
+        let later = now + STALE_TEMP_MILLIS + 60_000;
+        store
+            .save_automatic_with(record("new", later), &[0u8; 20], None, limits, later)
+            .unwrap();
+        assert!(!temp.exists());
+        assert!(store.exists(&older));
+        assert!(
+            manual.exists(),
+            "temporary files of manual saves are left alone"
         );
-        store.unpin_with(&own, limits, now).unwrap();
-        let left = automatic_ids(&store);
-        assert_eq!(left.len(), 3);
-        assert!(left.contains(&theirs));
-        assert!(left.contains(&own[4]) && left.contains(&own[3]));
     }
 
     fn fail_removing(path: PathBuf) {
@@ -1303,7 +1436,7 @@ mod tests {
         let older = fill(&store, "older", hours_ago(4));
         fail_removing(store.model_path(&older));
         assert!(store
-            .save_automatic_with(record("new", now), b"new", None, &[], limits, now)
+            .save_automatic_with(record("new", now), b"new", None, limits, now)
             .is_err());
         stop_failing();
         let written: Vec<String> = fs::read_dir(dir.path())
@@ -1338,7 +1471,6 @@ mod tests {
                 record("rollback-me", now),
                 b"x",
                 Some(now + 60_000),
-                &[],
                 limits,
                 now,
             )
@@ -1354,7 +1486,7 @@ mod tests {
         assert_eq!(left.len(), 1);
         let later = now + 1;
         store
-            .save_automatic_with(record("next", later), b"y", None, &[], limits, later)
+            .save_automatic_with(record("next", later), b"y", None, limits, later)
             .unwrap();
         assert!(!automatic_ids(&store).contains(&left[0]));
     }
@@ -1421,7 +1553,7 @@ mod tests {
         };
         let old = fill(&store, "old", hours_ago(3));
         fail_removing(store.model_path(&old));
-        let refused = store.save_automatic_with(record("new", now), b"new", None, &[], limits, now);
+        let refused = store.save_automatic_with(record("new", now), b"new", None, limits, now);
         assert!(refused.is_err());
         let left = automatic_ids(&store);
         assert_eq!(
@@ -1432,7 +1564,7 @@ mod tests {
         // Once the model can be deleted, the next save removes it.
         stop_failing();
         let saved = store
-            .save_automatic_with(record("new", now), b"new", None, &[], limits, now)
+            .save_automatic_with(record("new", now), b"new", None, limits, now)
             .unwrap();
         assert_eq!(automatic_ids(&store), vec![saved.id]);
         assert!(!store.model_path(&old).exists() && !store.record_path(&old).exists());
@@ -1466,12 +1598,12 @@ mod tests {
         // save that would go over 64 bytes is refused.
         fail_removing(store.model_path(orphan));
         assert!(store
-            .save_automatic_with(record("new", now), b"new", None, &[], limits, now)
+            .save_automatic_with(record("new", now), b"new", None, limits, now)
             .is_err());
         assert!(!store.record_path(&stray).exists(), "the stray record went");
         stop_failing();
         store
-            .save_automatic_with(record("new", now), b"new", None, &[], limits, now)
+            .save_automatic_with(record("new", now), b"new", None, limits, now)
             .unwrap();
         assert!(!store.model_path(orphan).exists());
         assert!(store.model_path(manual).exists());
@@ -1511,14 +1643,13 @@ mod tests {
                     record("pinned", now - 10 + index),
                     b"pin",
                     Some(now + 60_000),
-                    &[],
                     limits,
                     now,
                 )
                 .unwrap();
         }
         let error = store
-            .save_automatic_with(record("new", now), b"new", None, &[], limits, now)
+            .save_automatic_with(record("new", now), b"new", None, limits, now)
             .unwrap_err();
         assert!(format!("{error:#}").contains("still rely on"), "{error:#}");
         assert_eq!(automatic_ids(&store).len(), 2, "nothing was saved");
@@ -1535,13 +1666,12 @@ mod tests {
                 record("pinned", now),
                 b"pin",
                 Some(now + 60_000),
-                &[],
                 bytes,
                 now,
             )
             .unwrap();
         assert!(store
-            .save_automatic_with(record("new", now), b"new", None, &[], bytes, now)
+            .save_automatic_with(record("new", now), b"new", None, bytes, now)
             .is_err());
     }
 

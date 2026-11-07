@@ -1555,7 +1555,19 @@ impl StudioBridge {
         };
         let mut summaries = Vec::new();
         let mut groups: Vec<(String, Vec<String>)> = Vec::new();
-        for group in verify::backup_groups(fixes) {
+        let groups_needed = verify::backup_groups(fixes);
+        // Every group's backup must outlast the fix, and no backup may go
+        // over the folder's limits, so a fix needing more of them than are
+        // kept is refused before anything is exported or changed.
+        if groups_needed.len() > backup::MAX_AUTOMATIC {
+            return Err(format!(
+                "it would need {} backups, more than the {} automatic backups kept; \
+                 fix fewer scripts at once, or pass --no-backup",
+                groups_needed.len(),
+                backup::MAX_AUTOMATIC
+            ));
+        }
+        for group in groups_needed {
             if started.elapsed() > VERIFY_FIX_BUDGET {
                 return Err(format!(
                     "it took longer than {} seconds",
@@ -1623,7 +1635,21 @@ impl StudioBridge {
                 continue;
             }
             let model = backup_model_bytes(exported).map_err(|error| format!("{error:#}"))?;
-            self.check_restorable(&model).await?;
+            // The hash verify saw for each script, in the order the model
+            // holds them, which restoring must give back.
+            let expected: Vec<u32> = exported["ids"]
+                .as_array()
+                .ok_or("Studio's export does not say which scripts it holds")?
+                .iter()
+                .map(|id| {
+                    id.as_str()
+                        .and_then(|id| hashes.get(id))
+                        .and_then(Value::as_u64)
+                        .and_then(|hash| u32::try_from(hash).ok())
+                        .ok_or_else(|| "Studio exported a script it was not asked for".to_owned())
+                })
+                .collect::<Result<_, _>>()?;
+            self.check_restorable(&model, &expected).await?;
             let record = backup::automatic_record(
                 "auto-verify-fix",
                 "auto: before verify --fix",
@@ -1636,7 +1662,7 @@ impl StudioBridge {
             }
             let until = backup::now_millis() + BACKUP_PIN.as_millis() as u64;
             let (record, store_dir) = self
-                .save_backup(record, model, Some((until, pins.ids.clone())))
+                .save_backup(record, model, Some(until))
                 .await
                 .map_err(|error| format!("{error:#}"))?;
             pins.ids.push(record.id.clone());
@@ -1675,14 +1701,29 @@ impl StudioBridge {
 
     /// Runs the isolated check `backup restore` runs on `model`, so a backup
     /// that could never be restored is not saved as if it could.
-    async fn check_restorable(&self, model: &[u8]) -> Result<(), String> {
+    async fn check_restorable(&self, model: &[u8], expected: &[u32]) -> Result<(), String> {
         // Exactly what restore runs, re-encoding and its size limit included.
-        self.in_check_slot(model.to_vec(), |bytes, remaining| {
-            model_check::prepare_restore(bytes, true, remaining)
+        let restored = self
+            .in_check_slot(model.to_vec(), |bytes, remaining| {
+                model_check::prepare_restore(bytes, true, remaining)
+            })
+            .await
+            .map_err(|(_, message)| format!("the backup would not be restorable: {message}"))?;
+        // Re-encoding can still change a script's text, such as bytes that
+        // are not UTF-8, so each script must come back with the hash verify
+        // saw. The re-encoded model passed the isolated check above.
+        let expected = expected.to_vec();
+        tokio::task::spawn_blocking(move || {
+            std::thread::Builder::new()
+                .stack_size(DECODE_STACK_BYTES)
+                .spawn(move || restored_sources_match(&restored, &expected))
+                .map_err(|error| error.to_string())?
+                .join()
+                .map_err(|_| "the restored backup could not be read".to_owned())?
         })
         .await
-        .map(|_| ())
-        .map_err(|(_, message)| format!("the backup would not be restorable: {message}"))
+        .map_err(|_| "the restored backup could not be read".to_owned())?
+        .map_err(|message| format!("the backup would not be restorable as it is: {message}"))
     }
 
     /// The backup folder of the project's repository, which
@@ -1706,7 +1747,7 @@ impl StudioBridge {
         &self,
         record: backup::Record,
         model: Vec<u8>,
-        pin: Option<(u64, Vec<String>)>,
+        pin: Option<u64>,
     ) -> anyhow::Result<(backup::Record, PathBuf)> {
         let dir = self.backup_dir.get().cloned();
         let root = self.serve.root_dir().to_owned();
@@ -1714,7 +1755,7 @@ impl StudioBridge {
         let (record, store_dir) = tokio::task::spawn_blocking(move || {
             let store = Self::backup_store(dir, &root)?;
             let record = match pin {
-                Some((until, own)) => store.save_automatic_pinned(record, &model, until, &own)?,
+                Some(until) => store.save_automatic_pinned(record, &model, until)?,
                 None => store.save_automatic(record, &model)?,
             };
             anyhow::Ok((record, store.dir().to_owned()))
@@ -2062,6 +2103,34 @@ fn backup_summary(record: &backup::Record, store_dir: &Path) -> Value {
     })
 }
 
+/// Whether the roots of the binary model `restored` are scripts whose sources
+/// have the hashes in `expected`, in order.
+fn restored_sources_match(restored: &[u8], expected: &[u32]) -> Result<(), String> {
+    let dom = rbx_binary::from_reader(restored).map_err(|error| error.to_string())?;
+    let roots = dom.root().children();
+    if roots.len() != expected.len() {
+        return Err(format!(
+            "it holds {} scripts, not the {} exported",
+            roots.len(),
+            expected.len()
+        ));
+    }
+    for (root, &hash) in roots.iter().zip(expected) {
+        let instance = dom.get_by_ref(*root).ok_or("a script is missing")?;
+        let source = match instance.properties.get(&rbx_dom_weak::ustr("Source")) {
+            Some(rbx_dom_weak::types::Variant::String(source)) => source.as_str(),
+            _ => return Err(format!("{} has no source", instance.name)),
+        };
+        if verify::hash_source(source).0 != hash {
+            return Err(format!(
+                "{} would not come back with the source it has, such as when it is not valid UTF-8",
+                instance.name
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// The model bytes of a backup the plugin sent, within the model limit.
 fn backup_model_bytes(value: &Value) -> anyhow::Result<Vec<u8>> {
     let model = value
@@ -2272,6 +2341,37 @@ mod tests {
     ) -> std::pin::Pin<Box<impl std::future::Future<Output = Response<Body>>>> {
         let request = request("POST", "/api/studio/command", &bridge.token, Some(body));
         Box::pin(bridge.clone().call(PEER.parse().unwrap(), request))
+    }
+
+    /// What Studio holds for each script in the verify fixtures.
+    const STUDIO_SOURCE: &str = "return 'studio'\n";
+
+    fn studio_hash() -> u32 {
+        verify::hash_source(STUDIO_SOURCE).0
+    }
+
+    /// An export of `count` scripts holding [`STUDIO_SOURCE`], as the plugin
+    /// sends for a backup.
+    fn script_model(count: usize) -> String {
+        script_model_with(count, STUDIO_SOURCE)
+    }
+
+    fn script_model_with(count: usize, source: &str) -> String {
+        let mut dom = WeakDom::new(InstanceBuilder::new("DataModel"));
+        let root = dom.root_ref();
+        let scripts: Vec<_> = (0..count)
+            .map(|index| {
+                dom.insert(
+                    root,
+                    InstanceBuilder::new("ModuleScript")
+                        .with_name(format!("Script{index}"))
+                        .with_property("Source", source),
+                )
+            })
+            .collect();
+        let mut bytes = Vec::new();
+        rbx_binary::to_writer(&mut bytes, &dom, &scripts).unwrap();
+        data_encoding::BASE64.encode(&bytes)
     }
 
     fn model(children: &[&str]) -> String {
@@ -3304,7 +3404,7 @@ mod tests {
         assert_eq!(scripts.len(), count);
         let entries: Vec<Value> = scripts
             .iter()
-            .map(|script| json!({"id": script.id, "hash": 1, "length": length}))
+            .map(|script| json!({"id": script.id, "hash": studio_hash(), "length": length}))
             .collect();
         plugin(
             &bridge,
@@ -3331,7 +3431,7 @@ mod tests {
             bridge,
             "/api/studio/result",
             json!({"requestId":command["requestId"],"sessionId":session,"result":{"ok":true,"value":{
-                "model":model(&["ModuleScript"]),"instances":instances,"ids":ids,"placeId":5,"placeName":"Place"}}}),
+                "model":script_model(ids.len()),"instances":instances,"ids":ids,"placeId":5,"placeName":"Place"}}}),
         )
         .await;
     }
@@ -3344,7 +3444,7 @@ mod tests {
         assert_eq!(backup["args"]["ids"], json!([script.id]));
         // Studio's hash from the check, which `fix_past_sources` reports as 1,
         // and the verify whose exact sources the plugin compares with.
-        assert_eq!(backup["args"]["hashes"][&script.id], 1);
+        assert_eq!(backup["args"]["hashes"][&script.id], studio_hash());
         assert!(backup["args"]["verifyId"].is_string());
         // The fix waits for the backup: nothing else is queued yet.
         assert_eq!(bridge.state().pending.len(), 1);
@@ -3352,7 +3452,7 @@ mod tests {
             &bridge,
             "/api/studio/result",
             json!({"requestId":backup["requestId"],"sessionId":session,"result":{"ok":true,"value":{
-                "model":model(&["ModuleScript"]),
+                "model":script_model(1),
                 "instances":[{"path":"game/ReplicatedStorage/Shared/Main","className":"ModuleScript"}],
                 "ids":[script.id],"placeId":5,"placeName":"Place"}}}),
         )
@@ -3819,8 +3919,61 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn verify_fix_with_more_groups_than_the_hard_cap_keeps_all_of_them() {
+    async fn verify_fix_does_not_save_a_backup_whose_sources_would_not_come_back() {
+        // Studio held bytes that are not UTF-8, which the model can only
+        // hold as replacement characters, so restoring would not give back
+        // what verify hashed.
+        let (dir, bridge, session, script, verify) = fix_past_sources(json!({"fix":true})).await;
+        let command = next_command(&bridge, &session).await;
+        answer_export(
+            &bridge,
+            &session,
+            &command,
+            json!({"model": script_model_with(1, "return '\u{FFFD}'\n"), "ids": [script.id],
+                "instances": [{"path":"game/ReplicatedStorage/Shared/Main","className":"ModuleScript"}]}),
+        )
+        .await;
+        let (status, value) = into_value(verify.await.unwrap()).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{value}");
+        let error = value["error"].as_str().unwrap();
+        assert!(
+            error.starts_with("Changed nothing") && error.contains("would not come back"),
+            "{error}"
+        );
+        assert!(bridge.state().pending.is_empty(), "no resync was sent");
+        assert!(backup::Store::in_dir(&dir.path().join("backups"))
+            .list()
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn verify_fix_with_more_groups_than_the_hard_cap_changes_nothing() {
         let groups = backup::MAX_AUTOMATIC + 1;
+        let (dir, bridge, _session, _scripts, verify) =
+            fix_scripts_past_sources(json!({"fix":true}), groups, verify::MAX_BACKUP_SOURCE_BYTES)
+                .await;
+        let (status, value) = into_value(verify.await.unwrap()).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{value}");
+        let error = value["error"].as_str().unwrap();
+        assert!(error.starts_with("Changed nothing"), "{error}");
+        assert!(
+            error.contains("more than the 100") && error.contains("--no-backup"),
+            "{error}"
+        );
+        assert!(
+            bridge.state().pending.is_empty(),
+            "nothing was exported or resynced"
+        );
+        assert!(backup::Store::in_dir(&dir.path().join("backups"))
+            .list()
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn verify_fix_at_the_hard_cap_keeps_all_of_its_backups() {
+        let groups = backup::MAX_AUTOMATIC;
         let (dir, bridge, session, _scripts, verify) =
             fix_scripts_past_sources(json!({"fix":true}), groups, verify::MAX_BACKUP_SOURCE_BYTES)
                 .await;
@@ -3835,7 +3988,7 @@ mod tests {
         }
         let resync = next_command(&bridge, &session).await;
         assert_eq!(resync["action"], "resync");
-        // Over the hard cap, yet every group is still there and pinned
+        // At the hard cap, every group is still there and pinned
         // before any script is overwritten.
         let listed = store.list().unwrap();
         assert_eq!(listed.len(), groups);
@@ -3861,13 +4014,13 @@ mod tests {
                 .len(),
             groups
         );
-        // The verify is over, so its pins are gone, and releasing them
-        // brought the folder back within the cap without another save.
+        // The verify is over, so its pins are gone, and releasing them kept
+        // every one of its backups.
         let listed = store.list().unwrap();
         assert!(listed
             .iter()
             .all(|record| !backups.join(format!("{}.pin", record.id)).exists()));
-        assert_eq!(listed.len(), backup::MAX_AUTOMATIC);
+        assert_eq!(listed.len(), groups);
     }
 
     #[tokio::test]
@@ -3881,7 +4034,7 @@ mod tests {
             &bridge,
             &session,
             &command,
-            json!({"model": model(&["ModuleScript"]), "ids": [script.id], "instances": instances}),
+            json!({"model": script_model(1), "ids": [script.id], "instances": instances}),
         )
         .await;
         let resync = next_command(&bridge, &session).await;
@@ -3998,7 +4151,7 @@ mod tests {
             &bridge,
             &session,
             &command,
-            json!({"model": model(&["ModuleScript"]), "ids": [script.id], "instances": [
+            json!({"model": script_model(1), "ids": [script.id], "instances": [
                 {"path": first, "className": "ModuleScript"},
                 {"path": second, "className": "ModuleScript"},
             ]}),
@@ -4031,7 +4184,7 @@ mod tests {
             &bridge,
             &session,
             &command,
-            json!({"model": model(&["ModuleScript"]), "ids": [script.id], "instances": instances}),
+            json!({"model": script_model(1), "ids": [script.id], "instances": instances}),
         )
         .await;
         let (status, value) = into_value(verify.await.unwrap()).await;
