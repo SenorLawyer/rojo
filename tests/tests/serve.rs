@@ -1187,3 +1187,197 @@ fn intern_messages(
     }
     redactions.redacted_yaml(messages)
 }
+
+/// Studio only learns about changes from subscription messages, so a ref the
+/// server resolves while applying a patch has to be in those messages too,
+/// not just in the tree that `/api/read` serves on reconnect.
+///
+/// See: https://github.com/rojo-rbx/rojo/issues/1292
+#[test]
+fn primary_part_live_sync() {
+    run_serve_test("primary_part_live_sync", |session, _redactions| {
+        let info = session.get_api_rojo().unwrap();
+        let root_id = info.root_instance_id;
+        let primary_part = rbx_dom_weak::ustr("PrimaryPart");
+
+        let read_response = session.get_api_read(root_id).unwrap();
+        let find = |read: &ReadResponse<'_>, name: &str| {
+            read.instances
+                .values()
+                .find(|instance| instance.name == name)
+                .map(|instance| instance.id)
+        };
+        let model_id = find(&read_response, "CornerFlag").unwrap();
+        let pole_id = find(&read_response, "Pole").unwrap();
+        let model_path = session.path().join("CornerFlag.model.json");
+
+        // Replays the PrimaryPart value a client following the subscription
+        // ends up with, starting from what it read on connect.
+        let mut cursor = read_response.message_cursor;
+        let mut client_value = read_response.instances[&model_id]
+            .properties
+            .get(&primary_part)
+            .map(|value| value.clone().into_owned());
+        let mut follow = |expected: Ref, what: &str| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                let packet = session
+                    .get_api_socket_packet(SocketPacketType::Messages, cursor)
+                    .unwrap();
+                let SocketPacketBody::Messages(packet) = packet.body;
+                cursor = packet.message_cursor;
+                for message in packet.messages {
+                    if let Some(added) = message.added.get(&model_id) {
+                        client_value = added
+                            .properties
+                            .get(&primary_part)
+                            .map(|value| value.clone().into_owned());
+                    }
+                    for update in message.updated {
+                        if update.id != model_id {
+                            continue;
+                        }
+                        if let Some(value) = update.changed_properties.get(&primary_part) {
+                            client_value = value.clone();
+                        }
+                    }
+                }
+
+                let server = session.get_api_read(root_id).unwrap();
+                let server_value = server.instances[&model_id]
+                    .properties
+                    .get(&primary_part)
+                    .map(|value| value.as_ref().clone());
+                if server_value == Some(rbx_dom_weak::types::Variant::Ref(expected)) {
+                    assert_eq!(
+                        client_value, server_value,
+                        "{what}: the server resolved PrimaryPart but the \
+                         subscription told the client something else"
+                    );
+                    return server;
+                }
+                assert!(std::time::Instant::now() < deadline, "timed out: {what}");
+            }
+        };
+
+        // The target gains its ID in the same save that points at it.
+        fs::write(
+            &model_path,
+            r#"{
+                "className": "Model",
+                "attributes": { "Rojo_Target_PrimaryPart": "corner-flag-pole" },
+                "children": [
+                    {
+                        "name": "Pole",
+                        "className": "Part",
+                        "attributes": { "Rojo_Id": "corner-flag-pole" }
+                    },
+                    { "name": "Flag", "className": "Part" }
+                ]
+            }"#,
+        )
+        .unwrap();
+        follow(pole_id, "existing child gains an ID");
+
+        // The target is added in the same save that points at it.
+        fs::write(
+            &model_path,
+            r#"{
+                "className": "Model",
+                "attributes": { "Rojo_Target_PrimaryPart": "corner-flag-base" },
+                "children": [
+                    {
+                        "name": "Pole",
+                        "className": "Part",
+                        "attributes": { "Rojo_Id": "corner-flag-pole" }
+                    },
+                    { "name": "Flag", "className": "Part" },
+                    {
+                        "name": "Base",
+                        "className": "Part",
+                        "attributes": { "Rojo_Id": "corner-flag-base" }
+                    }
+                ]
+            }"#,
+        )
+        .unwrap();
+        // The new child's ID is only known once the server has added it.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let base_id = loop {
+            if let Some(id) = find(&session.get_api_read(root_id).unwrap(), "Base") {
+                break id;
+            }
+            assert!(std::time::Instant::now() < deadline, "Base never appeared");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        follow(base_id, "new child added with the pointer");
+    });
+}
+
+/// The sync fallback replaces an instance with a copy serialized without its
+/// children, so the copy's own refs into them come back unset. The ref patch
+/// it requests afterwards has to restore them.
+#[test]
+fn ref_patch_restores_refs_from_replaced_instances() {
+    run_serve_test("primary_part_live_sync", |session, _redactions| {
+        let info = session.get_api_rojo().unwrap();
+        let root_id = info.root_instance_id;
+        let primary_part = rbx_dom_weak::ustr("PrimaryPart");
+
+        fs::write(
+            session.path().join("CornerFlag.model.json"),
+            r#"{
+                "className": "Model",
+                "attributes": { "Rojo_Target_PrimaryPart": "corner-flag-pole" },
+                "children": [
+                    {
+                        "name": "Pole",
+                        "className": "Part",
+                        "attributes": { "Rojo_Id": "corner-flag-pole" }
+                    },
+                    { "name": "Flag", "className": "Part" }
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let (model_id, pole_id) = loop {
+            let read = session.get_api_read(root_id).unwrap();
+            let find = |name: &str| {
+                read.instances
+                    .values()
+                    .find(|instance| instance.name == name)
+                    .unwrap()
+            };
+            let model = find("CornerFlag");
+            if model.properties.contains_key(&primary_part) {
+                break (model.id, find("Pole").id);
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "PrimaryPart never set"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+
+        let body = session
+            .post_api_ref_patch(&[model_id], info.session_id)
+            .unwrap()
+            .bytes()
+            .unwrap();
+        let response: librojo::web_api::RefPatchResponse =
+            deserialize_msgpack(&body).expect("Server returned malformed response");
+
+        let update = response
+            .patch
+            .updated
+            .iter()
+            .find(|update| update.id == model_id)
+            .expect("ref patch did not restore the replaced Model's refs");
+        assert_eq!(
+            update.changed_properties.get(&primary_part),
+            Some(&Some(rbx_dom_weak::types::Variant::Ref(pole_id)))
+        );
+    });
+}

@@ -42,7 +42,8 @@ body:
               Attributes:
                 Rojo_Target_PrimaryPart:
                   String: model target 2
-            PrimaryPart: ~
+            PrimaryPart:
+              Ref: id-7
           id: id-8
 packetType: messages
 sessionId: id-1

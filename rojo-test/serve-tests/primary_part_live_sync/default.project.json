@@ -1,0 +1,11 @@
+{
+  "name": "primary_part_live_sync",
+  "tree": {
+    "$className": "DataModel",
+    "Workspace": {
+      "CornerFlag": {
+        "$path": "CornerFlag.model.json"
+      }
+    }
+  }
+}
