@@ -31,6 +31,10 @@ Making a new release? Simply add the new header with the version and date undern
 
 ## Unreleased
 
+* `rojo init` now creates a GitHub Actions workflow, `.github/workflows/rojo.yml`, that runs `rojo packages doctor` and `rojo typecheck` on every push and pull request with pinned releases of Rojo and luau-lsp. For places it also runs `rojo test --cloud` on pushes, skipped until the repository has the `ROBLOX_API_KEY` secret and the `TEST_UNIVERSE_ID` and `TEST_PLACE_ID` variables, so a new repository's checks pass without them. A project created inside an existing Git repository gets its workflow at the repository root instead, where GitHub reads workflows, as `.github/workflows/rojo-<project path>-<hash>.yml` with its jobs set to run in the project's folder. An existing workflow file is left alone, and `--no-ci` leaves the workflow out. ([fork#11])
+
+[fork#11]: https://github.com/SenorLawyer/rojo/pull/11
+
 ## [8.1.0] (November 5th, 2026)
 
 * Added `rojo studio verify`, which checks that every script Rojo syncs has the same source in a connected Studio as in its file, and lists, with each script's file, those that differ, are missing from Studio or were removed there. It exits with 1 when something does not match. `--fix` sets the scripts that differ back to their files' contents, one undo step named `Rojo: Resync` per batch of up to 2 MiB of source, without overwriting a script that changed in Studio since the check. `--all` lists every script that differs instead of the first 200 of each kind. The plugin sends hashes rather than sources, and line endings are ignored. `rojo mcp` offers it as `studio_verify`. See [docs/sync-health.md](docs/sync-health.md). ([fork#9])
