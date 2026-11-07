@@ -24,49 +24,31 @@ local function yieldIfNeeded(clock)
 	return clock
 end
 
-local function alphabeticalNext(t, state)
-	-- Equivalent of the next function, but returns the keys in the alphabetic
-	-- order of node names. We use a temporary ordered key table that is stored in the
-	-- table being iterated.
-
-	local key = nil
-	if state == nil then
-		-- First iteration, generate the index
-		local orderedIndex, i = table.create(5), 0
-		for k in t do
-			i += 1
-			orderedIndex[i] = k
-		end
-		table.sort(orderedIndex, function(a, b)
-			local nodeA, nodeB = t[a], t[b]
-			return (nodeA.name or "") < (nodeB.name or "")
-		end)
-
-		t.__orderedIndex = orderedIndex
-		key = orderedIndex[1]
-	else
-		-- Fetch the next value
-		for i, orderedState in t.__orderedIndex do
-			if orderedState == state then
-				key = t.__orderedIndex[i + 1]
-				break
-			end
-		end
-	end
-
-	if key then
-		return key, t[key]
-	end
-
-	-- No more value to return, cleanup
-	t.__orderedIndex = nil
-
-	return
-end
-
 local function alphabeticalPairs(t)
-	-- Equivalent of the pairs() iterator, but sorted
-	return alphabeticalNext, t, nil
+	-- Equivalent of the pairs() iterator, but returns the keys in the
+	-- alphabetic order of node names.
+	local orderedIndex, count = {}, 0
+	for k in t do
+		count += 1
+		orderedIndex[count] = k
+	end
+	table.sort(orderedIndex, function(a, b)
+		local nodeA, nodeB = t[a], t[b]
+		return (nodeA.name or "") < (nodeB.name or "")
+	end)
+
+	-- The position is kept here rather than found again from the previous key,
+	-- which made visiting a node's children quadratic and froze Studio after
+	-- every patch that added thousands of siblings.
+	local position = 0
+	return function()
+		position += 1
+		local key = orderedIndex[position]
+		if key ~= nil then
+			return key, t[key]
+		end
+		return nil
+	end
 end
 
 local Tree = {}
