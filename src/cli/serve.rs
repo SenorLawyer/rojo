@@ -13,8 +13,8 @@ use crate::{serve_session::ServeSession, web::LiveServer};
 
 use super::{resolve_path, GlobalOptions};
 
-const DEFAULT_BIND_ADDRESS: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 1);
-const DEFAULT_PORT: u16 = 34872;
+pub(super) const DEFAULT_BIND_ADDRESS: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 1);
+pub(super) const DEFAULT_PORT: u16 = 34872;
 
 /// Expose a Rojo project to the Rojo Studio plugin.
 #[derive(Debug, Parser)]
