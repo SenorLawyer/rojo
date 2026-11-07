@@ -14,9 +14,17 @@ The base and the output can each be `.rbxl` or `.rbxlx`, in any combination.
 The project's root must be a `DataModel`, as for any place build. The base
 place is only read; the output is written the same way as any build, to a
 temporary file that replaces the output once complete, so the output may be
-the base place itself. `--into` cannot be combined with `--plugin`, and
+the base place itself. `--into` cannot be combined with `--plugin`.
+
+When the output is the base itself, the base is checked again right before
+it is replaced. If it changed since it was read, for example because Studio
+saved it, the build stops without writing and leaves the newer file alone;
+build again to apply the project onto that version.
+
 `--watch` cannot write over its own base, since every rebuild would apply
-the project onto the previous output.
+the project onto the previous output. The paths are compared without either
+file having to exist, following links and ignoring case on Windows, and
+again before every rebuild.
 
 ## A complete place from a checkpoint
 
@@ -40,13 +48,21 @@ and class, such as `ReplicatedStorage/Shared`. This is the matching
   project sets overwrite the base value, and properties it does not mention
   keep the base value. `Attributes` and `Tags` are each one property, so
   setting any attribute replaces all of that instance's attributes.
+  Setting a property also removes the base's other names for it: its
+  aliases, and the properties it migrates to or from, such as `Color` when
+  the project sets `BrickColor`, or `FontFace` when it sets `Font`.
+  Otherwise the base's newer property would win when the place is written.
 * Project instances without a pair are added.
 * For base children that the project did not pair with anything,
   `$ignoreUnknownInstances` decides, as it does in Studio:
   * Where the project instance ignores unknown instances, the base's extra
     children are kept. This is the default for project nodes without a
     `$path`, so services listed only to set properties or to hold a few
-    children keep everything else they have in the base.
+    children keep everything else they have in the base. This includes
+    children that share a name with a project child: of several base `Part`
+    siblings, the project's `Part` pairs with the first and the others are
+    left as they are, as the Studio plugin leaves them. A base child whose
+    class differs from the project child of the same name stays next to it.
   * Where it does not, the project's content wins for that subtree and the
     base's extra children are removed. This is the default for a `$path`
     folder: a `Shared` folder built from `src/shared` contains exactly what
@@ -55,9 +71,6 @@ and class, such as `ReplicatedStorage/Shared`. This is the matching
     the node in the project file, or `"ignoreUnknownInstances": true`
     (without the `$`) in the folder's `init.meta.json`. A meta file does not
     recognize the `$` spelling, so the setting would have no effect.
-* A base child with the same name as a project child is replaced even where
-  unknown instances are ignored, for example a base `Remotes` model when the
-  project defines a `Remotes` folder.
 * Services the project does not mention are left alone. They are never
   removed for lacking a project node, even when the root does not ignore
   unknown instances, since a place needs them. A top-level instance whose
@@ -96,8 +109,12 @@ or `src/workspace/init.meta.json`:
   they were paired with a base instance or added.
 * A ref the project explicitly sets to nil, such as an `ObjectValue` in a
   model file with no value, clears the paired base instance's ref.
-* A `Rojo_Target_*` attribute can also point at a base-only instance that has
-  a `Rojo_Id` attribute, such as one left by an earlier `rojo build`.
+* A project `Rojo_Target_*` attribute can also point at a base-only instance
+  that has a `Rojo_Id` attribute, such as one left by an earlier
+  `rojo build`.
+* `Rojo_Target_*` attributes the base place has are kept as data only and
+  are not resolved. A ref the project sets, or one edited in Studio since the
+  attribute was written, is what the output has.
 * Project IDs (`$id`, `id` in meta files, `Rojo_Id` attributes) take
   precedence: when the project gives a paired instance an ID, its base
   `Rojo_Id` attribute is replaced with the project's ID.
@@ -119,6 +136,5 @@ the base changes, and the last good output stays in place meanwhile.
   syncback`, so content rbx-dom cannot read or write is not preserved.
 * Instances are matched by name and class only. When the base has several
   siblings with a name the project defines, the first with the same class is
-  paired and the others are replaced.
-* Added instances, including ones that replace a base instance, come after
-  the base instances under the same parent.
+  paired; what happens to the others follows `$ignoreUnknownInstances`.
+* Added instances come after the base instances under the same parent.

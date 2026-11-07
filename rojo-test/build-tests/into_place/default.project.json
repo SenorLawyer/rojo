@@ -5,6 +5,26 @@
     "Workspace": {
       "$properties": {
         "Gravity": 50
+      },
+      "Note": {
+        "$className": "StringValue",
+        "$properties": {
+          "Value": "project note"
+        }
+      },
+      "Brick": {
+        "$className": "Part",
+        "$properties": {
+          "BrickColor": {
+            "BrickColor": 21
+          }
+        }
+      },
+      "Label": {
+        "$className": "TextLabel",
+        "$properties": {
+          "Font": "Arial"
+        }
       }
     },
     "ReplicatedStorage": {

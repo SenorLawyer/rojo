@@ -11,7 +11,7 @@ use std::{
 
 use insta::assert_snapshot;
 use rbx_dom_weak::{
-    types::{Attributes, Ref, Variant},
+    types::{Attributes, Color3uint8, Font, Ref, Variant},
     ustr, InstanceBuilder, WeakDom,
 };
 use tempfile::tempdir;
@@ -359,6 +359,37 @@ fn into_place_base() -> WeakDom {
         workspace,
         InstanceBuilder::new("Terrain").with_name("Terrain"),
     );
+    // The project defines one `Note`. Workspace ignores unknown instances, so
+    // only the first is paired and the others stay with their children.
+    for value in ["first", "second", "third"] {
+        let note = dom.insert(
+            workspace,
+            InstanceBuilder::new("StringValue")
+                .with_name("Note")
+                .with_property("Value", value),
+        );
+        dom.insert(
+            note,
+            InstanceBuilder::new("Folder").with_name(format!("{value} detail")),
+        );
+    }
+    // The project sets BrickColor and Font; the base has the properties they
+    // migrate to, which must not win over the project's values.
+    dom.insert(
+        workspace,
+        InstanceBuilder::new("Part")
+            .with_name("Brick")
+            .with_property("Color", Color3uint8::new(0, 0, 255)),
+    );
+    dom.insert(
+        workspace,
+        InstanceBuilder::new("TextLabel")
+            .with_name("Label")
+            .with_property(
+                "FontFace",
+                Font::regular("rbxasset://fonts/families/Bangers.json"),
+            ),
+    );
 
     dom.insert(
         root,
@@ -387,6 +418,24 @@ fn into_place_base() -> WeakDom {
     let link = dom.insert(
         shared,
         InstanceBuilder::new("ObjectValue").with_name("Link"),
+    );
+    // Left by an earlier build: the pointer attribute stays as data, while
+    // the project's Aim.rbxmx sets Value to its own Target.
+    let aim = dom.insert(shared, InstanceBuilder::new("Folder").with_name("Aim"));
+    dom.insert(
+        aim,
+        InstanceBuilder::new("ObjectValue")
+            .with_name("Pointer")
+            .with_property(
+                "Attributes",
+                Attributes::new().with("Rojo_Target_Value", "BaseSpawn"),
+            ),
+    );
+    dom.insert(
+        aim,
+        InstanceBuilder::new("StringValue")
+            .with_name("Target")
+            .with_property("Value", "from base"),
     );
     let config = dom.insert(
         shared,
@@ -488,12 +537,30 @@ fn instance_path(dom: &WeakDom, id: Ref) -> String {
 fn describe_place(dom: &WeakDom) -> String {
     const SHOWN: &[&str] = &[
         "Attributes",
+        "BrickColor",
         "Brightness",
+        "Color",
         "FallenPartsDestroyHeight",
+        "Font",
+        "FontFace",
         "Gravity",
         "Source",
         "Value",
     ];
+
+    /// Binary files write the default of every property of a class that any
+    /// instance sets, so these are left out when they hold the default.
+    fn is_filled_in_default(class: &str, name: &str, value: &Variant) -> bool {
+        if !matches!(name, "BrickColor" | "Color" | "Font" | "FontFace") {
+            return false;
+        }
+        let database = rbx_reflection_database::get().unwrap();
+        database
+            .classes
+            .get(class)
+            .and_then(|class| database.find_default_property(class, name))
+            .is_some_and(|default| default == value)
+    }
 
     fn describe(dom: &WeakDom, id: Ref, depth: usize, out: &mut String) {
         let instance = dom.get_by_ref(id).unwrap();
@@ -503,6 +570,7 @@ fn describe_place(dom: &WeakDom) -> String {
             .properties
             .iter()
             .filter(|(name, _)| SHOWN.contains(&name.as_str()))
+            .filter(|(name, value)| !is_filled_in_default(&instance.class, name, value))
             .collect();
         properties.sort_by_key(|(name, _)| name.as_str());
         for (name, value) in properties {
@@ -734,6 +802,34 @@ fn build_into_refuses_non_place_inputs_and_outputs() {
         "{}",
         stderr(&result)
     );
+
+    // Also when the base does not exist yet, and (on Windows, whose file
+    // systems ignore case) when the two paths differ only in case.
+    let missing = temp.path().join("missing.rbxl");
+    let mut outputs = vec![missing.clone()];
+    if cfg!(windows) {
+        outputs.push(temp.path().join("MISSING.rbxl"));
+    }
+    for output in outputs {
+        let result = Command::new(ROJO_PATH)
+            .current_dir(get_working_dir_path())
+            .arg("build")
+            .arg(Path::new(BUILD_TESTS_PATH).join("into_place"))
+            .arg("--into")
+            .arg(&missing)
+            .arg("-o")
+            .arg(&output)
+            .arg("--watch")
+            .output()
+            .unwrap();
+        assert!(!result.status.success());
+        assert!(
+            stderr(&result).contains("--watch cannot write over"),
+            "{}",
+            stderr(&result)
+        );
+        assert!(!missing.exists());
+    }
 }
 
 /// A Workspace built from a `$path` folder keeps the base's map and Terrain

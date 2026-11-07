@@ -97,7 +97,7 @@ impl BuildCommand {
             }
             // Each rebuild would apply the project onto the previous output,
             // so instances removed from the project would never leave it.
-            if self.watch && is_same_file(base, &output_path) {
+            if self.watch && is_same_path(base, &output_path) {
                 bail!("--watch cannot write over its own --into base place; choose a different --output");
             }
         }
@@ -177,6 +177,20 @@ impl BuildCommand {
                 }
                 if !changed {
                     continue;
+                }
+
+                // A link created since startup can make the output the base
+                // after all, and every rebuild would then apply the project
+                // onto the previous output.
+                if let Some(base) = into {
+                    if is_same_path(base, &output_path) {
+                        bail!(
+                            "--watch cannot write over its own --into base place, \
+                             and {} now refers to {}; choose a different --output",
+                            output_path.display(),
+                            base.display()
+                        );
+                    }
                 }
 
                 // A rebuild can fail because of an in-progress edit (for
@@ -286,51 +300,61 @@ fn write_model(
     // The base is read on every build so a watched build picks up a newly
     // saved base place, and the merge never mutates the session's own tree.
     let merged;
+    let mut base_read = None;
     let tree = match into {
         Some(base) => {
-            let base_dom = build_into::read_base_place(base)?;
+            let (base_dom, digest) = build_into::read_base_place(base)?;
+            // Only an in-place build can lose work by replacing the base.
+            if is_same_path(base, output) {
+                base_read = Some((base, digest));
+            }
             merged = build_into::merge_into_place(&project_tree, base_dom)?;
             &merged
         }
         None => &*project_tree,
     };
     let root_id = tree.get_root_id();
+
     log::trace!("Serializing to a staged output file");
-    write_file_atomically(output, |file| {
-        match output_kind {
-            OutputKind::Rbxm => {
-                compression
-                    .unwrap_or(Compression::Lz4)
-                    .serializer()
-                    .serialize(file, tree.inner(), &[root_id])?;
-            }
-            OutputKind::Rbxl => {
-                let root_instance = tree.get_instance(root_id).unwrap();
-                let top_level_ids = root_instance.children();
+    write_file_atomically_checked(
+        output,
+        || check_base_unchanged(base_read),
+        |file| {
+            match output_kind {
+                OutputKind::Rbxm => {
+                    compression
+                        .unwrap_or(Compression::Lz4)
+                        .serializer()
+                        .serialize(file, tree.inner(), &[root_id])?;
+                }
+                OutputKind::Rbxl => {
+                    let root_instance = tree.get_instance(root_id).unwrap();
+                    let top_level_ids = root_instance.children();
 
-                compression
-                    .unwrap_or(Compression::Lz4)
-                    .serializer()
-                    .serialize(file, tree.inner(), top_level_ids)?;
-            }
-            OutputKind::Rbxmx => {
-                // Model files include the root instance of the tree and all its
-                // descendants.
+                    compression
+                        .unwrap_or(Compression::Lz4)
+                        .serializer()
+                        .serialize(file, tree.inner(), top_level_ids)?;
+                }
+                OutputKind::Rbxmx => {
+                    // Model files include the root instance of the tree and all its
+                    // descendants.
 
-                rbx_xml::to_writer(file, tree.inner(), &[root_id], xml_encode_config())?;
-            }
-            OutputKind::Rbxlx => {
-                // Place files don't contain an entry for the DataModel, but our
-                // WeakDom representation does.
+                    rbx_xml::to_writer(file, tree.inner(), &[root_id], xml_encode_config())?;
+                }
+                OutputKind::Rbxlx => {
+                    // Place files don't contain an entry for the DataModel, but our
+                    // WeakDom representation does.
 
-                let root_instance = tree.get_instance(root_id).unwrap();
-                let top_level_ids = root_instance.children();
+                    let root_instance = tree.get_instance(root_id).unwrap();
+                    let top_level_ids = root_instance.children();
 
-                rbx_xml::to_writer(file, tree.inner(), top_level_ids, xml_encode_config())?;
+                    rbx_xml::to_writer(file, tree.inner(), top_level_ids, xml_encode_config())?;
+                }
             }
-        }
-        Ok(())
-    })?;
+            Ok(())
+        },
+    )?;
 
     let filename = output
         .file_name()
@@ -338,6 +362,25 @@ fn write_model(
         .unwrap_or("<invalid utf-8>");
     println!("Built project to {}", filename);
 
+    Ok(())
+}
+
+/// Fails if the base place read for an in-place build has changed since.
+///
+/// Studio can save the place while it is being built into. Replacing it then
+/// would discard that save, so the build stops and leaves it alone, as
+/// `rojo merge` does when its output changes during a merge.
+fn check_base_unchanged(base_read: Option<(&Path, blake3::Hash)>) -> anyhow::Result<()> {
+    if let Some((base, digest)) = base_read {
+        if build_into::file_digest(base)? != Some(digest) {
+            bail!(
+                "{} changed while the project was being built into it, for example \
+                 because Studio saved it. It was left as it is; build again to apply \
+                 the project onto the new version.",
+                base.display()
+            );
+        }
+    }
     Ok(())
 }
 
@@ -358,11 +401,32 @@ impl BaseState {
     }
 }
 
-/// Whether `left` and `right` name the same existing file, following links.
-fn is_same_file(left: &Path, right: &Path) -> bool {
-    match (dunce::canonicalize(left), dunce::canonicalize(right)) {
-        (Ok(left), Ok(right)) => left == right,
+/// Whether `left` and `right` name the same file, following links. Neither
+/// needs to exist: a missing file is compared by its canonical directory and
+/// its name, ignoring case on Windows, whose file systems do too.
+fn is_same_path(left: &Path, right: &Path) -> bool {
+    match (comparable_path(left), comparable_path(right)) {
+        (Some(left), Some(right)) => {
+            if cfg!(windows) {
+                left.to_string_lossy().to_lowercase() == right.to_string_lossy().to_lowercase()
+            } else {
+                left == right
+            }
+        }
         _ => false,
+    }
+}
+
+fn comparable_path(path: &Path) -> Option<PathBuf> {
+    if let Ok(canonical) = dunce::canonicalize(path) {
+        return Some(canonical);
+    }
+    let absolute = std::path::absolute(path).ok()?;
+    let name = absolute.file_name()?;
+    let parent = absolute.parent()?;
+    match dunce::canonicalize(parent) {
+        Ok(parent) => Some(parent.join(name)),
+        Err(_) => Some(absolute),
     }
 }
 
@@ -379,6 +443,16 @@ fn is_same_file(left: &Path, right: &Path) -> bool {
 /// updated, since the new contents are a different file.
 pub(super) fn write_file_atomically(
     destination: &Path,
+    write: impl FnOnce(&mut dyn Write) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    write_file_atomically_checked(destination, || Ok(()), write)
+}
+
+/// Like `write_file_atomically`, but runs `check` right before replacing
+/// `destination` and leaves it untouched if `check` fails.
+fn write_file_atomically_checked(
+    destination: &Path,
+    check: impl FnOnce() -> anyhow::Result<()>,
     write: impl FnOnce(&mut dyn Write) -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
     // Renaming over a symlink would replace the link itself with a plain
@@ -429,6 +503,10 @@ pub(super) fn write_file_atomically(
             destination.display()
         )
     })?;
+
+    // As late as possible, so the window in which another program's write
+    // could still be replaced is only the rename itself.
+    check()?;
 
     // Dropping the staged file on error deletes it, so a failed rename leaves
     // only the previous output behind.
@@ -498,6 +576,56 @@ mod test {
         assert_eq!(std::fs::read(&destination).unwrap(), b"previous build");
         // The staged file is cleaned up rather than left next to the output.
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    /// An in-place `--into` build must not replace a base place that was
+    /// saved again (for example by Studio) after it was read.
+    #[test]
+    fn in_place_build_keeps_a_base_saved_during_the_build() {
+        let dir = tempfile::tempdir().unwrap();
+        let place = dir.path().join("place.rbxl");
+        std::fs::write(&place, b"read by the build").unwrap();
+        let digest = blake3::hash(b"read by the build");
+
+        let result = write_file_atomically_checked(
+            &place,
+            || check_base_unchanged(Some((&place, digest))),
+            |file| {
+                // Studio saves while the merged place is being written.
+                std::fs::write(&place, b"saved by Studio").unwrap();
+                Ok(file.write_all(b"merged build")?)
+            },
+        );
+
+        let error = format!("{:#}", result.unwrap_err());
+        assert!(error.contains("changed while the project"), "{error}");
+        assert_eq!(std::fs::read(&place).unwrap(), b"saved by Studio");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+
+        // Unchanged, the same build replaces it.
+        let digest = blake3::hash(b"saved by Studio");
+        write_file_atomically_checked(
+            &place,
+            || check_base_unchanged(Some((&place, digest))),
+            |file| Ok(file.write_all(b"merged build")?),
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(&place).unwrap(), b"merged build");
+    }
+
+    #[test]
+    fn same_path_does_not_need_the_files_to_exist() {
+        let dir = tempfile::tempdir().unwrap();
+        let place = dir.path().join("place.rbxl");
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        assert!(is_same_path(&place, &place));
+        assert!(is_same_path(
+            &place,
+            &dir.path().join("sub").join("..").join("place.rbxl")
+        ));
+        assert!(!is_same_path(&place, &dir.path().join("other.rbxl")));
+        #[cfg(windows)]
+        assert!(is_same_path(&place, &dir.path().join("PLACE.rbxl")));
     }
 
     #[test]

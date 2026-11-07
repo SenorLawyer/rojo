@@ -10,8 +10,7 @@
 
 use std::{
     collections::{HashMap, HashSet},
-    fs::File,
-    io::BufReader,
+    fs,
     path::Path,
 };
 
@@ -20,19 +19,37 @@ use rbx_dom_weak::{
     types::{Ref, Variant},
     ustr, Ustr, WeakDom,
 };
-use rbx_reflection::ClassTag;
+use rbx_reflection::{ClassTag, PropertyKind, PropertySerialization};
 
 use crate::{
     snapshot::{apply_patch_set, compute_patch_set, InstanceSnapshot, PatchSet, RojoTree},
-    RojoRef, REF_ID_ATTRIBUTE_NAME,
+    RojoRef, REF_ID_ATTRIBUTE_NAME, REF_POINTER_ATTRIBUTE_PREFIX,
 };
 
-/// Reads the place that `rojo build --into` starts from.
-pub fn read_base_place(path: &Path) -> anyhow::Result<WeakDom> {
+/// Reads the place that `rojo build --into` starts from, along with a digest
+/// of the bytes it was read from.
+pub fn read_base_place(path: &Path) -> anyhow::Result<(WeakDom, blake3::Hash)> {
+    // Read once, so the digest is of exactly the bytes that were parsed.
+    let bytes =
+        fs::read(path).with_context(|| format!("Could not open base place {}", path.display()))?;
+    let digest = blake3::hash(&bytes);
+    Ok((parse_base_place(path, &bytes)?, digest))
+}
+
+/// Returns the digest of the file at `path`, or `None` if it does not exist.
+pub fn file_digest(path: &Path) -> anyhow::Result<Option<blake3::Hash>> {
+    match fs::read(path) {
+        Ok(bytes) => Ok(Some(blake3::hash(&bytes))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => {
+            Err(error).with_context(|| format!("Could not read {} again", path.display()))
+        }
+    }
+}
+
+fn parse_base_place(path: &Path, bytes: &[u8]) -> anyhow::Result<WeakDom> {
     let extension = path.extension().and_then(|extension| extension.to_str());
-    let file = File::open(path)
-        .with_context(|| format!("Could not open base place {}", path.display()))?;
-    let reader = BufReader::new(file);
+    let reader = bytes;
     match extension {
         Some("rbxl") => rbx_binary::from_reader(reader)
             .with_context(|| format!("Could not read {} as a binary place file", path.display())),
@@ -60,6 +77,19 @@ pub fn merge_into_place(project: &RojoTree, base: WeakDom) -> anyhow::Result<Roj
     let mut patch_set = compute_patch_set(Some(snapshot), &tree, root_id);
 
     keep_unclaimed_base_content(&tree, &mut patch_set);
+    remove_base_property_aliases(&tree, &mut patch_set);
+
+    // Instances whose attributes the project replaces keep none of the
+    // base's, so only the others get the base's pointers back afterwards.
+    let attributes_key = ustr("Attributes");
+    let project_sets_attributes: HashSet<Ref> = patch_set
+        .updated_instances
+        .iter()
+        .filter(|update| update.changed_properties.contains_key(&attributes_key))
+        .map(|update| update.id)
+        .collect();
+    let base_pointers = take_base_ref_pointers(&mut tree);
+
     replace_base_ids(&tree, &mut patch_set);
     let null_refs = take_null_ref_assignments(&mut patch_set);
     apply_patch_set(&mut tree, patch_set);
@@ -70,11 +100,171 @@ pub fn merge_into_place(project: &RojoTree, base: WeakDom) -> anyhow::Result<Roj
             .properties_mut()
             .insert(name, Variant::Ref(Ref::none()));
     }
+    restore_base_ref_pointers(&mut tree, base_pointers, &project_sets_attributes);
 
     check_base_id_collisions(project, &tree)?;
     clear_dangling_refs(&mut tree);
 
     Ok(tree)
+}
+
+/// Takes the `Rojo_Target_*` attributes out of every base instance, returning
+/// them so they can be put back after the patch is applied.
+///
+/// Patch application resolves the pointer attributes of every instance it
+/// updates. A pointer the base place kept, for example from an earlier
+/// `rojo build`, would then override a ref the project sets on a paired
+/// instance, or a ref edited in Studio since. The base's pointers are kept as
+/// data only: Ref properties stay what the project or the base has.
+fn take_base_ref_pointers(tree: &mut RojoTree) -> Vec<(Ref, Vec<(String, Variant)>)> {
+    let attributes_key = ustr("Attributes");
+    let holders: Vec<Ref> = tree
+        .inner()
+        .descendants()
+        .filter(|instance| match instance.properties.get(&attributes_key) {
+            Some(Variant::Attributes(attributes)) => attributes
+                .iter()
+                .any(|(name, _)| name.starts_with(REF_POINTER_ATTRIBUTE_PREFIX)),
+            _ => false,
+        })
+        .map(|instance| instance.referent())
+        .collect();
+
+    let mut taken = Vec::new();
+    for id in holders {
+        let mut instance = tree.get_instance_mut(id).unwrap();
+        let Some(Variant::Attributes(attributes)) =
+            instance.properties_mut().get_mut(&attributes_key)
+        else {
+            continue;
+        };
+        let pointers: Vec<(String, Variant)> = attributes
+            .iter()
+            .filter(|(name, _)| name.starts_with(REF_POINTER_ATTRIBUTE_PREFIX))
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect();
+        for (name, _) in &pointers {
+            attributes.remove(name.as_str());
+        }
+        taken.push((id, pointers));
+    }
+    taken
+}
+
+/// Puts back the pointer attributes `take_base_ref_pointers` took, except on
+/// removed instances and on instances whose attributes the project replaced.
+fn restore_base_ref_pointers(
+    tree: &mut RojoTree,
+    pointers: Vec<(Ref, Vec<(String, Variant)>)>,
+    project_sets_attributes: &HashSet<Ref>,
+) {
+    let attributes_key = ustr("Attributes");
+    for (id, entries) in pointers {
+        if project_sets_attributes.contains(&id) {
+            continue;
+        }
+        let Some(mut instance) = tree.get_instance_mut(id) else {
+            continue;
+        };
+        if let Some(Variant::Attributes(attributes)) =
+            instance.properties_mut().get_mut(&attributes_key)
+        {
+            for (name, value) in entries {
+                attributes.insert(name, value);
+            }
+        }
+    }
+}
+
+/// Removes base properties that are another name for, or the migrated form
+/// of, a property the project sets.
+///
+/// A base place read from a file has `Color` where a project sets
+/// `BrickColor`, or `FontFace` where it sets `Font`. Keeping the base's would
+/// leave both on the instance, and the serializer writes the newer one, so
+/// the project's value would be lost.
+fn remove_base_property_aliases(tree: &RojoTree, patch_set: &mut PatchSet) {
+    for update in &mut patch_set.updated_instances {
+        let Some(instance) = tree.get_instance(update.id) else {
+            continue;
+        };
+        let class_name = update
+            .changed_class_name
+            .unwrap_or_else(|| instance.class_name());
+        let mut removals = Vec::new();
+        for (name, value) in &update.changed_properties {
+            if value.is_none() {
+                continue;
+            }
+            for related in related_property_names(&class_name, name) {
+                if !update.changed_properties.contains_key(&related)
+                    && instance.properties().contains_key(&related)
+                {
+                    removals.push(related);
+                }
+            }
+        }
+        for name in removals {
+            update.changed_properties.insert(name, None);
+        }
+    }
+}
+
+/// Returns the other names `property_name` of `class_name` goes by: the
+/// canonical property of an alias, other aliases of the same property, and
+/// properties one migrates to or from.
+fn related_property_names(class_name: &str, property_name: &str) -> Vec<Ustr> {
+    let Ok(database) = rbx_reflection_database::get() else {
+        return Vec::new();
+    };
+    let Some(class) = database.classes.get(class_name) else {
+        return Vec::new();
+    };
+    let properties: Vec<(&str, &PropertyKind)> = database
+        .superclasses_iter(class)
+        .flat_map(|class| {
+            class
+                .properties
+                .iter()
+                .map(|(name, descriptor)| (*name, &descriptor.kind))
+        })
+        .collect();
+
+    let canonical = properties
+        .iter()
+        .find(|(name, _)| *name == property_name)
+        .map(|(_, kind)| match kind {
+            PropertyKind::Alias { alias_for } => *alias_for,
+            _ => property_name,
+        })
+        .unwrap_or(property_name);
+
+    // Names that are, or are migrated from or to, the canonical property.
+    let mut group: HashSet<&str> = HashSet::from([canonical]);
+    for (name, kind) in &properties {
+        match kind {
+            PropertyKind::Alias { alias_for } if *alias_for == canonical => {
+                group.insert(name);
+            }
+            PropertyKind::Canonical {
+                serialization: PropertySerialization::Migrate(migration),
+            } => {
+                let targets = migration.new_property_names();
+                if *name == canonical {
+                    group.extend(targets.iter().copied());
+                } else if targets.contains(&canonical) {
+                    group.insert(name);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    group
+        .into_iter()
+        .filter(|name| *name != property_name)
+        .map(ustr)
+        .collect()
 }
 
 /// Makes the project's ID win over a base `Rojo_Id` attribute on a paired
@@ -264,8 +454,9 @@ fn snapshot_from_tree(tree: &RojoTree, id: Ref) -> InstanceSnapshot {
 ///
 /// - Properties the project does not set keep the base value.
 /// - A base child the project did not pair up (by name and class) is only
-///   removed when its parent ignores no unknown instances, or when the
-///   project defines a child with the same name there, which replaces it.
+///   removed when its parent ignores no unknown instances. Where the parent
+///   ignores them, it is kept even when it shares a name with a project
+///   child, as the Studio plugin keeps it.
 /// - Services are never removed for lacking a project node, whatever the
 ///   root's `$ignoreUnknownInstances`, since a place needs them. Other
 ///   top-level instances follow the root's setting like any child.
@@ -274,34 +465,6 @@ fn keep_unclaimed_base_content(tree: &RojoTree, patch_set: &mut PatchSet) {
 
     for update in &mut patch_set.updated_instances {
         update.changed_properties.retain(|_, value| value.is_some());
-    }
-
-    // Patch computation removes every base child it could not pair with a
-    // project child, so the base instances left are exactly the ones paired
-    // with a project instance.
-    let removed: HashSet<Ref> = patch_set.removed_instances.iter().copied().collect();
-
-    // The names the project defines under each paired parent: paired
-    // children, which keep their name, plus the children being added.
-    let mut project_names: HashMap<Ref, HashSet<&str>> = HashMap::new();
-    for addition in &patch_set.added_instances {
-        project_names
-            .entry(addition.parent_id)
-            .or_default()
-            .insert(addition.instance.name.as_ref());
-    }
-    let parents: HashSet<Ref> = patch_set
-        .removed_instances
-        .iter()
-        .filter_map(|&id| tree.get_instance(id).map(|instance| instance.parent()))
-        .collect();
-    for &parent in &parents {
-        let names = project_names.entry(parent).or_default();
-        for &child in tree.get_instance(parent).unwrap().children() {
-            if !removed.contains(&child) {
-                names.insert(tree.get_instance(child).unwrap().name());
-            }
-        }
     }
 
     // A paired instance only gets a metadata update when the project's
@@ -324,12 +487,8 @@ fn keep_unclaimed_base_content(tree: &RojoTree, patch_set: &mut PatchSet) {
         .filter(|&id| {
             let instance = tree.get_instance(id).unwrap();
             let parent = instance.parent();
-            let replaced = project_names
-                .get(&parent)
-                .is_some_and(|names| names.contains(instance.name()));
             let is_unclaimed_service = parent == root_id && is_service(&instance.class_name());
-            let unclaimed = is_unclaimed_service || ignores_unknown(parent);
-            unclaimed && !replaced
+            is_unclaimed_service || ignores_unknown(parent)
         })
         .collect();
 

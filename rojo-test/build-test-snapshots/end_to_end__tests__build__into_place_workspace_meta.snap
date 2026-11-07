@@ -16,6 +16,19 @@ Workspace (Workspace)
   OldRef (ObjectValue)
     .Value = -> ReplicatedStorage/Shared/OldModule
   Terrain (Terrain)
+  Note (StringValue)
+    .Value = "first"
+    first detail (Folder)
+  Note (StringValue)
+    .Value = "second"
+    second detail (Folder)
+  Note (StringValue)
+    .Value = "third"
+    third detail (Folder)
+  Brick (Part)
+    .Color = Color3uint8(Color3uint8 { r: 0, g: 0, b: 255 })
+  Label (TextLabel)
+    .FontFace = Font(Font { family: "rbxasset://fonts/families/Bangers.json", weight: Regular, style: Normal, cached_face_id: None })
   Spawner (Script)
     .Source = "print(\"spawner from project\")\n"
 Lighting (Lighting)
@@ -25,6 +38,12 @@ ReplicatedStorage (ReplicatedStorage)
     .Attributes = Owner="map-team", Rojo_Id="OldShared"
     Link (ObjectValue)
       .Value = -> Workspace/Map
+    Aim (Folder)
+      Pointer (ObjectValue)
+        .Attributes = Rojo_Target_Value="BaseSpawn"
+        .Value = nil
+      Target (StringValue)
+        .Value = "from base"
     Config (StringValue)
       .Attributes = Note="from base"
       .Value = "base value"

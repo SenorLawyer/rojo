@@ -16,6 +16,19 @@ Workspace (Workspace)
   OldRef (ObjectValue)
     .Value = nil
   Terrain (Terrain)
+  Note (StringValue)
+    .Value = "project note"
+    first detail (Folder)
+  Note (StringValue)
+    .Value = "second"
+    second detail (Folder)
+  Note (StringValue)
+    .Value = "third"
+    third detail (Folder)
+  Brick (Part)
+    .Color = Color3uint8(Color3uint8 { r: 196, g: 40, b: 28 })
+  Label (TextLabel)
+    .FontFace = Font(Font { family: "rbxasset://fonts/families/Arial.json", weight: Regular, style: Normal, cached_face_id: None })
 Lighting (Lighting)
   .Brightness = 3
 LooseFolder (Folder)
@@ -24,6 +37,12 @@ ReplicatedStorage (ReplicatedStorage)
     .Attributes = Owner="map-team", Rojo_Id="Shared"
     Link (ObjectValue)
       .Value = nil
+    Aim (Folder)
+      Pointer (ObjectValue)
+        .Attributes = Rojo_Target_Value="BaseSpawn"
+        .Value = -> ReplicatedStorage/Shared/Aim/Target
+      Target (StringValue)
+        .Value = "aimed at by Pointer"
     Config (StringValue)
       .Attributes = Note="from base"
       .Value = "project value"
@@ -31,6 +50,7 @@ ReplicatedStorage (ReplicatedStorage)
       .Source = "return \"util\"\n"
   BaseAssets (Folder)
     Tree (Model)
+  Remotes (Model)
   Pointers (Folder)
     ToShared (ObjectValue)
       .Attributes = Rojo_Target_Value="Shared"

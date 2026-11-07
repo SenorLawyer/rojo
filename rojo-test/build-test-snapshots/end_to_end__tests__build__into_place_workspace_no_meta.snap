@@ -14,6 +14,12 @@ ReplicatedStorage (ReplicatedStorage)
     .Attributes = Owner="map-team", Rojo_Id="OldShared"
     Link (ObjectValue)
       .Value = nil
+    Aim (Folder)
+      Pointer (ObjectValue)
+        .Attributes = Rojo_Target_Value="BaseSpawn"
+        .Value = nil
+      Target (StringValue)
+        .Value = "from base"
     Config (StringValue)
       .Attributes = Note="from base"
       .Value = "base value"
