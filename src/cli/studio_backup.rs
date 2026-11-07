@@ -397,7 +397,7 @@ impl Store {
                 .map_err(|error| error.error)?;
             named = true;
             // And the names of both, which live in the folder.
-            self.flush_dir()?;
+            self.flush_names(&id)?;
             Ok(())
         })();
         if let Err(error) = written {
@@ -428,14 +428,30 @@ impl Store {
             .context("Could not write the backup to disk")
     }
 
-    /// Writes the store folder's entries through to disk, where the system
-    /// allows it. Windows cannot open a folder as a file to flush it, and
-    /// writes a renamed file's name with the file there.
-    fn flush_dir(&self) -> anyhow::Result<()> {
+    /// Writes the names of a newly published backup through to disk.
+    fn flush_names(&self, id: &str) -> anyhow::Result<()> {
+        #[cfg(test)]
+        if failing_publish_flushes(&self.dir) {
+            anyhow::bail!("Simulated failure to write a backup's names to disk");
+        }
         #[cfg(unix)]
-        fs::File::open(&self.dir)
-            .and_then(|dir| dir.sync_all())
-            .context("Could not write the backup folder to disk")?;
+        {
+            let _ = id;
+            fs::File::open(&self.dir)
+                .and_then(|dir| dir.sync_all())
+                .context("Could not write the backup folder to disk")?;
+        }
+        // Windows renames without write-through and cannot flush a folder,
+        // so each published file is flushed under its final name instead,
+        // which also commits the rename to disk.
+        #[cfg(windows)]
+        for path in [self.model_path(id), self.record_path(id)] {
+            let file = fs::OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .with_context(|| format!("Could not reopen {}", path.display()))?;
+            self.flush(&file)?;
+        }
         Ok(())
     }
 
@@ -1009,6 +1025,30 @@ fn failing_flushes(dir: &Path) -> bool {
 #[cfg(test)]
 pub(crate) fn fail_flushes_in(dir: &Path, failing: bool) {
     let mut dirs = FAILING_FLUSHES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    dirs.retain(|existing| existing != dir);
+    if failing {
+        dirs.push(dir.to_owned());
+    }
+}
+
+#[cfg(test)]
+static FAILING_PUBLISH_FLUSHES: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+fn failing_publish_flushes(dir: &Path) -> bool {
+    FAILING_PUBLISH_FLUSHES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .any(|failing| failing == dir)
+}
+
+/// Makes writing a published backup's names through to disk fail in `dir`.
+#[cfg(test)]
+pub(crate) fn fail_publish_flushes_in(dir: &Path, failing: bool) {
+    let mut dirs = FAILING_PUBLISH_FLUSHES
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     dirs.retain(|existing| existing != dir);
@@ -1931,6 +1971,25 @@ mod tests {
             .save_automatic(record("auto", now_millis()), b"model")
             .unwrap();
         assert_eq!(store.list().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_backup_whose_names_cannot_be_written_to_disk_is_not_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::in_dir(dir.path());
+        fail_publish_flushes_in(dir.path(), true);
+        let error = store
+            .save_automatic(record("auto", now_millis()), b"model")
+            .unwrap_err();
+        fail_publish_flushes_in(dir.path(), false);
+        assert!(format!("{error:#}").contains("names to disk"), "{error:#}");
+        assert!(store.list().unwrap().is_empty());
+        let left: Vec<String> = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name != ".store.lock")
+            .collect();
+        assert!(left.is_empty(), "nothing is left of it: {left:?}");
     }
 
     #[test]
