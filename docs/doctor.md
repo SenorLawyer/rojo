@@ -56,7 +56,8 @@ attention has a one-line fix.
   that times out or fails otherwise is a `probe-inconclusive` warning,
   because something may be listening behind it. Doctor waits up to 3 seconds
   to connect (Windows takes about 2 to refuse a loopback connection) and 1.5
-  more for the answer, does not follow redirects (a redirect means something
+  more for the whole answer, however slowly it arrives (a server that stalls
+  or trickles is `no-answer`), does not follow redirects (a redirect means something
   else answers on the port), reads at most 1 MiB, and rejects answers nested
   more than 32 levels deep before decoding them.
 

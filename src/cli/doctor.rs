@@ -7,7 +7,7 @@ use std::{
     io::Read,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     path::{Path, PathBuf},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use clap::Parser;
@@ -42,6 +42,11 @@ const CLI_VERSION: &str = env!("CARGO_PKG_VERSION");
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(3000);
 /// Covers connecting and the answer: 1.5 seconds once connected.
 const REQUEST_TIMEOUT: Duration = Duration::from_millis(4500);
+/// Reading the installed plugin, a local file of about 600 KB, takes
+/// milliseconds; this only bounds a read that blocks (see `read_plugin`).
+const PLUGIN_READ_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long past a deadline doctor waits for a helper thread to report.
+const DEADLINE_GRACE: Duration = Duration::from_millis(250);
 /// `/api/rojo` answers with well under a kilobyte. Whatever listens on the
 /// port may not be Rojo, so doctor reads no more than this of its answer.
 const MAX_INFO_BYTES: usize = 1024 * 1024;
@@ -588,7 +593,32 @@ fn check_plugin(plugins_dir: Result<PathBuf, String>, explicit: bool) -> Vec<Che
 /// can block until something writes to it, which may be never, and a
 /// directory cannot be a plugin. The opened handle is checked again in case
 /// the path changed in between.
+///
+/// That still leaves a window: a FIFO swapped in after the check makes
+/// `open` itself block on Unix. Opening with `O_NONBLOCK` would close it, but
+/// that needs `libc`, which this crate does not depend on, so the open and
+/// read run on a helper thread instead and doctor stops waiting after
+/// [`PLUGIN_READ_TIMEOUT`]. A thread still blocked then is left behind.
 fn read_plugin(path: &Path) -> Result<Option<Vec<u8>>, String> {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let path = path.to_owned();
+    std::thread::Builder::new()
+        .name("doctor-plugin-read".into())
+        .spawn(move || {
+            let _ = sender.send(read_plugin_blocking(&path));
+        })
+        .map_err(|err| format!("could not start reading it: {err}"))?;
+    receiver
+        .recv_timeout(PLUGIN_READ_TIMEOUT)
+        .unwrap_or_else(|_| {
+            Err(format!(
+                "reading it did not finish within {} seconds",
+                PLUGIN_READ_TIMEOUT.as_secs()
+            ))
+        })
+}
+
+fn read_plugin_blocking(path: &Path) -> Result<Option<Vec<u8>>, String> {
     let not_a_file = || "it is not a regular file".to_owned();
     match fs::metadata(path) {
         Ok(metadata) if metadata.is_file() => {}
@@ -931,7 +961,55 @@ fn connection_refused(err: &(dyn std::error::Error + 'static)) -> bool {
     false
 }
 
+/// Whether a timeout is anywhere in `err`'s sources. reqwest reports a body
+/// read that timed out as an io error of kind `Other` wrapping its own
+/// timeout error, so the kind alone does not show it.
+fn is_timeout(err: &(dyn std::error::Error + 'static)) -> bool {
+    let mut source = Some(err);
+    while let Some(err) = source {
+        if let Some(io) = err.downcast_ref::<std::io::Error>() {
+            if io.kind() == std::io::ErrorKind::TimedOut {
+                return true;
+            }
+            // An io error's `source` skips the error it wraps, so look at
+            // that one directly.
+            if io.get_ref().is_some_and(|inner| is_timeout(inner)) {
+                return true;
+            }
+        }
+        if err
+            .downcast_ref::<reqwest::Error>()
+            .is_some_and(reqwest::Error::is_timeout)
+        {
+            return true;
+        }
+        source = err.source();
+    }
+    false
+}
+
+/// Probes `/api/rojo` within [`REQUEST_TIMEOUT`] overall, however slowly the
+/// other side answers. reqwest 0.11's blocking timeout does not bound the
+/// whole body: a server that trickles a byte at a time keeps each read
+/// alive. So the probe runs on a helper thread, which also stops reading at
+/// the deadline, and this waits for it only until shortly after the deadline.
+/// A helper still stuck in a read then is left behind; doctor exits soon.
 fn fetch_server_info(address: SocketAddr) -> Probe {
+    let deadline = Instant::now() + REQUEST_TIMEOUT;
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let spawned = std::thread::Builder::new()
+        .name("doctor-probe".into())
+        .spawn(move || {
+            let _ = sender.send(fetch_server_info_until(address, deadline));
+        });
+    if let Err(err) = spawned {
+        return Probe::NotRojo(format!("could not start the probe: {err}"));
+    }
+    let wait = deadline.saturating_duration_since(Instant::now()) + DEADLINE_GRACE;
+    receiver.recv_timeout(wait).unwrap_or(Probe::NoAnswer)
+}
+
+fn fetch_server_info_until(address: SocketAddr, deadline: Instant) -> Probe {
     let client = match reqwest::blocking::Client::builder()
         .connect_timeout(CONNECT_TIMEOUT)
         .timeout(REQUEST_TIMEOUT)
@@ -974,14 +1052,19 @@ fn fetch_server_info(address: SocketAddr) -> Probe {
         return Probe::NotRojo(format!("answered {status}"));
     }
     let mut bytes = Vec::new();
-    if let Err(err) = response
-        .take(MAX_INFO_BYTES as u64 + 1)
-        .read_to_end(&mut bytes)
-    {
-        return match err.kind() {
-            std::io::ErrorKind::TimedOut => Probe::NoAnswer,
-            _ => Probe::NotRojo(err.to_string()),
-        };
+    let mut body = response.take(MAX_INFO_BYTES as u64 + 1);
+    let mut chunk = [0u8; 8192];
+    loop {
+        if Instant::now() >= deadline {
+            return Probe::NoAnswer;
+        }
+        match body.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(read) => bytes.extend_from_slice(&chunk[..read]),
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(err) if is_timeout(&err) => return Probe::NoAnswer,
+            Err(err) => return Probe::NotRojo(err.to_string()),
+        }
     }
     if bytes.len() > MAX_INFO_BYTES {
         return Probe::NotRojo(format!(
@@ -2052,6 +2135,86 @@ mod tests {
         );
         assert!(start.elapsed() < REQUEST_TIMEOUT + Duration::from_secs(2));
         drop(listener);
+    }
+
+    /// Accepts one request, sends `head`, then calls `rest` with the stream.
+    /// The thread is left running, as doctor leaves a stuck probe behind.
+    fn slow_server(
+        head: &'static [u8],
+        rest: impl FnOnce(std::net::TcpStream) + Send + 'static,
+    ) -> SocketAddr {
+        use std::io::{Read, Write};
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buffer = [0; 1024];
+            let _ = stream.read(&mut buffer);
+            if stream.write_all(head).is_ok() {
+                rest(stream);
+            }
+        });
+        address
+    }
+
+    /// The bound the probe promises: the deadline plus the grace period, with
+    /// some slack for a loaded test machine.
+    fn within_probe_bound(start: Instant) -> bool {
+        start.elapsed() < REQUEST_TIMEOUT + DEADLINE_GRACE + Duration::from_millis(750)
+    }
+
+    #[test]
+    fn a_trickling_server_cannot_hold_doctor_past_its_deadline() {
+        use std::io::Write;
+        // Each byte keeps a single read alive, which reqwest's own timeout
+        // does not stop: before the deadline it took 9 s and more.
+        let address = slow_server(
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 1000\r\nConnection: close\r\n\r\n",
+            |mut stream| {
+                for _ in 0..1000 {
+                    std::thread::sleep(Duration::from_millis(300));
+                    if stream.write_all(b" ").is_err() {
+                        return;
+                    }
+                }
+            },
+        );
+        let start = Instant::now();
+        let probe = fetch_server_info(address);
+        assert!(within_probe_bound(start), "{:?}", start.elapsed());
+        assert!(matches!(probe, Probe::NoAnswer));
+        assert_eq!(
+            codes(&check_server(address, probe, None)),
+            [("no-answer", Status::Warning)]
+        );
+    }
+
+    #[test]
+    fn a_partial_answer_then_a_stall_is_no_answer_not_a_stranger() {
+        use std::io::Write;
+        let address = slow_server(
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 200\r\nConnection: close\r\n\r\n",
+            |mut stream| {
+                let _ = stream.write_all(br#"{"serverVersion":"8.1.0","#);
+                std::thread::sleep(Duration::from_secs(20));
+            },
+        );
+        let start = Instant::now();
+        let probe = fetch_server_info(address);
+        assert!(within_probe_bound(start), "{:?}", start.elapsed());
+        assert!(matches!(probe, Probe::NoAnswer));
+    }
+
+    #[test]
+    fn timeouts_are_found_inside_wrapped_io_errors() {
+        // reqwest's body timeout reaches the reader as an io error of kind
+        // Other that wraps the real timeout.
+        let inner = std::io::Error::new(std::io::ErrorKind::TimedOut, "operation timed out");
+        let wrapped = std::io::Error::other(inner);
+        assert_eq!(wrapped.kind(), std::io::ErrorKind::Other);
+        assert!(is_timeout(&wrapped));
+        let unrelated = std::io::Error::other("connection reset");
+        assert!(!is_timeout(&unrelated));
     }
 
     /// Answers one request with `body`, then probes it.
