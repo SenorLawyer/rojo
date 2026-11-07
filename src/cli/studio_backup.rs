@@ -262,8 +262,26 @@ impl Store {
     }
 
     fn lock_file(&self) -> anyhow::Result<fs::File> {
+        let missing: Vec<PathBuf> = self
+            .dir
+            .ancestors()
+            .take_while(|dir| !dir.exists())
+            .map(Path::to_path_buf)
+            .collect();
         fs::create_dir_all(&self.dir)
             .with_context(|| format!("Could not create {}", self.dir.display()))?;
+        // A folder created here is only reachable after a crash once its
+        // parent's entry for it is on disk too.
+        #[cfg(unix)]
+        for created in &missing {
+            if let Some(parent) = created.parent() {
+                fs::File::open(parent)
+                    .and_then(|parent| parent.sync_all())
+                    .with_context(|| format!("Could not write {} to disk", parent.display()))?;
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = missing;
         fs::OpenOptions::new()
             .create(true)
             .truncate(false)
