@@ -551,9 +551,14 @@ fn check_plugin(plugins_dir: Result<PathBuf, String>, explicit: bool) -> Vec<Che
         .flatten()
         .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
         .filter(|name| plugin::is_side_by_side_file_name(name))
+        .filter(|name| plugins_dir.join(name).is_file())
         .collect();
     copies.sort();
     if !copies.is_empty() {
+        let paths: Vec<String> = copies
+            .iter()
+            .map(|name| format!("\"{}\"", plugins_dir.join(name).display()))
+            .collect();
         checks.push(check(
             category,
             "side-by-side-copies",
@@ -563,8 +568,12 @@ fn check_plugin(plugins_dir: Result<PathBuf, String>, explicit: bool) -> Vec<Che
                 plugins_dir.display(),
                 copies.join(", ")
             ),
+            // `uninstall --side-by-side` only removes this CLI's version, and
+            // `uninstall --all` also removes the managed plugin, so name the
+            // files, and give --all only together with the reinstall.
             Some(&format!(
-                "Remove the ones you no longer test with `rojo plugin uninstall --side-by-side{flag}` (this version) or `rojo plugin uninstall --all{flag}`."
+                "Delete the copies you no longer test: {}. Or remove every copy and reinstall the managed plugin with `rojo plugin uninstall --all{flag}` followed by {install}.",
+                paths.join(", ")
             )),
         ));
     }
@@ -574,12 +583,27 @@ fn check_plugin(plugins_dir: Result<PathBuf, String>, explicit: bool) -> Vec<Che
 /// Reads at most the size limit for untrusted models, so a huge file in the
 /// plugins folder is reported instead of read into memory. `None` when the
 /// file does not exist.
+///
+/// Only regular files are opened. Opening or reading a named pipe or FIFO
+/// can block until something writes to it, which may be never, and a
+/// directory cannot be a plugin. The opened handle is checked again in case
+/// the path changed in between.
 fn read_plugin(path: &Path) -> Result<Option<Vec<u8>>, String> {
+    let not_a_file = || "it is not a regular file".to_owned();
+    match fs::metadata(path) {
+        Ok(metadata) if metadata.is_file() => {}
+        Ok(_) => return Err(not_a_file()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err.to_string()),
+    }
     let file = match fs::File::open(path) {
         Ok(file) => file,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(err) => return Err(err.to_string()),
     };
+    if !file.metadata().is_ok_and(|metadata| metadata.is_file()) {
+        return Err(not_a_file());
+    }
     let mut bytes = Vec::new();
     file.take(MAX_MODEL_BYTES as u64 + 1)
         .read_to_end(&mut bytes)
@@ -677,10 +701,75 @@ struct ServerInfo {
     protocol_version: u64,
     #[serde(default)]
     project_name: Option<String>,
-    /// Only whether it is present matters. Its contents include the plugin's
-    /// pairing token, so they are never kept or printed.
+    /// Absent or null when the bridge is off or hidden from this request.
     #[serde(default)]
-    studio_bridge: Option<IgnoredAny>,
+    studio_bridge: Option<BridgeField>,
+}
+
+/// `studioBridge` as the server sends it, or anything else. The fields exist
+/// only so decoding checks their shape, hence `dead_code`.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+#[allow(dead_code)]
+enum BridgeField {
+    Advertised(BridgeAdvert),
+    Unrecognized(IgnoredAny),
+}
+
+/// The pairing details `StudioBridge::pairing` (src/web/studio.rs) sends:
+/// `{"protocolVersion": 1, "pluginToken": "...", "identity": {...}}`. Only
+/// their shape is checked. The token is never kept, so it cannot be printed.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
+struct BridgeAdvert {
+    protocol_version: u64,
+    plugin_token: Shape<StringShape>,
+    identity: Shape<MapShape>,
+}
+
+/// A value of the kind `K` names, checked and then discarded.
+#[derive(Debug)]
+struct Shape<K>(std::marker::PhantomData<K>);
+
+#[derive(Debug)]
+struct StringShape;
+#[derive(Debug)]
+struct MapShape;
+
+impl<'de> Deserialize<'de> for Shape<StringShape> {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visitor;
+        impl serde::de::Visitor<'_> for Visitor {
+            type Value = ();
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("a string")
+            }
+            fn visit_str<E: serde::de::Error>(self, _: &str) -> Result<(), E> {
+                Ok(())
+            }
+        }
+        deserializer.deserialize_str(Visitor)?;
+        Ok(Shape(std::marker::PhantomData))
+    }
+}
+
+impl<'de> Deserialize<'de> for Shape<MapShape> {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visitor;
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = ();
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("a map")
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
+                while map.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
+                Ok(())
+            }
+        }
+        deserializer.deserialize_map(Visitor)?;
+        Ok(Shape(std::marker::PhantomData))
+    }
 }
 
 /// The deepest nesting accepted in a `/api/rojo` answer. Real answers nest
@@ -1027,22 +1116,28 @@ fn check_server(address: SocketAddr, probe: Probe, project_name: Option<&str>) -
     // Origin, or from another user's process), so their absence does not
     // prove the bridge is off. The details carry the plugin's token and are
     // never printed.
-    checks.push(if info.studio_bridge.is_some() {
-        check(
+    checks.push(match info.studio_bridge {
+        Some(BridgeField::Advertised(_)) => check(
             category,
             "studio-bridge-enabled",
             Status::Info,
             "The Studio control bridge is enabled.",
             Some("Run `rojo studio sessions --token-file <file>` to see connected Studios and their sync health."),
-        )
-    } else {
-        check(
+        ),
+        Some(BridgeField::Unrecognized(_)) => check(
+            category,
+            "studio-bridge-unrecognized",
+            Status::Info,
+            "The server sent Studio bridge details doctor does not recognize, so it cannot tell whether the bridge is enabled.",
+            Some("Run doctor from the same Rojo version as rojo serve."),
+        ),
+        None => check(
             category,
             "studio-bridge-not-advertised",
             Status::Info,
             "The server did not advertise a Studio control bridge to doctor. It may be off, or hidden from this address or user.",
             Some("To use `rojo studio` and `rojo mcp`, serve with --studio-token-file on a loopback address and run doctor as the same user."),
-        )
+        ),
     });
     checks
 }
@@ -1480,6 +1575,34 @@ mod tests {
         let checks = check_plugin(Ok(dir.path().to_owned()), false);
         assert_eq!(codes(&checks), [("plugin-unreadable", Status::Warning)]);
         assert!(checks[0].message.contains("larger than"), "{:?}", checks[0]);
+
+        // Something that is not a regular file is not opened. A directory
+        // stands in for a named pipe or FIFO, whose read could block forever.
+        fs::remove_file(&path).unwrap();
+        fs::create_dir(&path).unwrap();
+        fs::create_dir(dir.path().join("Rojo-7.7.1.rbxm")).unwrap();
+        let checks = check_plugin(Ok(dir.path().to_owned()), false);
+        // The directory named like a side-by-side copy is not listed either.
+        assert_eq!(codes(&checks), [("plugin-unreadable", Status::Warning)]);
+        assert!(
+            checks[0].message.contains("not a regular file"),
+            "{:?}",
+            checks[0]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_named_like_the_plugin_does_not_block() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join(plugin::PLUGIN_FILE_NAME);
+        let status = std::process::Command::new("mkfifo")
+            .arg(&path)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let checks = check_plugin(Ok(dir.path().to_owned()), false);
+        assert_eq!(codes(&checks), [("plugin-unreadable", Status::Warning)]);
     }
 
     #[test]
@@ -1500,8 +1623,22 @@ mod tests {
         }
         assert_eq!(missing.len(), 2);
         assert_eq!(unreadable.len(), 2);
-        // Both uninstall commands in the side-by-side hint name it.
-        assert_eq!(unreadable[1].matches(&flag).count(), 2, "{}", unreadable[1]);
+        // The side-by-side hint names the stray file, and offers --all only
+        // together with the reinstall, both naming the folder.
+        let copy = format!("\"{}\"", dir.path().join("Rojo-7.7.1.rbxm").display());
+        assert!(unreadable[1].contains(&copy), "{}", unreadable[1]);
+        assert!(
+            !unreadable[1].contains("--side-by-side"),
+            "{}",
+            unreadable[1]
+        );
+        assert!(
+            unreadable[1].contains(&format!(
+                "`rojo plugin uninstall --all {flag}` followed by `rojo plugin install {flag}`"
+            )),
+            "{}",
+            unreadable[1]
+        );
 
         // An outdated plugin's hint too.
         fs::remove_file(dir.path().join("Rojo-7.7.1.rbxm")).unwrap();
@@ -1558,8 +1695,22 @@ mod tests {
 
     /// This fork's real `/api/rojo` body, encoded as the server encodes it.
     fn msgpack_info(server_version: &str, protocol_version: u64, bridge: bool) -> Vec<u8> {
+        // The shape `StudioBridge::pairing` sends.
+        let pairing = serde_json::json!({
+            "protocolVersion": 1,
+            "pluginToken": "secret",
+            "identity": {"serverSession": "session", "digest": "abc"},
+        });
+        msgpack_info_with_bridge(server_version, protocol_version, bridge.then_some(pairing))
+    }
+
+    fn msgpack_info_with_bridge(
+        server_version: &str,
+        protocol_version: u64,
+        bridge: Option<serde_json::Value>,
+    ) -> Vec<u8> {
         crate::web::util::serialize_msgpack(ServerInfoResponse {
-            studio_bridge: bridge.then(|| serde_json::json!({"pluginToken": "secret"})),
+            studio_bridge: bridge,
             session_id: crate::SessionId::new(),
             server_version: server_version.to_owned(),
             protocol_version,
@@ -1589,7 +1740,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(info.protocol_version, PROTOCOL_VERSION);
-        assert!(info.studio_bridge.is_some());
+        assert!(matches!(
+            info.studio_bridge,
+            Some(BridgeField::Advertised(_))
+        ));
 
         for content_type in [Some("application/json"), None] {
             let info = parse_server_info(content_type, UPSTREAM_V7_INFO.as_bytes()).unwrap();
@@ -1607,6 +1761,44 @@ mod tests {
         .is_ok());
         assert!(parse_server_info(Some("application/json"), b"{\"hello\":1}").is_err());
         assert!(parse_server_info(None, b"hello").is_err());
+    }
+
+    #[test]
+    fn only_the_real_pairing_shape_counts_as_an_enabled_bridge() {
+        let address: SocketAddr = "127.0.0.1:34872".parse().unwrap();
+        let bridge_code = |bridge: Option<serde_json::Value>| {
+            let bytes = msgpack_info_with_bridge(CLI_VERSION, PROTOCOL_VERSION, bridge);
+            let info = parse_server_info(Some("application/msgpack"), &bytes).unwrap();
+            let checks = check_server(address, Probe::Rojo(info), None);
+            checks.last().unwrap().code.clone()
+        };
+        let pairing = serde_json::json!({
+            "protocolVersion": 1, "pluginToken": "t", "identity": {"digest": "d"}
+        });
+        assert_eq!(bridge_code(Some(pairing)), "studio-bridge-enabled");
+        assert_eq!(bridge_code(None), "studio-bridge-not-advertised");
+        for odd in [
+            serde_json::json!(false),
+            serde_json::json!(true),
+            serde_json::json!("on"),
+            serde_json::json!({}),
+            serde_json::json!({"protocolVersion": 1, "identity": {}}),
+            serde_json::json!({"protocolVersion": 1, "pluginToken": false, "identity": {}}),
+            serde_json::json!({"protocolVersion": 1, "pluginToken": "t", "identity": "x"}),
+        ] {
+            assert_eq!(
+                bridge_code(Some(odd.clone())),
+                "studio-bridge-unrecognized",
+                "{odd}"
+            );
+        }
+        // The same through upstream-style JSON.
+        let json = r#"{"serverVersion":"8.1.0","protocolVersion":5,"studioBridge":false}"#;
+        let info = parse_server_info(Some("application/json"), json.as_bytes()).unwrap();
+        assert!(matches!(
+            info.studio_bridge,
+            Some(BridgeField::Unrecognized(_))
+        ));
     }
 
     /// A MessagePack `/api/rojo` answer with valid fields whose `studioBridge`

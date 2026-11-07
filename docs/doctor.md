@@ -40,9 +40,11 @@ attention has a one-line fix.
   warning, since it may be installed another way. The installed file is read
   as an untrusted model, with the checks `rojo studio import` uses: at most
   5 MiB, structural checks, and decoding in a child process with a memory cap,
-  so a corrupted file is reported as `plugin-unreadable`. With
-  `--plugins-dir`, the suggested install and uninstall commands name that
-  folder too.
+  so a corrupted file is reported as `plugin-unreadable`, as is anything that
+  is not a regular file (a directory, named pipe or FIFO is never opened).
+  For side-by-side copies doctor lists the files to delete, or the complete
+  `rojo plugin uninstall --all` then `rojo plugin install` sequence. With
+  `--plugins-dir`, the suggested commands name that folder too.
 * rojo serve: whether a server answers on the address and port serve would use
   (`--address` and `--port`, then the project's `serveAddress` and
   `servePort`, then `127.0.0.1:34872`). Its version against this CLI's, its
@@ -63,7 +65,9 @@ attention has a one-line fix.
   worktree of the same project; doctor says so instead of claiming a match.
   The Studio bridge only shows itself to requests it trusts (from loopback,
   without an Origin, by the same user), so doctor reports "enabled" or "not
-  advertised", never "disabled". Listing Studio sessions and their sync
+  advertised", never "disabled". Only pairing details with the shape the
+  server sends (`protocolVersion`, a string `pluginToken` and an `identity`
+  object) count as enabled; any other value is `studio-bridge-unrecognized`. Listing Studio sessions and their sync
   health needs the bridge's token, so doctor points to `rojo studio sessions
   --token-file` instead.
 * Git: whether Git runs, whether it is at least 2.31, which checkpoints,
