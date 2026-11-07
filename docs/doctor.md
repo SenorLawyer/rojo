@@ -38,9 +38,18 @@ attention has a one-line fix.
 * rojo serve: whether a server answers on the address and port serve would use
   (`--address` and `--port`, then the project's `serveAddress` and
   `servePort`, then `127.0.0.1:34872`). Its version against this CLI's, its
-  protocol against the plugin's, whether it serves this project, and whether
-  its Studio bridge is enabled. No server is information, not a problem.
-  Doctor waits at most 1.5 seconds. Listing Studio sessions and their sync
+  protocol against the plugin's, and whether it serves a project with this
+  project's name. It reads both this fork's MessagePack answer and the JSON
+  that released upstream Rojo sends, so an upstream or older server is
+  reported as a version or protocol mismatch. No server is information, not a
+  problem. Doctor waits at most 1.5 seconds.
+
+  The API names the served project but not its folder, so a matching name
+  does not show that the server runs this checkout rather than another
+  worktree of the same project; doctor says so instead of claiming a match.
+  The Studio bridge only shows itself to requests it trusts (from loopback,
+  without an Origin, by the same user), so doctor reports "enabled" or "not
+  advertised", never "disabled". Listing Studio sessions and their sync
   health needs the bridge's token, so doctor points to `rojo studio sessions
   --token-file` instead.
 * Git: whether Git runs, whether it is at least 2.31, which checkpoints,

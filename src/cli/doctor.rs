@@ -13,14 +13,11 @@ use clap::Parser;
 use memofs::Vfs;
 use rbx_dom_weak::{types::Variant, Ustr};
 use roblox_install::RobloxStudio;
-use serde::Serialize;
+use serde::{de::IgnoredAny, Deserialize, Serialize};
 
 use crate::{
     serve_session::ServeSession,
-    web::{
-        interface::{ServerInfoResponse, PROTOCOL_VERSION},
-        util::deserialize_msgpack,
-    },
+    web::{interface::PROTOCOL_VERSION, util::deserialize_msgpack},
     Project,
 };
 
@@ -571,7 +568,36 @@ enum Probe {
     NoAnswer,
     /// Something answered, but not with Rojo's server info.
     NotRojo(String),
-    Rojo(Box<ServerInfoResponse>),
+    Rojo(ServerInfo),
+}
+
+/// The parts of `/api/rojo` doctor reads. This is deliberately looser than
+/// [`crate::web::interface::ServerInfoResponse`] so that older servers still parse: upstream Rojo 7
+/// answers with JSON and protocol 4, and doctor should report that as a
+/// version mismatch rather than as "not Rojo".
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ServerInfo {
+    server_version: String,
+    protocol_version: u64,
+    #[serde(default)]
+    project_name: Option<String>,
+    /// Only whether it is present matters. Its contents include the plugin's
+    /// pairing token, so they are never kept or printed.
+    #[serde(default)]
+    studio_bridge: Option<IgnoredAny>,
+}
+
+/// Decodes `/api/rojo` as this fork's MessagePack, or as the JSON that
+/// released upstream Rojo sends. The content type picks which to try first.
+fn parse_server_info(content_type: Option<&str>, bytes: &[u8]) -> Option<ServerInfo> {
+    let json = || serde_json::from_slice::<ServerInfo>(bytes).ok();
+    let msgpack = || deserialize_msgpack::<ServerInfo>(bytes).ok();
+    if content_type.is_some_and(|value| value.contains("json")) {
+        json().or_else(msgpack)
+    } else {
+        msgpack().or_else(json)
+    }
 }
 
 fn fetch_server_info(address: SocketAddr) -> Probe {
@@ -591,11 +617,16 @@ fn fetch_server_info(address: SocketAddr) -> Probe {
         Err(err) => return Probe::NotRojo(err.to_string()),
     };
     let status = response.status();
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
     match response.bytes() {
         Ok(bytes) if status.is_success() => {
-            match deserialize_msgpack::<ServerInfoResponse>(&bytes) {
-                Ok(info) => Probe::Rojo(Box::new(info)),
-                Err(_) => Probe::NotRojo(format!("answered {status} without Rojo's server info")),
+            match parse_server_info(content_type.as_deref(), &bytes) {
+                Some(info) => Probe::Rojo(info),
+                None => Probe::NotRojo(format!("answered {status} without Rojo's server info")),
             }
         }
         Ok(_) => Probe::NotRojo(format!("answered {status}")),
@@ -645,8 +676,8 @@ fn check_server(address: SocketAddr, probe: Probe, project_name: Option<&str>) -
             "server-current",
             Status::Ok,
             format!(
-                "rojo serve {} is running on {address} for {}.",
-                info.server_version, info.project_name
+                "rojo serve {} is running on {address}, the same version as this CLI.",
+                info.server_version
             ),
             None,
         ));
@@ -674,23 +705,43 @@ fn check_server(address: SocketAddr, probe: Probe, project_name: Option<&str>) -
             Some("Restart rojo serve with this CLI, or install the plugin from the Rojo that runs the server."),
         ));
     }
-    if let Some(name) = project_name {
-        if info.project_name != name {
-            checks.push(check(
-                category,
-                "other-project",
-                Status::Warning,
-                format!(
-                    "The server on {address} serves {}, not this project ({name}).",
-                    info.project_name
-                ),
-                Some("Stop it, or serve this project on another port with `rojo serve --port`."),
-            ));
-        }
+    // The API names the project but not its folder, and nothing else in it
+    // identifies a checkout: the session ID is new on every start, and the
+    // bridge's identity digest covers that session too. So a matching name
+    // is only reported as a matching name.
+    match (project_name, info.project_name.as_deref()) {
+        (Some(name), Some(served)) if served == name => checks.push(check(
+            category,
+            "same-project-name",
+            Status::Info,
+            format!(
+                "The server serves a project named {served}, like this one. The API does not say which folder it serves, so doctor cannot confirm it is this checkout."
+            ),
+            Some("With several checkouts or worktrees, check the folder in the terminal that runs rojo serve."),
+        )),
+        (Some(name), Some(served)) => checks.push(check(
+            category,
+            "other-project",
+            Status::Warning,
+            format!("The server on {address} serves {served}, not this project ({name})."),
+            Some("Stop it, or serve this project on another port with `rojo serve --port`."),
+        )),
+        (Some(_), None) => checks.push(check(
+            category,
+            "project-unknown",
+            Status::Info,
+            "The server did not say which project it serves.",
+            None,
+        )),
+        (None, _) => {}
     }
     // Listing sessions and their sync health needs the operator token, which
-    // doctor does not take, so only whether the bridge is on is reported. The
-    // pairing details carry the plugin's token and are never printed.
+    // doctor does not take. The API has no separate "bridge enabled" field:
+    // the bridge only answers with its pairing details, and it withholds
+    // those from requests it does not trust (not from loopback, with an
+    // Origin, or from another user's process), so their absence does not
+    // prove the bridge is off. The details carry the plugin's token and are
+    // never printed.
     checks.push(if info.studio_bridge.is_some() {
         check(
             category,
@@ -702,10 +753,10 @@ fn check_server(address: SocketAddr, probe: Probe, project_name: Option<&str>) -
     } else {
         check(
             category,
-            "studio-bridge-disabled",
+            "studio-bridge-not-advertised",
             Status::Info,
-            "The Studio control bridge is not enabled on this server.",
-            Some("Serve with --studio-token-file to let `rojo studio` and `rojo mcp` reach Studio."),
+            "The server did not advertise a Studio control bridge to doctor. It may be off, or hidden from this address or user.",
+            Some("To use `rojo studio` and `rojo mcp`, serve with --studio-token-file on a loopback address and run doctor as the same user."),
         )
     });
     checks
@@ -855,6 +906,7 @@ fn render_text(report: &Report) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::web::interface::ServerInfoResponse;
     use std::net::TcpListener;
     use tempfile::tempdir;
 
@@ -1131,8 +1183,9 @@ mod tests {
         );
     }
 
-    fn info(server_version: &str, protocol_version: u64, bridge: bool) -> Probe {
-        Probe::Rojo(Box::new(ServerInfoResponse {
+    /// This fork's real `/api/rojo` body, encoded as the server encodes it.
+    fn msgpack_info(server_version: &str, protocol_version: u64, bridge: bool) -> Vec<u8> {
+        crate::web::util::serialize_msgpack(ServerInfoResponse {
             studio_bridge: bridge.then(|| serde_json::json!({"pluginToken": "secret"})),
             session_id: crate::SessionId::new(),
             server_version: server_version.to_owned(),
@@ -1143,7 +1196,44 @@ mod tests {
             game_id: None,
             place_id: None,
             root_instance_id: rbx_dom_weak::types::Ref::new(),
-        }))
+        })
+        .unwrap()
+    }
+
+    fn info(server_version: &str, protocol_version: u64, bridge: bool) -> Probe {
+        let bytes = msgpack_info(server_version, protocol_version, bridge);
+        Probe::Rojo(parse_server_info(Some("application/msgpack"), &bytes).unwrap())
+    }
+
+    /// The shape upstream Rojo 7.x answers `/api/rojo` with: JSON, protocol 4.
+    const UPSTREAM_V7_INFO: &str = r#"{"sessionId":"5f0e2c4e-8a35-4f0b-9f4e-0f2b8b1d9a77","serverVersion":"7.6.1","protocolVersion":4,"projectName":"game","expectedPlaceIds":null,"unexpectedPlaceIds":null,"gameId":null,"placeId":null,"rootInstanceId":"0123456789abcdef0123456789abcdef"}"#;
+
+    #[test]
+    fn server_info_parses_from_msgpack_and_upstream_json() {
+        let info = parse_server_info(
+            Some("application/msgpack"),
+            &msgpack_info(CLI_VERSION, PROTOCOL_VERSION, true),
+        )
+        .unwrap();
+        assert_eq!(info.protocol_version, PROTOCOL_VERSION);
+        assert!(info.studio_bridge.is_some());
+
+        for content_type in [Some("application/json"), None] {
+            let info = parse_server_info(content_type, UPSTREAM_V7_INFO.as_bytes()).unwrap();
+            assert_eq!(
+                (info.server_version.as_str(), info.protocol_version),
+                ("7.6.1", 4)
+            );
+            assert!(info.studio_bridge.is_none());
+        }
+        // A mislabeled body is still tried in the other format.
+        assert!(parse_server_info(
+            Some("application/json"),
+            &msgpack_info(CLI_VERSION, PROTOCOL_VERSION, false)
+        )
+        .is_some());
+        assert!(parse_server_info(Some("application/json"), b"{\"hello\":1}").is_none());
+        assert!(parse_server_info(None, b"hello").is_none());
     }
 
     #[test]
@@ -1165,7 +1255,31 @@ mod tests {
             )),
             [
                 ("server-current", Status::Ok),
-                ("studio-bridge-disabled", Status::Info)
+                ("same-project-name", Status::Info),
+                ("studio-bridge-not-advertised", Status::Info)
+            ]
+        );
+        // A matching name is not claimed to be the same checkout, and missing
+        // pairing details are not claimed to mean the bridge is off.
+        let checks = check_server(
+            address,
+            info(CLI_VERSION, PROTOCOL_VERSION, false),
+            Some("game"),
+        );
+        let messages: String = checks.iter().map(|check| check.message.as_str()).collect();
+        assert!(messages.contains("cannot confirm"), "{messages}");
+        assert!(messages.contains("may be off"), "{messages}");
+        assert!(!messages.contains("not enabled"), "{messages}");
+        // Without a project to compare, no name check is made.
+        assert_eq!(
+            codes(&check_server(
+                address,
+                info(CLI_VERSION, PROTOCOL_VERSION, true),
+                None
+            )),
+            [
+                ("server-current", Status::Ok),
+                ("studio-bridge-enabled", Status::Info)
             ]
         );
         let checks = check_server(address, info("7.0.0", 4, true), Some("other"));
@@ -1212,23 +1326,54 @@ mod tests {
         drop(listener);
     }
 
-    #[test]
-    fn probing_a_server_that_is_not_rojo_says_so() {
+    /// Answers one request with `body`, then probes it.
+    fn probe_one_response(content_type: &str, body: &[u8]) -> (SocketAddr, Probe) {
         use std::io::{Read, Write};
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
+        let mut response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        response.extend_from_slice(body);
         let server = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             let mut buffer = [0; 1024];
             let _ = stream.read(&mut buffer);
-            stream
-                .write_all(
-                    b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello",
-                )
-                .unwrap();
+            stream.write_all(&response).unwrap();
         });
-        assert!(matches!(fetch_server_info(address), Probe::NotRojo(_)));
+        let probe = fetch_server_info(address);
         server.join().unwrap();
+        (address, probe)
+    }
+
+    #[test]
+    fn probing_a_server_that_is_not_rojo_says_so() {
+        let (_, probe) = probe_one_response("text/plain", b"hello");
+        assert!(matches!(probe, Probe::NotRojo(_)));
+    }
+
+    #[test]
+    fn an_upstream_json_server_is_a_protocol_mismatch_not_a_stranger() {
+        let (address, probe) = probe_one_response("application/json", UPSTREAM_V7_INFO.as_bytes());
+        let checks = check_server(address, probe, Some("game"));
+        assert_eq!(
+            codes(&checks),
+            [
+                ("server-version-mismatch", Status::Warning),
+                ("protocol-mismatch", Status::Error),
+                ("same-project-name", Status::Info),
+                ("studio-bridge-not-advertised", Status::Info)
+            ]
+        );
+        assert!(!Report::new(checks, None).ok);
+
+        // The same through this fork's MessagePack.
+        let (address, probe) =
+            probe_one_response("application/msgpack", &msgpack_info("7.6.1", 4, false));
+        assert!(codes(&check_server(address, probe, None))
+            .contains(&("protocol-mismatch", Status::Error)));
     }
 
     struct FakeGit {
