@@ -1461,6 +1461,57 @@ fn partition_ignore_globs() {
 }
 
 #[test]
+fn partition_ignore_globs_csv() {
+    run_serve_test("partition_ignore_globs_csv", |session, _redactions| {
+        let info = session.get_api_rojo().unwrap();
+        let root_id = info.root_instance_id;
+        let strings = |read: &ReadResponse<'_>| {
+            read.instances
+                .values()
+                .find(|instance| instance.name == "Strings")
+                .map(|instance| {
+                    let contents = match instance.properties.get(&rbx_dom_weak::ustr("Contents")) {
+                        Some(value) => format!("{:?}", value.as_ref()),
+                        None => String::new(),
+                    };
+                    let from_meta = matches!(
+                        instance.properties.get(&rbx_dom_weak::ustr("Attributes")).map(|v| v.as_ref()),
+                        Some(rbx_dom_weak::types::Variant::Attributes(attributes))
+                            if attributes.get("FromMeta").is_some()
+                    );
+                    (contents, from_meta)
+                })
+                .unwrap()
+        };
+        let (_, from_meta) = strings(&session.get_api_read(root_id).unwrap());
+        assert!(!from_meta, "the excluded meta file was applied");
+
+        // Changes to the CSV are snapshotted again with the ignore rules it
+        // was first read with: the excluded meta file stays unapplied, even
+        // when it is not valid.
+        fs::write(session.path().join("src/Strings.meta.json"), "{ not json").unwrap();
+        fs::write(
+            session.path().join("src/Strings.csv"),
+            "Key,Source,Context,Example,en\nhello,Bonjour,,,Bonjour\n",
+        )
+        .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            let (contents, from_meta) = strings(&session.get_api_read(root_id).unwrap());
+            assert!(!from_meta, "the excluded meta file was applied");
+            if contents.contains("Bonjour") {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the CSV change was not synced: {contents}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    });
+}
+
+#[test]
 fn partition_ignore_globs_reload() {
     run_serve_test("partition_ignore_globs_reload", |session, _redactions| {
         let info = session.get_api_rojo().unwrap();

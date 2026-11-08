@@ -42,7 +42,10 @@ pub fn snapshot_csv(
         .metadata(
             InstanceMetadata::new()
                 .instigating_source(path)
-                .relevant_paths(vec![vfs.canonicalize(path)?]),
+                .relevant_paths(vec![vfs.canonicalize(path)?])
+                // Live sync re-snapshots the file with this context, which
+                // must keep the ignore rules it was first read with.
+                .context(context),
         );
 
     AdjacentMetadata::read_and_apply_all(
