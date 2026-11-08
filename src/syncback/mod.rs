@@ -177,10 +177,14 @@ pub fn syncback_loop(
     if !ignore_referents {
         log::debug!("Linking referents for new DOM");
         let old: &RojoTree = old_tree;
-        let unlinkable = |dom: &WeakDom, target: Ref, id: Option<&str>| {
+        // An ID in a protected partition is never given or changed, since
+        // the change would not be written: only a target there that keeps an
+        // ID its files already have can be linked to.
+        let unlinkable = |dom: &WeakDom, target: Ref, id: Option<&str>, needs_new_id: bool| {
             let persisted =
                 id.is_some_and(|id| old.get_specified_id(&RojoRef::new(id.to_owned())).is_some());
-            !persisted && in_protected_partition(dom, target, old, &skipped_partitions)
+            (needs_new_id || !persisted)
+                && in_protected_partition(dom, target, old, &skipped_partitions)
         };
         // What the files say for a pointer whose target cannot be linked.
         let on_disk = |dom: &WeakDom, holder: Ref, attribute: &str| {

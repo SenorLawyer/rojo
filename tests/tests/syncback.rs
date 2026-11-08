@@ -246,6 +246,33 @@ fn partition_ignore_globs_ref() {
     });
 }
 
+/// Studio duplicated an instance with an ID inside a partition syncback
+/// leaves alone, and a synced partition points at both copies. The copy's
+/// ID would have to be changed, which would never be written, so no pointer
+/// may name anything but the ID the files have.
+#[test]
+fn partition_ignore_globs_dup_ref() {
+    run_syncback_test("partition_ignore_globs_dup_ref", |path| {
+        assert_eq!(
+            fs_err::read_to_string(path.join("filtered/Kept.model.json")).unwrap(),
+            "{\n  \"className\": \"Folder\",\n  \"attributes\": {\n    \"Rojo_Id\": \"kept\"\n  }\n}\n"
+        );
+        assert!(!path.join("filtered/KeptCopy.model.json").exists());
+        let mut linked = 0;
+        for name in ["KeptPointer", "CopyPointer"] {
+            let text =
+                fs_err::read_to_string(path.join(format!("unfiltered/{name}.model.json"))).unwrap();
+            let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+            if let Some(target) = value["attributes"].get("Rojo_Target_Value") {
+                assert_eq!(target, "kept", "{name}: {text}");
+                linked += 1;
+            }
+        }
+        // One copy keeps the ID the files have, and only it is linked to.
+        assert_eq!(linked, 1);
+    });
+}
+
 /// Partitions are found from every project file: a nested project's root
 /// node, and a node whose `$path` names a project file (based at that file's
 /// folder), are both skipped.

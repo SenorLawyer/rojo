@@ -110,22 +110,25 @@ pub fn collect_referents(dom: &WeakDom) -> RefLinks {
 /// pointed at an ID where it needs one, and every pointer a
 /// `Rojo_Target_*` attribute naming it.
 ///
-/// `unlinkable(dom, target, id)` says a target must not be given an ID,
-/// because it would never be written, such as one in a partition syncback
-/// leaves alone. A pointer at such a target gets the `Rojo_Target_*`
+/// `unlinkable(dom, target, id, needs_new_id)` says a target's ID must not
+/// be given or changed, because the change would never be written, such as
+/// one in a partition syncback leaves alone. `needs_new_id` is set when
+/// linking would have to write one: the target has none, or shares it with
+/// another target. A pointer at such a target gets the `Rojo_Target_*`
 /// attribute its files have, `on_disk(dom, holder, attribute)`, or none,
 /// with a warning, rather than one naming an ID that no file holds.
 pub fn link_referents(
     links: RefLinks,
     dom: &mut WeakDom,
-    unlinkable: &dyn Fn(&WeakDom, Ref, Option<&str>) -> bool,
+    unlinkable: &dyn Fn(&WeakDom, Ref, Option<&str>, bool) -> bool,
     on_disk: &dyn Fn(&WeakDom, Ref, &str) -> Option<Variant>,
 ) -> anyhow::Result<()> {
     let mut skipped = HashSet::new();
     for (_, properties) in links.prop_links.iter() {
         for link in properties {
             if let Some(target) = dom.get_by_ref(link.value) {
-                if unlinkable(dom, link.value, get_existing_id(target)) {
+                let needs_new_id = links.need_rewrite.contains(&link.value);
+                if unlinkable(dom, link.value, get_existing_id(target), needs_new_id) {
                     skipped.insert(link.value);
                 }
             }
@@ -140,9 +143,9 @@ pub fn link_referents(
         for ref_link in properties {
             if skipped.contains(&ref_link.value) {
                 log::warn!(
-                    "{}.{} points at {}, which has no ID in the files and is in a partition \
-                     with $globIgnorePaths that syncback leaves alone, so the pointer is left \
-                     as it was. Give {} an ID in its files to sync this ref back.",
+                    "{}.{} points at {}, which has no ID of its own in the files and is in a \
+                     partition with $globIgnorePaths that syncback leaves alone, so the pointer \
+                     is left as it was. Give {} a unique ID in its files to sync this ref back.",
                     inst_path(dom, inst_id),
                     ref_link.name,
                     inst_path(dom, ref_link.value),
