@@ -281,3 +281,52 @@ fn stop(dev: &mut Dev, _output: &Mutex<String>, _dev_state: &Path) {
     dev.0.kill().unwrap();
     dev.0.wait().unwrap();
 }
+
+/// Without its record, commands run here without flags would go to the
+/// default port with the shared token, so rojo dev does not start.
+#[test]
+fn dev_does_not_start_when_it_cannot_record_the_server() {
+    let dir = tempfile::tempdir().unwrap();
+    let project = dir.path().join("project");
+    let state = dir.path().join("state");
+    let plugins = dir.path().join("plugins");
+    fs::create_dir_all(project.join("src")).unwrap();
+    fs::create_dir_all(&plugins).unwrap();
+    fs::write(
+        project.join("default.project.json"),
+        r#"{"name":"DevTest","servePlaceIds":[0],"tree":{"$path":"src"}}"#,
+    )
+    .unwrap();
+    fs::write(project.join("src/main.luau"), "return 1").unwrap();
+
+    // The project is not in Git, so its record goes in its own state folder,
+    // where a folder named dev.json stops it from being written.
+    let canonical = dunce::canonicalize(&project).unwrap();
+    let id = blake3::hash(canonical.to_string_lossy().as_bytes()).to_hex();
+    let base = if cfg!(windows) {
+        state.join("Rojo")
+    } else {
+        state.join("rojo")
+    };
+    fs::create_dir_all(base.join("projects").join(&id[..16]).join("dev.json")).unwrap();
+
+    let port = {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.local_addr().unwrap().port()
+    };
+    let mut command = Command::new(env!("CARGO_BIN_EXE_rojo"));
+    command
+        .arg("dev")
+        .arg(&project)
+        .args(["--port", &port.to_string(), "--plugins-dir"])
+        .arg(&plugins)
+        .current_dir(&project)
+        .stdin(Stdio::null());
+    isolate(&mut command, &state);
+    let output = command.output().unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(!output.status.success(), "{stdout}\n{stderr}");
+    assert!(stderr.contains("could not record this server"), "{stderr}");
+    assert!(!stdout.contains("rojo dev is serving"), "{stdout}");
+}

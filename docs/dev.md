@@ -49,7 +49,9 @@ with `default.project.json`, defaulting to the current directory.
    `--no-sourcemap` turns this off. Paths are relative and only scripts are
    included, as `rojo sourcemap` does by default.
 6. Records the server's loopback URL and token path in `dev.json` in the
-   worktree's per-user state folder, and prints the status block.
+   worktree's per-user state folder, and prints the status block. When the
+   record cannot be written, `rojo dev` stops with an error instead of
+   serving, since flagless commands would otherwise use the default port.
 
 ## The status block
 

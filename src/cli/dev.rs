@@ -204,18 +204,23 @@ impl DevCommand {
         };
 
         let server = LiveServer::new(Arc::clone(&session)).with_studio_token_file(&token_file)?;
+        // Written before serving, while the port is already held, and
+        // required: without a record, `rojo studio`, `rojo test` and
+        // `rojo mcp` run here without flags would use the default port and
+        // the shared token, often another worktree's server.
+        if let Some(state) = &state {
+            state.write(&state_path).with_context(|| {
+                format!(
+                    "rojo dev did not start because it could not record this server in {}, \
+                     which `rojo studio`, `rojo test` and `rojo mcp` use to find it",
+                    state_path.display()
+                )
+            })?;
+        }
         let result = server.start_on_until(
             listener,
             allowed_hosts,
             || {
-                if let Some(state) = &state {
-                    if let Err(err) = state.write(&state_path) {
-                        log::warn!(
-                            "Could not record this server in {}, so `rojo studio` needs --address: {err:#}",
-                            state_path.display()
-                        );
-                    }
-                }
                 print!("{}", render_status(&status));
                 let _ = std::io::stdout().flush();
             },
