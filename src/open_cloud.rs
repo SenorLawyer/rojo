@@ -1008,6 +1008,13 @@ impl OpenCloud {
 
     /// Removes the key from text that came from a server, in case it echoes
     /// request headers back.
+    /// `text` with every occurrence of this client's API key taken out, for
+    /// output that does not come from Open Cloud errors, which are already
+    /// redacted.
+    pub fn redact_key(&self, text: &str) -> String {
+        self.redact(text.to_owned())
+    }
+
     fn redact(&self, text: String) -> String {
         match std::str::from_utf8(self.key.as_bytes()) {
             Ok(key) if text.contains(key) => text.replace(key, "[redacted]"),
@@ -1298,6 +1305,13 @@ fn query(params: &[(&str, &str)]) -> String {
 
 /// Whether `value` is safe as one URL path segment: Roblox's job ids are
 /// GUIDs and place versions are numbers, so anything else is refused.
+/// Whether `value` can be used as one segment of a request path, as Open
+/// Cloud requests check before sending. Callers can check arguments with it
+/// up front, rather than have every request with them refused.
+pub fn is_path_segment(value: &str) -> bool {
+    path_segment(value)
+}
+
 fn path_segment(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 128

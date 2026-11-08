@@ -9,7 +9,6 @@
 
 use std::{
     collections::{HashMap, HashSet},
-    io::Write as _,
     thread::sleep,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -22,8 +21,8 @@ use super::{
     UsageError,
 };
 use crate::open_cloud::{
-    GameServer, GameServerLog, GameServerLogPage, GameServerPage, LogSeverity, OpenCloud,
-    OpenCloudError, DEFAULT_API_KEY_VAR,
+    is_path_segment, GameServer, GameServerLog, GameServerLogPage, GameServerPage, LogSeverity,
+    OpenCloud, OpenCloudError, DEFAULT_API_KEY_VAR,
 };
 
 /// Place versions read when none are given: the newest few, since servers
@@ -48,7 +47,8 @@ const MAX_REQUESTS_PER_MINUTE: u32 = 100;
 /// client logs), and entries take about three minutes to appear. The key
 /// owner's requests are limited to 100 a minute across all of their keys and
 /// every program using them, including other `rojo logs` runs, so this paces
-/// every request, retries included, and reads at most --max-servers servers
+/// every request, retries included, to 50 a minute unless
+/// --requests-per-minute says otherwise, and reads at most --max-servers servers
 /// and 10 pages of 100 entries per server per round. A server with more is
 /// reported as behind and read further in the next rounds. A server that
 /// cannot be read is skipped with a warning (exit status 1 without --follow);
@@ -110,8 +110,9 @@ pub struct LogsCommand {
     /// Open Cloud requests this command may send per minute, at most 100,
     /// counting each retry. Roblox's limit is per API key owner, not per key
     /// or per process: several `rojo logs` running at once, and any other use
-    /// of the owner's keys, share the same 100, so give each a share.
-    #[clap(long, default_value = "60")]
+    /// of the owner's keys, share the same 100, so give each a share. The
+    /// default of 50 leaves room for one other run at the default.
+    #[clap(long, default_value = "50")]
     pub requests_per_minute: u32,
     /// The environment variable that holds the API key.
     #[clap(long, value_name = "VAR", default_value = DEFAULT_API_KEY_VAR)]
@@ -147,15 +148,41 @@ impl LogsCommand {
         let client = OpenCloud::from_env(&self.api_key_env)
             .map_err(UsageError)?
             .with_request_spacing(Duration::from_secs(60) / self.requests_per_minute);
+        // Open Cloud's own errors leave the key out already, but job ids,
+        // versions and messages that came back from Roblox, or from the
+        // arguments, are printed too, and none of it may show the key.
+        let redact = |text: &str| client.redact_key(text);
         let mut reader = Reader::new(&client, &self);
-        let mut out = std::io::stdout();
-        if self.follow {
-            return self.follow(&mut reader, &mut out);
-        }
-        let batch = reader.round(now_ms());
+        let result = if self.follow {
+            self.follow(&mut reader, &mut std::io::stdout(), &redact)
+        } else {
+            self.read_once(
+                &mut reader,
+                &mut std::io::stdout(),
+                &mut std::io::stderr(),
+                &redact,
+                now_ms(),
+            )
+        };
+        result.map_err(|error| redact_error(error, &redact))
+    }
+
+    /// One read without --follow: prints the newest entries, and fails when
+    /// the read was not whole.
+    fn read_once(
+        &self,
+        reader: &mut Reader<impl LogSource>,
+        out: &mut impl std::io::Write,
+        err: &mut impl std::io::Write,
+        redact: &dyn Fn(&str) -> String,
+        now_ms: u64,
+    ) -> anyhow::Result<()> {
+        let batch = reader.round(now_ms);
         for notice in &batch.notices {
-            eprintln!("{notice}");
+            writeln!(err, "{}", redact(notice))?;
         }
+        let failed_servers: Vec<String> =
+            batch.failed_servers.iter().map(|job| redact(job)).collect();
         let entries = newest(batch.entries, self.limit);
         // Entries from the servers read before a failure are still printed.
         if self.json {
@@ -164,10 +191,10 @@ impl LogsCommand {
                 "serversRead": batch.servers_read,
                 "truncated": batch.truncated,
                 "incomplete": batch.incomplete,
-                "failedServers": batch.failed_servers,
+                "failedServers": failed_servers,
             });
             if let Some(error) = &batch.error {
-                value["error"] = json!(error.to_string());
+                value["error"] = json!(redact(&error.to_string()));
             }
             writeln!(
                 out,
@@ -176,7 +203,7 @@ impl LogsCommand {
             )?;
         } else {
             if entries.is_empty() && batch.error.is_none() {
-                eprintln!("No matching log entries in the last {}.", self.since);
+                writeln!(err, "No matching log entries in the last {}.", self.since)?;
             }
             for entry in &entries {
                 writeln!(out, "{}", entry_text(entry))?;
@@ -185,10 +212,10 @@ impl LogsCommand {
         match batch.error {
             Some(error) => Err(self.explain(error)),
             // The entries were printed, but the read was not whole.
-            None if !batch.failed_servers.is_empty() => Err(anyhow::anyhow!(
+            None if !failed_servers.is_empty() => Err(anyhow::anyhow!(
                 "Could not read {} of the servers: {}",
-                batch.failed_servers.len(),
-                batch.failed_servers.join(", ")
+                failed_servers.len(),
+                failed_servers.join(", ")
             )),
             None => Ok(()),
         }
@@ -199,6 +226,19 @@ impl LogsCommand {
             self.universe_id > 0 && self.place_id > 0,
             "--universe-id and --place-id must be positive"
         );
+        // They go into request paths, where Open Cloud refuses them before
+        // sending anything, and would do so again every round.
+        for (flag, values) in [
+            ("--place-version", &self.place_versions),
+            ("--job-id", &self.job_ids),
+        ] {
+            if let Some(value) = values.iter().find(|value| !is_path_segment(value)) {
+                anyhow::bail!(
+                    "{flag} {:?} is not valid: use only letters, digits, '-', '_' and '.'",
+                    escape_controls(value)
+                );
+            }
+        }
         anyhow::ensure!(self.limit > 0, "--limit must be at least 1");
         anyhow::ensure!(self.max_servers > 0, "--max-servers must be at least 1");
         anyhow::ensure!(self.interval > 0, "--interval must be at least 1 second");
@@ -213,6 +253,7 @@ impl LogsCommand {
         &self,
         reader: &mut Reader<impl LogSource>,
         out: &mut impl std::io::Write,
+        redact: &dyn Fn(&str) -> String,
     ) -> anyhow::Result<()> {
         let interval = Duration::from_secs(self.interval);
         let mut first = true;
@@ -221,7 +262,7 @@ impl LogsCommand {
             let started = Instant::now();
             let batch = reader.round(now_ms());
             for notice in &batch.notices {
-                eprintln!("{notice}");
+                eprintln!("{}", redact(notice));
             }
             // Like `tail -f`, start with the newest entries only.
             let entries = if first {
@@ -255,7 +296,10 @@ impl LogsCommand {
                             anyhow::Error::new(error).context("Stopped following game server logs")
                         );
                     }
-                    log::warn!("Could not read game server logs, trying again: {error}");
+                    log::warn!(
+                        "Could not read game server logs, trying again: {}",
+                        redact(&error.to_string())
+                    );
                 }
             }
             sleep(interval.saturating_sub(started.elapsed()));
@@ -291,11 +335,31 @@ impl LogsCommand {
     }
 }
 
-/// Errors that retrying will not fix.
+/// Errors that retrying will not fix. A request that was not sent, such as
+/// one with a job id that cannot go into its path, fails the same way every
+/// time.
 fn is_usage_problem(error: &OpenCloudError) -> bool {
     match error {
         OpenCloudError::Status { status, .. } => matches!(status.as_u16(), 400 | 401 | 403 | 404),
+        OpenCloudError::NotSent(_) => true,
         _ => false,
+    }
+}
+
+/// `error` with every occurrence of the API key taken out, keeping whether
+/// it is a usage error, which sets the exit status.
+fn redact_error(error: anyhow::Error, redact: &dyn Fn(&str) -> String) -> anyhow::Error {
+    let text = format!("{error:#}");
+    let redacted = redact(&text);
+    if redacted == text {
+        return error;
+    }
+    let usage = error.is::<UsageError>();
+    let replaced = anyhow::anyhow!(redacted);
+    if usage {
+        UsageError(replaced).into()
+    } else {
+        replaced
     }
 }
 
@@ -428,6 +492,9 @@ struct Read {
     pages: usize,
     /// Set when the page budget ran out with entries left.
     next_token: Option<String>,
+    /// Whether it started at the server's newest entry, rather than where an
+    /// earlier read stopped.
+    from_newest: bool,
 }
 
 /// Why one server could not be read, and what that means.
@@ -523,6 +590,7 @@ impl<'a, S: LogSource> Reader<'a, S> {
                 }
             };
             batch.servers_read += 1;
+            let read_from_newest = reads.iter().any(|read| read.from_newest);
             let state = self.servers.entry(target.job.clone()).or_default();
             state.last_listed_ms = now_ms;
             let mut gap = None;
@@ -563,10 +631,15 @@ impl<'a, S: LogSource> Reader<'a, S> {
             };
             state.seen.retain(|_, ms| *ms >= keep_from);
 
-            // Its last entries are readable by now and nothing older is left
-            // to read, so later rounds can skip it.
+            // Its last entries are readable by now, nothing older is left to
+            // read, and this round read it from its newest entry, so later
+            // rounds can skip it. A round that only drained older entries,
+            // using up the page budget, has not seen the newest ones yet.
             if let Some(terminated) = target.terminated_ms.filter(|ms| {
-                target.shut_down && state.gap.is_none() && ms.saturating_add(overlap_ms) < now_ms
+                target.shut_down
+                    && state.gap.is_none()
+                    && read_from_newest
+                    && ms.saturating_add(overlap_ms) < now_ms
             }) {
                 self.servers.remove(&target.job);
                 self.finished.insert(target.job.clone(), terminated);
@@ -631,6 +704,11 @@ impl<'a, S: LogSource> Reader<'a, S> {
     }
 
     fn classify(&self, target: &Target, error: OpenCloudError) -> ServerFailure {
+        if matches!(error, OpenCloudError::NotSent(_)) {
+            // Refused before sending, such as a listed job id that cannot go
+            // into a path; it would be refused again every round.
+            return ServerFailure::Fatal(error);
+        }
         match status_of(&error) {
             Some(400 | 401 | 403) => ServerFailure::Fatal(error),
             // A server named with --job-id that Roblox does not know is a
@@ -776,6 +854,7 @@ impl<'a, S: LogSource> Reader<'a, S> {
         counts: HashMap<[u8; 32], u64>,
         budget: usize,
     ) -> Result<Read, OpenCloudError> {
+        let from_newest = token.is_none();
         let mut logs = Vec::new();
         for pages in 1..=budget {
             let page = self.source.logs(
@@ -801,6 +880,7 @@ impl<'a, S: LogSource> Reader<'a, S> {
                         counts,
                         pages,
                         next_token: None,
+                        from_newest,
                     })
                 }
             }
@@ -811,6 +891,7 @@ impl<'a, S: LogSource> Reader<'a, S> {
             counts,
             pages: budget,
             next_token: token,
+            from_newest,
         })
     }
 }
@@ -1340,6 +1421,126 @@ mod tests {
     }
 
     #[test]
+    fn a_drain_that_uses_the_whole_budget_does_not_retire_the_server() {
+        let fake = Fake::default();
+        let command = parse(&["--place-version", "45"]);
+        let mut reader = reader(&fake, &command);
+        let ended = || vec![server("a", true, Some("2026-11-07T11:50:00Z"))];
+
+        // Exactly two rounds' worth of pages: the second round drains the
+        // rest with its whole budget and has none left to read from the top.
+        fake.servers(ended(), None);
+        queue_pages(&fake, "a", 2 * MAX_PAGES as u64, NOW - MINUTE);
+        reader.round(NOW);
+        fake.servers(ended(), None);
+        let second = reader.round(NOW + MINUTE);
+        assert_eq!(second.entries.len(), MAX_PAGES);
+        assert!(reader.servers["a"].gap.is_none());
+        assert!(
+            !reader.finished.contains_key("a"),
+            "retired without reading its newest entries after it shut down"
+        );
+        assert_eq!(log_tokens(&fake, "a").len(), 2 * MAX_PAGES);
+
+        // The next round reads it from the top, and only then retires it.
+        fake.servers(ended(), None);
+        fake.logs(
+            "a",
+            vec![log("a", NOW - MINUTE / 2, LogSeverity::Error, "late")],
+            None,
+        );
+        let third = reader.round(NOW + 2 * MINUTE);
+        assert_eq!(messages(&third), ["late"]);
+        assert_eq!(log_tokens(&fake, "a").last(), Some(&None));
+        assert!(reader.finished.contains_key("a"));
+    }
+
+    #[test]
+    fn path_arguments_are_checked_before_any_request() {
+        for args in [
+            ["--job-id", "../other"],
+            ["--job-id", "a/b"],
+            ["--place-version", "45?x=1"],
+            ["--place-version", ".."],
+        ] {
+            let error = parse(&args).validate().unwrap_err().to_string();
+            assert!(error.contains(args[0]), "{error}");
+        }
+        assert!(
+            parse(&["--job-id", "0f8e-11aa_b.c", "--place-version", "45"])
+                .validate()
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn a_request_that_could_not_be_sent_is_fatal_not_retried() {
+        let fake = Fake::default();
+        let command = parse(&["--place-version", "45"]);
+        let mut reader = reader(&fake, &command);
+        fake.servers(
+            vec![server("bad", false, None), server("b", false, None)],
+            None,
+        );
+        fake.logs
+            .borrow_mut()
+            .entry("bad".to_owned())
+            .or_default()
+            .push_back(Err(OpenCloudError::NotSent(
+                "job id \"bad\" cannot be used in a request path".into(),
+            )));
+        let batch = reader.round(NOW);
+        assert!(matches!(batch.error, Some(OpenCloudError::NotSent(_))));
+        assert!(batch.failed_servers.is_empty());
+        assert!(log_tokens(&fake, "b").is_empty());
+        let error = batch.error.unwrap();
+        assert!(is_usage_problem(&error));
+        assert!(command.explain(error).is::<UsageError>());
+    }
+
+    #[test]
+    fn the_api_key_is_left_out_of_everything_printed() {
+        const KEY: &str = "SECRETKEY";
+        let redact = |text: &str| text.replace(KEY, "[redacted]");
+        let fake = Fake::default();
+        let command = parse(&["--place-version", "45", "--json"]);
+        let mut reader = reader(&fake, &command);
+        let job = format!("job-{KEY}");
+        fake.servers(vec![server(&job, false, None)], None);
+        fake.logs
+            .borrow_mut()
+            .entry(job.clone())
+            .or_default()
+            .push_back(Err(OpenCloudError::Unconfirmed(format!("echoed {KEY}"))));
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let error = command
+            .read_once(&mut reader, &mut out, &mut err, &redact, NOW)
+            .map_err(|error| redact_error(error, &redact))
+            .unwrap_err();
+        let (out, err) = (
+            String::from_utf8(out).unwrap(),
+            String::from_utf8(err).unwrap(),
+        );
+        let error = format!("{error:#}");
+        for text in [&out, &err, &error] {
+            assert!(!text.contains(KEY), "{text}");
+        }
+        assert!(
+            err.contains("could not read server job-[redacted]"),
+            "{err}"
+        );
+        let value: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(value["failedServers"], json!(["job-[redacted]"]));
+        assert!(error.contains("job-[redacted]"), "{error}");
+
+        // A usage error stays one once redacted, so the exit status holds.
+        let usage: anyhow::Error = UsageError(anyhow::anyhow!("bad {KEY}")).into();
+        let redacted = redact_error(usage, &redact);
+        assert!(redacted.is::<UsageError>());
+        assert!(format!("{redacted:#}").contains("bad [redacted]"));
+    }
+
+    #[test]
     fn a_refused_page_token_reads_the_server_again_from_the_top() {
         let fake = Fake::default();
         let command = parse(&["--place-version", "45", "--job-id", "a"]);
@@ -1698,6 +1899,8 @@ mod tests {
         assert_eq!(command.level, [Level::Error, Level::Warning]);
         assert_eq!(Duration::from(command.since), Duration::from_secs(900));
 
+        // Half of the owner's 100 a minute, leaving room for another run.
+        assert_eq!(command.requests_per_minute, 50);
         assert!(parse(&["--requests-per-minute", "101"]).validate().is_err());
         assert!(parse(&["--limit", "0"]).validate().is_err());
         assert!(LogsCommand::try_parse_from(["logs", "--place-id", "2"]).is_err());
