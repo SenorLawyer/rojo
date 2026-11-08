@@ -2,6 +2,7 @@
 
 mod assets;
 mod build;
+mod build_into;
 mod doc;
 mod doctor;
 mod fmt_project;

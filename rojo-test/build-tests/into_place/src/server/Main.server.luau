@@ -1,0 +1,1 @@
+print("main from project")

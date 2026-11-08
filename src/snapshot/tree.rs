@@ -8,7 +8,7 @@ use rbx_dom_weak::{
     ustr, Instance, InstanceBuilder, Ustr, UstrMap, WeakDom,
 };
 
-use crate::{multimap::MultiMap, RojoRef, REF_POINTER_ATTRIBUTE_PREFIX};
+use crate::{multimap::MultiMap, RojoRef, REF_ID_ATTRIBUTE_NAME, REF_POINTER_ATTRIBUTE_PREFIX};
 
 use super::{InstanceMetadata, InstanceSnapshot};
 
@@ -73,6 +73,45 @@ impl RojoTree {
 
         for child in snapshot.children {
             tree.insert_instance(root_ref, child);
+        }
+
+        tree
+    }
+
+    /// Wraps an existing `WeakDom`, such as one read from a place file, without
+    /// copying its instances.
+    ///
+    /// Unlike `RojoTree::new`, instances keep their referents, so Ref
+    /// properties between them stay valid. Each instance gets default
+    /// metadata, except that a `Rojo_Id` attribute (left by an earlier
+    /// `rojo build`) is registered as its specified ID so `Rojo_Target_*`
+    /// attributes can resolve to it.
+    pub fn from_dom(dom: WeakDom) -> RojoTree {
+        let mut tree = RojoTree {
+            inner: dom,
+            metadata_map: HashMap::new(),
+            path_to_ids: MultiMap::new(),
+            specified_id_to_refs: MultiMap::new(),
+            ref_pointer_holders: HashSet::new(),
+        };
+
+        let ids: Vec<Ref> = tree.inner.descendants().map(|i| i.referent()).collect();
+        for id in ids {
+            let properties = &tree.inner.get_by_ref(id).unwrap().properties;
+            let mut metadata = InstanceMetadata::new();
+            if let Some(Variant::Attributes(attributes)) = properties.get(&ustr("Attributes")) {
+                metadata.specified_id = match attributes.get(REF_ID_ATTRIBUTE_NAME) {
+                    Some(Variant::String(value)) => Some(RojoRef::new(value.clone())),
+                    Some(Variant::BinaryString(value)) => std::str::from_utf8(value.as_ref())
+                        .ok()
+                        .map(|value| RojoRef::new(value.to_owned())),
+                    _ => None,
+                };
+            }
+            if has_ref_pointer_attribute(properties) {
+                tree.ref_pointer_holders.insert(id);
+            }
+            tree.insert_metadata(id, metadata);
         }
 
         tree

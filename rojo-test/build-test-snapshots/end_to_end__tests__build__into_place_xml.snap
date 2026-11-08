@@ -1,0 +1,240 @@
+---
+source: tests/tests/build.rs
+expression: xml
+---
+<roblox version="4">
+  <Item class="Workspace" referent="0">
+    <Properties>
+      <string name="Name">Workspace</string>
+      <float name="FallenPartsDestroyHeight">-1000</float>
+      <float name="Gravity">50</float>
+      <bool name="NeedsPivotMigration">false</bool>
+    </Properties>
+    <Item class="Model" referent="1">
+      <Properties>
+        <string name="Name">Map</string>
+      </Properties>
+      <Item class="Part" referent="2">
+        <Properties>
+          <string name="Name">Baseplate</string>
+        </Properties>
+      </Item>
+      <Item class="Part" referent="3">
+        <Properties>
+          <string name="Name">Spawn</string>
+          <BinaryString name="AttributesSerialize">AQAAAAcAAABSb2pvX0lkAgkAAABCYXNlU3Bhd24=</BinaryString>
+        </Properties>
+      </Item>
+    </Item>
+    <Item class="ObjectValue" referent="4">
+      <Properties>
+        <string name="Name">MapRef</string>
+        <Ref name="Value">1</Ref>
+      </Properties>
+    </Item>
+    <Item class="ObjectValue" referent="5">
+      <Properties>
+        <string name="Name">ConfigRef</string>
+        <Ref name="Value">6</Ref>
+      </Properties>
+    </Item>
+    <Item class="ObjectValue" referent="7">
+      <Properties>
+        <string name="Name">OldRef</string>
+        <Ref name="Value">null</Ref>
+      </Properties>
+    </Item>
+    <Item class="Terrain" referent="8">
+      <Properties>
+        <string name="Name">Terrain</string>
+      </Properties>
+    </Item>
+    <Item class="StringValue" referent="9">
+      <Properties>
+        <string name="Name">Note</string>
+        <string name="Value">project note</string>
+      </Properties>
+      <Item class="Folder" referent="10">
+        <Properties>
+          <string name="Name">first detail</string>
+        </Properties>
+      </Item>
+    </Item>
+    <Item class="StringValue" referent="11">
+      <Properties>
+        <string name="Name">Note</string>
+        <string name="Value">second</string>
+      </Properties>
+      <Item class="Folder" referent="12">
+        <Properties>
+          <string name="Name">second detail</string>
+        </Properties>
+      </Item>
+    </Item>
+    <Item class="StringValue" referent="13">
+      <Properties>
+        <string name="Name">Note</string>
+        <string name="Value">third</string>
+      </Properties>
+      <Item class="Folder" referent="14">
+        <Properties>
+          <string name="Name">third detail</string>
+        </Properties>
+      </Item>
+    </Item>
+    <Item class="Part" referent="15">
+      <Properties>
+        <string name="Name">Brick</string>
+        <Color3uint8 name="Color">12855324</Color3uint8>
+      </Properties>
+    </Item>
+    <Item class="TextLabel" referent="16">
+      <Properties>
+        <string name="Name">Label</string>
+        <Font name="FontFace">
+          <Family>
+            <url>rbxasset://fonts/families/Arial.json</url>
+          </Family>
+          <Weight>400</Weight>
+          <Style>Normal</Style>
+        </Font>
+      </Properties>
+    </Item>
+  </Item>
+  <Item class="Lighting" referent="17">
+    <Properties>
+      <string name="Name">Lighting</string>
+      <float name="Brightness">3</float>
+    </Properties>
+  </Item>
+  <Item class="Folder" referent="18">
+    <Properties>
+      <string name="Name">LooseFolder</string>
+    </Properties>
+  </Item>
+  <Item class="ReplicatedStorage" referent="19">
+    <Properties>
+      <string name="Name">ReplicatedStorage</string>
+    </Properties>
+    <Item class="Folder" referent="20">
+      <Properties>
+        <string name="Name">Shared</string>
+        <BinaryString name="AttributesSerialize">AgAAAAUAAABPd25lcgIIAAAAbWFwLXRlYW0HAAAAUm9qb19JZAIGAAAAU2hhcmVk</BinaryString>
+      </Properties>
+      <Item class="ObjectValue" referent="21">
+        <Properties>
+          <string name="Name">Link</string>
+          <Ref name="Value">null</Ref>
+        </Properties>
+      </Item>
+      <Item class="Folder" referent="22">
+        <Properties>
+          <string name="Name">Aim</string>
+        </Properties>
+        <Item class="ObjectValue" referent="23">
+          <Properties>
+            <string name="Name">Pointer</string>
+            <BinaryString name="AttributesSerialize">AQAAABEAAABSb2pvX1RhcmdldF9WYWx1ZQIJAAAAQmFzZVNwYXdu</BinaryString>
+            <Ref name="Value">24</Ref>
+          </Properties>
+        </Item>
+        <Item class="StringValue" referent="24">
+          <Properties>
+            <string name="Name">Target</string>
+            <string name="Value">aimed at by Pointer</string>
+          </Properties>
+        </Item>
+      </Item>
+      <Item class="StringValue" referent="6">
+        <Properties>
+          <string name="Name">Config</string>
+          <BinaryString name="AttributesSerialize">AQAAAAQAAABOb3RlAgkAAABmcm9tIGJhc2U=</BinaryString>
+          <string name="Value">project value</string>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="25">
+        <Properties>
+          <string name="Name">Util</string>
+          <string name="Source"><![CDATA[return "util"
+]]></string>
+        </Properties>
+      </Item>
+    </Item>
+    <Item class="Folder" referent="26">
+      <Properties>
+        <string name="Name">BaseAssets</string>
+      </Properties>
+      <Item class="Model" referent="27">
+        <Properties>
+          <string name="Name">Tree</string>
+        </Properties>
+      </Item>
+    </Item>
+    <Item class="Model" referent="28">
+      <Properties>
+        <string name="Name">Remotes</string>
+      </Properties>
+    </Item>
+    <Item class="Folder" referent="29">
+      <Properties>
+        <string name="Name">Pointers</string>
+      </Properties>
+      <Item class="ObjectValue" referent="30">
+        <Properties>
+          <string name="Name">ToShared</string>
+          <BinaryString name="AttributesSerialize">AQAAABEAAABSb2pvX1RhcmdldF9WYWx1ZQIGAAAAU2hhcmVk</BinaryString>
+          <Ref name="Value">20</Ref>
+        </Properties>
+      </Item>
+      <Item class="ObjectValue" referent="31">
+        <Properties>
+          <string name="Name">BasePointer</string>
+          <Ref name="Value">1</Ref>
+        </Properties>
+      </Item>
+      <Item class="ObjectValue" referent="32">
+        <Properties>
+          <string name="Name">ToRemotes</string>
+          <BinaryString name="AttributesSerialize">AQAAABEAAABSb2pvX1RhcmdldF9WYWx1ZQIHAAAAUmVtb3Rlcw==</BinaryString>
+          <Ref name="Value">33</Ref>
+        </Properties>
+      </Item>
+      <Item class="ObjectValue" referent="34">
+        <Properties>
+          <string name="Name">ToSpawn</string>
+          <BinaryString name="AttributesSerialize">AQAAABEAAABSb2pvX1RhcmdldF9WYWx1ZQIJAAAAQmFzZVNwYXdu</BinaryString>
+          <Ref name="Value">3</Ref>
+        </Properties>
+      </Item>
+    </Item>
+    <Item class="Folder" referent="33">
+      <Properties>
+        <string name="Name">Remotes</string>
+      </Properties>
+      <Item class="RemoteEvent" referent="35">
+        <Properties>
+          <string name="Name">Ping</string>
+        </Properties>
+      </Item>
+    </Item>
+  </Item>
+  <Item class="ServerScriptService" referent="36">
+    <Properties>
+      <string name="Name">ServerScriptService</string>
+    </Properties>
+    <Item class="Script" referent="37">
+      <Properties>
+        <string name="Name">LegacyScript</string>
+        <string name="Source">print('legacy')</string>
+      </Properties>
+    </Item>
+    <Item class="Script" referent="38">
+      <Properties>
+        <string name="Name">Main</string>
+        <token name="RunContext">0</token>
+        <string name="Source"><![CDATA[print("main from project")
+]]></string>
+      </Properties>
+    </Item>
+  </Item>
+</roblox>

@@ -105,7 +105,7 @@
 | [1016](https://github.com/rojo-rbx/rojo/issues/1016) | Special file names as $path cause errors | Explicit init script paths work without adding a duplicate init child. |
 | [1014](https://github.com/rojo-rbx/rojo/issues/1014) | "[Rojo-Warn] Precommit hook errored" each time rojo updates roblox studio files from filesystem change. | Open report. No verified fix for this individual reproduction. |
 | [1009](https://github.com/rojo-rbx/rojo/issues/1009) | Inconsistent sync result depending on whether plugin is connected when the change happens | Open: file identity or invalidation. The reported tree must converge after that sequence. |
-| [1007](https://github.com/rojo-rbx/rojo/issues/1007) | Rojo should have a command to 'patch' an existing Roblox file using a Rojo project | Related upstream proposal reviewed; see the pull request inventory for disposition. |
+| [1007](https://github.com/rojo-rbx/rojo/issues/1007) | Rojo should have a command to 'patch' an existing Roblox file using a Rojo project | `rojo build --into <BASE>` applies the project onto an existing place. See [build-into.md](build-into.md). |
 | [1003](https://github.com/rojo-rbx/rojo/issues/1003) | Rojo's library could use dependency trimming | Proposal or workflow change. Not implemented in this fork. |
 | [1001](https://github.com/rojo-rbx/rojo/issues/1001) | Rojo's library should export more | Proposal or workflow change. Not implemented in this fork. |
 | [999](https://github.com/rojo-rbx/rojo/issues/999) | `rojo sourcemap` should generate sourcemaps relative to the output instead of the cwd. | Proposal or workflow change. Not implemented in this fork. |
@@ -180,7 +180,7 @@
 | [296](https://github.com/rojo-rbx/rojo/issues/296) | Instance tracking and partial rehydration | Proposal or workflow change. Not implemented in this fork. |
 | [295](https://github.com/rojo-rbx/rojo/issues/295) | Track "source" for PatchSet | Proposal or workflow change. Not implemented in this fork. |
 | [293](https://github.com/rojo-rbx/rojo/issues/293) | Write-through caching in VFS | Proposal or workflow change. Not implemented in this fork. |
-| [287](https://github.com/rojo-rbx/rojo/issues/287) | rojo build should be able to update a place without nuking it | Related upstream proposal reviewed; see the pull request inventory for disposition. |
+| [287](https://github.com/rojo-rbx/rojo/issues/287) | rojo build should be able to update a place without nuking it | `rojo build --into <BASE>` keeps what the project does not define. See [build-into.md](build-into.md). |
 | [278](https://github.com/rojo-rbx/rojo/issues/278) | Symlinked folders drop changes on some platforms | Open: file identity or invalidation. The reported tree must converge after that sequence. |
 | [276](https://github.com/rojo-rbx/rojo/issues/276) | Normalize paths to use system directory separator | Open report. No verified fix for this individual reproduction. |
 | [254](https://github.com/rojo-rbx/rojo/issues/254) | Flag to make Rojo output all input paths when building | Proposal or workflow change. Not implemented in this fork. |

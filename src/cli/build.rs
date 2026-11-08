@@ -2,6 +2,7 @@ use std::{
     io::{BufWriter, Write},
     mem::forget,
     path::{Path, PathBuf},
+    time::{Duration, SystemTime},
 };
 
 use anyhow::{anyhow, bail, Context};
@@ -12,7 +13,7 @@ use tokio::runtime::Runtime;
 
 use crate::serve_session::ServeSession;
 
-use super::resolve_path;
+use super::{build_into, resolve_path};
 
 const UNKNOWN_OUTPUT_KIND_ERR: &str = "Could not detect what kind of file to build. \
                                        Expected output file to end in .rbxl, .rbxlx, .rbxm, or .rbxmx.";
@@ -45,6 +46,15 @@ pub struct BuildCommand {
     /// Whether to automatically rebuild when any input files change.
     #[clap(long)]
     pub watch: bool,
+
+    /// Apply the project onto this existing place (.rbxl or .rbxlx) instead
+    /// of building a new one.
+    ///
+    /// Instances, properties and services the project does not define keep
+    /// what the base place has, such as the map, terrain and lighting. The
+    /// output may be the base place itself. See docs/build-into.md.
+    #[clap(long, value_name = "BASE", requires = "output")]
+    pub into: Option<PathBuf>,
 }
 
 impl BuildCommand {
@@ -81,6 +91,17 @@ impl BuildCommand {
         if self.compress.is_some() && matches!(output_kind, OutputKind::Rbxlx | OutputKind::Rbxmx) {
             bail!("--compress requires a binary output (.rbxl or .rbxm)");
         }
+        if let Some(base) = &self.into {
+            if !matches!(output_kind, OutputKind::Rbxl | OutputKind::Rbxlx) {
+                bail!("--into builds a place, so the output must end in .rbxl or .rbxlx");
+            }
+            // Each rebuild would apply the project onto the previous output,
+            // so instances removed from the project would never leave it.
+            if self.watch && is_same_path(base, &output_path) {
+                bail!("--watch cannot write over its own --into base place; choose a different --output");
+            }
+        }
+        let into = self.into.as_deref();
         let project_path = resolve_path(&self.project)?;
 
         log::trace!("Constructing in-memory filesystem");
@@ -93,7 +114,11 @@ impl BuildCommand {
         let session = ServeSession::new(vfs, project_path)?;
         let mut cursor = session.message_queue().cursor();
 
-        let initial_build = write_model(&session, &output_path, output_kind, self.compress);
+        // Taken before the first build reads the base, so a base saved while
+        // that build runs still triggers a rebuild.
+        let mut base_state = into.map(BaseState::read);
+
+        let initial_build = write_model(&session, &output_path, output_kind, self.compress, into);
 
         if self.watch {
             // The first build can fail for the same transient reasons as a
@@ -108,14 +133,64 @@ impl BuildCommand {
             loop {
                 // A rebuild always reads the whole tree, so missing trimmed
                 // history only means rebuilding from the current state now.
-                match session.message_queue().subscribe(cursor) {
-                    Ok(receiver) => match rt.block_on(receiver) {
-                        Ok((new_cursor, _patch_set)) => cursor = new_cursor,
-                        // The message queue was dropped, so there is nothing
-                        // left to watch. Stop watching gracefully.
-                        Err(_) => break,
+                let mut changed = match session.message_queue().subscribe(cursor) {
+                    Ok(receiver) => match &into {
+                        // The base place is outside the project, so the
+                        // project's watcher never reports it. Its file is
+                        // polled instead, waking up between project changes.
+                        Some(_) => {
+                            match rt.block_on(async {
+                                tokio::time::timeout(BASE_POLL_INTERVAL, receiver).await
+                            }) {
+                                Ok(Ok((new_cursor, _patch_set))) => {
+                                    cursor = new_cursor;
+                                    true
+                                }
+                                Ok(Err(_)) => break,
+                                Err(_elapsed) => false,
+                            }
+                        }
+                        None => match rt.block_on(receiver) {
+                            Ok((new_cursor, _patch_set)) => {
+                                cursor = new_cursor;
+                                true
+                            }
+                            // The message queue was dropped, so there is
+                            // nothing left to watch. Stop watching gracefully.
+                            Err(_) => break,
+                        },
                     },
-                    Err(_) => cursor = session.message_queue().cursor(),
+                    Err(_) => {
+                        cursor = session.message_queue().cursor();
+                        true
+                    }
+                };
+
+                // A base that was missing, unreadable or mid-save failed the
+                // last build; saving it again changes its state and retries.
+                if let Some(base) = into {
+                    let current = BaseState::read(base);
+                    if base_state.as_ref() != Some(&current) {
+                        base_state = Some(current);
+                        changed = true;
+                    }
+                }
+                if !changed {
+                    continue;
+                }
+
+                // A link created since startup can make the output the base
+                // after all, and every rebuild would then apply the project
+                // onto the previous output.
+                if let Some(base) = into {
+                    if is_same_path(base, &output_path) {
+                        bail!(
+                            "--watch cannot write over its own --into base place, \
+                             and {} now refers to {}; choose a different --output",
+                            output_path.display(),
+                            base.display()
+                        );
+                    }
                 }
 
                 // A rebuild can fail because of an in-progress edit (for
@@ -123,7 +198,8 @@ impl BuildCommand {
                 // Keep watching so that the next change can fix the build;
                 // write_model validates before touching the output, so the
                 // last good build stays in place.
-                if let Err(error) = write_model(&session, &output_path, output_kind, self.compress)
+                if let Err(error) =
+                    write_model(&session, &output_path, output_kind, self.compress, into)
                 {
                     log::error!("Failed to rebuild project: {error:?}");
                 }
@@ -209,52 +285,76 @@ fn write_model(
     output: &Path,
     output_kind: OutputKind,
     compression: Option<Compression>,
+    into: Option<&Path>,
 ) -> anyhow::Result<()> {
     println!("Building project '{}'", session.project_name());
 
-    let tree = session.tree();
-    let root_id = tree.get_root_id();
+    let project_tree = session.tree();
+    let root_id = project_tree.get_root_id();
 
-    let class = tree.get_instance(root_id).unwrap().class_name();
+    let class = project_tree.get_instance(root_id).unwrap().class_name();
     if matches!(output_kind, OutputKind::Rbxl | OutputKind::Rbxlx) && class != "DataModel" {
         bail!("Cannot build a {} root as a place. Use .rbxm or .rbxmx, or set the root class to DataModel.", class);
     }
-    log::trace!("Serializing to a staged output file");
-    write_file_atomically(output, |file| {
-        match output_kind {
-            OutputKind::Rbxm => {
-                compression
-                    .unwrap_or(Compression::Lz4)
-                    .serializer()
-                    .serialize(file, tree.inner(), &[root_id])?;
-            }
-            OutputKind::Rbxl => {
-                let root_instance = tree.get_instance(root_id).unwrap();
-                let top_level_ids = root_instance.children();
 
-                compression
-                    .unwrap_or(Compression::Lz4)
-                    .serializer()
-                    .serialize(file, tree.inner(), top_level_ids)?;
+    // The base is read on every build so a watched build picks up a newly
+    // saved base place, and the merge never mutates the session's own tree.
+    let merged;
+    let mut base_read = None;
+    let tree = match into {
+        Some(base) => {
+            let (base_dom, digest) = build_into::read_base_place(base)?;
+            // Only an in-place build can lose work by replacing the base.
+            if is_same_path(base, output) {
+                base_read = Some((base, digest));
             }
-            OutputKind::Rbxmx => {
-                // Model files include the root instance of the tree and all its
-                // descendants.
-
-                rbx_xml::to_writer(file, tree.inner(), &[root_id], xml_encode_config())?;
-            }
-            OutputKind::Rbxlx => {
-                // Place files don't contain an entry for the DataModel, but our
-                // WeakDom representation does.
-
-                let root_instance = tree.get_instance(root_id).unwrap();
-                let top_level_ids = root_instance.children();
-
-                rbx_xml::to_writer(file, tree.inner(), top_level_ids, xml_encode_config())?;
-            }
+            merged = build_into::merge_into_place(&project_tree, base_dom)?;
+            &merged
         }
-        Ok(())
-    })?;
+        None => &*project_tree,
+    };
+    let root_id = tree.get_root_id();
+
+    log::trace!("Serializing to a staged output file");
+    write_file_atomically_checked(
+        output,
+        || check_base_unchanged(base_read),
+        |file| {
+            match output_kind {
+                OutputKind::Rbxm => {
+                    compression
+                        .unwrap_or(Compression::Lz4)
+                        .serializer()
+                        .serialize(file, tree.inner(), &[root_id])?;
+                }
+                OutputKind::Rbxl => {
+                    let root_instance = tree.get_instance(root_id).unwrap();
+                    let top_level_ids = root_instance.children();
+
+                    compression
+                        .unwrap_or(Compression::Lz4)
+                        .serializer()
+                        .serialize(file, tree.inner(), top_level_ids)?;
+                }
+                OutputKind::Rbxmx => {
+                    // Model files include the root instance of the tree and all its
+                    // descendants.
+
+                    rbx_xml::to_writer(file, tree.inner(), &[root_id], xml_encode_config())?;
+                }
+                OutputKind::Rbxlx => {
+                    // Place files don't contain an entry for the DataModel, but our
+                    // WeakDom representation does.
+
+                    let root_instance = tree.get_instance(root_id).unwrap();
+                    let top_level_ids = root_instance.children();
+
+                    rbx_xml::to_writer(file, tree.inner(), top_level_ids, xml_encode_config())?;
+                }
+            }
+            Ok(())
+        },
+    )?;
 
     let filename = output
         .file_name()
@@ -263,6 +363,71 @@ fn write_model(
     println!("Built project to {}", filename);
 
     Ok(())
+}
+
+/// Fails if the base place read for an in-place build has changed since.
+///
+/// Studio can save the place while it is being built into. Replacing it then
+/// would discard that save, so the build stops and leaves it alone, as
+/// `rojo merge` does when its output changes during a merge.
+fn check_base_unchanged(base_read: Option<(&Path, blake3::Hash)>) -> anyhow::Result<()> {
+    if let Some((base, digest)) = base_read {
+        if build_into::file_digest(base)? != Some(digest) {
+            bail!(
+                "{} changed while the project was being built into it, for example \
+                 because Studio saved it. It was left as it is; build again to apply \
+                 the project onto the new version.",
+                base.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+/// How often `--watch --into` checks the base place for changes.
+const BASE_POLL_INTERVAL: Duration = Duration::from_millis(500);
+
+/// What `--watch --into` compares to notice that the base place changed.
+#[derive(Debug, PartialEq, Eq)]
+struct BaseState(Option<(Option<SystemTime>, u64)>);
+
+impl BaseState {
+    fn read(path: &Path) -> Self {
+        Self(
+            std::fs::metadata(path)
+                .ok()
+                .map(|metadata| (metadata.modified().ok(), metadata.len())),
+        )
+    }
+}
+
+/// Whether `left` and `right` name the same file, following links. Neither
+/// needs to exist: a missing file is compared by its canonical directory and
+/// its name, ignoring case on Windows, whose file systems do too.
+fn is_same_path(left: &Path, right: &Path) -> bool {
+    match (comparable_path(left), comparable_path(right)) {
+        (Some(left), Some(right)) => {
+            if cfg!(windows) {
+                left.to_string_lossy().to_lowercase() == right.to_string_lossy().to_lowercase()
+            } else {
+                left == right
+            }
+        }
+        _ => false,
+    }
+}
+
+fn comparable_path(path: &Path) -> Option<PathBuf> {
+    if let Ok(canonical) = dunce::canonicalize(path) {
+        return Some(canonical);
+    }
+    let absolute = std::path::absolute(path).ok()?;
+    let name = absolute.file_name()?;
+    let parent = absolute.parent()?;
+    match dunce::canonicalize(parent) {
+        Ok(parent) => Some(parent.join(name)),
+        Err(_) => Some(absolute),
+    }
 }
 
 /// Replaces `destination` with the bytes produced by `write`, leaving the
@@ -278,6 +443,16 @@ fn write_model(
 /// updated, since the new contents are a different file.
 pub(super) fn write_file_atomically(
     destination: &Path,
+    write: impl FnOnce(&mut dyn Write) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    write_file_atomically_checked(destination, || Ok(()), write)
+}
+
+/// Like `write_file_atomically`, but runs `check` right before replacing
+/// `destination` and leaves it untouched if `check` fails.
+fn write_file_atomically_checked(
+    destination: &Path,
+    check: impl FnOnce() -> anyhow::Result<()>,
     write: impl FnOnce(&mut dyn Write) -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
     // Renaming over a symlink would replace the link itself with a plain
@@ -328,6 +503,10 @@ pub(super) fn write_file_atomically(
             destination.display()
         )
     })?;
+
+    // As late as possible, so the window in which another program's write
+    // could still be replaced is only the rename itself.
+    check()?;
 
     // Dropping the staged file on error deletes it, so a failed rename leaves
     // only the previous output behind.
@@ -397,6 +576,56 @@ mod test {
         assert_eq!(std::fs::read(&destination).unwrap(), b"previous build");
         // The staged file is cleaned up rather than left next to the output.
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    /// An in-place `--into` build must not replace a base place that was
+    /// saved again (for example by Studio) after it was read.
+    #[test]
+    fn in_place_build_keeps_a_base_saved_during_the_build() {
+        let dir = tempfile::tempdir().unwrap();
+        let place = dir.path().join("place.rbxl");
+        std::fs::write(&place, b"read by the build").unwrap();
+        let digest = blake3::hash(b"read by the build");
+
+        let result = write_file_atomically_checked(
+            &place,
+            || check_base_unchanged(Some((&place, digest))),
+            |file| {
+                // Studio saves while the merged place is being written.
+                std::fs::write(&place, b"saved by Studio").unwrap();
+                Ok(file.write_all(b"merged build")?)
+            },
+        );
+
+        let error = format!("{:#}", result.unwrap_err());
+        assert!(error.contains("changed while the project"), "{error}");
+        assert_eq!(std::fs::read(&place).unwrap(), b"saved by Studio");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+
+        // Unchanged, the same build replaces it.
+        let digest = blake3::hash(b"saved by Studio");
+        write_file_atomically_checked(
+            &place,
+            || check_base_unchanged(Some((&place, digest))),
+            |file| Ok(file.write_all(b"merged build")?),
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(&place).unwrap(), b"merged build");
+    }
+
+    #[test]
+    fn same_path_does_not_need_the_files_to_exist() {
+        let dir = tempfile::tempdir().unwrap();
+        let place = dir.path().join("place.rbxl");
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        assert!(is_same_path(&place, &place));
+        assert!(is_same_path(
+            &place,
+            &dir.path().join("sub").join("..").join("place.rbxl")
+        ));
+        assert!(!is_same_path(&place, &dir.path().join("other.rbxl")));
+        #[cfg(windows)]
+        assert!(is_same_path(&place, &dir.path().join("PLACE.rbxl")));
     }
 
     #[test]
