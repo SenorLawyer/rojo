@@ -293,6 +293,11 @@ fn write_model(
         bail!("Cannot build a {} root as a place. Use .rbxm or .rbxmx, or set the root class to DataModel.", class);
     }
 
+    // Resolved once: the base check and the write both use this path, so a
+    // link repointed in between cannot send the write somewhere unchecked.
+    let destination = resolve_output(output)
+        .with_context(|| format!("Could not resolve symlink {}", output.display()))?;
+
     // The base is read on every build so a watched build picks up a newly
     // saved base place, and the merge never mutates the session's own tree.
     let merged;
@@ -300,7 +305,7 @@ fn write_model(
         Some(base) => {
             // Checked here as well as at startup, so that a link created
             // while watching cannot make a rebuild replace the base.
-            if is_same_path(base, output) {
+            if is_same_path(base, &destination) {
                 bail!("{}", same_file_error(base, output));
             }
             let base_dom = build_into::read_base_place(base)?;
@@ -316,7 +321,7 @@ fn write_model(
     }
 
     log::trace!("Serializing to a staged output file");
-    write_file_atomically(output, |file| {
+    write_resolved_file_atomically(&destination, |file| {
         match output_kind {
             OutputKind::Rbxm => {
                 compression
@@ -484,9 +489,17 @@ pub(super) fn write_file_atomically(
 ) -> anyhow::Result<()> {
     // Renaming over a symlink would replace the link itself with a plain
     // file, and whatever it pointed to would silently stop being updated.
-    let destination = &resolve_symlinks(destination)
+    let destination = resolve_output(destination)
         .with_context(|| format!("Could not resolve symlink {}", destination.display()))?;
+    write_resolved_file_atomically(&destination, write)
+}
 
+/// [`write_file_atomically`] to a destination [`resolve_output`] already
+/// resolved, which is used exactly as given: links are not followed again.
+fn write_resolved_file_atomically(
+    destination: &Path,
+    write: impl FnOnce(&mut dyn Write) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
     // The staged file must be on the same filesystem for the rename to be
     // atomic, so it goes in the destination's directory.
     let parent = match destination.parent() {
@@ -550,6 +563,25 @@ pub(super) fn write_file_atomically(
     }
 
     Ok(())
+}
+
+/// The file a write to `path` ends up in: `path` followed through any chain
+/// of symlinks, in its folder with that folder's links resolved too, so a
+/// link to the folder repointed later does not move the write.
+fn resolve_output(path: &Path) -> std::io::Result<PathBuf> {
+    let resolved = resolve_symlinks(path)?;
+    let (Some(parent), Some(name)) = (resolved.parent(), resolved.file_name()) else {
+        return Ok(resolved);
+    };
+    let parent = if parent.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        parent
+    };
+    Ok(match dunce::canonicalize(parent) {
+        Ok(parent) => parent.join(name),
+        Err(_) => resolved,
+    })
 }
 
 /// Follows `path` through any chain of symlinks to the path that would be
@@ -681,6 +713,56 @@ mod test {
         {
             std::os::windows::fs::symlink_file(target, link).is_ok()
         }
+    }
+
+    /// The writer publishes to the path it is given and does not follow it
+    /// again, so what was checked is what is written.
+    #[test]
+    fn a_resolved_destination_is_not_followed_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real.rbxl");
+        let link = dir.path().join("link.rbxl");
+        std::fs::write(&real, b"previous build").unwrap();
+        if !symlink_file(Path::new("real.rbxl"), &link) {
+            eprintln!("skipping: cannot create symlinks here");
+            return;
+        }
+        assert_eq!(
+            resolve_output(&link).unwrap(),
+            dunce::canonicalize(&real).unwrap()
+        );
+
+        // Given the link itself as the resolved path, it replaces the link.
+        write_resolved_file_atomically(&link, |file| Ok(file.write_all(b"new build")?)).unwrap();
+        assert!(!std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(std::fs::read(&real).unwrap(), b"previous build");
+    }
+
+    /// A link repointed at the base after the output was resolved and
+    /// checked does not make the build write over the base.
+    #[cfg(unix)]
+    #[test]
+    fn a_link_repointed_after_resolving_does_not_redirect_the_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base.rbxl");
+        let output = dir.path().join("out.rbxl");
+        let link = dir.path().join("link.rbxl");
+        std::fs::write(&base, b"base").unwrap();
+        std::fs::write(&output, b"previous build").unwrap();
+        std::os::unix::fs::symlink(&output, &link).unwrap();
+
+        let destination = resolve_output(&link).unwrap();
+        assert!(!is_same_path(&base, &destination));
+        std::fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(&base, &link).unwrap();
+
+        write_resolved_file_atomically(&destination, |file| Ok(file.write_all(b"merged")?))
+            .unwrap();
+        assert_eq!(std::fs::read(&base).unwrap(), b"base");
+        assert_eq!(std::fs::read(&output).unwrap(), b"merged");
     }
 
     #[test]
