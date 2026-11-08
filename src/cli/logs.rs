@@ -341,20 +341,21 @@ impl LogsCommand {
                     .to_owned(),
                 _ => return error.into(),
             },
-            OpenCloudError::NotSent(_) => return UsageError(error.into()).into(),
+            OpenCloudError::InvalidRequest(_) => return UsageError(error.into()).into(),
             _ => return error.into(),
         };
         UsageError(anyhow::Error::new(error).context(advice)).into()
     }
 }
 
-/// Errors that retrying will not fix. A request that was not sent, such as
-/// one with a job id that cannot go into its path, fails the same way every
-/// time.
+/// Errors that retrying will not fix. A request refused as invalid before
+/// sending, such as one with a job id that cannot go into its path, fails
+/// the same way every time; one that could not be sent because the
+/// connection failed may well work next round.
 fn is_usage_problem(error: &OpenCloudError) -> bool {
     match error {
         OpenCloudError::Status { status, .. } => matches!(status.as_u16(), 400 | 401 | 403 | 404),
-        OpenCloudError::NotSent(_) => true,
+        OpenCloudError::InvalidRequest(_) => true,
         _ => false,
     }
 }
@@ -761,9 +762,10 @@ impl<'a, S: LogSource> Reader<'a, S> {
     }
 
     fn classify(&self, target: &Target, error: OpenCloudError) -> ServerFailure {
-        if matches!(error, OpenCloudError::NotSent(_)) {
+        if matches!(error, OpenCloudError::InvalidRequest(_)) {
             // Refused before sending, such as a listed job id that cannot go
-            // into a path; it would be refused again every round.
+            // into a path; it would be refused again every round. A
+            // connection that failed is transient like any other.
             return ServerFailure::Fatal(error);
         }
         match status_of(&error) {
@@ -1531,7 +1533,7 @@ mod tests {
     }
 
     #[test]
-    fn a_request_that_could_not_be_sent_is_fatal_not_retried() {
+    fn an_invalid_request_is_fatal_not_retried() {
         let fake = Fake::default();
         let command = parse(&["--place-version", "45"]);
         let mut reader = reader(&fake, &command);
@@ -1543,16 +1545,70 @@ mod tests {
             .borrow_mut()
             .entry("bad".to_owned())
             .or_default()
-            .push_back(Err(OpenCloudError::NotSent(
+            .push_back(Err(OpenCloudError::InvalidRequest(
                 "job id \"bad\" cannot be used in a request path".into(),
             )));
         let batch = reader.round(NOW);
-        assert!(matches!(batch.error, Some(OpenCloudError::NotSent(_))));
+        assert!(matches!(
+            batch.error,
+            Some(OpenCloudError::InvalidRequest(_))
+        ));
         assert!(batch.failed_servers.is_empty());
         assert!(log_tokens(&fake, "b").is_empty());
         let error = batch.error.unwrap();
         assert!(is_usage_problem(&error));
         assert!(command.explain(error).is::<UsageError>());
+    }
+
+    #[test]
+    fn a_failed_connection_is_retried_while_following() {
+        let fake = Fake::default();
+        let command = parse(&["--place-version", "45", "--follow", "--interval", "1"]);
+        let mut reader = reader(&fake, &command);
+        // Listing servers fails to connect, then works.
+        fake.servers
+            .borrow_mut()
+            .push_back(Err(OpenCloudError::NotSent("connection refused".into())));
+        fake.servers(vec![server("a", false, None)], None);
+        fake.logs(
+            "a",
+            vec![
+                log("a", now_ms() - MINUTE, LogSeverity::Error, "after"),
+                log("a", now_ms() - 2 * MINUTE, LogSeverity::Error, "before"),
+            ],
+            None,
+        );
+        let mut out = Lines {
+            written: Vec::new(),
+            lines: 1,
+        };
+        // Ends when the second round prints, through the closed pipe.
+        command
+            .follow(&mut reader, &mut out, &|text: &str| text.to_owned())
+            .unwrap();
+        assert!(String::from_utf8(out.written).unwrap().contains("before"));
+        let listings = fake
+            .calls
+            .borrow()
+            .iter()
+            .filter(|call| matches!(call, Call::Servers(..)))
+            .count();
+        assert_eq!(listings, 2);
+
+        // A server that cannot be reached is skipped for the round, not fatal.
+        let fake = Fake::default();
+        let command = parse(&["--place-version", "45"]);
+        let mut reader = Reader::new(&fake, &command);
+        fake.servers(vec![server("a", false, None)], None);
+        fake.logs
+            .borrow_mut()
+            .entry("a".to_owned())
+            .or_default()
+            .push_back(Err(OpenCloudError::NotSent("connection refused".into())));
+        let batch = reader.round(NOW);
+        assert!(batch.error.is_none());
+        assert_eq!(batch.failed_servers, ["a"]);
+        assert!(!is_usage_problem(&OpenCloudError::NotSent("x".into())));
     }
 
     #[test]

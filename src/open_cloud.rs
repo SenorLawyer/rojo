@@ -306,9 +306,16 @@ pub struct StartedUpload {
 /// Why an Open Cloud call failed. None of these contain the API key.
 #[derive(Debug, thiserror::Error)]
 pub enum OpenCloudError {
-    /// The request never reached Roblox, so nothing changed.
+    /// The request never reached Roblox, so nothing changed: it could not
+    /// be sent, such as when the connection failed. Trying again later may
+    /// work.
     #[error("Request to Open Cloud was not sent: {0}")]
     NotSent(String),
+    /// The request was refused before sending because it is invalid, such
+    /// as a value that cannot go into its path. Nothing changed, and the same
+    /// request would be refused again.
+    #[error("Request to Open Cloud was not sent: {0}")]
+    InvalidRequest(String),
     /// Roblox answered with an error status.
     #[error("Open Cloud returned HTTP {status} for {request}{body}")]
     Status {
@@ -346,7 +353,9 @@ impl OpenCloudError {
     /// repeat such requests.
     pub fn may_have_applied(&self) -> bool {
         match self {
-            OpenCloudError::NotSent(_) | OpenCloudError::Failed(_) => false,
+            OpenCloudError::NotSent(_)
+            | OpenCloudError::InvalidRequest(_)
+            | OpenCloudError::Failed(_) => false,
             // 408 (request timeout), 409 (conflict) and 499 (client closed
             // request) can be reported after the server already acted.
             OpenCloudError::Status { status, .. } => {
@@ -708,7 +717,7 @@ impl OpenCloud {
             content_type,
             bytes,
         )
-        .map_err(OpenCloudError::NotSent)?;
+        .map_err(OpenCloudError::InvalidRequest)?;
         let response = self.send(
             Method::POST,
             "/assets/v1/assets",
@@ -796,7 +805,7 @@ impl OpenCloud {
         let path = self
             .checked_path(operation, "operations/")
             .map_err(|error| {
-                OpenCloudError::NotSent(format!("cannot resume asset upload: {error}"))
+                OpenCloudError::InvalidRequest(format!("cannot resume asset upload: {error}"))
             })?
             .to_owned();
         self.finish_asset_upload(StartedUpload {
@@ -904,7 +913,7 @@ impl OpenCloud {
         if path_segment(value) {
             Ok(value)
         } else {
-            Err(OpenCloudError::NotSent(format!(
+            Err(OpenCloudError::InvalidRequest(format!(
                 "{what} {:?} cannot be used in a request path",
                 self.redact(value.to_owned())
             )))
@@ -2193,7 +2202,7 @@ mod tests {
             "",
         ] {
             let error = client.resume_asset_upload(path).unwrap_err();
-            assert!(matches!(error, OpenCloudError::NotSent(_)), "{path}");
+            assert!(matches!(error, OpenCloudError::InvalidRequest(_)), "{path}");
         }
     }
 
@@ -2255,7 +2264,10 @@ mod tests {
                     b"",
                 )
                 .unwrap_err();
-            assert!(matches!(error, OpenCloudError::NotSent(_)), "{error:?}");
+            assert!(
+                matches!(error, OpenCloudError::InvalidRequest(_)),
+                "{error:?}"
+            );
         }
     }
 
@@ -2562,7 +2574,10 @@ mod tests {
             let error = client
                 .list_game_server_logs(1, 2, version, job, "", None)
                 .unwrap_err();
-            assert!(matches!(error, OpenCloudError::NotSent(_)), "{error}");
+            assert!(
+                matches!(error, OpenCloudError::InvalidRequest(_)),
+                "{error}"
+            );
         }
     }
 
