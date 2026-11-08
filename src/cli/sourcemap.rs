@@ -17,7 +17,7 @@ use tokio::runtime::Runtime;
 
 use crate::{
     serve_session::ServeSession,
-    snapshot::{AppliedPatchSet, InstanceWithMeta, RojoTree},
+    snapshot::{AppliedPatchSet, InstanceWithMeta, InstigatingSource, RojoTree},
 };
 
 use super::resolve_path;
@@ -234,6 +234,23 @@ fn recurse_create_node<'a>(
         });
     }
 
+    // A project node's own `$path` is used even when a parent node's
+    // `$globIgnorePaths` match it, as `rojo build` does: naming a file is a
+    // deliberate choice to include it.
+    let explicit_path = match &instance.metadata().instigating_source {
+        Some(InstigatingSource::ProjectNode { path, node, .. }) => {
+            node.path.as_ref().and_then(|node_path| {
+                let node_path = node_path.path();
+                let full = if node_path.is_absolute() {
+                    node_path.to_owned()
+                } else {
+                    path.parent()?.join(node_path)
+                };
+                dunce::canonicalize(full).ok()
+            })
+        }
+        _ => None,
+    };
     let file_paths = instance
         .metadata()
         .relevant_paths
@@ -247,7 +264,9 @@ fn recurse_create_node<'a>(
             !crate::snapshot_middleware::is_ignored_by_node_rules(
                 &instance.metadata().context.path_ignore_rules,
                 path,
-            )
+            ) || explicit_path
+                .as_ref()
+                .is_some_and(|explicit| dunce::canonicalize(path).ok().as_ref() == Some(explicit))
         })
         .map(|path| path.as_path());
 
@@ -575,6 +594,49 @@ mod test {
             .map(|path| path.to_string_lossy().replace('\\', "/"))
             .collect();
         assert_eq!(root_paths, ["default.project.json"], "{path}");
+    }
+
+    /// A node's own `$path` naming a file that a parent node's
+    /// `$globIgnorePaths` match is built, so the sourcemap lists it too.
+    #[test]
+    fn keeps_a_file_a_node_names_although_a_parent_excludes_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("project");
+        fs_err::create_dir_all(project.join("filtered")).unwrap();
+        fs_err::write(
+            project.join("default.project.json"),
+            r#"{
+                "name": "root",
+                "tree": {
+                    "$path": "filtered",
+                    "$globIgnorePaths": ["**/*.spec.luau"],
+                    "Spec": { "$path": "filtered/Foo.spec.luau" }
+                }
+            }"#,
+        )
+        .unwrap();
+        fs_err::write(project.join("filtered/Foo.spec.luau"), "return 1").unwrap();
+        fs_err::write(project.join("filtered/Bar.spec.luau"), "return 1").unwrap();
+        let sourcemap_output = dir.path().join("sourcemap.json");
+        let sourcemap_command = SourcemapCommand {
+            project,
+            output: Some(sourcemap_output.clone()),
+            include_non_scripts: true,
+            watch: false,
+            absolute: false,
+        };
+        assert!(sourcemap_command.run().is_ok());
+
+        let raw = fs_err::read_to_string(sourcemap_output.as_path()).unwrap();
+        let root = serde_json::from_str::<SourcemapNode>(&raw).unwrap();
+        let names: Vec<_> = root.children.iter().map(|child| child.name).collect();
+        assert_eq!(names, ["Spec"], "{raw}");
+        let paths: Vec<_> = root.children[0]
+            .file_paths
+            .iter()
+            .map(|path| path.to_string_lossy().replace('\\', "/"))
+            .collect();
+        assert_eq!(paths, ["filtered/Foo.spec.luau"], "{raw}");
     }
 
     #[test]

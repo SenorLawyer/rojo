@@ -89,6 +89,8 @@ this guide, `--help` and the bundled topics over them. Each topic prints with
   folder a Folder. Syncback skips such a partition entirely, writing and
   removing nothing under its `$path`, and warns; edit those files directly.
   `Generated/**` leaves an empty `Generated` folder; `Generated` removes it.
+  A child node whose own `$path` names a matching file still gets it: an
+  explicit `$path` overrides the parent's globs, in build and sourcemap alike.
 * Packages and merges: `rojo packages doctor` checks Wally and pesde
   mappings, see `rojo doc --agent packages`; `rojo merge` merges binary and
   XML place files, see `rojo doc --agent merge`.
