@@ -929,6 +929,53 @@ fn build_into_workspace_path_with_meta_file() {
     assert!(!replaced.contains("Terrain (Terrain)"), "{replaced}");
 }
 
+/// A `.model.json` with `$ignoreUnknownInstances` keeps the base's children
+/// it does not have, like a meta file or project node saying the same;
+/// without it, the model's content wins.
+#[test]
+fn build_into_model_json_ignore_unknown_instances() {
+    let temp = tempdir().unwrap();
+    let mut dom = into_place_base();
+    let workspace = dom.root().children()[0];
+    let map = dom.insert(workspace, InstanceBuilder::new("Model").with_name("Arena"));
+    dom.insert(map, InstanceBuilder::new("Part").with_name("BaseOnly"));
+    let base = temp.path().join("base.rbxl");
+    write_place(&dom, &base);
+
+    for (ignore, kept) in [(true, true), (false, false)] {
+        let project = temp.path().join(format!("project-{ignore}"));
+        fs::create_dir_all(&project).unwrap();
+        fs::write(
+            project.join("default.project.json"),
+            r#"{"name": "into", "tree": {"$className": "DataModel",
+                "Workspace": {"Arena": {"$path": "Arena.model.json"}}}}"#,
+        )
+        .unwrap();
+        let field = if ignore {
+            r#""$ignoreUnknownInstances": true,"#
+        } else {
+            ""
+        };
+        fs::write(
+            project.join("Arena.model.json"),
+            format!(
+                r#"{{"className": "Model", {field}
+                    "children": [{{"name": "FromProject", "className": "Part"}}]}}"#
+            ),
+        )
+        .unwrap();
+        let output = temp.path().join(format!("out-{ignore}.rbxl"));
+        assert_success(&build_project_into(&project, &base, &output));
+        let description = describe_place(&read_place(&output));
+        assert!(description.contains("FromProject (Part)"), "{description}");
+        assert_eq!(
+            description.contains("BaseOnly (Part)"),
+            kept,
+            "ignore={ignore}: {description}"
+        );
+    }
+}
+
 /// A `Rojo_Id` that a kept base instance shares with a project ID would leave
 /// both unresolvable, so the build fails before writing.
 #[test]

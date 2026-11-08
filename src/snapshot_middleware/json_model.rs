@@ -145,6 +145,7 @@ fn json_model_from_pair<'sync>(
         attributes,
         id: None,
         schema: None,
+        ignore_unknown_instances: None,
         unknown_fields: UnknownFields::default(),
     }
 }
@@ -188,6 +189,16 @@ struct JsonModel {
     )]
     attributes: IndexMap<String, UnresolvedValue>,
 
+    /// Whether Studio keeps children of this instance that the file does not
+    /// have, as `ignoreUnknownInstances` does in meta files and project
+    /// nodes.
+    #[serde(
+        alias = "$ignoreUnknownInstances",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    ignore_unknown_instances: Option<bool>,
+
     #[serde(flatten, skip_serializing)]
     unknown_fields: UnknownFields,
 }
@@ -224,7 +235,10 @@ impl JsonModel {
         // Children keep their IDs so `Rojo_Target_*` attributes, such as a
         // Model's PrimaryPart, can point at them. The top-level ID is taken
         // out before this and applied by the caller.
-        let metadata = InstanceMetadata::new().specified_id(self.id.map(RojoRef::new));
+        let mut metadata = InstanceMetadata::new().specified_id(self.id.map(RojoRef::new));
+        if let Some(ignore) = self.ignore_unknown_instances {
+            metadata.ignore_unknown_instances = ignore;
+        }
 
         Ok(InstanceSnapshot {
             snapshot_id: Ref::none(),
@@ -332,6 +346,39 @@ mod test {
             .properties
             .contains_key(&rbx_dom_weak::ustr("Attributes")));
         assert_eq!(tags(&snapshot.children[0]), vec!["Child"]);
+    }
+
+    /// `ignoreUnknownInstances` (or `$ignoreUnknownInstances`) used to be
+    /// reported as an unknown field and dropped.
+    #[test]
+    fn model_ignore_unknown_instances_is_applied() {
+        let mut imfs = InMemoryFs::new();
+        imfs.load_snapshot(
+            "/foo.model.json",
+            VfsSnapshot::file(
+                r#"{
+                    "className": "Model",
+                    "$ignoreUnknownInstances": true,
+                    "children": [
+                        { "name": "Kept", "className": "Folder", "ignoreUnknownInstances": true },
+                        { "name": "Plain", "className": "Folder" }
+                    ]
+                }"#,
+            ),
+        )
+        .unwrap();
+        let vfs = Vfs::new(imfs);
+        let snapshot = snapshot_json_model(
+            &InstanceContext::default(),
+            &vfs,
+            Path::new("/foo.model.json"),
+            "foo",
+        )
+        .unwrap()
+        .unwrap();
+        assert!(snapshot.metadata.ignore_unknown_instances);
+        assert!(snapshot.children[0].metadata.ignore_unknown_instances);
+        assert!(!snapshot.children[1].metadata.ignore_unknown_instances);
     }
 
     /// IDs on nested children used to be dropped, so a parent's
