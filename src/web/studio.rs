@@ -210,13 +210,16 @@ fn packed_ref(packed: &str, name: &str) -> Option<String> {
 
 /// Reads and validates a token file, warning when other users can read it.
 /// What `/api/studio/prove` answers for `nonce`: a hash keyed with a key
-/// derived from `token`, over the nonce and the serve session, in hex. Both
-/// the server and a client that holds the token can compute it; it reveals
-/// nothing about the token to anyone else.
-pub(crate) fn token_proof(token: &str, nonce: &[u8], session: &str) -> String {
+/// derived from `token`, over the nonce, the serve session and the port the
+/// server listens on, in hex. Both the server and a client that holds the
+/// token can compute it; it reveals nothing about the token to anyone else.
+/// The port ties the answer to the server that gave it, so one relayed from
+/// a bridge on another port does not prove anything about the relay.
+pub(crate) fn token_proof(token: &str, nonce: &[u8], session: &str, port: u16) -> String {
     let key = blake3::derive_key("rojo studio token proof", token.as_bytes());
     let mut message = nonce.to_vec();
     message.extend_from_slice(session.as_bytes());
+    message.extend_from_slice(&port.to_be_bytes());
     blake3::keyed_hash(&key, &message).to_hex().to_string()
 }
 
@@ -1006,6 +1009,14 @@ impl StudioBridge {
                 "prove needs a nonce of 32 bytes in hex",
             );
         };
+        // The port this connection arrived on, as the listener saw it, never
+        // anything the request says.
+        let Some(LocalAddr(local)) = request.extensions().get::<LocalAddr>().copied() else {
+            return failure(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "prove does not know which port it listens on",
+            );
+        };
         let session = self.identity_json["serverSession"]
             .as_str()
             .unwrap_or_default();
@@ -1014,7 +1025,8 @@ impl StudioBridge {
             json!({
                 "serverSession": session,
                 "projectPath": self.identity_json["projectPath"],
-                "proof": token_proof(&self.token, &nonce, session),
+                "port": local.port(),
+                "proof": token_proof(&self.token, &nonce, session, local.port()),
             }),
         )
     }
@@ -4299,12 +4311,16 @@ mod tests {
         let (_dir, bridge) = fixture();
         let nonce = [7u8; 32];
         let prove = |query: String| {
-            Request::builder()
+            let mut request = Request::builder()
                 .method("GET")
                 .uri(format!("/api/studio/prove{query}"))
                 .header(HOST, "127.0.0.1:34872")
                 .body(Body::empty())
-                .unwrap()
+                .unwrap();
+            request
+                .extensions_mut()
+                .insert(LocalAddr("127.0.0.1:34872".parse().unwrap()));
+            request
         };
         let request = prove(format!("?nonce={}", data_encoding::HEXLOWER.encode(&nonce)));
         let (status, value) =
@@ -4316,19 +4332,20 @@ mod tests {
             bridge.identity_json["serverSession"].as_str()
         );
         assert_eq!(value["projectPath"], bridge.identity_json["projectPath"]);
+        // The port is the one the connection arrived on.
+        assert_eq!(value["port"], 34872);
         assert_eq!(
             value["proof"].as_str(),
-            Some(token_proof(&bridge.token, &nonce, session).as_str())
+            Some(token_proof(&bridge.token, &nonce, session, 34872).as_str())
         );
-        // Another nonce gives another proof, and another token another.
+        // Another nonce, token or port gives another proof.
+        let proof = token_proof(&bridge.token, &nonce, session, 34872);
         assert_ne!(
-            token_proof(&bridge.token, &[8u8; 32], session),
-            token_proof(&bridge.token, &nonce, session)
+            token_proof(&bridge.token, &[8u8; 32], session, 34872),
+            proof
         );
-        assert_ne!(
-            token_proof("another-token", &nonce, session),
-            token_proof(&bridge.token, &nonce, session)
-        );
+        assert_ne!(token_proof("another-token", &nonce, session, 34872), proof);
+        assert_ne!(token_proof(&bridge.token, &nonce, session, 34873), proof);
         assert!(!value.to_string().contains(&bridge.token));
 
         for query in ["", "?nonce=abc", "?nonce=zz"] {

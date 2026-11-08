@@ -586,8 +586,13 @@ fn prove(address: &str, token_file: &Path) -> Result<(String, String), String> {
         .json()
         .map_err(|_| format!("the server on {address} is not its Studio bridge"))?;
     let session = identity["serverSession"].as_str().unwrap_or_default();
-    if identity["proof"].as_str()
-        != Some(crate::web::studio::token_proof(&token, &nonce, session).as_str())
+    // The proof covers the port the answering server listens on, which must
+    // be the one connected to: a relay passing on another bridge's answer
+    // gives that bridge's port.
+    let port = base.port_or_known_default().unwrap_or_default();
+    if identity["port"].as_u64() != Some(u64::from(port))
+        || identity["proof"].as_str()
+            != Some(crate::web::studio::token_proof(&token, &nonce, session, port).as_str())
     {
         return Err(format!(
             "the server on {address} could not prove it holds this worktree's Studio token"
@@ -1679,7 +1684,7 @@ mod test {
         project: PathBuf,
         delay: Duration,
     ) -> (String, thread::JoinHandle<String>) {
-        answer_with(delay, move |request| {
+        answer_with(delay, move |request, port| {
             let nonce = request
                 .split(['?', '&', ' '])
                 .find_map(|part| part.strip_prefix("nonce="))
@@ -1688,7 +1693,8 @@ mod test {
             let body = serde_json::json!({
                 "serverSession": session,
                 "projectPath": project,
-                "proof": crate::web::studio::token_proof(token, &nonce, session),
+                "port": port,
+                "proof": crate::web::studio::token_proof(token, &nonce, session, port),
             })
             .to_string();
             format!(
@@ -1703,17 +1709,18 @@ mod test {
     /// Answers one HTTP request with `response` after `delay`, and returns
     /// the address to reach it and the request it got.
     fn answer_raw(response: String, delay: Duration) -> (String, thread::JoinHandle<String>) {
-        answer_with(delay, move |_| response)
+        answer_with(delay, move |_, _| response)
     }
 
     /// Answers one HTTP request with what `respond` makes of it, after
     /// `delay`, and returns the address to reach it and the request it got.
     fn answer_with(
         delay: Duration,
-        respond: impl FnOnce(&str) -> String + Send + 'static,
+        respond: impl FnOnce(&str, u16) -> String + Send + 'static,
     ) -> (String, thread::JoinHandle<String>) {
         use std::io::{BufRead, BufReader};
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
         let address = format!("http://{}", listener.local_addr().unwrap());
         let handle = thread::spawn(move || {
             let (stream, _) = listener.accept().unwrap();
@@ -1728,7 +1735,9 @@ mod test {
             }
             thread::sleep(delay);
             let mut stream = stream;
-            stream.write_all(respond(&request).as_bytes()).unwrap();
+            stream
+                .write_all(respond(&request, port).as_bytes())
+                .unwrap();
             request
         });
         (address, handle)
@@ -1845,6 +1854,57 @@ mod test {
             use_default("http://127.0.0.1:1", None).unwrap(),
             ("http://127.0.0.1:1".to_owned(), None)
         );
+    }
+
+    /// A process on the recorded port passes the nonce on to a real bridge
+    /// on another port and returns its answer. The proof covers that
+    /// bridge's port, so the relay is not trusted and never gets the token.
+    #[test]
+    fn a_relayed_proof_from_another_port_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let (bridge, _) = answer_proof(
+            RECORDED_TOKEN,
+            "recorded-session",
+            dir.path().join("default.project.json"),
+            Duration::ZERO,
+        );
+        let (relay, relayed) = answer_with(Duration::ZERO, move |request, _| {
+            let path = request.split_whitespace().nth(1).unwrap_or("/").to_owned();
+            let body = reqwest::blocking::get(format!("{bridge}{path}"))
+                .unwrap()
+                .text()
+                .unwrap();
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+        });
+        let state = recorded(dir.path(), relay.clone(), std::process::id());
+        let reason = verify(&state).unwrap_err();
+        assert!(reason.contains("could not prove"), "{reason}");
+        let request = relayed.join().unwrap();
+        assert!(!request.to_ascii_lowercase().contains("x-rojo-studio-token"));
+        assert!(!request.contains(RECORDED_TOKEN), "{request}");
+
+        // The fallback to the default port checks the same way.
+        let (bridge, _) = answer_proof(
+            RECORDED_TOKEN,
+            "any-session",
+            dir.path().join("default.project.json"),
+            Duration::ZERO,
+        );
+        let (relay, _) = answer_with(Duration::ZERO, move |request, _| {
+            let path = request.split_whitespace().nth(1).unwrap_or("/").to_owned();
+            let body = reqwest::blocking::get(format!("{bridge}{path}"))
+                .unwrap()
+                .text()
+                .unwrap();
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+        });
+        assert!(use_default(&relay, Some(state.token_file.clone())).is_err());
     }
 
     #[test]
