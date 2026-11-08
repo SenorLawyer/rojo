@@ -71,7 +71,10 @@ Press Ctrl+C to stop.
 The plugin line comes from doctor's plugin check. The port line is only shown
 for a port other than 34872, the plugin's default. When the server is bound to
 a single non-loopback address, `rojo studio` cannot reach it, and the block
-says so instead of printing the command.
+says so instead of printing the command. `dev.json` is still written and says
+so too, so `rojo studio`, `rojo test` and `rojo mcp` run there without flags
+stop with an error asking for `--address` and `--token-file` instead of
+using the default port.
 
 ## Commands that find it without flags
 

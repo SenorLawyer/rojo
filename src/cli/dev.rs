@@ -175,12 +175,18 @@ impl DevCommand {
         let studio_address = studio_address(ip, port);
         let state_path = checkout.worktree_state.join(STATE_FILE);
         let project_file = &session.root_project().file_location;
-        let state = studio_address.as_ref().map(|address| DevState {
+        // Recorded whatever the address, so that commands run here without
+        // flags never fall back to the default port: for an address they
+        // cannot reach, the record says so and they stop with an error.
+        let state = Some(DevState {
             pid: std::process::id(),
-            address: address.clone(),
+            address: studio_address
+                .clone()
+                .unwrap_or_else(|| format!("http://{}:{port}", display_host(ip))),
             token_file: token_file.clone(),
             project: dunce::canonicalize(project_file).unwrap_or_else(|_| project_file.clone()),
             server_session: session.session_id().to_string(),
+            discoverable: studio_address.is_some(),
         });
 
         let mut place_ids: Option<Vec<u64>> = session
@@ -335,6 +341,16 @@ struct DevState {
     /// callers holding the token. A server that later takes the port, even
     /// one serving the same project with the shared token, reports another.
     server_session: String,
+    /// Whether `rojo studio` can reach the server through `address`. It
+    /// cannot when the server listens on one non-loopback address; the
+    /// record then only stops flagless commands from using the default
+    /// port. Records written before this field existed were reachable.
+    #[serde(default = "reachable")]
+    discoverable: bool,
+}
+
+fn reachable() -> bool {
+    true
 }
 
 impl DevState {
@@ -444,6 +460,18 @@ fn use_record(
     path: &Path,
     state: Result<DevState, String>,
 ) -> anyhow::Result<(String, Option<PathBuf>)> {
+    if let Ok(state) = &state {
+        if !state.discoverable {
+            return Err(super::UsageError(anyhow::anyhow!(
+                "This worktree's rojo dev, recorded in {}, listens on {}, which is not a \
+                 loopback address, so commands cannot find it by themselves. Pass --address \
+                 and --token-file for the server to use.",
+                path.display(),
+                state.address
+            ))
+            .into());
+        }
+    }
     match state.and_then(|state| verify(&state).map(|()| state)) {
         Ok(state) => Ok((state.address, Some(state.token_file))),
         Err(reason) => Err(super::UsageError(anyhow::anyhow!(
@@ -1462,6 +1490,7 @@ mod test {
             token_file: PathBuf::from("token"),
             project: PathBuf::from("default.project.json"),
             server_session: "session".to_owned(),
+            discoverable: true,
         };
         state.write(&path).unwrap();
         assert_eq!(DevState::read(&path), Ok(Some(state.clone())));
@@ -1527,6 +1556,7 @@ mod test {
             token_file: PathBuf::from("token"),
             project: PathBuf::from("default.project.json"),
             server_session: session.to_owned(),
+            discoverable: true,
         };
         let old = state("old");
         old.write(&path).unwrap();
@@ -1655,6 +1685,7 @@ mod test {
             token_file,
             project: dir.join("default.project.json"),
             server_session: "recorded-session".to_owned(),
+            discoverable: true,
         }
     }
 
@@ -1851,6 +1882,40 @@ mod test {
         assert!(text.contains("Restart `rojo dev`"), "{text}");
         // A usage problem, so the command exits with 2.
         assert_eq!(super::super::exit_status(&error).0, 2);
+    }
+
+    #[test]
+    fn a_record_of_a_server_on_another_address_is_an_error_not_a_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = recorded(
+            dir.path(),
+            "http://192.168.1.20:34900".to_owned(),
+            std::process::id(),
+        );
+        state.discoverable = false;
+        let path = dir.path().join(STATE_FILE);
+        state.write(&path).unwrap();
+
+        let checkout = Checkout {
+            root: dir.path().to_owned(),
+            primary: true,
+            in_git: true,
+            shared_state: dir.path().to_owned(),
+            worktree_state: dir.path().to_owned(),
+        };
+        let (found, state) = find_running(&checkout, dir.path()).unwrap();
+        let error = use_record(&found, state).unwrap_err();
+        let text = format!("{error:#}");
+        assert!(text.contains("not a loopback address"), "{text}");
+        assert!(text.contains("--address and --token-file"), "{text}");
+        assert_eq!(super::super::exit_status(&error).0, 2);
+
+        // Records from before the field are reachable ones.
+        let old: DevState = serde_json::from_str(
+            r#"{"pid":1,"address":"http://127.0.0.1:1","tokenFile":"t","project":"p","serverSession":"s"}"#,
+        )
+        .unwrap();
+        assert!(old.discoverable);
     }
 
     #[test]
