@@ -81,6 +81,7 @@ pub fn merge_into_place(project: &RojoTree, base: WeakDom) -> anyhow::Result<Roj
     replace_base_ids(&tree, &mut patch_set);
     let null_refs = take_null_ref_assignments(&mut patch_set);
     apply_patch_set(&mut tree, patch_set);
+    remove_project_attributes_marker(&mut tree);
 
     for (id, name) in null_refs {
         tree.get_instance_mut(id)
@@ -454,6 +455,32 @@ fn is_service(class_name: &str) -> bool {
     }
 }
 
+/// Takes [`PROJECT_ATTRIBUTES_MARKER`] out of every instance again.
+fn remove_project_attributes_marker(tree: &mut RojoTree) {
+    let attributes_key = ustr("Attributes");
+    let marked: Vec<Ref> = tree
+        .inner()
+        .descendants()
+        .filter(|instance| match instance.properties.get(&attributes_key) {
+            Some(Variant::Attributes(attributes)) => {
+                attributes.get(PROJECT_ATTRIBUTES_MARKER).is_some()
+            }
+            _ => false,
+        })
+        .map(|instance| instance.referent())
+        .collect();
+    for id in marked {
+        if let Some(Variant::Attributes(attributes)) = tree
+            .get_instance_mut(id)
+            .unwrap()
+            .properties_mut()
+            .get_mut(&attributes_key)
+        {
+            attributes.remove(PROJECT_ATTRIBUTES_MARKER);
+        }
+    }
+}
+
 /// Sets refs to instances that are no longer in the tree to nil.
 ///
 /// A base instance can point at one the project removed or replaced. The XML
@@ -478,6 +505,14 @@ fn clear_dangling_refs(tree: &mut RojoTree) {
     }
 }
 
+/// An attribute added to every project instance's attributes while merging
+/// and removed again right after. Whether the project sets an instance's
+/// attributes decides whether the base's `Rojo_Target_*` attributes come
+/// back, and the patch only shows that when the values differ: a base with
+/// `{Keep, Rojo_Target_Value}` and a project with `{Keep}` differ only in
+/// the pointer, which is taken out before the patch is computed.
+const PROJECT_ATTRIBUTES_MARKER: &str = "__RojoBuildIntoProjectAttributes";
+
 /// Copies a tree back into a snapshot, metadata included.
 ///
 /// Each snapshot ID is the instance's ID in `tree`, which is what the tree's
@@ -485,12 +520,19 @@ fn clear_dangling_refs(tree: &mut RojoTree) {
 /// them to the IDs the instances end up with in the base place.
 fn snapshot_from_tree(tree: &RojoTree, id: Ref) -> InstanceSnapshot {
     let instance = tree.get_instance(id).unwrap();
+    let mut properties = instance.properties().clone();
+    // Marks the attributes as the project's, so the patch carries them even
+    // when they equal what is left of the base's once its pointers are taken
+    // out; see `PROJECT_ATTRIBUTES_MARKER`.
+    if let Some(Variant::Attributes(attributes)) = properties.get_mut(&ustr("Attributes")) {
+        attributes.insert(PROJECT_ATTRIBUTES_MARKER.to_owned(), Variant::Bool(true));
+    }
     InstanceSnapshot {
         snapshot_id: id,
         metadata: instance.metadata().clone(),
         name: instance.name().to_owned().into(),
         class_name: instance.class_name(),
-        properties: instance.properties().clone(),
+        properties,
         children: instance
             .children()
             .iter()
@@ -636,6 +678,42 @@ mod test {
             panic!("the base pointer's attributes were dropped");
         };
         assert!(kept.get("Rojo_Target_Value").is_some());
+    }
+
+    #[test]
+    fn project_attributes_drop_base_pointers_even_when_otherwise_equal() {
+        let mut base = WeakDom::new(InstanceBuilder::new("DataModel"));
+        let workspace = base.insert(base.root_ref(), InstanceBuilder::new("Workspace"));
+        base.insert(
+            workspace,
+            InstanceBuilder::new("ObjectValue")
+                .with_name("Pointer")
+                .with_property(
+                    "Attributes",
+                    attributes(&[("Keep", "1"), ("Rojo_Target_Value", "elsewhere")]),
+                ),
+        );
+
+        let project = project(vec![InstanceSnapshot::new()
+            .name("Pointer")
+            .class_name("ObjectValue")
+            .property("Attributes", attributes(&[("Keep", "1")]))]);
+
+        let merged = merge_into_place(&project, base).unwrap();
+        let pointer = merged.get_instance(find(&merged, "Pointer")).unwrap();
+        let Some(Variant::Attributes(kept)) = pointer.properties().get(&ustr("Attributes")) else {
+            panic!("the project's attributes were dropped");
+        };
+        assert!(kept.get("Keep").is_some());
+        assert!(kept.get("Rojo_Target_Value").is_none(), "{kept:?}");
+        assert!(kept.get(PROJECT_ATTRIBUTES_MARKER).is_none());
+        for instance in merged.inner().descendants() {
+            if let Some(Variant::Attributes(attributes)) =
+                instance.properties.get(&ustr("Attributes"))
+            {
+                assert!(attributes.get(PROJECT_ATTRIBUTES_MARKER).is_none());
+            }
+        }
     }
 
     #[test]
