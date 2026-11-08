@@ -451,7 +451,30 @@ pub(super) fn bridge_target(
         let default = checkout.shared_state.join(TOKEN_FILE);
         default.is_file().then_some(default)
     });
-    Ok((DEFAULT_STUDIO_ADDRESS.to_owned(), token_file))
+    use_default(DEFAULT_STUDIO_ADDRESS, token_file)
+}
+
+/// The default bridge, with the shared token when there is one. Nothing
+/// says which server should be there, so any serve session and project
+/// will do, but the server must prove it holds the token before it is sent:
+/// whatever listens on the default port may be anything.
+fn use_default(
+    address: &str,
+    token_file: Option<PathBuf>,
+) -> anyhow::Result<(String, Option<PathBuf>)> {
+    let Some(token_file) = token_file else {
+        return Ok((address.to_owned(), None));
+    };
+    match prove(address, &token_file) {
+        Ok(_) => Ok((address.to_owned(), Some(token_file))),
+        Err(reason) => Err(super::UsageError(anyhow::anyhow!(
+            "No rojo dev is recorded for this worktree, and the server on {address} could not \
+             be confirmed to hold the shared Studio token {}: {reason}. Pass --address and \
+             --token-file for the server to use.",
+            token_file.display()
+        ))
+        .into()),
+    }
 }
 
 /// The bridge a confirmed record names, or an error when it cannot be read
@@ -509,9 +532,26 @@ fn verify(state: &DevState) -> Result<(), String> {
     if process_alive(state.pid) == Some(false) {
         return Err(format!("its process {} is no longer running", state.pid));
     }
-    let base = studio::local_address(&state.address).map_err(|err| format!("{err:#}"))?;
+    let (session, project) = prove(&state.address, &state.token_file)?;
+    let same_session = session == state.server_session;
+    let same_project = Path::new(&project) == state.project;
+    if same_session && same_project {
+        Ok(())
+    } else {
+        Err(format!(
+            "the server on {} is not the one rojo dev recorded",
+            state.address
+        ))
+    }
+}
+
+/// Has the server on `address` prove that it holds the token in
+/// `token_file`, without sending it the token, and returns the serve session
+/// and project it reports.
+fn prove(address: &str, token_file: &Path) -> Result<(String, String), String> {
+    let base = studio::local_address(address).map_err(|err| format!("{err:#}"))?;
     let token =
-        crate::web::studio::read_token_file(&state.token_file).map_err(|err| format!("{err:#}"))?;
+        crate::web::studio::read_token_file(token_file).map_err(|err| format!("{err:#}"))?;
     // The bridge may hold a request while Git is busy, so a shorter wait
     // would reject a live server whose repository is mid-checkout.
     let client = studio::bridge_client(VERIFY_TIMEOUT).map_err(|err| err.to_string())?;
@@ -529,44 +569,37 @@ fn verify(state: &DevState) -> Result<(), String> {
         .map_err(|err| err.to_string())?;
     let response = client.get(url).send().map_err(|err| {
         if err.is_timeout() {
-            format!("the server on {} did not answer in time", state.address)
+            format!("the server on {address} did not answer in time")
         } else {
-            format!("nothing answered on {}", state.address)
+            format!("nothing answered on {address}")
         }
     })?;
     // Redirects are not followed (see `bridge_client`), and one is never
-    // the bridge's answer.
+    // the bridge's answer. An older bridge without the route answers 404.
     if !response.status().is_success() {
         return Err(format!(
-            "the server on {} answered with HTTP {}",
-            state.address,
+            "the server on {address} answered with HTTP {}",
             response.status()
         ));
     }
     let identity: serde_json::Value = response
         .json()
-        .map_err(|_| format!("the server on {} is not its Studio bridge", state.address))?;
+        .map_err(|_| format!("the server on {address} is not its Studio bridge"))?;
     let session = identity["serverSession"].as_str().unwrap_or_default();
     if identity["proof"].as_str()
         != Some(crate::web::studio::token_proof(&token, &nonce, session).as_str())
     {
         return Err(format!(
-            "the server on {} could not prove it holds this worktree's Studio token",
-            state.address
+            "the server on {address} could not prove it holds this worktree's Studio token"
         ));
     }
-    let same_session = session == state.server_session;
-    let same_project = identity["projectPath"]
-        .as_str()
-        .is_some_and(|project| Path::new(project) == state.project);
-    if same_session && same_project {
-        Ok(())
-    } else {
-        Err(format!(
-            "the server on {} is not the one rojo dev recorded",
-            state.address
-        ))
-    }
+    Ok((
+        session.to_owned(),
+        identity["projectPath"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned(),
+    ))
 }
 
 /// Whether process `pid` runs, or None when that cannot be told.
@@ -1765,6 +1798,53 @@ mod test {
         );
         assert!(!request.contains("x-rojo-studio-token"), "{request}");
         assert!(!request.contains(RECORDED_TOKEN), "{request}");
+    }
+
+    #[test]
+    fn the_default_port_must_prove_it_holds_the_shared_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let token_file = dir.path().join(TOKEN_FILE);
+        fs::write(&token_file, RECORDED_TOKEN).unwrap();
+
+        // Something without the token listens where the token would go.
+        let (address, request) = answer_proof(
+            "not-the-token-not-the-token-not-the",
+            "any-session",
+            dir.path().join("default.project.json"),
+            Duration::ZERO,
+        );
+        let error = use_default(&address, Some(token_file.clone())).unwrap_err();
+        let text = format!("{error:#}");
+        assert!(text.contains("could not prove"), "{text}");
+        assert!(text.contains("--address and --token-file"), "{text}");
+        assert_eq!(super::super::exit_status(&error).0, 2);
+        let request = request.join().unwrap();
+        assert!(!request.to_ascii_lowercase().contains("x-rojo-studio-token"));
+        assert!(!request.contains(RECORDED_TOKEN), "{request}");
+
+        // An older bridge without the route fails closed too.
+        let (address, _) = answer_raw(
+            "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_owned(),
+            Duration::ZERO,
+        );
+        assert!(use_default(&address, Some(token_file.clone())).is_err());
+
+        // A bridge holding the token is used, whatever it serves.
+        let (address, _) = answer_proof(
+            RECORDED_TOKEN,
+            "any-session",
+            dir.path().join("other.project.json"),
+            Duration::ZERO,
+        );
+        let (found, found_token) = use_default(&address, Some(token_file.clone())).unwrap();
+        assert_eq!(found, address);
+        assert_eq!(found_token, Some(token_file));
+
+        // Without a shared token, nothing is sent and nothing is asked.
+        assert_eq!(
+            use_default("http://127.0.0.1:1", None).unwrap(),
+            ("http://127.0.0.1:1".to_owned(), None)
+        );
     }
 
     #[test]

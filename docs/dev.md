@@ -85,7 +85,9 @@ use the `dev.json` of the worktree they run in (`rojo mcp`: the worktree of
 its `--project`, looked up on every tool call, so a restarted `rojo dev` on
 another port is found; a cancellation goes to the server its command was sent
 to), and only when there is no record, `http://127.0.0.1:34872` and the shared
-`studio-token` if it exists. Outside Git, `dev.json` is found from the
+`studio-token` if it exists, once the server there proves it holds that token
+(see below); one that cannot is an error, as for a record. Outside Git,
+`dev.json` is found from the
 project folder or any folder below it.
 
 A record is only used once it is confirmed: its address must be loopback,
