@@ -247,9 +247,9 @@ fn partition_ignore_globs_ref() {
 }
 
 /// Studio duplicated an instance with an ID inside a partition syncback
-/// leaves alone, and a synced partition points at both copies. The copy's
-/// ID would have to be changed, which would never be written, so no pointer
-/// may name anything but the ID the files have.
+/// leaves alone, and a synced partition points at both copies. The ID is the
+/// original's in the files, so only the pointer at the original is linked;
+/// the copy is not in the files, so its pointer keeps what its file had.
 #[test]
 fn partition_ignore_globs_dup_ref() {
     run_syncback_test("partition_ignore_globs_dup_ref", |path| {
@@ -258,18 +258,20 @@ fn partition_ignore_globs_dup_ref() {
             "{\n  \"className\": \"Folder\",\n  \"attributes\": {\n    \"Rojo_Id\": \"kept\"\n  }\n}\n"
         );
         assert!(!path.join("filtered/KeptCopy.model.json").exists());
-        let mut linked = 0;
-        for name in ["KeptPointer", "CopyPointer"] {
+        let read = |name: &str| {
             let text =
                 fs_err::read_to_string(path.join(format!("unfiltered/{name}.model.json"))).unwrap();
-            let value: serde_json::Value = serde_json::from_str(&text).unwrap();
-            if let Some(target) = value["attributes"].get("Rojo_Target_Value") {
-                assert_eq!(target, "kept", "{name}: {text}");
-                linked += 1;
-            }
-        }
-        // One copy keeps the ID the files have, and only it is linked to.
-        assert_eq!(linked, 1);
+            serde_json::from_str::<serde_json::Value>(&text).unwrap()
+        };
+        assert_eq!(
+            read("KeptPointer")["attributes"]["Rojo_Target_Value"],
+            "kept"
+        );
+        let copy = read("CopyPointer");
+        assert!(
+            copy["attributes"].get("Rojo_Target_Value").is_none(),
+            "{copy}"
+        );
     });
 }
 

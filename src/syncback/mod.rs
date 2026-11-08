@@ -177,13 +177,25 @@ pub fn syncback_loop(
     if !ignore_referents {
         log::debug!("Linking referents for new DOM");
         let old: &RojoTree = old_tree;
+        // Whether the files give `id` to this very instance, matched to its
+        // counterpart there, rather than to some other instance.
+        let owns_on_disk = |dom: &WeakDom, target: Ref, id: &str| {
+            old_instance_at_same_path(dom, target, old)
+                .and_then(|old_ref| old.get_metadata(old_ref))
+                .and_then(|metadata| metadata.specified_id.as_ref())
+                .is_some_and(|specified| *specified == RojoRef::new(id.to_owned()))
+        };
         // An ID in a protected partition is never given or changed, since
-        // the change would not be written: only a target there that keeps an
-        // ID its files already have can be linked to.
+        // the change would not be written: only a target there that keeps
+        // the ID its own files give it can be linked to.
         let unlinkable = |dom: &WeakDom, target: Ref, id: Option<&str>, needs_new_id: bool| {
-            let persisted =
-                id.is_some_and(|id| old.get_specified_id(&RojoRef::new(id.to_owned())).is_some());
+            let persisted = id.is_some_and(|id| owns_on_disk(dom, target, id));
             (needs_new_id || !persisted)
+                && in_protected_partition(dom, target, old, &skipped_partitions)
+        };
+        // Such an ID stays with its owner, so a copy cannot take it first.
+        let reserved = |dom: &WeakDom, target: Ref, id: &str| {
+            owns_on_disk(dom, target, id)
                 && in_protected_partition(dom, target, old, &skipped_partitions)
         };
         // What the files say for a pointer whose target cannot be linked.
@@ -198,7 +210,13 @@ pub fn syncback_loop(
                 _ => None,
             }
         };
-        link_referents(deferred_referents, &mut new_tree, &unlinkable, &on_disk)?;
+        link_referents(
+            deferred_referents,
+            &mut new_tree,
+            &unlinkable,
+            &reserved,
+            &on_disk,
+        )?;
     } else {
         log::debug!("Skipping referent linking as per project syncback rules");
     }

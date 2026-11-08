@@ -120,12 +120,44 @@ pub type Unlinkable<'a> = dyn Fn(&WeakDom, Ref, Option<&str>, bool) -> bool + 'a
 /// another target. A pointer at such a target gets the `Rojo_Target_*`
 /// attribute its files have, `on_disk(dom, holder, attribute)`, or none,
 /// with a warning, rather than one naming an ID that no file holds.
+///
+/// `reserved(dom, target, id)` says `id` belongs to that very target in the
+/// files and must stay its own: another target with the same ID, such as a
+/// copy Studio made, is the one that counts as a duplicate, whatever order
+/// they were found in.
 pub fn link_referents(
-    links: RefLinks,
+    mut links: RefLinks,
     dom: &mut WeakDom,
     unlinkable: &Unlinkable,
+    reserved: &dyn Fn(&WeakDom, Ref, &str) -> bool,
     on_disk: &dyn Fn(&WeakDom, Ref, &str) -> Option<Variant>,
 ) -> anyhow::Result<()> {
+    let mut targets: Vec<(Ref, String)> = Vec::new();
+    for (_, properties) in links.prop_links.iter() {
+        for link in properties {
+            if let Some(id) = dom.get_by_ref(link.value).and_then(get_existing_id) {
+                if !targets.iter().any(|(target, _)| *target == link.value) {
+                    targets.push((link.value, id.to_owned()));
+                }
+            }
+        }
+    }
+    let mut owners: HashMap<&str, Ref> = HashMap::new();
+    for (target, id) in &targets {
+        if reserved(dom, *target, id) {
+            owners.entry(id.as_str()).or_insert(*target);
+        }
+    }
+    for (target, id) in &targets {
+        if let Some(owner) = owners.get(id.as_str()) {
+            if owner == target {
+                links.need_rewrite.remove(target);
+            } else {
+                links.need_rewrite.insert(*target);
+            }
+        }
+    }
+
     let mut skipped = HashSet::new();
     for (_, properties) in links.prop_links.iter() {
         for link in properties {
