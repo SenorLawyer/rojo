@@ -372,7 +372,7 @@ fn redact_entry(log: &GameServerLog, redact: &dyn Fn(&str) -> String) -> GameSer
             other => other.clone(),
         }
     }
-    let optional = |text: &Option<String>| text.as_deref().map(|text| redact(text));
+    let optional = |text: &Option<String>| text.as_deref().map(redact);
     GameServerLog {
         timestamp_ms: log.timestamp_ms,
         severity: match &log.severity {
