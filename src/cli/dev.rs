@@ -730,7 +730,26 @@ fn bind_with_companion(
     port: u16,
 ) -> std::io::Result<(TcpListener, Option<tokio::net::TcpSocket>)> {
     let listener = TcpListener::bind(SocketAddr::new(ip, port))?;
-    let Some(other) = companion_address(ip) else {
+    // Deprecated because setting the option after binding does nothing;
+    // reading it, as here, is what tells the two cases apart.
+    #[allow(deprecated)]
+    let only_v6 = || listener.only_v6();
+    let other = match ip {
+        // `::` also accepts IPv4 connections unless the socket is IPv6-only,
+        // which it is by default on Windows. Then 127.0.0.1 is left for
+        // another server to take; otherwise this listener holds it already,
+        // and reserving it would fail against the listener itself.
+        IpAddr::V6(v6) if v6.is_unspecified() => match only_v6() {
+            Ok(true) => Some(Ipv4Addr::LOCALHOST.into()),
+            Ok(false) => None,
+            Err(err) => {
+                log::debug!("Could not tell whether [::]:{port} accepts IPv4: {err}");
+                None
+            }
+        },
+        _ => companion_address(ip),
+    };
+    let Some(other) = other else {
         return Ok((listener, None));
     };
     let socket = match other {
@@ -763,9 +782,8 @@ fn companion_address(ip: IpAddr) -> Option<IpAddr> {
             Some(Ipv6Addr::LOCALHOST.into())
         }
         IpAddr::V6(v6) if v6.is_loopback() => Some(Ipv4Addr::LOCALHOST.into()),
-        // `::` usually accepts IPv4 too, where reserving 127.0.0.1 would
-        // fail against this very listener. Other addresses are not reached
-        // through `localhost`.
+        // `::` is decided by `bind_with_companion`, from the listener. Other
+        // addresses are not reached through `localhost`.
         _ => None,
     }
 }
@@ -2045,6 +2063,21 @@ mod test {
         assert!(connected.is_err());
         drop(companion);
         drop(TcpListener::bind(("::1", port)).unwrap());
+    }
+
+    #[test]
+    fn a_server_on_the_ipv6_wildcard_also_holds_ipv4_loopback() {
+        let port = free_port();
+        let Ok((listener, _companion)) = bind_with_companion(Ipv6Addr::UNSPECIFIED.into(), port)
+        else {
+            // No IPv6 on this machine.
+            return;
+        };
+        // Whether the listener is dual-stack or IPv6-only (Windows' default),
+        // no other server can take 127.0.0.1 on the same port.
+        let taken = TcpListener::bind(("127.0.0.1", port));
+        assert!(taken.is_err(), "127.0.0.1:{port} was free");
+        drop(listener);
     }
 
     #[test]

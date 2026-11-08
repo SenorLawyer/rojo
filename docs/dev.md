@@ -120,7 +120,8 @@ address, on 127.0.0.1 or ::1, or on either wildcard address, since the plugin
 connects to `localhost`, which can resolve to either. It then binds the port
 at once and holds it while it sets up. For as long as the server runs, it
 also reserves the same port on the other IP version's loopback address (::1
-for a server on 127.0.0.1 or 0.0.0.0, 127.0.0.1 for one on ::1) with a socket
+for a server on 127.0.0.1 or 0.0.0.0, 127.0.0.1 for one on ::1, or on :: when that
+only accepts IPv6, as it does by default on Windows) with a socket
 that is bound but does not listen, so no other server can take it there and
 answer `localhost` instead; a client trying it is refused and moves on. If
 another launch took an automatically chosen port, on either address, in
