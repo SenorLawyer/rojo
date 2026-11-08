@@ -19,6 +19,8 @@ rojo studio --token-file <private-token-file> --json status --session <session-i
 rojo studio --token-file <private-token-file> --json capabilities --session <session-id>
 ```
 
+`rojo dev` creates the token and serves with the bridge in one step; while it runs, `rojo studio` in the same worktree finds its address and token without `--address` or `--token-file`. See [dev.md](dev.md).
+
 Use `--address http://127.0.0.1:<port>` when serving on another port. The CLI refuses remote addresses and disables HTTP proxies. Every operation except listing sessions requires an explicit session ID; it never chooses an arbitrary open Studio window.
 
 Sessions report their canonical project path, workspace path, initial Git HEAD and branch when available, and unique server/session IDs. Each listed session also reports `registeredAt` (Unix milliseconds) and `lastSeenMs` (milliseconds since its last poll), alongside the plugin-provided `placeId`, `placeName` and `pluginVersion`. Plugins from this release (8.1.0) on also send a `sync` health summary with every poll, reported with `syncAgeMs` since it arrived; see [sync-health.md](sync-health.md). Session IDs are UUIDs and may be given in any standard spelling; the server stores and reports the lowercase hyphenated form.

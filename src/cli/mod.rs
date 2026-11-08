@@ -3,6 +3,7 @@
 mod assets;
 mod build;
 mod build_into;
+mod dev;
 mod doc;
 mod doctor;
 mod fmt_project;
@@ -34,6 +35,7 @@ use thiserror::Error;
 
 pub use self::assets::AssetsCommand;
 pub use self::build::BuildCommand;
+pub use self::dev::DevCommand;
 pub use self::doc::DocCommand;
 pub use self::doctor::DoctorCommand;
 pub use self::fmt_project::FmtProjectCommand;
@@ -69,6 +71,7 @@ impl Options {
         match self.subcommand {
             Subcommand::Init(subcommand) => subcommand.run(),
             Subcommand::Serve(subcommand) => subcommand.run(self.global),
+            Subcommand::Dev(subcommand) => subcommand.run(),
             Subcommand::Build(subcommand) => subcommand.run(),
             Subcommand::Upload(subcommand) => subcommand.run(),
             Subcommand::Sourcemap(subcommand) => subcommand.run(),
@@ -155,6 +158,7 @@ pub struct ColorChoiceParseError {
 pub enum Subcommand {
     Init(InitCommand),
     Serve(ServeCommand),
+    Dev(DevCommand),
     Build(BuildCommand),
     Upload(UploadCommand),
     Sourcemap(SourcemapCommand),

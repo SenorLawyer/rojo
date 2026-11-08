@@ -148,14 +148,14 @@ fn filter_nothing(_instance: &InstanceWithMeta) -> bool {
     true
 }
 
-fn filter_non_scripts(instance: &InstanceWithMeta) -> bool {
+pub(super) fn filter_non_scripts(instance: &InstanceWithMeta) -> bool {
     matches!(
         instance.class_name().as_str(),
         "Script" | "LocalScript" | "ModuleScript"
     )
 }
 
-fn patch_set_affects_sourcemap(
+pub(super) fn patch_set_affects_sourcemap(
     session: &ServeSession,
     patch_set: &[AppliedPatchSet],
     filter: fn(&InstanceWithMeta) -> bool,
