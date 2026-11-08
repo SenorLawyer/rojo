@@ -733,6 +733,14 @@ pub struct StudioBridge {
     /// fix runs.
     #[cfg(test)]
     fix_budgets: Mutex<Option<(Duration, Duration)>>,
+    /// Replaces the budgets, once a backup is saved, with these from then
+    /// on, so a test can set what is left for the next group exactly.
+    #[cfg(test)]
+    budgets_after_save: Mutex<Option<(Duration, Duration)>>,
+    /// How long each automatic save sleeps first, standing in for a slow
+    /// disk.
+    #[cfg(test)]
+    save_delay: Mutex<Duration>,
 }
 
 fn reply(status: StatusCode, value: Value) -> Response<Body> {
@@ -865,6 +873,10 @@ impl StudioBridge {
             backup_dir: OnceLock::new(),
             #[cfg(test)]
             fix_budgets: Mutex::new(None),
+            #[cfg(test)]
+            budgets_after_save: Mutex::new(None),
+            #[cfg(test)]
+            save_delay: Mutex::new(Duration::ZERO),
         }))
     }
 
@@ -1769,14 +1781,19 @@ impl StudioBridge {
                     record,
                     model,
                     until,
-                    // A store another process keeps locked stops the backup
-                    // by the cutoff.
+                    // A store another process keeps locked, or a slow disk,
+                    // stops the backup by the cutoff.
                     left().min(BACKUP_LOCK_WAIT),
+                    left(),
                 )
                 .await;
             let (record, store_dir) = match saved {
                 Ok(saved) => saved,
                 Err(error) => {
+                    // A save that ran into the cutoff may still finish in
+                    // the background, but this fix never counts it: its
+                    // scripts are left for the next run like any group the
+                    // cutoff stopped.
                     if left().is_zero() {
                         cut_off!();
                     }
@@ -1786,6 +1803,11 @@ impl StudioBridge {
             pins.ids.push(record.id.clone());
             summaries.push(backup_summary(&record, &store_dir));
             groups.push((record.id, held));
+            #[cfg(test)]
+            if let Some((fix, backup)) = lock(&self.budgets_after_save).take() {
+                *lock(&self.fix_budgets) =
+                    Some((started.elapsed() + fix, started.elapsed() + backup));
+            }
         }
         // Another process may have removed one since, for example from a
         // pin that expired; its scripts must not be overwritten.
@@ -1857,30 +1879,41 @@ impl StudioBridge {
     /// backups the same operation pinned. Returns the record and the folder it
     /// is in, which depends on the project `rojo serve` serves rather than on
     /// where a later `rojo studio backup list` runs.
+    ///
+    /// Waits at most `limit` for the save. One still running then finishes
+    /// on its own, all or nothing like any save, and pinned like the rest,
+    /// but the caller does not count it as saved.
     async fn save_backup(
         &self,
         record: backup::Record,
         model: Vec<u8>,
         pin: u64,
         lock_wait: Duration,
+        limit: Duration,
     ) -> anyhow::Result<(backup::Record, PathBuf)> {
         let dir = self.backup_dir.get().cloned();
         let root = self.serve.root_dir().to_owned();
-        let project = root.clone();
-        let (record, store_dir) = tokio::task::spawn_blocking(move || {
+        #[cfg(test)]
+        let delay = *lock(&self.save_delay);
+        let saving = tokio::task::spawn_blocking(move || {
+            #[cfg(test)]
+            std::thread::sleep(delay);
             let store = Self::backup_store(dir, &root)?;
             let record = store.save_automatic_pinned(record, &model, pin, lock_wait)?;
+            // Logged here, so a save that finishes after its caller stopped
+            // waiting is logged too.
+            log::info!(
+                "Saved automatic backup {} in {}. `rojo studio backup list --project {}` lists it.",
+                record.id,
+                store.dir().display(),
+                root.display()
+            );
             anyhow::Ok((record, store.dir().to_owned()))
-        })
-        .await
-        .context("The backup stopped before it was saved")??;
-        log::info!(
-            "Saved automatic backup {} in {}. `rojo studio backup list --project {}` lists it.",
-            record.id,
-            store_dir.display(),
-            project.display()
-        );
-        Ok((record, store_dir))
+        });
+        tokio::time::timeout(limit, saving)
+            .await
+            .map_err(|_| anyhow::anyhow!("Saving the backup took too long"))?
+            .context("The backup stopped before it was saved")?
     }
 
     /// The backup store this bridge saves automatic backups in.
@@ -4514,8 +4547,8 @@ mod tests {
         assert!(BACKUP_BUDGET < VERIFY_FIX_BUDGET);
         let fixed = before + VERIFY_FIX_BUDGET + COMMAND_TIMEOUT;
         assert!(fixed <= MAX_COMMAND_REQUEST);
-        // The margin left covers writing a backup once its store is locked,
-        // which no deadline bounds, and the response.
+        // Saving a backup is waited for only until the cutoff too, so the
+        // margin left is for the response.
         assert!(cli - fixed >= Duration::from_secs(5));
     }
 
@@ -4571,28 +4604,21 @@ mod tests {
             None,
         )
         .await;
-        // The verify started before this, so at most 3 seconds are left to
-        // back up after the first group and at most 10 to begin fixing. An
-        // export given its whole 15 seconds would leave no time to fix.
-        let since = Instant::now();
+        // Once the first group is saved, 3 seconds are left to back up and
+        // 10 to begin fixing, however long that save took. An export given
+        // its whole 15 seconds would leave no time to fix.
+        *lock(&bridge.budgets_after_save) = Some((Duration::from_secs(10), Duration::from_secs(3)));
         let first = next_command(&bridge, &session).await;
         assert_eq!(first["action"], "backup");
         let ids = command_ids(&first);
-        *lock(&bridge.fix_budgets) = Some((
-            since.elapsed() + Duration::from_secs(10),
-            since.elapsed() + Duration::from_secs(3),
-        ));
         answer_backup(&bridge, &session, &first, &[&ids[0]]).await;
-        let mut command = next_command(&bridge, &session).await;
-        if command["action"] == "backup" {
-            // Given only what was left before the cutoff, which the plugin
-            // is told too. It is never answered.
-            let left = command["expiresAt"].as_u64().unwrap() as i64 - backup::now_millis() as i64;
-            assert!(left <= 3_500, "{left} ms");
-            command = next_command(&bridge, &session).await;
-        }
-        // Otherwise the first group's save took past the cutoff, and no
-        // other export was asked for.
+        let second = next_command(&bridge, &session).await;
+        assert_eq!(second["action"], "backup");
+        // Given only what was left before the cutoff, which the plugin is
+        // told too. It is never answered.
+        let left = second["expiresAt"].as_u64().unwrap() as i64 - backup::now_millis() as i64;
+        assert!(left <= 3_000, "{left} ms");
+        let command = next_command(&bridge, &session).await;
         finish_partly_backed_up_fix(
             &dir,
             &bridge,
@@ -4653,6 +4679,72 @@ mod tests {
             verify,
         )
         .await;
+    }
+
+    #[tokio::test]
+    async fn verify_fix_stops_waiting_for_a_save_at_the_backup_cutoff() {
+        let (dir, bridge, session, scripts, verify) = fix_scripts_past_sources_with(
+            json!({"fix":true}),
+            3,
+            verify::MAX_BACKUP_SOURCE_BYTES,
+            None,
+            None,
+        )
+        .await;
+        // Once the first group is saved, 2 seconds are left to back up and
+        // 10 to begin fixing, which waiting for an 8-second save would pass.
+        *lock(&bridge.budgets_after_save) = Some((Duration::from_secs(10), Duration::from_secs(2)));
+        let first = next_command(&bridge, &session).await;
+        let ids = command_ids(&first);
+        answer_backup(&bridge, &session, &first, &[&ids[0]]).await;
+        let second = next_command(&bridge, &session).await;
+        assert_eq!(second["action"], "backup");
+        let second_ids = command_ids(&second);
+        let delay = Duration::from_secs(8);
+        *lock(&bridge.save_delay) = delay;
+        let answered = Instant::now();
+        answer_backup(&bridge, &session, &second, &[&second_ids[0]]).await;
+        let resync = next_command(&bridge, &session).await;
+        assert!(
+            answered.elapsed() < delay,
+            "the fix did not wait for the save"
+        );
+        assert_eq!(resync["action"], "resync");
+        let updated = resync["args"]["patch"]["updated"].as_array().unwrap();
+        assert_eq!(updated.len(), 1, "only the first group is fixed");
+        assert_eq!(updated[0]["id"], json!(ids[0]));
+        plugin(
+            &bridge,
+            "/api/studio/result",
+            json!({"requestId":resync["requestId"],"sessionId":session,"result":{"ok":true,"value":{"updated":1,"failed":0,"skipped":0}}}),
+        )
+        .await;
+        let (status, value) = into_value(verify.await.unwrap()).await;
+        assert_eq!(status, StatusCode::OK, "{value}");
+        let report = &value["result"]["value"];
+        assert_eq!(report["fixed"]["notBackedUp"], scripts.len() - 1);
+        // The late save is not one of this fix's backups.
+        let backups = report["backups"].as_array().unwrap();
+        assert_eq!(backups.len(), 1, "{backups:?}");
+        // It finishes on its own, whole, and stays pinned, since this fix
+        // never released it.
+        let dir_path = dir.path().join("backups");
+        let store = backup::Store::in_dir(&dir_path);
+        let mut listed = store.list().unwrap();
+        for _ in 0..300 {
+            if listed.len() == 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            listed = store.list().unwrap();
+        }
+        assert_eq!(listed.len(), 2, "the late save finished");
+        let late = listed
+            .iter()
+            .find(|record| json!(record.id) != backups[0]["id"])
+            .unwrap();
+        assert!(store.exists(&late.id));
+        assert!(dir_path.join(format!("{}.pin", late.id)).exists());
     }
 
     #[tokio::test]
