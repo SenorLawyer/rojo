@@ -1009,15 +1009,16 @@ impl OpenCloud {
         OpenCloudError::Unconfirmed(self.redact(message))
     }
 
-    /// Removes the key from text that came from a server, in case it echoes
-    /// request headers back.
-    /// `text` with every occurrence of this client's API key taken out, for
-    /// output that does not come from Open Cloud errors, which are already
-    /// redacted.
+    /// `text` with this client's API key taken out, as [`OpenCloud::redact`]
+    /// does, for tests of callers.
+    #[cfg(test)]
     pub fn redact_key(&self, text: &str) -> String {
         self.redact(text.to_owned())
     }
 
+    /// Removes the key, in any of the forms [`redact_key_in`] knows, from
+    /// text that came from a server, in case it echoes request headers back,
+    /// or from a request, whose URL may hold it.
     fn redact(&self, text: String) -> String {
         match std::str::from_utf8(self.key.as_bytes()) {
             Ok(key) => redact_key_in(key, text),

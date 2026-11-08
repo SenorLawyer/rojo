@@ -224,6 +224,28 @@ fn partition_ignore_globs_alias() {
     });
 }
 
+/// A ref from a synced partition into one syncback leaves alone. A target
+/// whose files have no ID is not given one, since that ID would never be
+/// written, so its pointer keeps what its file had (here nothing) instead of
+/// naming it. A target whose files have an ID is linked as usual.
+#[test]
+fn partition_ignore_globs_ref() {
+    run_syncback_test("partition_ignore_globs_ref", |path| {
+        assert_eq!(
+            fs_err::read_to_string(path.join("filtered/Target.model.json")).unwrap(),
+            "{\n  \"className\": \"Folder\"\n}\n"
+        );
+        let pointer = fs_err::read_to_string(path.join("unfiltered/Pointer.model.json")).unwrap();
+        assert!(!pointer.contains("Rojo_Target_Value"), "{pointer}");
+        let kept = fs_err::read_to_string(path.join("unfiltered/KeptPointer.model.json")).unwrap();
+        assert!(kept.contains("\"Rojo_Target_Value\": \"kept\""), "{kept}");
+        assert_eq!(
+            fs_err::read_to_string(path.join("unfiltered/Foo.luau")).unwrap(),
+            "return \"Foo from Studio\"\n"
+        );
+    });
+}
+
 /// Partitions are found from every project file: a nested project's root
 /// node, and a node whose `$path` names a project file (based at that file's
 /// folder), are both skipped.

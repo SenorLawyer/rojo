@@ -25,14 +25,14 @@ use crate::{
     glob::{Glob, IgnorableGlob},
     snapshot::{
         content_property_aliases, object_content_warning, remove_object_contents, InstanceWithMeta,
-        RojoTree,
+        InstigatingSource, RojoTree,
     },
     snapshot_middleware::{node_ignore_base, Middleware},
     syncback::{
         ref_properties::{collect_referents, link_referents},
         snapshot::inst_path,
     },
-    Project,
+    Project, RojoRef,
 };
 
 pub use file_names::{extension_for_middleware, name_for_inst, validate_file_name};
@@ -166,9 +166,35 @@ pub fn syncback_loop(
         .as_ref()
         .and_then(|s| s.ignore_referents)
         .unwrap_or_default();
+    // Syncback compares the tree from the files against Studio's, but files
+    // that `$globIgnorePaths` exclude are not in that tree. Writing, removing
+    // or replacing anything in such a partition could therefore overwrite or
+    // delete those files, so syncback leaves these partitions alone. Found
+    // before linking referents, which must not give an ID to an instance in
+    // one, since that ID would never be written.
+    let skipped_partitions = partitions_with_ignore_globs(vfs, old_tree)?;
+
     if !ignore_referents {
         log::debug!("Linking referents for new DOM");
-        link_referents(deferred_referents, &mut new_tree)?;
+        let old: &RojoTree = old_tree;
+        let unlinkable = |dom: &WeakDom, target: Ref, id: Option<&str>| {
+            let persisted =
+                id.is_some_and(|id| old.get_specified_id(&RojoRef::new(id.to_owned())).is_some());
+            !persisted && in_protected_partition(dom, target, old, &skipped_partitions)
+        };
+        // What the files say for a pointer whose target cannot be linked.
+        let on_disk = |dom: &WeakDom, holder: Ref, attribute: &str| {
+            let old_ref = old_instance_at_same_path(dom, holder, old)?;
+            match old
+                .get_instance(old_ref)?
+                .properties()
+                .get(&ustr("Attributes"))
+            {
+                Some(Variant::Attributes(attributes)) => attributes.get(attribute).cloned(),
+                _ => None,
+            }
+        };
+        link_referents(deferred_referents, &mut new_tree, &unlinkable, &on_disk)?;
     } else {
         log::debug!("Skipping referent linking as per project syncback rules");
     }
@@ -183,11 +209,6 @@ pub fn syncback_loop(
     log::debug!("Hashing file DOM");
     let new_hashes = hash_tree(project, &new_tree, new_tree.root_ref());
 
-    // Syncback compares the tree from the files against Studio's, but files
-    // that `$globIgnorePaths` exclude are not in that tree. Writing, removing
-    // or replacing anything in such a partition could therefore overwrite or
-    // delete those files, so syncback leaves these partitions alone.
-    let skipped_partitions = partitions_with_ignore_globs(vfs, old_tree)?;
     for (node, base) in skipped_partitions.iter() {
         log::warn!(
             "syncback skipped {node} ({}) because it has $globIgnorePaths; edit those files directly",
@@ -626,6 +647,47 @@ fn get_property_filter(project: &Project, new_inst: &Instance) -> Option<UstrSet
 
 /// Finds the instance in `old` at the same path as `new_ref` in `new`, if
 /// every name along the path picks out exactly one child of the same class.
+/// Whether `new_ref` in Studio's tree is in a protected partition: whether
+/// the nearest instance at or above it that the files' tree has at the same
+/// path was made from a file in one, or is the project node of one.
+fn in_protected_partition(
+    new: &WeakDom,
+    new_ref: Ref,
+    old: &RojoTree,
+    protected: &ProtectedPartitions,
+) -> bool {
+    let mut current = new_ref;
+    while let Some(inst) = new.get_by_ref(current) {
+        if let Some(old_ref) = old_instance_at_same_path(new, current, old) {
+            let Some(source) = old
+                .get_metadata(old_ref)
+                .and_then(|metadata| metadata.instigating_source.as_ref())
+            else {
+                return false;
+            };
+            return match source {
+                InstigatingSource::Path(path) => protected.contains(path),
+                InstigatingSource::ProjectNode { path, node, .. } => {
+                    node.path.as_ref().is_some_and(|node_path| {
+                        let node_path = node_path.path();
+                        if node_path.is_absolute() {
+                            protected.contains(node_path)
+                        } else {
+                            path.parent()
+                                .is_some_and(|folder| protected.contains(&folder.join(node_path)))
+                        }
+                    })
+                }
+            };
+        }
+        if inst.parent().is_none() {
+            return false;
+        }
+        current = inst.parent();
+    }
+    false
+}
+
 fn old_instance_at_same_path(new: &WeakDom, new_ref: Ref, old: &RojoTree) -> Option<Ref> {
     let mut path = Vec::new();
     let mut current = new.get_by_ref(new_ref)?;

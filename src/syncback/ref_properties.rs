@@ -106,13 +106,54 @@ pub fn collect_referents(dom: &WeakDom) -> RefLinks {
     }
 }
 
-pub fn link_referents(links: RefLinks, dom: &mut WeakDom) -> anyhow::Result<()> {
-    write_id_attributes(&links, dom)?;
+/// Links Ref properties with attributes: gives every instance that is
+/// pointed at an ID where it needs one, and every pointer a
+/// `Rojo_Target_*` attribute naming it.
+///
+/// `unlinkable(dom, target, id)` says a target must not be given an ID,
+/// because it would never be written, such as one in a partition syncback
+/// leaves alone. A pointer at such a target gets the `Rojo_Target_*`
+/// attribute its files have, `on_disk(dom, holder, attribute)`, or none,
+/// with a warning, rather than one naming an ID that no file holds.
+pub fn link_referents(
+    links: RefLinks,
+    dom: &mut WeakDom,
+    unlinkable: &dyn Fn(&WeakDom, Ref, Option<&str>) -> bool,
+    on_disk: &dyn Fn(&WeakDom, Ref, &str) -> Option<Variant>,
+) -> anyhow::Result<()> {
+    let mut skipped = HashSet::new();
+    for (_, properties) in links.prop_links.iter() {
+        for link in properties {
+            if let Some(target) = dom.get_by_ref(link.value) {
+                if unlinkable(dom, link.value, get_existing_id(target)) {
+                    skipped.insert(link.value);
+                }
+            }
+        }
+    }
+    write_id_attributes(&links, dom, &skipped)?;
 
     let mut prop_list = Vec::new();
 
     for (inst_id, properties) in links.prop_links {
+        let mut kept = Vec::new();
         for ref_link in properties {
+            if skipped.contains(&ref_link.value) {
+                log::warn!(
+                    "{}.{} points at {}, which has no ID in the files and is in a partition \
+                     with $globIgnorePaths that syncback leaves alone, so the pointer is left \
+                     as it was. Give {} an ID in its files to sync this ref back.",
+                    inst_path(dom, inst_id),
+                    ref_link.name,
+                    inst_path(dom, ref_link.value),
+                    inst_path(dom, ref_link.value),
+                );
+                let attribute = format!("{REF_POINTER_ATTRIBUTE_PREFIX}{}", ref_link.name);
+                if let Some(value) = on_disk(dom, inst_id, &attribute) {
+                    kept.push((attribute, value));
+                }
+                continue;
+            }
             let prop_inst = match dom.get_by_ref(ref_link.value) {
                 Some(inst) => inst,
                 None => continue,
@@ -139,6 +180,9 @@ pub fn link_referents(links: RefLinks, dom: &mut WeakDom) -> anyhow::Result<()> 
         .into_iter()
         .filter(|(name, _)| !name.starts_with(REF_POINTER_ATTRIBUTE_PREFIX))
         .collect();
+        for (name, value) in kept {
+            attributes.insert(name, value);
+        }
 
         for (prop_name, prop_value) in prop_list.drain(..) {
             attributes.insert(
@@ -154,8 +198,12 @@ pub fn link_referents(links: RefLinks, dom: &mut WeakDom) -> anyhow::Result<()> 
     Ok(())
 }
 
-fn write_id_attributes(links: &RefLinks, dom: &mut WeakDom) -> anyhow::Result<()> {
-    for referent in &links.need_rewrite {
+fn write_id_attributes(
+    links: &RefLinks,
+    dom: &mut WeakDom,
+    skipped: &HashSet<Ref>,
+) -> anyhow::Result<()> {
+    for referent in links.need_rewrite.difference(skipped) {
         let inst = match dom.get_by_ref_mut(*referent) {
             Some(inst) => inst,
             None => continue,

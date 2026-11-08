@@ -39,6 +39,13 @@ impl<K: Hash + Eq, V: Eq> MultiMap<K, V> {
         bucket.push(v);
     }
 
+    /// Each key with all of its values.
+    pub fn iter(&self) -> impl Iterator<Item = (&K, &[V])> {
+        self.inner
+            .iter()
+            .map(|(key, values)| (key, values.as_slice()))
+    }
+
     pub fn remove<Q: Borrow<K>, U: Borrow<V>>(&mut self, k: Q, v: U) -> Option<V> {
         let b = v.borrow();
 
