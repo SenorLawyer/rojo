@@ -15,6 +15,12 @@
 	returns it.
 ]]
 local function orderSwaps(swaps)
+	-- Each parent's children are listed once. Calling `GetChildren` and
+	-- searching it for every swap is quadratic in the number of siblings, which
+	-- froze Studio for many seconds when a large flat model fell back to
+	-- replacement.
+	local siblingIndexes = {}
+
 	for _, swap in swaps do
 		local depth = 0
 		local ancestor = swap.oldInstance.Parent
@@ -25,8 +31,17 @@ local function orderSwaps(swaps)
 		swap.depth = depth
 
 		local siblingIndex = 0
-		if swap.oldInstance.Parent ~= nil then
-			siblingIndex = table.find(swap.oldInstance.Parent:GetChildren(), swap.oldInstance) or 0
+		local parent = swap.oldInstance.Parent
+		if parent ~= nil then
+			local indexes = siblingIndexes[parent]
+			if indexes == nil then
+				indexes = {}
+				for index, child in parent:GetChildren() do
+					indexes[child] = index
+				end
+				siblingIndexes[parent] = indexes
+			end
+			siblingIndex = indexes[swap.oldInstance] or 0
 		end
 		swap.siblingIndex = siblingIndex
 	end

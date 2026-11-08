@@ -526,7 +526,16 @@ impl ApiService {
                 let Variant::Ref(prop_value) = prop_value else {
                     continue;
                 };
-                if let Some(target_id) = request.ids.get(prop_value) {
+                // A replacement is serialized without its descendants or
+                // anything else it points at, so its own refs (a Model's
+                // PrimaryPart, say) arrive unset and are restored here along
+                // with the refs pointing at it.
+                let restore = request.ids.contains(prop_value)
+                    || (request.ids.contains(&instance.id())
+                        && prop_value.is_some()
+                        && tree.get_instance(*prop_value).is_some());
+                if restore {
+                    let target_id = prop_value;
                     let instance_id = instance.id();
                     let update =
                         instance_updates

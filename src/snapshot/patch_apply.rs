@@ -127,6 +127,22 @@ fn finalize_patch_application(context: PatchApplyContext, tree: &mut RojoTree) -
         }
     }
 
+    let mut applied_patch_set = context.applied_patch_set;
+
+    // Updates are sent to clients with the values they carry rather than
+    // being read back from the tree, so a ref resolved here has to be
+    // written into the instance's update too. Patch computation resolves
+    // pointers against the tree as it was before this patch, so a target
+    // that is added or gains its `Rojo_Id` in this same patch is reported
+    // there as unset, and without this Studio would clear the property while
+    // a reconnect, which reads the tree, would set it.
+    let update_indices: HashMap<Ref, usize> = applied_patch_set
+        .updated
+        .iter()
+        .enumerate()
+        .map(|(index, update)| (update.id, index))
+        .collect();
+
     // This is to get around the fact that `RojoTre::get_specified_id` borrows
     // the tree as immutable, but we need to hold a mutable reference to it.
     // Not exactly elegant, but it does the job.
@@ -140,10 +156,21 @@ fn finalize_patch_application(context: PatchApplyContext, tree: &mut RojoTree) -
         let mut instance = tree
             .get_instance_mut(id)
             .expect("Invalid instance ID in deferred attribute ref map");
-        instance.properties_mut().extend(real_rewrites.drain(..));
+        for (prop_name, value) in real_rewrites.drain(..) {
+            let previous = instance.properties_mut().insert(prop_name, value.clone());
+            if previous.as_ref() == Some(&value) {
+                continue;
+            }
+            // Added instances are serialized from the tree, so only updates
+            // need the resolved value.
+            if let Some(&index) = update_indices.get(&id) {
+                applied_patch_set.updated[index]
+                    .changed_properties
+                    .insert(prop_name, Some(value));
+            }
+        }
     }
 
-    let mut applied_patch_set = context.applied_patch_set;
     if context.removed_specified_id || context.added_specified_id {
         reconcile_ref_pointers(tree, &mut applied_patch_set);
     }
@@ -359,6 +386,14 @@ fn apply_update_child(context: &mut PatchApplyContext, tree: &mut RojoTree, patc
                 instance
                     .properties_mut()
                     .insert(key, Variant::Ref(new_referent));
+
+                // Clients only know instance IDs, so the update must carry the
+                // rewritten referent. A snapshot ID would point at nothing in
+                // Studio, which leaves the property unset there.
+                applied_patch
+                    .changed_properties
+                    .insert(key, Some(Variant::Ref(new_referent)));
+                continue;
             }
             Some(ref value) => {
                 instance.properties_mut().insert(key, value.clone());
@@ -537,5 +572,47 @@ mod test {
         assert_eq!(root_instance.name(), "Foo");
         assert_eq!(root_instance.class_name(), "NewClassName");
         assert_eq!(root_instance.properties(), &expected_properties);
+    }
+
+    /// An update pointing at an instance added by the same patch must report
+    /// the instance's real ID, since that is what clients receive.
+    #[test]
+    fn update_ref_to_added_instance_reports_instance_id() {
+        let _ = env_logger::try_init();
+
+        let mut tree = RojoTree::new(InstanceSnapshot::new().class_name("Model"));
+        let root_id = tree.get_root_id();
+        let snapshot_id = Ref::new();
+
+        let patch_set = PatchSet {
+            added_instances: vec![PatchAdd {
+                parent_id: root_id,
+                instance: InstanceSnapshot::new()
+                    .snapshot_id(snapshot_id)
+                    .name("Pole")
+                    .class_name("Part"),
+            }],
+            updated_instances: vec![PatchUpdate {
+                id: root_id,
+                changed_name: None,
+                changed_class_name: None,
+                changed_properties: UstrMap::from_iter([(
+                    ustr("PrimaryPart"),
+                    Some(Variant::Ref(snapshot_id)),
+                )]),
+                changed_metadata: None,
+            }],
+            ..Default::default()
+        };
+
+        let applied = apply_patch_set(&mut tree, patch_set);
+        let pole_id = tree.get_instance(root_id).unwrap().children()[0];
+
+        assert_eq!(
+            applied.updated[0]
+                .changed_properties
+                .get(&ustr("PrimaryPart")),
+            Some(&Some(Variant::Ref(pole_id)))
+        );
     }
 }

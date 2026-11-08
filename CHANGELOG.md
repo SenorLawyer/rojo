@@ -36,11 +36,15 @@ Making a new release? Simply add the new header with the version and date undern
 * `rojo studio verify --fix` now saves Studio's copies of the scripts it is about to overwrite as a backup first, and prints its ID, so `rojo studio backup restore` can put them back. A script is backed up from its editor's text, and only while that is valid UTF-8 and exactly the source verify checked; only scripts in the backup are fixed, and the others are listed as `notBackedUp`. The backup is checked to restore with those sources before it is saved, and is pinned while the fix runs; a fix that would need more than 100 backups is refused before it changes anything. A fix with more scripts than it can back up in 12 seconds fixes those backed up by then and lists the rest as `notBackedUp` for the next run. When it cannot be saved, the fix changes nothing and says why; `--no-backup` fixes without one. Updating the plugin and restarting `rojo serve` is required: the CLI refuses `--fix` against a `rojo serve` that does not say it backs up first, and an older plugin cannot export the scripts. ([fork#13])
 * Automatic backups are marked `automatic`. Each automatic save keeps the 20 newest, keeps older ones for an hour, and never keeps more than 100 or 512 MiB of them, oldest first, except backups a running fix is pinned to; backups made with `rojo studio backup create` are never removed. Records list every script in the backup with its original path (`roots`). `rojo studio backup list` marks them `[automatic]`, and `rojo studio backup --project <path>` uses the backups of the project `rojo serve` serves. ([fork#13])
 * `rojo mcp`'s instructions and tool descriptions now send agents to Roblox's Studio MCP server for generic Studio work, including data stores through `execute_luau`, and for Open Cloud calls (`open_cloud_invoke`), and to `rojo` for work that depends on the files. Tools that overlap Roblox's, such as `studio_tree` and `search_game_tree`, name their counterpart and say when to use each; `studio_tree` and `studio_properties` are described as the source of the instance IDs `studio_backup` and `studio_export` accept. Every tool is still listed. `rojo doc --agent`, `rojo doc --agent mcp` and the `AGENTS.md` that `rojo init` writes say which server to use for what. ([fork#14])
+* Fixed `PrimaryPart` and other Ref properties not being set by live sync, only after reconnecting, when the instance they point at was added or given its `Rojo_Id` in the same change. The sync fallback also no longer leaves a replaced instance's own Ref properties unset. ([fork#15])
+* `.model.json` and `.meta.json` files now accept the field names project files use, `$properties`, `$attributes`, `$className`, `$id` and `$ignoreUnknownInstances`, which were ignored silently before, so `Tags` and other properties written that way were never applied. Fields Rojo does not recognize in these files are now reported with a warning. ([fork#15])
+* Fixed Studio freezing when live sync adds or replaces thousands of instances under one parent, such as a large map `.rbxm`. Ordering the sync fallback's replacements and refreshing the patch visualizer's tree after each patch were quadratic in the number of siblings: replacing 10,000 siblings took about 15 seconds and now takes about 1. ([fork#15])
 
 [fork#11]: https://github.com/SenorLawyer/rojo/pull/11
 [fork#12]: https://github.com/SenorLawyer/rojo/pull/12
 [fork#13]: https://github.com/SenorLawyer/rojo/pull/13
 [fork#14]: https://github.com/SenorLawyer/rojo/pull/14
+[fork#15]: https://github.com/SenorLawyer/rojo/pull/15
 
 ## [8.1.0] (November 5th, 2026)
 
@@ -1087,7 +1091,6 @@ This is a general maintenance release for the Rojo 0.5.x release series.
 ## [0.5.1] (October 4, 2019)
 
 * Fixed an issue where Rojo would drop changes if they happened too quickly ([#252])
-* Improved diagnostics for when the Rojo plugin cannot create an instance.
 * Updated dependencies
   * This brings Rojo's reflection database from client release 395 to client release 404.
 
@@ -1458,14 +1461,12 @@ This is a general maintenance release for the Rojo 0.5.x release series.
 
 ## [0.2.2] (December 1, 2017)
 
-* Plugin only release
 * Fixed broken reconciliation behavior with `init` files
 
 [0.2.2]: https://github.com/rojo-rbx/rojo/releases/tag/v0.2.2
 
 ## [0.2.1] (December 1, 2017)
 
-* Plugin only release
 * Changes default port to 8000
 
 [0.2.1]: https://github.com/rojo-rbx/rojo/releases/tag/v0.2.1
