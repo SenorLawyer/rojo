@@ -545,15 +545,29 @@ fn write_resolved_file_atomically(
     })?;
 
     // Dropping the staged file on error deletes it, so a failed rename leaves
-    // only the previous output behind.
-    staged.persist(destination).map_err(|error| {
-        anyhow!(
-            "Could not replace {}: {}. The previous file was left unchanged; \
-             if another program such as Roblox Studio has it open, close it and try again.",
-            destination.display(),
-            error.error
-        )
-    })?;
+    // only the previous output behind. On Windows, another program reading
+    // the output at that moment makes the rename fail briefly, and a watched
+    // build would then keep the old output until the next change, so it is
+    // tried a few times.
+    let mut attempt = 0;
+    loop {
+        match staged.persist(destination) {
+            Ok(_) => break,
+            Err(error) if attempt < 5 => {
+                attempt += 1;
+                staged = error.file;
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Err(error) => {
+                return Err(anyhow!(
+                    "Could not replace {}: {}. The previous file was left unchanged; \
+                     if another program such as Roblox Studio has it open, close it and try again.",
+                    destination.display(),
+                    error.error
+                ))
+            }
+        }
+    }
 
     // Persist the rename itself. This is best-effort: some filesystems do not
     // support syncing directories, and the output is already complete.
