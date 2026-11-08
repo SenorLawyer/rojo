@@ -1348,6 +1348,81 @@ mod test {
     }
 
     #[test]
+    fn node_glob_ignore_paths_treat_excluded_meta_files_as_absent() {
+        let partition = |malformed: bool| {
+            let mut entries = vec![
+                ("Foo.luau", VfsSnapshot::file("return 1")),
+                (
+                    "Foo.meta.json",
+                    VfsSnapshot::file(r#"{"attributes": {"FromMeta": true}}"#),
+                ),
+                (
+                    "Dir",
+                    VfsSnapshot::dir([
+                        (
+                            "init.meta.json",
+                            VfsSnapshot::file(r#"{"className": "Configuration"}"#),
+                        ),
+                        ("Child.luau", VfsSnapshot::file("return 1")),
+                    ]),
+                ),
+            ];
+            if malformed {
+                entries.push(("Bad.luau", VfsSnapshot::file("return 1")));
+                entries.push(("Bad.meta.json", VfsSnapshot::file("{ not json")));
+            }
+            VfsSnapshot::dir(entries)
+        };
+        let mut fs = InMemoryFs::new();
+        fs.load_snapshot(
+            "/foo",
+            VfsSnapshot::dir([
+                (
+                    "default.project.json",
+                    VfsSnapshot::file(
+                        r#"{
+                            "name": "partitions",
+                            "tree": {
+                                "$className": "Folder",
+                                "Filtered": {
+                                    "$path": "filtered",
+                                    "$globIgnorePaths": ["**/*.meta.json"]
+                                },
+                                "Unfiltered": { "$path": "unfiltered" }
+                            }
+                        }"#,
+                    ),
+                ),
+                ("filtered", partition(true)),
+                ("unfiltered", partition(false)),
+            ]),
+        )
+        .unwrap();
+        // The malformed meta file is excluded, so it does not fail the build.
+        let snapshot = snapshot_project(
+            &InstanceContext::default(),
+            &Vfs::new(fs),
+            Path::new("/foo/default.project.json"),
+            "partitions",
+        )
+        .unwrap()
+        .unwrap();
+
+        let has_meta_attribute = |instance: &InstanceSnapshot| {
+            matches!(
+                instance.properties.get(&ustr("Attributes")),
+                Some(Variant::Attributes(attributes)) if attributes.get("FromMeta").is_some()
+            )
+        };
+        let filtered = child(&snapshot, "Filtered");
+        assert!(!has_meta_attribute(child(filtered, "Foo")));
+        assert_eq!(child(filtered, "Dir").class_name, "Folder");
+        let unfiltered = child(&snapshot, "Unfiltered");
+        assert!(has_meta_attribute(child(unfiltered, "Foo")));
+        assert_eq!(child(unfiltered, "Dir").class_name, "Configuration");
+    }
+
+    #[test]
     fn project_glob_ignore_paths_do_not_hide_init_files() {
         // Only node-level `$globIgnorePaths` decide whether an init file
         // counts. The project-wide list never did, so it still does not.

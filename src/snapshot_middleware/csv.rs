@@ -21,7 +21,7 @@ use super::{
 };
 
 pub fn snapshot_csv(
-    _context: &InstanceContext,
+    context: &InstanceContext,
     vfs: &Vfs,
     path: &Path,
     name: &str,
@@ -45,7 +45,13 @@ pub fn snapshot_csv(
                 .relevant_paths(vec![vfs.canonicalize(path)?]),
         );
 
-    AdjacentMetadata::read_and_apply_all(vfs, path, name, &mut snapshot)?;
+    AdjacentMetadata::read_and_apply_all(
+        vfs,
+        path,
+        name,
+        &context.path_ignore_rules,
+        &mut snapshot,
+    )?;
 
     Ok(Some(snapshot))
 }
@@ -82,7 +88,12 @@ pub fn snapshot_csv_init(
     // The directory snapshot middleware includes all possible init paths
     // so we don't need to add it here.
 
-    DirectoryMetadata::read_and_apply_all(vfs, folder_path, &mut init_snapshot)?;
+    DirectoryMetadata::read_and_apply_all(
+        vfs,
+        folder_path,
+        &context.path_ignore_rules,
+        &mut init_snapshot,
+    )?;
 
     Ok(Some(init_snapshot))
 }

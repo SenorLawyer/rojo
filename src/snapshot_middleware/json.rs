@@ -36,7 +36,13 @@ pub fn snapshot_json(
                 .context(context),
         );
 
-    AdjacentMetadata::read_and_apply_all(vfs, path, name, &mut snapshot)?;
+    AdjacentMetadata::read_and_apply_all(
+        vfs,
+        path,
+        name,
+        &context.path_ignore_rules,
+        &mut snapshot,
+    )?;
 
     Ok(Some(snapshot))
 }

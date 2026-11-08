@@ -10,7 +10,11 @@ use rbx_dom_weak::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    json, resolution::UnresolvedValue, snapshot::InstanceSnapshot, syncback::SyncbackSnapshot,
+    json,
+    resolution::UnresolvedValue,
+    snapshot::{InstanceSnapshot, PathIgnoreRule},
+    snapshot_middleware::is_ignored_by_node_rules,
+    syncback::SyncbackSnapshot,
     RojoRef,
 };
 
@@ -62,10 +66,14 @@ impl AdjacentMetadata {
     ///
     /// Also inserts the potential metadata paths into the snapshot's relevant
     /// paths for convenience purposes.
+    ///
+    /// A meta file a node's `$globIgnorePaths` exclude, by `ignore_rules`,
+    /// is treated as absent, like any other excluded file.
     pub fn read_and_apply_all(
         vfs: &Vfs,
         path: &Path,
         name: &str,
+        ignore_rules: &[PathIgnoreRule],
         snapshot: &mut InstanceSnapshot,
     ) -> anyhow::Result<()> {
         // An init file referenced directly (for example `"$path":
@@ -86,14 +94,14 @@ impl AdjacentMetadata {
         let meta_path_json = path.with_file_name(format!("{name}.meta.json"));
         let meta_path_jsonc = path.with_file_name(format!("{name}.meta.jsonc"));
 
-        if let Some(meta_contents) = vfs.read(&meta_path_json).with_not_found()? {
-            let mut metadata = Self::from_slice(&meta_contents, meta_path_json.clone())?;
-            metadata.apply_all(snapshot)?;
-        }
-
-        if let Some(meta_contents) = vfs.read(&meta_path_jsonc).with_not_found()? {
-            let mut metadata = Self::from_slice(&meta_contents, meta_path_jsonc.clone())?;
-            metadata.apply_all(snapshot)?;
+        for meta_path in [&meta_path_json, &meta_path_jsonc] {
+            if is_ignored_by_node_rules(ignore_rules, meta_path) {
+                continue;
+            }
+            if let Some(meta_contents) = vfs.read(meta_path).with_not_found()? {
+                let mut metadata = Self::from_slice(&meta_contents, meta_path.clone())?;
+                metadata.apply_all(snapshot)?;
+            }
         }
 
         // Rather than pushing these in the snapshot middleware, we can just do it here.
@@ -345,22 +353,26 @@ impl DirectoryMetadata {
     ///
     /// Also inserts the potential metadata paths into the snapshot's relevant
     /// paths for convenience purposes.
+    ///
+    /// An `init.meta.json` a node's `$globIgnorePaths` exclude, by
+    /// `ignore_rules`, is treated as absent, like any other excluded file.
     pub fn read_and_apply_all(
         vfs: &Vfs,
         path: &Path,
+        ignore_rules: &[PathIgnoreRule],
         snapshot: &mut InstanceSnapshot,
     ) -> anyhow::Result<()> {
         let meta_path_json = path.join("init.meta.json");
         let meta_path_jsonc = path.join("init.meta.jsonc");
 
-        if let Some(meta_contents) = vfs.read(&meta_path_json).with_not_found()? {
-            let mut metadata = Self::from_slice(&meta_contents, meta_path_json.clone())?;
-            metadata.apply_all(snapshot)?;
-        }
-
-        if let Some(meta_contents) = vfs.read(&meta_path_jsonc).with_not_found()? {
-            let mut metadata = Self::from_slice(&meta_contents, meta_path_jsonc.clone())?;
-            metadata.apply_all(snapshot)?;
+        for meta_path in [&meta_path_json, &meta_path_jsonc] {
+            if is_ignored_by_node_rules(ignore_rules, meta_path) {
+                continue;
+            }
+            if let Some(meta_contents) = vfs.read(meta_path).with_not_found()? {
+                let mut metadata = Self::from_slice(&meta_contents, meta_path.clone())?;
+                metadata.apply_all(snapshot)?;
+            }
         }
 
         // Rather than pushing these in the snapshot middleware, we can just do it here.
@@ -626,8 +638,14 @@ mod test {
         let vfs = Vfs::new(imfs);
         let mut snapshot = InstanceSnapshot::new().class_name("ModuleScript");
 
-        AdjacentMetadata::read_and_apply_all(&vfs, Path::new("/foo/bar.lua"), "bar", &mut snapshot)
-            .unwrap();
+        AdjacentMetadata::read_and_apply_all(
+            &vfs,
+            Path::new("/foo/bar.lua"),
+            "bar",
+            &[],
+            &mut snapshot,
+        )
+        .unwrap();
 
         assert_eq!(
             tags_of(&snapshot),
@@ -656,7 +674,7 @@ mod test {
         let vfs = Vfs::new(imfs);
         let mut snapshot = InstanceSnapshot::new().class_name("Folder");
 
-        DirectoryMetadata::read_and_apply_all(&vfs, Path::new("/foo"), &mut snapshot).unwrap();
+        DirectoryMetadata::read_and_apply_all(&vfs, Path::new("/foo"), &[], &mut snapshot).unwrap();
 
         assert_eq!(snapshot.class_name, "Configuration");
         assert_eq!(
@@ -678,7 +696,7 @@ mod test {
         let path = Path::new("/foo/bar.rojo");
         let mut snapshot = InstanceSnapshot::new();
 
-        AdjacentMetadata::read_and_apply_all(&vfs, path, "bar", &mut snapshot).unwrap();
+        AdjacentMetadata::read_and_apply_all(&vfs, path, "bar", &[], &mut snapshot).unwrap();
 
         insta::assert_yaml_snapshot!(snapshot);
     }
@@ -696,7 +714,7 @@ mod test {
         let path = Path::new("/foo/bar.rojo");
         let mut snapshot = InstanceSnapshot::new();
 
-        AdjacentMetadata::read_and_apply_all(&vfs, path, "bar", &mut snapshot).unwrap();
+        AdjacentMetadata::read_and_apply_all(&vfs, path, "bar", &[], &mut snapshot).unwrap();
 
         insta::assert_yaml_snapshot!(snapshot);
     }
@@ -714,7 +732,7 @@ mod test {
         let path = Path::new("/foo/");
         let mut snapshot = InstanceSnapshot::new();
 
-        DirectoryMetadata::read_and_apply_all(&vfs, path, &mut snapshot).unwrap();
+        DirectoryMetadata::read_and_apply_all(&vfs, path, &[], &mut snapshot).unwrap();
 
         insta::assert_yaml_snapshot!(snapshot);
     }
@@ -732,7 +750,7 @@ mod test {
         let path = Path::new("/foo/");
         let mut snapshot = InstanceSnapshot::new();
 
-        DirectoryMetadata::read_and_apply_all(&vfs, path, &mut snapshot).unwrap();
+        DirectoryMetadata::read_and_apply_all(&vfs, path, &[], &mut snapshot).unwrap();
 
         insta::assert_yaml_snapshot!(snapshot);
     }
