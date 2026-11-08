@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     json,
     resolution::UnresolvedValue,
-    snapshot::{InstanceContext, InstanceSnapshot},
+    snapshot::{InstanceContext, InstanceMetadata, InstanceSnapshot},
     snapshot_middleware::meta_file::UnknownFields,
     syncback::{filter_properties_preallocated, FsSnapshot, SyncbackReturn, SyncbackSnapshot},
     RojoRef,
@@ -221,9 +221,14 @@ impl JsonModel {
             properties.insert("Attributes".into(), attributes.into());
         }
 
+        // Children keep their IDs so `Rojo_Target_*` attributes, such as a
+        // Model's PrimaryPart, can point at them. The top-level ID is taken
+        // out before this and applied by the caller.
+        let metadata = InstanceMetadata::new().specified_id(self.id.map(RojoRef::new));
+
         Ok(InstanceSnapshot {
             snapshot_id: Ref::none(),
-            metadata: Default::default(),
+            metadata,
             name: Cow::Owned(name),
             class_name,
             properties,
@@ -327,6 +332,66 @@ mod test {
             .properties
             .contains_key(&rbx_dom_weak::ustr("Attributes")));
         assert_eq!(tags(&snapshot.children[0]), vec!["Child"]);
+    }
+
+    /// IDs on nested children used to be dropped, so a parent's
+    /// `Rojo_Target_PrimaryPart` could never point at one of its own parts.
+    #[test]
+    fn model_children_keep_their_ids() {
+        let mut imfs = InMemoryFs::new();
+        imfs.load_snapshot(
+            "/foo.model.json",
+            VfsSnapshot::file(
+                r#"{
+                    "className": "Model",
+                    "id": "model",
+                    "attributes": { "Rojo_Target_PrimaryPart": "pole" },
+                    "children": [
+                        { "name": "Pole", "className": "Part", "$id": "pole" },
+                        { "name": "Flag", "className": "Part", "id": "flag" },
+                        { "name": "Plain", "className": "Part" }
+                    ]
+                }"#,
+            ),
+        )
+        .unwrap();
+
+        let vfs = Vfs::new(imfs);
+        let snapshot = snapshot_json_model(
+            &InstanceContext::default(),
+            &vfs,
+            Path::new("/foo.model.json"),
+            "foo",
+        )
+        .unwrap()
+        .unwrap();
+
+        let id = |snapshot: &InstanceSnapshot| {
+            snapshot
+                .metadata
+                .specified_id
+                .as_ref()
+                .map(ToString::to_string)
+        };
+        assert_eq!(id(&snapshot).as_deref(), Some("model"));
+        assert_eq!(id(&snapshot.children[0]).as_deref(), Some("pole"));
+        assert_eq!(id(&snapshot.children[1]).as_deref(), Some("flag"));
+        assert_eq!(id(&snapshot.children[2]), None);
+
+        // Building the tree resolves the parent's pointer to the child.
+        let mut tree = crate::snapshot::RojoTree::new(InstanceSnapshot::new());
+        let root_id = tree.get_root_id();
+        let patch = crate::snapshot::compute_patch_set(Some(snapshot), &tree, root_id);
+        crate::snapshot::apply_patch_set(&mut tree, patch);
+        let model = tree.get_instance(root_id).unwrap();
+        let pole = tree
+            .get_specified_id(&RojoRef::new("pole".to_owned()))
+            .unwrap();
+        assert_eq!(model.children()[0], pole);
+        assert_eq!(
+            model.properties().get(&rbx_dom_weak::ustr("PrimaryPart")),
+            Some(&Variant::Ref(pole))
+        );
     }
 
     #[test]

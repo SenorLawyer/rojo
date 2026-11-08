@@ -1,0 +1,31 @@
+---
+source: tests/tests/build.rs
+expression: contents
+---
+<roblox version="4">
+  <Item class="Model" referent="0">
+    <Properties>
+      <string name="Name">json_model_child_id</string>
+      <BinaryString name="AttributesSerialize">AQAAABcAAABSb2pvX1RhcmdldF9QcmltYXJ5UGFydAIQAAAAY29ybmVyLWZsYWctcG9sZQ==</BinaryString>
+      <bool name="NeedsPivotMigration">false</bool>
+      <Ref name="PrimaryPart">1</Ref>
+    </Properties>
+    <Item class="Part" referent="1">
+      <Properties>
+        <string name="Name">Pole</string>
+      </Properties>
+    </Item>
+    <Item class="Part" referent="2">
+      <Properties>
+        <string name="Name">Flag</string>
+      </Properties>
+    </Item>
+    <Item class="ObjectValue" referent="3">
+      <Properties>
+        <string name="Name">FlagPointer</string>
+        <BinaryString name="AttributesSerialize">AQAAABEAAABSb2pvX1RhcmdldF9WYWx1ZQIQAAAAY29ybmVyLWZsYWctZmxhZw==</BinaryString>
+        <Ref name="Value">2</Ref>
+      </Properties>
+    </Item>
+  </Item>
+</roblox>

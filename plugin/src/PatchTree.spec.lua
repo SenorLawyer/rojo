@@ -3,7 +3,7 @@ return function()
 	local PatchSet = require(script.Parent.PatchSet)
 	local InstanceMap = require(script.Parent.InstanceMap)
 
-	local function buildFlatTree(count)
+	local function buildFlatTree(count, sameName)
 		local container = Instance.new("Folder")
 		container.Parent = workspace
 		local instanceMap = InstanceMap.new()
@@ -16,7 +16,7 @@ return function()
 				Id = id,
 				Parent = "CONTAINER",
 				-- Zero-padded so name order matches index order.
-				Name = string.format("Child%06d", index),
+				Name = if sameName then "Part" else string.format("Child%06d", index),
 				ClassName = "Folder",
 				Properties = {},
 				Children = {},
@@ -45,6 +45,28 @@ return function()
 			expect(type(child)).to.equal("table")
 			expect(child.id).to.equal(key)
 		end
+
+		instanceMap:stop()
+		container:Destroy()
+	end)
+
+	it("marks only the last child of each parent as final, even with shared names", function()
+		local tree, instanceMap, container = buildFlatTree(50, true)
+
+		local finals, finalIds, lastSeen = {}, {}, {}
+		tree:forEach(function(node, _depth, isFinalChild)
+			lastSeen[node.parentId] = node.id
+			if isFinalChild then
+				finals[node.parentId] = (finals[node.parentId] or 0) + 1
+				finalIds[node.parentId] = node.id
+			end
+		end)
+
+		for parentId, lastId in lastSeen do
+			expect(finals[parentId]).to.equal(1)
+			expect(finalIds[parentId]).to.equal(lastId)
+		end
+		expect(finals.CONTAINER).to.equal(1)
 
 		instanceMap:stop()
 		container:Destroy()

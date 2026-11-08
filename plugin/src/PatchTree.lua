@@ -45,7 +45,11 @@ local function alphabeticalPairs(t)
 		position += 1
 		local key = orderedIndex[position]
 		if key ~= nil then
-			return key, t[key]
+			-- The third value says whether this is the last key, which the
+			-- visualizer uses to draw tree lines. Finding that out by comparing
+			-- against every sibling was quadratic, and never stopped early when
+			-- siblings shared a name, such as thousands of Parts.
+			return key, t[key], position == count
 		end
 		return nil
 	end
@@ -81,10 +85,12 @@ end
 -- Iterates over all sub-nodes, depth first
 -- node is where to start from, defaults to root
 -- depth is used for recursion but can be used to set the starting depth
+-- callback receives the node, its depth, and whether it is its parent's last
+-- child in this order
 function Tree:forEach(callback, node, depth)
 	depth = depth or 1
-	for _, child in alphabeticalPairs(if node then node.children else self.ROOT.children) do
-		callback(child, depth)
+	for _, child, isFinalChild in alphabeticalPairs(if node then node.children else self.ROOT.children) do
+		callback(child, depth, isFinalChild)
 		if type(child.children) == "table" then
 			self:forEach(callback, child, depth + 1)
 		end
