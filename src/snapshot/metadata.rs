@@ -192,11 +192,13 @@ impl InstanceContext {
             return;
         }
 
+        // Later rules win, so a rule given again moves to the end rather than
+        // being dropped: a child node repeating its parent's exclusion must
+        // still override a negation the parent has after it.
         let rules = Arc::make_mut(&mut self.path_ignore_rules);
         for rule in new_rules {
-            if !rules.contains(&rule) {
-                rules.push(rule);
-            }
+            rules.retain(|existing| *existing != rule);
+            rules.push(rule);
         }
     }
 

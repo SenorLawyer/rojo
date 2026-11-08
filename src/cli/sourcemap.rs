@@ -596,6 +596,57 @@ mod test {
         assert_eq!(root_paths, ["default.project.json"], "{path}");
     }
 
+    /// A child node repeating an exclusion its parent negates for one file
+    /// leaves that file out of its own instances, as the build does.
+    #[test]
+    fn a_child_nodes_exclusion_wins_over_its_parents_negation() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("project");
+        fs_err::create_dir_all(project.join("src")).unwrap();
+        fs_err::write(
+            project.join("default.project.json"),
+            r#"{
+                "name": "root",
+                "tree": {
+                    "$path": "src",
+                    "$globIgnorePaths": ["**/*.spec.luau", "!Keep.spec.luau"],
+                    "Child": { "$path": "src", "$globIgnorePaths": ["**/*.spec.luau"] }
+                }
+            }"#,
+        )
+        .unwrap();
+        fs_err::write(project.join("src/Foo.luau"), "return 1").unwrap();
+        fs_err::write(project.join("src/Keep.spec.luau"), "return 1").unwrap();
+        let sourcemap_output = dir.path().join("sourcemap.json");
+        let sourcemap_command = SourcemapCommand {
+            project,
+            output: Some(sourcemap_output.clone()),
+            include_non_scripts: true,
+            watch: false,
+            absolute: false,
+        };
+        assert!(sourcemap_command.run().is_ok());
+
+        let raw = fs_err::read_to_string(sourcemap_output.as_path()).unwrap();
+        let root = serde_json::from_str::<SourcemapNode>(&raw).unwrap();
+        let names = |node: &SourcemapNode| {
+            let mut names: Vec<String> = node
+                .children
+                .iter()
+                .map(|child| child.name.to_string())
+                .collect();
+            names.sort_unstable();
+            names
+        };
+        assert_eq!(names(&root), ["Child", "Foo", "Keep.spec"], "{raw}");
+        let child = root
+            .children
+            .iter()
+            .find(|child| child.name == "Child")
+            .unwrap();
+        assert_eq!(names(child), ["Foo"], "{raw}");
+    }
+
     /// A node's own `$path` naming a file that a parent node's
     /// `$globIgnorePaths` match is built, so the sourcemap lists it too.
     #[test]

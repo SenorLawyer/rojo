@@ -1348,6 +1348,58 @@ mod test {
     }
 
     #[test]
+    fn a_child_node_repeating_an_exclusion_overrides_its_parents_negation() {
+        let mut fs = InMemoryFs::new();
+        fs.load_snapshot(
+            "/foo",
+            VfsSnapshot::dir([
+                (
+                    "default.project.json",
+                    VfsSnapshot::file(
+                        r#"{
+                            "name": "partitions",
+                            "tree": {
+                                "$className": "Folder",
+                                "Shared": {
+                                    "$path": "src",
+                                    "$globIgnorePaths": ["**/*.spec.luau", "!Keep.spec.luau"],
+                                    "Child": {
+                                        "$path": "src",
+                                        "$globIgnorePaths": ["**/*.spec.luau"]
+                                    }
+                                }
+                            }
+                        }"#,
+                    ),
+                ),
+                (
+                    "src",
+                    VfsSnapshot::dir([
+                        ("Foo.luau", VfsSnapshot::file("")),
+                        ("Keep.spec.luau", VfsSnapshot::file("")),
+                        ("Other.spec.luau", VfsSnapshot::file("")),
+                    ]),
+                ),
+            ]),
+        )
+        .unwrap();
+        let snapshot = snapshot_project(
+            &InstanceContext::default(),
+            &Vfs::new(fs),
+            Path::new("/foo/default.project.json"),
+            "partitions",
+        )
+        .unwrap()
+        .unwrap();
+
+        let shared = child(&snapshot, "Shared");
+        assert_eq!(child_names(shared), ["Child", "Foo", "Keep.spec"]);
+        // The child's own exclusion comes last, so it wins over the parent's
+        // negation, as its own rules always do.
+        assert_eq!(child_names(child(shared, "Child")), ["Foo"]);
+    }
+
+    #[test]
     fn node_glob_ignore_paths_treat_excluded_meta_files_as_absent() {
         let partition = |malformed: bool| {
             let mut entries = vec![
