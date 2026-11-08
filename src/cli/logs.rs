@@ -183,7 +183,10 @@ impl LogsCommand {
         }
         let failed_servers: Vec<String> =
             batch.failed_servers.iter().map(|job| redact(job)).collect();
-        let entries = newest(batch.entries, self.limit);
+        let entries: Vec<GameServerLog> = newest(batch.entries, self.limit)
+            .iter()
+            .map(|entry| redact_entry(entry, redact))
+            .collect();
         // Entries from the servers read before a failure are still printed.
         if self.json {
             let mut value = json!({
@@ -274,10 +277,11 @@ impl LogsCommand {
             // The reader counts these as shown, so they are printed even
             // when a later server in the round failed.
             for entry in &entries {
+                let entry = redact_entry(entry, redact);
                 let line = if self.json {
-                    json_escape_controls(serde_json::to_string(&entry_json(entry))?)
+                    json_escape_controls(serde_json::to_string(&entry_json(&entry))?)
                 } else {
-                    entry_text(entry)
+                    entry_text(&entry)
                 };
                 // A reader that stops early, such as `head`, ends following
                 // like Ctrl+C does.
@@ -343,6 +347,50 @@ fn is_usage_problem(error: &OpenCloudError) -> bool {
         OpenCloudError::Status { status, .. } => matches!(status.as_u16(), 400 | 401 | 403 | 404),
         OpenCloudError::NotSent(_) => true,
         _ => false,
+    }
+}
+
+/// `log` with the API key taken out of every text it has. The entries come
+/// from game servers, which can log anything, a key read from a secret
+/// included, and all of it is printed.
+fn redact_entry(log: &GameServerLog, redact: &dyn Fn(&str) -> String) -> GameServerLog {
+    fn redact_value(value: &Value, redact: &dyn Fn(&str) -> String) -> Value {
+        match value {
+            Value::String(text) => Value::String(redact(text)),
+            Value::Array(items) => Value::Array(
+                items
+                    .iter()
+                    .map(|item| redact_value(item, redact))
+                    .collect(),
+            ),
+            Value::Object(fields) => Value::Object(
+                fields
+                    .iter()
+                    .map(|(name, value)| (redact(name), redact_value(value, redact)))
+                    .collect(),
+            ),
+            other => other.clone(),
+        }
+    }
+    let optional = |text: &Option<String>| text.as_deref().map(|text| redact(text));
+    GameServerLog {
+        timestamp_ms: log.timestamp_ms,
+        severity: match &log.severity {
+            LogSeverity::Other(text) => LogSeverity::Other(redact(text)),
+            severity => severity.clone(),
+        },
+        universe_id: redact(&log.universe_id),
+        place_id: redact(&log.place_id),
+        place_version: redact(&log.place_version),
+        job_id: redact(&log.job_id),
+        message: redact(&log.message),
+        stack_trace: redact(&log.stack_trace),
+        message_template: optional(&log.message_template),
+        context: optional(&log.context),
+        logger_full_path: optional(&log.logger_full_path),
+        skipped_count: log.skipped_count,
+        rate_limited_count: log.rate_limited_count,
+        structured_stack_trace: redact_value(&log.structured_stack_trace, redact),
     }
 }
 
@@ -1538,6 +1586,101 @@ mod tests {
         let redacted = redact_error(usage, &redact);
         assert!(redacted.is::<UsageError>());
         assert!(format!("{redacted:#}").contains("bad [redacted]"));
+    }
+
+    /// An entry with the key in every text field it has.
+    fn leaky_entry(job: &str, ms: u64, key: &str) -> GameServerLog {
+        let mut entry = log(job, ms, LogSeverity::Error, &format!("message {key}"));
+        entry.stack_trace = format!("Script line 1 {key}");
+        entry.message_template = Some(format!("template {key}"));
+        entry.context = Some(format!("context {key}"));
+        entry.logger_full_path = Some(format!("logger {key}"));
+        entry.structured_stack_trace = json!([{ "source": format!("frame {key}") }]);
+        entry
+    }
+
+    #[test]
+    fn the_api_key_is_left_out_of_entries_printed_once() {
+        const KEY: &str = "SECRETKEY";
+        let redact = |text: &str| text.replace(KEY, "[redacted]");
+        for json in [false, true] {
+            let fake = Fake::default();
+            let mut args = vec!["--place-version", "45"];
+            if json {
+                args.push("--json");
+            }
+            let command = parse(&args);
+            let mut reader = reader(&fake, &command);
+            fake.servers(vec![server("a", false, None)], None);
+            fake.logs("a", vec![leaky_entry("a", NOW - MINUTE, KEY)], None);
+            let (mut out, mut err) = (Vec::new(), Vec::new());
+            command
+                .read_once(&mut reader, &mut out, &mut err, &redact, NOW)
+                .unwrap();
+            let out = String::from_utf8(out).unwrap();
+            assert!(!out.contains(KEY), "{out}");
+            assert!(out.contains("message [redacted]"), "{out}");
+            if json {
+                assert!(out.contains("frame [redacted]"), "{out}");
+                assert!(out.contains("context [redacted]"), "{out}");
+            } else {
+                assert!(out.contains("Script line 1 [redacted]"), "{out}");
+            }
+        }
+    }
+
+    /// Takes whole lines, then reports a closed pipe, which ends following.
+    struct Lines {
+        written: Vec<u8>,
+        lines: usize,
+    }
+
+    impl std::io::Write for Lines {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if self.written.iter().filter(|&&b| b == b'\n').count() >= self.lines {
+                return Err(std::io::ErrorKind::BrokenPipe.into());
+            }
+            self.written.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn the_api_key_is_left_out_of_entries_followed() {
+        const KEY: &str = "SECRETKEY";
+        let redact = |text: &str| text.replace(KEY, "[redacted]");
+        let now = now_ms();
+        for json in [false, true] {
+            let fake = Fake::default();
+            let mut args = vec!["--place-version", "45", "--follow"];
+            if json {
+                args.push("--json");
+            }
+            let command = parse(&args);
+            let mut reader = reader(&fake, &command);
+            fake.servers(vec![server("a", false, None)], None);
+            fake.logs(
+                "a",
+                vec![
+                    leaky_entry("a", now - MINUTE, KEY),
+                    leaky_entry("a", now - 2 * MINUTE, KEY),
+                ],
+                None,
+            );
+            let mut out = Lines {
+                written: Vec::new(),
+                // The first entry whole: its message, and in text its stack trace.
+                lines: if json { 1 } else { 2 },
+            };
+            command.follow(&mut reader, &mut out, &redact).unwrap();
+            let out = String::from_utf8(out.written).unwrap();
+            assert!(!out.contains(KEY), "{out}");
+            assert!(out.contains("message [redacted]"), "{out}");
+        }
     }
 
     #[test]
