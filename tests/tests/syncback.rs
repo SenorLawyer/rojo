@@ -186,6 +186,44 @@ fn partition_ignore_globs_holder() {
     });
 }
 
+/// Studio has two children with the same name inside a partition with
+/// `$globIgnorePaths`, which syncback would refuse in a project node. The
+/// partition is skipped before anything checks it, so the rest still syncs.
+#[test]
+fn partition_ignore_globs_dup() {
+    run_syncback_test("partition_ignore_globs_dup", |path| {
+        assert_eq!(
+            fs_err::read_to_string(path.join("filtered/Foo.luau")).unwrap(),
+            "return \"Foo\"\n"
+        );
+        assert!(path.join("filtered/Foo.spec.luau").exists());
+        assert!(!path.join("filtered/Dup").exists());
+        assert!(!path.join("filtered/Dup.model.json").exists());
+        assert_eq!(
+            fs_err::read_to_string(path.join("unfiltered/Foo.luau")).unwrap(),
+            "return \"Foo from Studio\"\n"
+        );
+    });
+}
+
+/// Another node reaches the partition's folder as `src/../filtered`. It is
+/// the same folder on disk, so it is protected too.
+#[test]
+fn partition_ignore_globs_alias() {
+    run_syncback_test("partition_ignore_globs_alias", |path| {
+        assert_eq!(
+            fs_err::read_to_string(path.join("filtered/Foo.luau")).unwrap(),
+            "return \"Foo\"\n"
+        );
+        assert!(path.join("filtered/Foo.spec.luau").exists());
+        assert!(!path.join("filtered/New.luau").exists());
+        assert_eq!(
+            fs_err::read_to_string(path.join("unfiltered/Foo.luau")).unwrap(),
+            "return \"Foo from Studio\"\n"
+        );
+    });
+}
+
 /// Partitions are found from every project file: a nested project's root
 /// node, and a node whose `$path` names a project file (based at that file's
 /// folder), are both skipped.

@@ -28,6 +28,8 @@ pub struct SyncbackData<'sync> {
     /// Properties removed from instances in the new tree because Rojo cannot
     /// represent their values, keyed by the instance's referent.
     pub(super) unreadable_properties: &'sync HashMap<Ref, UstrSet>,
+    /// Partitions syncback leaves alone, see [`super::ProtectedPartitions`].
+    pub(super) protected: &'sync super::ProtectedPartitions,
 }
 
 pub struct SyncbackSnapshot<'sync> {
@@ -198,6 +200,12 @@ impl<'sync> SyncbackSnapshot<'sync> {
     #[inline]
     pub fn vfs(&self) -> &'sync Vfs {
         self.data.vfs
+    }
+
+    /// Partitions that syncback must not write, remove or replace anything
+    /// in.
+    pub fn protected(&self) -> &'sync super::ProtectedPartitions {
+        self.data.protected
     }
 
     /// Returns the WeakDom used for the 'new' tree.

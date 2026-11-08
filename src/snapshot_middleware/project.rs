@@ -464,7 +464,27 @@ pub fn syncback_project<'sync>(
     let mut node_queue = VecDeque::with_capacity(1);
     node_queue.push_back((&mut project.tree, old_inst, snapshot.new_inst()));
 
+    // A node whose `$path` is in a protected partition is skipped whole,
+    // before anything checks its contents: they may be what makes syncback
+    // fail, such as children with the same name, and they are not synced
+    // back anyway.
+    let protected = snapshot.protected();
+    let is_protected = |node: &ProjectNode| {
+        node.path.as_ref().is_some_and(|path| {
+            let path = path.path();
+            if path.is_absolute() {
+                protected.contains(path)
+            } else {
+                protected.contains(&base_path.join(path))
+            }
+        })
+    };
+
     while let Some((node, old_inst, new_inst)) = node_queue.pop_front() {
+        if is_protected(node) {
+            log::debug!("Skipping node {} in a protected partition", old_inst.name());
+            continue;
+        }
         log::debug!("Processing node {}", old_inst.name());
         let untouched = snapshot.untouched_properties(new_inst.referent());
         if old_inst.class_name() != new_inst.class {
@@ -555,6 +575,12 @@ pub fn syncback_project<'sync>(
         // children. It ensures that `new_child_map` and `old_child_map` will
         // only contain Instances that don't belong to the project after this.
         for (child_name, child_node) in &mut node.children {
+            // Neither added, removed nor checked; see `is_protected`.
+            if is_protected(child_node) {
+                new_child_map.remove(child_name);
+                old_child_map.remove(child_name.as_str());
+                continue;
+            }
             // If a node's path is optional, we want to skip it if the path
             // doesn't exist since it isn't in the current old DOM.
             if let Some(path) = &child_node.path {

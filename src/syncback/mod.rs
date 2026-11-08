@@ -2,6 +2,7 @@ mod file_names;
 mod fs_snapshot;
 mod hash;
 mod property_filter;
+mod protected;
 mod ref_properties;
 mod snapshot;
 
@@ -40,6 +41,7 @@ pub use hash::*;
 pub use property_filter::{
     filter_properties, filter_properties_preallocated, is_excluded_by_rules,
 };
+pub use protected::ProtectedPartitions;
 pub use snapshot::{SyncbackData, SyncbackSnapshot};
 
 /// The name of an enviroment variable to use to override the behavior of
@@ -186,7 +188,7 @@ pub fn syncback_loop(
     // or replacing anything in such a partition could therefore overwrite or
     // delete those files, so syncback leaves these partitions alone.
     let skipped_partitions = partitions_with_ignore_globs(vfs, old_tree)?;
-    for (node, base) in &skipped_partitions {
+    for (node, base) in skipped_partitions.iter() {
         log::warn!(
             "syncback skipped {node} ({}) because it has $globIgnorePaths; edit those files directly",
             base.display()
@@ -194,18 +196,10 @@ pub fn syncback_loop(
     }
 
     let project_path = project.folder_location();
-    let in_partition = |path: &Path| {
-        skipped_partitions
-            .iter()
-            .any(|(_, base)| path.starts_with(base))
-    };
+    let in_partition = |path: &Path| skipped_partitions.contains(path);
     // Removing or replacing a directory that holds a partition would delete
     // the partition along with it.
-    let holds_partition = |path: &Path| {
-        skipped_partitions
-            .iter()
-            .any(|(_, base)| base.starts_with(path))
-    };
+    let holds_partition = |path: &Path| skipped_partitions.held_by(path);
     let is_writable =
         |path: &Path| is_valid_path(&ignore_patterns, project_path, path) && !in_partition(path);
     let is_changeable = |path: &Path| is_writable(path) && !holds_partition(path);
@@ -216,6 +210,7 @@ pub fn syncback_loop(
         new_tree: &new_tree,
         project,
         unreadable_properties: &unreadable_properties,
+        protected: &skipped_partitions,
     };
 
     let mut snapshots = vec![SyncbackSnapshot {
@@ -371,7 +366,7 @@ pub fn syncback_loop(
 fn partitions_with_ignore_globs(
     vfs: &Vfs,
     old_tree: &RojoTree,
-) -> anyhow::Result<Vec<(String, PathBuf)>> {
+) -> anyhow::Result<ProtectedPartitions> {
     let mut project_paths: Vec<PathBuf> = Vec::new();
     for inst in old_tree.descendants(old_tree.get_root_id()) {
         let metadata = inst.metadata();
@@ -391,7 +386,7 @@ fn partitions_with_ignore_globs(
         }
     }
 
-    let mut partitions = Vec::new();
+    let mut partitions = ProtectedPartitions::default();
     for project_path in project_paths {
         if !vfs.exists(&project_path)? {
             continue;
@@ -403,10 +398,7 @@ fn partitions_with_ignore_globs(
         while let Some((name, node)) = nodes.pop() {
             if !node.glob_ignore_paths.is_empty() {
                 if let Some(base) = node_ignore_base(&project_path, node) {
-                    let name = format!("{name} in {}", project_path.display());
-                    if !partitions.iter().any(|(_, b)| b == &base) {
-                        partitions.push((name, base));
-                    }
+                    partitions.add(format!("{name} in {}", project_path.display()), &base);
                 }
             }
             nodes.extend(
