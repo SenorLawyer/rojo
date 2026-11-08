@@ -741,6 +741,10 @@ pub struct StudioBridge {
     /// disk.
     #[cfg(test)]
     save_delay: Mutex<Duration>,
+    /// How long each check in a check slot sleeps first, standing in for a
+    /// busy blocking pool or a slow child process.
+    #[cfg(test)]
+    check_delay: Mutex<Duration>,
 }
 
 fn reply(status: StatusCode, value: Value) -> Response<Body> {
@@ -877,6 +881,8 @@ impl StudioBridge {
             budgets_after_save: Mutex::new(None),
             #[cfg(test)]
             save_delay: Mutex::new(Duration::ZERO),
+            #[cfg(test)]
+            check_delay: Mutex::new(Duration::ZERO),
         }))
     }
 
@@ -2158,6 +2164,10 @@ impl StudioBridge {
         check: impl FnOnce(Vec<u8>, Duration) -> anyhow::Result<T> + Send + 'static,
     ) -> Result<T, (StatusCode, String)> {
         let started = Instant::now();
+        // The whole check ends by `limit`: waiting for a slot, and the
+        // blocking task too, which can wait for a thread or for its child
+        // process to start before its own time limit applies.
+        let deadline = tokio::time::Instant::now().checked_add(limit);
         let slot =
             match tokio::time::timeout(limit, Arc::clone(&self.decodes).acquire_owned()).await {
                 Ok(Ok(slot)) => slot,
@@ -2175,13 +2185,30 @@ impl StudioBridge {
                 }
             };
         let remaining = limit.saturating_sub(started.elapsed());
+        #[cfg(test)]
+        let delay = *lock(&self.check_delay);
         // The slot is released when the check ends, which its time limit
-        // bounds even if this request is abandoned first.
-        let checked = tokio::task::spawn_blocking(move || {
+        // bounds even if this request is abandoned first. A check still
+        // running at the deadline finishes in the background, and its result
+        // is dropped.
+        let checking = tokio::task::spawn_blocking(move || {
             let _slot = slot;
+            #[cfg(test)]
+            std::thread::sleep(delay);
             check(bytes, remaining)
-        })
-        .await;
+        });
+        let checked = match deadline {
+            Some(deadline) => match tokio::time::timeout_at(deadline, checking).await {
+                Ok(checked) => checked,
+                Err(_) => {
+                    return Err((
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "The check did not finish in time".to_owned(),
+                    ))
+                }
+            },
+            None => checking.await,
+        };
         match checked {
             Ok(Ok(output)) => Ok(output),
             Ok(Err(error)) => Err((StatusCode::BAD_REQUEST, format!("{error:#}"))),
@@ -4669,6 +4696,44 @@ mod tests {
         let resync = next_command(&bridge, &session).await;
         assert!(answered.elapsed() < Duration::from_secs(10));
         drop(held);
+        finish_partly_backed_up_fix(
+            &dir,
+            &bridge,
+            &session,
+            &resync,
+            &ids[0],
+            scripts.len(),
+            verify,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn verify_fix_stops_waiting_for_a_slow_check_at_the_backup_cutoff() {
+        let (dir, bridge, session, scripts, verify) = fix_scripts_past_sources_with(
+            json!({"fix":true}),
+            3,
+            verify::MAX_BACKUP_SOURCE_BYTES,
+            None,
+            None,
+        )
+        .await;
+        // Once the first group is saved, 2 seconds are left to back up and
+        // 10 to begin fixing, which waiting for an 8-second check would pass.
+        *lock(&bridge.budgets_after_save) = Some((Duration::from_secs(10), Duration::from_secs(2)));
+        let first = next_command(&bridge, &session).await;
+        let ids = command_ids(&first);
+        answer_backup(&bridge, &session, &first, &[&ids[0]]).await;
+        let second = next_command(&bridge, &session).await;
+        assert_eq!(second["action"], "backup");
+        let second_ids = command_ids(&second);
+        // The slot is free, but the check itself is slow to run.
+        let delay = Duration::from_secs(8);
+        *lock(&bridge.check_delay) = delay;
+        let answered = Instant::now();
+        answer_backup(&bridge, &session, &second, &[&second_ids[0]]).await;
+        let resync = next_command(&bridge, &session).await;
+        assert!(answered.elapsed() < delay, "the fix waited for the check");
         finish_partly_backed_up_fix(
             &dir,
             &bridge,
