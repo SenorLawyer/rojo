@@ -745,6 +745,10 @@ pub struct StudioBridge {
     /// busy blocking pool or a slow child process.
     #[cfg(test)]
     check_delay: Mutex<Duration>,
+    /// How long the last check that the backups are still there sleeps
+    /// first, standing in for a slow disk.
+    #[cfg(test)]
+    presence_delay: Mutex<Duration>,
 }
 
 fn reply(status: StatusCode, value: Value) -> Response<Body> {
@@ -883,6 +887,8 @@ impl StudioBridge {
             save_delay: Mutex::new(Duration::ZERO),
             #[cfg(test)]
             check_delay: Mutex::new(Duration::ZERO),
+            #[cfg(test)]
+            presence_delay: Mutex::new(Duration::ZERO),
         }))
     }
 
@@ -1818,7 +1824,18 @@ impl StudioBridge {
         // Another process may have removed one since, for example from a
         // pin that expired; its scripts must not be overwritten.
         let ids: Vec<String> = groups.iter().map(|(id, _)| id.clone()).collect();
-        let present = self.backups_present(ids).await;
+        // Bounded like every other backup step, by when fixing must start:
+        // a store too slow to answer by then confirms none of them.
+        let left = self.fix_budgets().0.saturating_sub(started.elapsed());
+        let present = tokio::time::timeout(left, self.backups_present(ids))
+            .await
+            .unwrap_or_else(|_| {
+                log::warn!(
+                    "Could not check in time that this fix's backups are still there, \
+                     so none of its scripts are fixed"
+                );
+                HashSet::new()
+            });
         let scripts = groups
             .into_iter()
             .filter(|(id, _)| present.contains(id))
@@ -1836,7 +1853,11 @@ impl StudioBridge {
     async fn backups_present(&self, ids: Vec<String>) -> HashSet<String> {
         let dir = self.backup_dir.get().cloned();
         let root = self.serve.root_dir().to_owned();
+        #[cfg(test)]
+        let delay = *lock(&self.presence_delay);
         tokio::task::spawn_blocking(move || {
+            #[cfg(test)]
+            std::thread::sleep(delay);
             let Ok(store) = Self::backup_store(dir, &root) else {
                 return HashSet::new();
             };
@@ -4744,6 +4765,36 @@ mod tests {
             verify,
         )
         .await;
+    }
+
+    #[tokio::test]
+    async fn verify_fix_stops_waiting_for_the_last_backup_check_in_time() {
+        let (_dir, bridge, session, scripts, verify) = fix_scripts_past_sources_with(
+            json!({"fix":true}),
+            3,
+            verify::MAX_BACKUP_SOURCE_BYTES,
+            None,
+            None,
+        )
+        .await;
+        // Once the first group is saved, nothing more is backed up, and 2
+        // seconds are left before fixing must start, which waiting for an
+        // 8-second check that the backup is still there would pass.
+        *lock(&bridge.budgets_after_save) = Some((Duration::from_secs(2), Duration::ZERO));
+        let delay = Duration::from_secs(8);
+        *lock(&bridge.presence_delay) = delay;
+        let first = next_command(&bridge, &session).await;
+        let ids = command_ids(&first);
+        let answered = Instant::now();
+        answer_backup(&bridge, &session, &first, &[&ids[0]]).await;
+        let (status, value) = into_value(verify.await.unwrap()).await;
+        assert!(answered.elapsed() < delay, "the fix waited for the check");
+        assert_eq!(status, StatusCode::OK, "{value}");
+        let fixed = &value["result"]["value"]["fixed"];
+        // Not confirmed, so not fixed: no resync was sent.
+        assert_eq!(fixed["updated"], 0, "{value}");
+        assert_eq!(fixed["notBackedUp"], scripts.len(), "{value}");
+        assert!(bridge.state().pending.is_empty());
     }
 
     #[tokio::test]
