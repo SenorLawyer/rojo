@@ -129,8 +129,10 @@ impl DevCommand {
             .or_else(|| session.serve_address())
             .unwrap_or(DEFAULT_BIND_ADDRESS.into());
         // Bound now and held until the server starts, so the setup below
-        // cannot lose the port to another launch.
-        let (listener, port, port_source) = bind_port(
+        // cannot lose the port to another launch. The companion holds the
+        // same port on the other IP version's loopback address for as long
+        // as the server runs (see `bind_with_companion`).
+        let ((listener, companion), port, port_source) = bind_port(
             &PortRequest {
                 flag: self.port,
                 project: session.project_port(),
@@ -138,14 +140,14 @@ impl DevCommand {
                 slot: worktree_slot(&checkout.root),
             },
             |port| port_is_free(ip, port),
-            |port| TcpListener::bind(SocketAddr::new(ip, port)),
+            |port| bind_with_companion(ip, port),
         )?;
 
-        let token_file = match self.studio_token_file {
-            Some(path) => resolve_path(&path)?.into_owned(),
+        let token_file = match &self.studio_token_file {
+            Some(path) => resolve_path(path)?.into_owned(),
             None => checkout.shared_state.join(TOKEN_FILE),
         };
-        ensure_token(&token_file)?;
+        ensure_token(&token_file, self.studio_token_file.is_none())?;
 
         let allowed_hosts = if self.allowed_hosts.is_empty() {
             session.serve_allowed_hosts().to_vec()
@@ -225,9 +227,12 @@ impl DevCommand {
         if let Some(writer) = &sourcemap {
             mem::forget(writer.lock());
         }
-        if state.is_some() {
-            DevState::remove_own(&state_path);
+        if let Some(state) = &state {
+            state.remove_own(&state_path);
         }
+        // Held until the server stopped, so no other server could take this
+        // port on the other loopback address meanwhile.
+        drop(companion);
         if result.is_ok() {
             println!("rojo dev stopped.");
         }
@@ -328,24 +333,61 @@ struct DevState {
 }
 
 impl DevState {
+    /// Writes the record while holding its lock (see [`lock_beside`]).
     fn write(&self, path: &Path) -> anyhow::Result<()> {
         let parent = path.parent().context("State file has no folder")?;
         fs::create_dir_all(parent)
             .with_context(|| format!("Could not create {}", parent.display()))?;
+        let _lock = lock_beside(path)?;
         write_atomically(path, &serde_json::to_vec_pretty(self)?)
     }
 
-    fn read(path: &Path) -> Option<DevState> {
-        serde_json::from_slice(&fs::read(path).ok()?).ok()
+    /// The record at `path`: `None` only when there is no file. A file that
+    /// cannot be read or is not a record is an error, because treating it as
+    /// "no rojo dev here" would send commands to the default address, which
+    /// is often another worktree's server.
+    fn read(path: &Path) -> Result<Option<DevState>, String> {
+        match fs::read(path) {
+            Ok(bytes) => serde_json::from_slice(&bytes)
+                .map(Some)
+                .map_err(|err| format!("it is not a valid record ({err})")),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(err) => Err(format!("it could not be read ({err})")),
+        }
     }
 
-    /// Removes the state file unless another `rojo dev` has replaced it
-    /// since, which a second one in the same worktree does.
-    fn remove_own(path: &Path) {
-        if DevState::read(path).is_some_and(|state| state.pid == std::process::id()) {
+    /// Removes the record if it is still exactly this one. The check and the
+    /// removal happen under the record's lock, so a `rojo dev` that is
+    /// stopping cannot delete the record of one that started meanwhile.
+    fn remove_own(&self, path: &Path) {
+        let Ok(_lock) = lock_beside(path) else {
+            return;
+        };
+        if DevState::read(path).ok().flatten().as_ref() == Some(self) {
             let _ = fs::remove_file(path);
         }
     }
+}
+
+/// Takes an exclusive lock on a hidden file next to `path`, released when
+/// the returned file is dropped or the process dies. Every writer of `path`
+/// holds it, so checking the file and changing it cannot interleave with
+/// another process doing the same.
+fn lock_beside(path: &Path) -> anyhow::Result<fs::File> {
+    let name = path
+        .file_name()
+        .context("Path has no file name")?
+        .to_string_lossy();
+    let lock_path = path.with_file_name(format!(".{name}.lock"));
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&lock_path)
+        .with_context(|| format!("Could not open {}", lock_path.display()))?;
+    file.lock()
+        .with_context(|| format!("Could not lock {}", lock_path.display()))?;
+    Ok(file)
 }
 
 /// The Studio bridge address and token a command should use.
@@ -391,11 +433,14 @@ pub(super) fn bridge_target(
     Ok((DEFAULT_STUDIO_ADDRESS.to_owned(), token_file))
 }
 
-/// The bridge a confirmed record names, or an error when it cannot be
-/// confirmed (see [`bridge_target`]).
-fn use_record(path: &Path, state: DevState) -> anyhow::Result<(String, Option<PathBuf>)> {
-    match verify(&state) {
-        Ok(()) => Ok((state.address, Some(state.token_file))),
+/// The bridge a confirmed record names, or an error when it cannot be read
+/// or confirmed (see [`bridge_target`]).
+fn use_record(
+    path: &Path,
+    state: Result<DevState, String>,
+) -> anyhow::Result<(String, Option<PathBuf>)> {
+    match state.and_then(|state| verify(&state).map(|()| state)) {
+        Ok(state) => Ok((state.address, Some(state.token_file))),
         Err(reason) => Err(super::UsageError(anyhow::anyhow!(
             "This worktree's rojo dev, recorded in {}, could not be confirmed: {reason}. \
              Restart `rojo dev` here, or pass --address and --token-file for the server to use. \
@@ -409,8 +454,8 @@ fn use_record(path: &Path, state: DevState) -> anyhow::Result<(String, Option<Pa
 /// The state a `rojo dev` recorded for this worktree, and where. Outside Git
 /// it is keyed by the project folder, so the folders above `start` are tried
 /// too, for commands run in a subfolder of the project.
-fn find_running(checkout: &Checkout, start: &Path) -> Option<(PathBuf, DevState)> {
-    let read = |path: PathBuf| DevState::read(&path).map(|state| (path, state));
+fn find_running(checkout: &Checkout, start: &Path) -> Option<(PathBuf, Result<DevState, String>)> {
+    let read = |path: PathBuf| DevState::read(&path).transpose().map(|state| (path, state));
     if checkout.in_git {
         return read(checkout.worktree_state.join(STATE_FILE));
     }
@@ -589,6 +634,21 @@ fn pick_port(
     request: &PortRequest,
     is_free: impl Fn(u16) -> bool,
 ) -> anyhow::Result<(u16, PortSource)> {
+    // Port 0 asks the system for any free port, which rojo dev would only
+    // learn after binding, too late to probe both IP versions for it or to
+    // have set the plugin up for it. Leaving the port out picks a free one.
+    if request.flag == Some(0) {
+        return Err(super::UsageError(anyhow::anyhow!(
+            "rojo dev does not support --port 0. Leave --port out to have it pick a free port, or name one."
+        ))
+        .into());
+    }
+    if request.flag.is_none() && request.project == Some(0) {
+        return Err(super::UsageError(anyhow::anyhow!(
+            "The project sets servePort 0, which rojo dev does not support. Remove servePort to have it pick a free port, or pass --port."
+        ))
+        .into());
+    }
     if let Some(port) = request.flag {
         anyhow::ensure!(
             is_free(port),
@@ -652,6 +712,64 @@ fn port_is_free(ip: IpAddr, port: u16) -> bool {
         )
 }
 
+/// Binds the server's listener on `ip` and `port`, and reserves the same port
+/// on the other IP version's loopback address with a socket that is bound
+/// but not listening.
+///
+/// The plugin connects to `localhost`, which may resolve to either version.
+/// [`port_is_free`] checked that nothing listens on the other one, but
+/// another server could take it later, and `localhost` would then reach that
+/// server instead of this one. The reservation never accepts connections, so
+/// a client trying it is refused and moves on to this server's address.
+///
+/// The other address being in use means another launch took the port first,
+/// and is reported as the bind failing, so [`bind_port`] treats it as a lost
+/// race. A machine without the other IP version gets no reservation.
+fn bind_with_companion(
+    ip: IpAddr,
+    port: u16,
+) -> std::io::Result<(TcpListener, Option<tokio::net::TcpSocket>)> {
+    let listener = TcpListener::bind(SocketAddr::new(ip, port))?;
+    let Some(other) = companion_address(ip) else {
+        return Ok((listener, None));
+    };
+    let socket = match other {
+        IpAddr::V4(_) => tokio::net::TcpSocket::new_v4(),
+        IpAddr::V6(_) => tokio::net::TcpSocket::new_v6(),
+    };
+    // Not setting SO_REUSEADDR, so that no other socket can share the port.
+    match socket.and_then(|socket| socket.bind(SocketAddr::new(other, port)).map(|()| socket)) {
+        Ok(socket) => Ok((listener, Some(socket))),
+        Err(err)
+            if matches!(
+                err.kind(),
+                std::io::ErrorKind::AddrInUse | std::io::ErrorKind::PermissionDenied
+            ) =>
+        {
+            Err(err)
+        }
+        Err(err) => {
+            log::debug!("Not reserving port {port} on {other}: {err}");
+            Ok((listener, None))
+        }
+    }
+}
+
+/// The loopback address of the other IP version, which `localhost` may
+/// resolve to instead of the one the server listens on.
+fn companion_address(ip: IpAddr) -> Option<IpAddr> {
+    match ip {
+        IpAddr::V4(v4) if v4.is_loopback() || v4.is_unspecified() => {
+            Some(Ipv6Addr::LOCALHOST.into())
+        }
+        IpAddr::V6(v6) if v6.is_loopback() => Some(Ipv4Addr::LOCALHOST.into()),
+        // `::` usually accepts IPv4 too, where reserving 127.0.0.1 would
+        // fail against this very listener. Other addresses are not reached
+        // through `localhost`.
+        _ => None,
+    }
+}
+
 /// The URL `rojo studio` reaches the server on, which must be loopback. A
 /// server bound to one non-loopback address cannot be reached that way.
 fn studio_address(ip: IpAddr, port: u16) -> Option<String> {
@@ -703,65 +821,86 @@ fn valid_token(token: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
 }
 
+/// Whether `contents` is exactly a token as [`studio::create_token`] writes
+/// it: two UUIDs as 64 lowercase hex digits, nothing before or after.
+fn is_created_token(contents: &str) -> bool {
+    contents.len() == 64
+        && contents
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
 /// Makes sure `path` holds a valid token, creating one when it does not
-/// exist. Several worktrees may start `rojo dev` at once for the first time,
-/// so the token is written whole, with its permissions set first, to a file
-/// of this process's own, then hard-linked into place: a link appears
-/// complete and never replaces an existing file, so every process ends up
-/// with the same token. A process that loses the race reads the winner's,
-/// waiting briefly in case it was made by something that writes in place.
-fn ensure_token(path: &Path) -> anyhow::Result<()> {
-    let read_valid = || {
-        fs::read_to_string(path)
-            .ok()
-            .is_some_and(|token| valid_token(token.trim()))
+/// exist.
+///
+/// Several worktrees may start `rojo dev` at once for the first time, so a
+/// new token is written whole, permissions first, to a file of this
+/// process's own, and renamed into place only while no token exists, under
+/// a lock every `rojo dev` takes for it. Readers therefore only ever see no
+/// file or a complete one, and every process ends up with the same token.
+///
+/// `created` says the file is one `rojo dev` makes (the default), whose
+/// contents must then be exactly what it writes. A file passed with
+/// `--studio-token-file` may be any token the bridge accepts.
+fn ensure_token(path: &Path, created: bool) -> anyhow::Result<()> {
+    let check = || -> anyhow::Result<bool> {
+        let contents = match fs::read_to_string(path) {
+            Ok(contents) => contents,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(err) => {
+                return Err(err).with_context(|| format!("Could not read {}", path.display()))
+            }
+        };
+        let valid = if created {
+            is_created_token(&contents)
+        } else {
+            valid_token(contents.trim())
+        };
+        anyhow::ensure!(
+            valid,
+            "{} is not a valid Studio token ({}). Delete it to have rojo dev create a new one, or pass --studio-token-file.",
+            path.display(),
+            if created {
+                "64 lowercase hex digits, as rojo dev writes it"
+            } else {
+                "32-256 letters, digits or hyphens"
+            }
+        );
+        Ok(true)
     };
-    if read_valid() {
+    if check()? {
         return Ok(());
     }
-    if !path.exists() {
-        let parent = path.parent().context("Token path has no folder")?;
-        fs::create_dir_all(parent)
-            .with_context(|| format!("Could not create {}", parent.display()))?;
-        let name = path
-            .file_name()
-            .context("Token path has no file name")?
-            .to_string_lossy();
-        let temporary = path.with_file_name(format!(
-            ".{name}.{}.{}.tmp",
-            std::process::id(),
-            uuid::Uuid::new_v4().simple()
-        ));
-        studio::create_token(&temporary).with_context(|| {
-            format!("Could not create the Studio token {}", temporary.display())
-        })?;
-        let linked = fs::hard_link(&temporary, path);
-        let _ = fs::remove_file(&temporary);
-        match linked {
-            Ok(()) => return Ok(()),
-            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
-            // A file system without hard links: create the file in place,
-            // which still never overwrites another process's token.
-            Err(_) => {
-                if let Err(err) = studio::create_token(path) {
-                    if !path.exists() {
-                        return Err(err).with_context(|| {
-                            format!("Could not create the Studio token {}", path.display())
-                        });
-                    }
-                }
-            }
+
+    let parent = path.parent().context("Token path has no folder")?;
+    fs::create_dir_all(parent).with_context(|| format!("Could not create {}", parent.display()))?;
+    let name = path
+        .file_name()
+        .context("Token path has no file name")?
+        .to_string_lossy();
+    let temporary = path.with_file_name(format!(
+        ".{name}.{}.{}.tmp",
+        std::process::id(),
+        uuid::Uuid::new_v4().simple()
+    ));
+    studio::create_token(&temporary)
+        .with_context(|| format!("Could not create the Studio token {}", temporary.display()))?;
+    let published = (|| {
+        let _lock = lock_beside(path)?;
+        if !path.exists() {
+            fs::rename(&temporary, path)
+                .with_context(|| format!("Could not create the Studio token {}", path.display()))?;
         }
-    }
-    let deadline = Instant::now() + Duration::from_secs(2);
-    while !read_valid() {
-        anyhow::ensure!(
-            Instant::now() < deadline,
-            "{} is not a valid Studio token (32-256 letters, digits or hyphens). Delete it to have rojo dev create a new one, or pass --studio-token-file.",
-            path.display()
-        );
-        thread::sleep(Duration::from_millis(50));
-    }
+        anyhow::Ok(())
+    })();
+    let _ = fs::remove_file(&temporary);
+    published?;
+
+    anyhow::ensure!(
+        check()?,
+        "{} disappeared right after it was created",
+        path.display()
+    );
     Ok(())
 }
 
@@ -1302,13 +1441,94 @@ mod test {
             server_session: "session".to_owned(),
         };
         state.write(&path).unwrap();
-        assert_eq!(DevState::read(&path), Some(state.clone()));
-        DevState::remove_own(&path);
+        assert_eq!(DevState::read(&path), Ok(Some(state.clone())));
+        let mine = DevState {
+            pid: std::process::id(),
+            ..state.clone()
+        };
+        mine.remove_own(&path);
         assert!(path.exists(), "another process's state was removed");
+
+        // A newer rojo dev in the same process (or one whose PID was reused)
+        // recorded another server since: still not this record.
+        mine.write(&path).unwrap();
         state.pid = std::process::id();
+        state.server_session = "newer".to_owned();
         state.write(&path).unwrap();
-        DevState::remove_own(&path);
-        assert!(!path.exists());
+        mine.remove_own(&path);
+        assert_eq!(DevState::read(&path), Ok(Some(state.clone())));
+
+        state.remove_own(&path);
+        assert_eq!(DevState::read(&path), Ok(None));
+    }
+
+    #[test]
+    fn only_a_missing_record_means_no_rojo_dev() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(STATE_FILE);
+        assert_eq!(DevState::read(&path), Ok(None));
+
+        fs::write(&path, "{\"pid\": 1").unwrap();
+        let reason = DevState::read(&path).unwrap_err();
+        assert!(reason.contains("not a valid record"), "{reason}");
+        // An unreadable record (here a folder in its place) fails closed too.
+        fs::remove_file(&path).unwrap();
+        fs::create_dir(&path).unwrap();
+        let reason = DevState::read(&path).unwrap_err();
+        assert!(reason.contains("could not be read"), "{reason}");
+
+        let checkout = Checkout {
+            root: dir.path().to_owned(),
+            primary: true,
+            in_git: true,
+            shared_state: dir.path().to_owned(),
+            worktree_state: dir.path().to_owned(),
+        };
+        let (found, state) = find_running(&checkout, dir.path()).unwrap();
+        assert_eq!(found, path);
+        let error = use_record(&found, state).unwrap_err();
+        let text = format!("{error:#}");
+        assert!(text.contains("could not be confirmed"), "{text}");
+        assert!(text.contains("could not be read"), "{text}");
+        assert_eq!(super::super::exit_status(&error).0, 2);
+    }
+
+    #[test]
+    fn concurrent_record_writes_and_removals_never_lose_the_newest() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = Arc::new(dir.path().join(STATE_FILE));
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let state = |session: &str| DevState {
+            pid: std::process::id(),
+            address: "http://127.0.0.1:34900".to_owned(),
+            token_file: PathBuf::from("token"),
+            project: PathBuf::from("default.project.json"),
+            server_session: session.to_owned(),
+        };
+        let old = state("old");
+        old.write(&path).unwrap();
+        let new = state("new");
+        let threads = [
+            {
+                let (path, barrier, old) = (Arc::clone(&path), Arc::clone(&barrier), old.clone());
+                thread::spawn(move || {
+                    barrier.wait();
+                    old.remove_own(&path);
+                })
+            },
+            {
+                let (path, barrier, new) = (Arc::clone(&path), Arc::clone(&barrier), new.clone());
+                thread::spawn(move || {
+                    barrier.wait();
+                    new.write(&path).unwrap();
+                })
+            },
+        ];
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        // Whichever ran first, the new record survives.
+        assert_eq!(DevState::read(&path), Ok(Some(new)));
     }
 
     #[test]
@@ -1488,7 +1708,7 @@ mod test {
                 let barrier = Arc::clone(&barrier);
                 thread::spawn(move || {
                     barrier.wait();
-                    ensure_token(&path).unwrap();
+                    ensure_token(&path, true).unwrap();
                     fs::read_to_string(&*path).unwrap()
                 })
             })
@@ -1498,27 +1718,59 @@ mod test {
             .map(|thread| thread.join().unwrap())
             .collect();
         assert_eq!(tokens.len(), 1, "{tokens:?}");
-        assert!(valid_token(tokens.iter().next().unwrap().trim()));
-        // Only the token is left, no temporary files.
-        assert_eq!(fs::read_dir(path.parent().unwrap()).unwrap().count(), 1);
+        assert!(is_created_token(tokens.iter().next().unwrap()));
+        // Only the token and its lock are left, no temporary files.
+        let mut names: Vec<_> = fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            [format!(".{TOKEN_FILE}.lock"), TOKEN_FILE.to_owned()]
+        );
     }
 
     #[test]
     fn an_existing_token_is_kept_and_an_invalid_one_is_an_error() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(TOKEN_FILE);
+        // A token passed with --studio-token-file may be any the bridge
+        // accepts.
         fs::write(&path, "0123456789abcdef0123456789abcdef\n").unwrap();
-        ensure_token(&path).unwrap();
+        ensure_token(&path, false).unwrap();
         assert_eq!(
             fs::read_to_string(&path).unwrap(),
             "0123456789abcdef0123456789abcdef\n"
         );
         fs::write(&path, "short").unwrap();
-        let error = ensure_token(&path).unwrap_err();
+        let error = ensure_token(&path, false).unwrap_err();
         assert!(
             error.to_string().contains("not a valid Studio token"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn a_created_token_must_be_exactly_what_rojo_dev_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(TOKEN_FILE);
+        let full = "0123456789abcdef".repeat(4);
+        fs::write(&path, &full).unwrap();
+        ensure_token(&path, true).unwrap();
+        // A prefix of one, as a write cut short would leave, is valid for the
+        // bridge but not what rojo dev writes, and is refused at once.
+        for contents in [&full[..40], &format!("{full}\n"), &full.to_uppercase()] {
+            fs::write(&path, contents).unwrap();
+            let started = Instant::now();
+            let error = ensure_token(&path, true).unwrap_err();
+            assert!(started.elapsed() < Duration::from_secs(1));
+            assert!(
+                error.to_string().contains("not a valid Studio token"),
+                "{error}"
+            );
+            assert_eq!(fs::read_to_string(&path).unwrap(), contents);
+        }
     }
 
     #[test]
@@ -1569,7 +1821,7 @@ mod test {
         let pid = child.id();
         child.wait().unwrap();
         let state = recorded(dir.path(), "http://127.0.0.1:9".to_owned(), pid);
-        let error = use_record(&dir.path().join(STATE_FILE), state).unwrap_err();
+        let error = use_record(&dir.path().join(STATE_FILE), Ok(state)).unwrap_err();
         let text = format!("{error:#}");
         assert!(text.contains("could not be confirmed"), "{text}");
         assert!(text.contains("--address and --token-file"), "{text}");
@@ -1589,7 +1841,7 @@ mod test {
         }));
         let state = recorded(dir.path(), address.clone(), std::process::id());
         let token = state.token_file.clone();
-        let (found, found_token) = use_record(&dir.path().join(STATE_FILE), state).unwrap();
+        let (found, found_token) = use_record(&dir.path().join(STATE_FILE), Ok(state)).unwrap();
         assert_eq!(found, address);
         assert_eq!(found_token, Some(token));
     }
@@ -1744,6 +1996,94 @@ mod test {
             error.to_string().contains(&taken_port.to_string()),
             "{error}"
         );
+    }
+
+    #[test]
+    fn port_zero_is_refused() {
+        let error = pick_port(&request(Some(0), None, true), |_| true).unwrap_err();
+        assert!(error.to_string().contains("--port 0"), "{error}");
+        assert_eq!(super::super::exit_status(&error).0, 2);
+        let error = pick_port(&request(None, Some(0), true), |_| true).unwrap_err();
+        assert!(error.to_string().contains("servePort 0"), "{error}");
+        // --port wins over the project's servePort 0, as it does over any.
+        let picked = pick_port(&request(Some(5000), Some(0), true), |_| true).unwrap();
+        assert_eq!(picked, (5000, PortSource::Flag));
+    }
+
+    /// A port nothing listens on for either loopback address right now.
+    fn free_port() -> u16 {
+        loop {
+            let port = TcpListener::bind("127.0.0.1:0")
+                .unwrap()
+                .local_addr()
+                .unwrap()
+                .port();
+            if port_is_free(Ipv4Addr::LOCALHOST.into(), port) {
+                return port;
+            }
+        }
+    }
+
+    #[test]
+    fn the_other_loopback_address_is_held_without_accepting() {
+        let port = free_port();
+        let (listener, companion) = bind_with_companion(Ipv4Addr::LOCALHOST.into(), port).unwrap();
+        assert_eq!(listener.local_addr().unwrap().port(), port);
+        let Some(companion) = companion else {
+            // No IPv6 on this machine, so `localhost` cannot be ambiguous.
+            return;
+        };
+        // Nothing else can listen there while it is held.
+        let taken = TcpListener::bind(("::1", port)).unwrap_err();
+        assert_eq!(taken.kind(), std::io::ErrorKind::AddrInUse);
+        // A client trying it is refused rather than left waiting, so it moves
+        // on to 127.0.0.1.
+        let connected = std::net::TcpStream::connect_timeout(
+            &SocketAddr::new(Ipv6Addr::LOCALHOST.into(), port),
+            Duration::from_secs(5),
+        );
+        assert!(connected.is_err());
+        drop(companion);
+        drop(TcpListener::bind(("::1", port)).unwrap());
+    }
+
+    #[test]
+    fn a_taken_other_loopback_address_is_a_lost_race() {
+        let port = free_port();
+        let Ok(other) = TcpListener::bind(("::1", port)) else {
+            return;
+        };
+        let error = bind_with_companion(Ipv4Addr::LOCALHOST.into(), port).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::AddrInUse);
+        // The listener on 127.0.0.1 was let go again.
+        drop(TcpListener::bind(("127.0.0.1", port)).unwrap());
+
+        // An automatic port moves on to the next one; an explicit one fails.
+        let first = WORKTREE_PORT_FIRST + 10;
+        let mut tried = Vec::new();
+        let (_, chosen, _) = bind_port(
+            &request(None, None, false),
+            |_| true,
+            |candidate| {
+                tried.push(candidate);
+                if candidate == first {
+                    bind_with_companion(Ipv4Addr::LOCALHOST.into(), port)
+                } else {
+                    bind_with_companion(Ipv4Addr::LOCALHOST.into(), free_port())
+                }
+            },
+        )
+        .unwrap();
+        assert_eq!(chosen, first + 1);
+        assert_eq!(tried, vec![first, first + 1]);
+        let error = bind_port(
+            &request(Some(port), None, true),
+            |_| true,
+            |candidate| bind_with_companion(Ipv4Addr::LOCALHOST.into(), candidate),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains(&port.to_string()), "{error}");
+        drop(other);
     }
 
     #[test]

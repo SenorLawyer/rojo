@@ -23,7 +23,8 @@ with `default.project.json`, defaulting to the current directory.
    with exit status 1, unless `--force` is given. `--plugins-dir` is passed to
    the plugin check as for `rojo doctor`.
 2. Picks the port. `--port`, then the project's `servePort`, are used exactly
-   and are an error when something already listens there. Without either, a
+   and are an error when something already listens there. Port 0 is refused
+   in both; leave the port out to have `rojo dev` pick one. Without either, a
    repository's main checkout (or a project outside Git) takes 34872, the
    plugin's default, when it is free. A linked worktree, or a main checkout
    whose 34872 is taken, takes a port from 34873 to 34936: it starts at a slot
@@ -91,7 +92,9 @@ even another worktree's `rojo dev` with the shared token, does not match. The
 check waits up to 20 seconds, longer than the bridge holds a request while Git
 is busy, and never follows a redirect.
 
-A record that cannot be confirmed is an error (exit status 2), not a reason
+A record that cannot be confirmed is an error (exit status 2), and so is a
+`dev.json` that cannot be read or is not a valid record; only a missing file
+means no `rojo dev` runs there. Neither is a reason
 to try the default address: that server is often another worktree's, such as
 the main checkout's, and a command meant for this worktree's Studio must not
 run against it. The error says to restart `rojo dev`, pass `--address` and
@@ -101,7 +104,10 @@ run against it. The error says to restart `rojo dev`, pass `--address` and
 console window, SIGTERM or SIGHUP. A `rojo dev` that is killed leaves it
 behind, so flagless commands in that worktree fail until `rojo dev` starts
 there again or the file is deleted. Two `rojo dev` in one worktree share one
-`dev.json`, and the last one started wins.
+`dev.json`, and the last one started wins. Writing and removing it happen
+under a lock file next to it (`.dev.json.lock`), and a stopping `rojo dev`
+removes the record only while it is still its own, so it never deletes a
+newer one's.
 
 Requests that carry the Studio token, from `rojo studio`, `rojo test` and this
 check, never follow redirects, since the HTTP client would otherwise send the
@@ -112,13 +118,20 @@ token on to wherever a redirect points.
 Before taking a port, `rojo dev` checks that nothing holds it on the listen
 address, on 127.0.0.1 or ::1, or on either wildcard address, since the plugin
 connects to `localhost`, which can resolve to either. It then binds the port
-at once and holds it while it sets up. If another launch took an
-automatically chosen port in between, it tries the next one (up to 8 ports);
-a port from `--port` or `servePort` is never swapped. Several worktrees can
-start `rojo dev` for the first time at once: the token is written whole to a
-private temporary file and hard-linked into place, which never replaces an
-existing token, so they all end up with the same one. A token file that is
-not 32-256 letters, digits or hyphens is an error.
+at once and holds it while it sets up. For as long as the server runs, it
+also reserves the same port on the other IP version's loopback address (::1
+for a server on 127.0.0.1 or 0.0.0.0, 127.0.0.1 for one on ::1) with a socket
+that is bound but does not listen, so no other server can take it there and
+answer `localhost` instead; a client trying it is refused and moves on. If
+another launch took an automatically chosen port, on either address, in
+between, it tries the next one (up to 8 ports); a port from `--port` or
+`servePort` is never swapped. Several worktrees can start `rojo dev` for the
+first time at once: the token is written whole to a private temporary file
+and renamed into place only while no token exists, under a lock file next to
+it, so readers never see part of one and they all end up with the same one.
+The default token file must hold exactly what `rojo dev` writes, 64 lowercase
+hex digits; one passed with `--studio-token-file` may be any 32-256 letters,
+digits or hyphens. Anything else is an error.
 
 A sourcemap write that fails, for example because an editor holds the file,
 is retried every second until it succeeds.
