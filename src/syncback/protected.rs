@@ -26,6 +26,10 @@ impl ProtectedPartitions {
         true
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.bases.is_empty()
+    }
+
     pub fn iter(&self) -> impl Iterator<Item = &(String, PathBuf)> {
         self.bases.iter()
     }

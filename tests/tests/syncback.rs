@@ -275,6 +275,27 @@ fn partition_ignore_globs_dup_ref() {
     });
 }
 
+/// Studio added an instance under a nested project's root, whose partition is
+/// the nested project's `$path` while the root itself is made from its
+/// project file. It is in the partition all the same, so a pointer at it is
+/// not linked with an ID no file would hold.
+#[test]
+fn partition_ignore_globs_nested_ref() {
+    run_syncback_test("partition_ignore_globs_nested_ref", |path| {
+        assert!(!path.join("pkg/src/NewTarget.model.json").exists());
+        assert_eq!(
+            fs_err::read_to_string(path.join("pkg/src/Foo.luau")).unwrap(),
+            "return \"Foo\"\n"
+        );
+        let pointer = fs_err::read_to_string(path.join("unfiltered/Pointer.model.json")).unwrap();
+        assert!(!pointer.contains("Rojo_Target_Value"), "{pointer}");
+        assert_eq!(
+            fs_err::read_to_string(path.join("unfiltered/Foo.luau")).unwrap(),
+            "return \"Foo from Studio\"\n"
+        );
+    });
+}
+
 /// Partitions are found from every project file: a nested project's root
 /// node, and a node whose `$path` names a project file (based at that file's
 /// folder), are both skipped.

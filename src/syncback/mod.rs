@@ -177,6 +177,7 @@ pub fn syncback_loop(
     if !ignore_referents {
         log::debug!("Linking referents for new DOM");
         let old: &RojoTree = old_tree;
+        let protected = ProtectedInstances::new(old, &skipped_partitions);
         // Whether the files give `id` to this very instance, matched to its
         // counterpart there, rather than to some other instance.
         let owns_on_disk = |dom: &WeakDom, target: Ref, id: &str| {
@@ -188,15 +189,15 @@ pub fn syncback_loop(
         // An ID in a protected partition is never given or changed, since
         // the change would not be written: only a target there that keeps
         // the ID its own files give it can be linked to.
+        // Checked first: without protected partitions, nothing else is
+        // looked up.
         let unlinkable = |dom: &WeakDom, target: Ref, id: Option<&str>, needs_new_id: bool| {
-            let persisted = id.is_some_and(|id| owns_on_disk(dom, target, id));
-            (needs_new_id || !persisted)
-                && in_protected_partition(dom, target, old, &skipped_partitions)
+            protected.contains(dom, target)
+                && (needs_new_id || !id.is_some_and(|id| owns_on_disk(dom, target, id)))
         };
         // Such an ID stays with its owner, so a copy cannot take it first.
         let reserved = |dom: &WeakDom, target: Ref, id: &str| {
-            owns_on_disk(dom, target, id)
-                && in_protected_partition(dom, target, old, &skipped_partitions)
+            protected.contains(dom, target) && owns_on_disk(dom, target, id)
         };
         // What the files say for a pointer whose target cannot be linked.
         let on_disk = |dom: &WeakDom, holder: Ref, attribute: &str| {
@@ -669,45 +670,95 @@ fn get_property_filter(project: &Project, new_inst: &Instance) -> Option<UstrSet
 
 /// Finds the instance in `old` at the same path as `new_ref` in `new`, if
 /// every name along the path picks out exactly one child of the same class.
-/// Whether `new_ref` in Studio's tree is in a protected partition: whether
-/// the nearest instance at or above it that the files' tree has at the same
-/// path was made from a file in one, or is the project node of one.
-fn in_protected_partition(
-    new: &WeakDom,
-    new_ref: Ref,
-    old: &RojoTree,
-    protected: &ProtectedPartitions,
-) -> bool {
-    let mut current = new_ref;
-    while let Some(inst) = new.get_by_ref(current) {
-        if let Some(old_ref) = old_instance_at_same_path(new, current, old) {
-            let Some(source) = old
-                .get_metadata(old_ref)
-                .and_then(|metadata| metadata.instigating_source.as_ref())
-            else {
-                return false;
-            };
-            return match source {
-                InstigatingSource::Path(path) => protected.contains(path),
-                InstigatingSource::ProjectNode { path, node, .. } => {
-                    node.path.as_ref().is_some_and(|node_path| {
-                        let node_path = node_path.path();
-                        if node_path.is_absolute() {
-                            protected.contains(node_path)
-                        } else {
-                            path.parent()
-                                .is_some_and(|folder| protected.contains(&folder.join(node_path)))
-                        }
-                    })
-                }
-            };
+/// The instances of the files' tree that are in protected partitions, by
+/// their place in the tree, so that a ref target in Studio's tree can be
+/// checked by where it sits rather than by which file made the instance
+/// nearest it. A nested project's root is made from its project file, but
+/// sits on the partition its `$path` names, and so does anything Studio adds
+/// under it.
+struct ProtectedInstances {
+    /// The name and class of each protected instance and its ancestors, from
+    /// the DataModel down, outermost first.
+    roots: Vec<Vec<(String, Ustr)>>,
+}
+
+impl ProtectedInstances {
+    fn new(old: &RojoTree, protected: &ProtectedPartitions) -> Self {
+        let mut roots: Vec<Vec<(String, Ustr)>> = Vec::new();
+        if protected.is_empty() {
+            return ProtectedInstances { roots };
         }
-        if inst.parent().is_none() {
+        for inst in old.descendants(old.get_root_id()) {
+            let metadata = inst.metadata();
+            // The files an instance is made from, as it records them: a
+            // folder, a file, or a project node's `$path` folder.
+            let instigating =
+                metadata
+                    .instigating_source
+                    .as_ref()
+                    .and_then(|source| match source {
+                        InstigatingSource::Path(path) => Some(path.clone()),
+                        InstigatingSource::ProjectNode { path, node, .. } => {
+                            let node_path = node.path.as_ref()?.path();
+                            Some(if node_path.is_absolute() {
+                                node_path.to_owned()
+                            } else {
+                                path.parent()?.join(node_path)
+                            })
+                        }
+                    });
+            let in_partition = instigating
+                .iter()
+                .chain(&metadata.relevant_paths)
+                .filter(|path| !Project::is_project_file(path))
+                .any(|path| protected.contains(path));
+            if !in_partition {
+                continue;
+            }
+            let path = tree_path(old, inst.id());
+            // A descendant of one already listed adds nothing.
+            if !roots.iter().any(|root| path.starts_with(root)) {
+                roots.retain(|root| !root.starts_with(&path));
+                roots.push(path);
+            }
+        }
+        ProtectedInstances { roots }
+    }
+
+    /// Whether `new_ref` in Studio's tree is a protected instance or under
+    /// one.
+    fn contains(&self, new: &WeakDom, new_ref: Ref) -> bool {
+        if self.roots.is_empty() {
             return false;
         }
+        let mut path = Vec::new();
+        let mut current = new_ref;
+        while let Some(inst) = new.get_by_ref(current) {
+            if inst.parent().is_none() {
+                break;
+            }
+            path.push((inst.name.clone(), inst.class));
+            current = inst.parent();
+        }
+        path.reverse();
+        self.roots.iter().any(|root| path.starts_with(root))
+    }
+}
+
+/// The name and class of `id` and its ancestors below the root, outermost
+/// first.
+fn tree_path(tree: &RojoTree, id: Ref) -> Vec<(String, Ustr)> {
+    let mut path = Vec::new();
+    let mut current = id;
+    while let Some(inst) = tree.get_instance(current) {
+        if inst.parent().is_none() {
+            break;
+        }
+        path.push((inst.name().to_owned(), inst.class_name()));
         current = inst.parent();
     }
-    false
+    path.reverse();
+    path
 }
 
 fn old_instance_at_same_path(new: &WeakDom, new_ref: Ref, old: &RojoTree) -> Option<Ref> {
@@ -794,6 +845,18 @@ fn strip_unknown_root_children(new: &mut WeakDom, old: &RojoTree) {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    /// Without protected partitions, ref targets are never looked up in the
+    /// files' tree.
+    #[test]
+    fn no_protected_partitions_means_no_lookups() {
+        let tree = RojoTree::new(crate::snapshot::InstanceSnapshot::new().class_name("DataModel"));
+        let protected = ProtectedInstances::new(&tree, &ProtectedPartitions::default());
+        assert!(protected.roots.is_empty());
+        let mut dom = WeakDom::new(rbx_dom_weak::InstanceBuilder::new("DataModel"));
+        let child = dom.insert(dom.root_ref(), rbx_dom_weak::InstanceBuilder::new("Folder"));
+        assert!(!protected.contains(&dom, child));
+    }
 
     fn rules(ignore_paths: &[&str], create_ignore_dir_paths: Option<bool>) -> SyncbackRules {
         SyncbackRules {
