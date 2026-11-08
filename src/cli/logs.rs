@@ -190,6 +190,9 @@ impl LogsCommand {
         for notice in &batch.notices {
             writeln!(err, "{}", redact(notice))?;
         }
+        if let Some(message) = &batch.unknown_jobs_message {
+            return Err(UsageError(anyhow::anyhow!("{message}")).into());
+        }
         let failed_servers: Vec<String> =
             batch.failed_servers.iter().map(|job| redact(job)).collect();
         let entries: Vec<GameServerLog> = newest(batch.entries, self.limit)
@@ -275,6 +278,9 @@ impl LogsCommand {
             let batch = reader.round(now_ms());
             for notice in &batch.notices {
                 eprintln!("{}", redact(notice));
+            }
+            if let Some(message) = &batch.unknown_jobs_message {
+                return Err(UsageError(anyhow::anyhow!("{message}")).into());
             }
             // Like `tail -f`, start with the newest entries only.
             let entries = if first {
@@ -490,6 +496,10 @@ struct Batch {
     /// Why the round stopped early. `entries` still holds what the servers
     /// read before it returned, and the reader counts those as shown.
     error: Option<OpenCloudError>,
+    /// Servers named with --job-id that a complete listing does not have.
+    unknown_jobs: Vec<String>,
+    /// What to say about `unknown_jobs`, which ends the command.
+    unknown_jobs_message: Option<String>,
 }
 
 impl Batch {
@@ -888,6 +898,28 @@ impl<'a, S: LogSource> Reader<'a, S> {
         if batch.listing_complete() {
             let listed: HashSet<&str> = servers.iter().map(|(_, s)| s.job_id.as_str()).collect();
             self.finished.retain(|job, _| listed.contains(job.as_str()));
+        }
+        // A --job-id that a listing of every server does not have at all,
+        // running or shut down, in any of the versions, is a mistake in the
+        // arguments, such as a typo, which reading again would not fix.
+        if batch.listing_complete() && !self.jobs.is_empty() {
+            let listed: HashSet<&str> = servers.iter().map(|(_, s)| s.job_id.as_str()).collect();
+            batch.unknown_jobs = self
+                .jobs
+                .iter()
+                .filter(|job| !listed.contains(job.as_str()))
+                .cloned()
+                .collect();
+            if !batch.unknown_jobs.is_empty() {
+                batch.unknown_jobs_message = Some(format!(
+                    "No server with job id {} in place {} versions {}. Check --job-id, \
+                     and --place-version for servers of other versions.",
+                    batch.unknown_jobs.join(", "),
+                    self.place,
+                    versions.join(", ")
+                ));
+                return Ok(Vec::new());
+            }
         }
         let targets = select_servers(servers, since_ms, &self.jobs, &self.finished);
         if !self.jobs.is_empty() {
@@ -1609,6 +1641,115 @@ mod tests {
         assert!(batch.error.is_none());
         assert_eq!(batch.failed_servers, ["a"]);
         assert!(!is_usage_problem(&OpenCloudError::NotSent("x".into())));
+    }
+
+    #[test]
+    fn a_job_id_no_listed_server_has_is_an_error() {
+        // Neither running nor shut down in any listed version.
+        for (args, follow) in [
+            (vec!["--job-id", "typo"], false),
+            (
+                vec![
+                    "--job-id",
+                    "typo",
+                    "--place-version",
+                    "44",
+                    "--place-version",
+                    "45",
+                ],
+                false,
+            ),
+            (
+                vec!["--job-id", "typo", "--follow", "--interval", "1"],
+                true,
+            ),
+        ] {
+            let mut fake = Fake::default();
+            fake.versions = vec!["45".to_owned()];
+            for _ in 0..2 {
+                fake.servers(
+                    vec![
+                        server("a", false, None),
+                        server("old", true, Some("2026-11-07T08:00:00Z")),
+                    ],
+                    None,
+                );
+            }
+            let command = parse(&args);
+            let mut reader = Reader::new(&fake, &command);
+            let error = if follow {
+                let mut out = Lines {
+                    written: Vec::new(),
+                    lines: 100,
+                };
+                command
+                    .follow(&mut reader, &mut out, &|text: &str| text.to_owned())
+                    .unwrap_err()
+            } else {
+                let (mut out, mut err) = (Vec::new(), Vec::new());
+                command
+                    .read_once(
+                        &mut reader,
+                        &mut out,
+                        &mut err,
+                        &|text: &str| text.to_owned(),
+                        NOW,
+                    )
+                    .unwrap_err()
+            };
+            let text = format!("{error:#}");
+            assert!(
+                text.contains("No server with job id typo in place 2"),
+                "{text}"
+            );
+            assert!(error.is::<UsageError>(), "{text}");
+            assert!(log_tokens(&fake, "a").is_empty());
+        }
+    }
+
+    #[test]
+    fn a_job_id_missing_from_an_incomplete_listing_is_only_a_notice() {
+        let fake = Fake::default();
+        let command = parse(&[
+            "--place-version",
+            "45",
+            "--place-version",
+            "46",
+            "--job-id",
+            "maybe",
+        ]);
+        let mut reader = Reader::new(&fake, &command);
+        fake.partial_servers(vec![server("a", false, None)]);
+        let batch = reader.round(NOW);
+        assert!(batch.unknown_jobs_message.is_none());
+        assert!(batch.error.is_none());
+        assert!(
+            batch
+                .notices
+                .iter()
+                .any(|notice| notice.contains("Server maybe is not among")),
+            "{:?}",
+            batch.notices
+        );
+
+        // A named server that only shut down before --since is listed, so it
+        // is not a mistake either.
+        let fake = Fake::default();
+        let command = parse(&[
+            "--place-version",
+            "45",
+            "--place-version",
+            "46",
+            "--job-id",
+            "old",
+        ]);
+        let mut reader = Reader::new(&fake, &command);
+        fake.servers(
+            vec![server("old", true, Some("2026-11-07T08:00:00Z"))],
+            None,
+        );
+        let batch = reader.round(NOW);
+        assert!(batch.unknown_jobs_message.is_none());
     }
 
     #[test]
@@ -2375,9 +2516,17 @@ mod tests {
             "x",
         ]);
         let mut reader = reader(&fake, &command);
-        fake.servers(vec![server("a", false, None)], None);
+        // Listed, but shut down before --since, so not read.
+        fake.servers(
+            vec![
+                server("a", false, None),
+                server("x", true, Some("2026-11-07T08:00:00Z")),
+            ],
+            None,
+        );
         let batch = reader.round(NOW);
         assert_eq!(batch.servers_read, 0);
+        assert!(batch.unknown_jobs_message.is_none());
         assert!(
             batch.notices[0].contains("Server x is not among"),
             "{:?}",
