@@ -106,6 +106,9 @@ pub fn collect_referents(dom: &WeakDom) -> RefLinks {
     }
 }
 
+/// See `unlinkable` on [`link_referents`].
+pub type Unlinkable<'a> = dyn Fn(&WeakDom, Ref, Option<&str>, bool) -> bool + 'a;
+
 /// Links Ref properties with attributes: gives every instance that is
 /// pointed at an ID where it needs one, and every pointer a
 /// `Rojo_Target_*` attribute naming it.
@@ -120,7 +123,7 @@ pub fn collect_referents(dom: &WeakDom) -> RefLinks {
 pub fn link_referents(
     links: RefLinks,
     dom: &mut WeakDom,
-    unlinkable: &dyn Fn(&WeakDom, Ref, Option<&str>, bool) -> bool,
+    unlinkable: &Unlinkable,
     on_disk: &dyn Fn(&WeakDom, Ref, &str) -> Option<Variant>,
 ) -> anyhow::Result<()> {
     let mut skipped = HashSet::new();
