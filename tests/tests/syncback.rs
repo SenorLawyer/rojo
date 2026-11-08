@@ -341,6 +341,30 @@ fn json_model_ignore_unknown_instances() {
     });
 }
 
+/// Studio copied a protected instance, ID and all, into a synced partition,
+/// and points at the copy only. The ID stays the protected file's, so the
+/// copy is written with a new one, which its pointer uses.
+#[test]
+fn partition_ignore_globs_reserved_id() {
+    run_syncback_test("partition_ignore_globs_reserved_id", |path| {
+        assert_eq!(
+            fs_err::read_to_string(path.join("filtered/Kept.model.json")).unwrap(),
+            "{\n  \"className\": \"Folder\",\n  \"attributes\": {\n    \"Rojo_Id\": \"kept\"\n  }\n}\n"
+        );
+        let read = |name: &str| {
+            let text = fs_err::read_to_string(path.join(name)).unwrap();
+            serde_json::from_str::<serde_json::Value>(&text).unwrap()
+        };
+        // A Folder is written as a directory with its attributes in its
+        // init.meta.json.
+        let copy = read("unfiltered/Copy/init.meta.json");
+        let id = copy["attributes"]["Rojo_Id"].as_str().unwrap();
+        assert_ne!(id, "kept", "{copy}");
+        let pointer = read("unfiltered/Pointer.model.json");
+        assert_eq!(pointer["attributes"]["Rojo_Target_Value"], id, "{pointer}");
+    });
+}
+
 /// Partitions are found from every project file: a nested project's root
 /// node, and a node whose `$path` names a project file (based at that file's
 /// folder), are both skipped.

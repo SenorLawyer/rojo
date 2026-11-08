@@ -32,7 +32,7 @@ use crate::{
         ref_properties::{collect_referents, link_referents},
         snapshot::inst_path,
     },
-    Project, RojoRef,
+    Project, RojoRef, REF_ID_ATTRIBUTE_NAME,
 };
 
 pub use file_names::{extension_for_middleware, name_for_inst, validate_file_name};
@@ -211,6 +211,16 @@ pub fn syncback_loop(
                 _ => None,
             }
         };
+        // The IDs files in protected partitions hold stay theirs, whether
+        // or not anything points at those instances now, and even if Studio
+        // deleted them, since their files stay. An instance syncback writes
+        // that carries one, such as a copy Studio made of a protected
+        // instance, gets a new ID of its own, which its pointers then use;
+        // otherwise two files would hold the same ID.
+        let reserved_ids = protected.ids_on_disk(old);
+        if !reserved_ids.is_empty() {
+            give_new_ids_to_writable_holders(&mut new_tree, &protected, &reserved_ids)?;
+        }
         link_referents(
             deferred_referents,
             &mut new_tree,
@@ -728,6 +738,24 @@ impl ProtectedInstances {
         ProtectedInstances { roots }
     }
 
+    /// The IDs that instances in protected partitions have in the files'
+    /// tree.
+    fn ids_on_disk(&self, old: &RojoTree) -> HashSet<String> {
+        if self.roots.is_empty() {
+            return HashSet::new();
+        }
+        old.descendants(old.get_root_id())
+            .filter_map(|inst| {
+                let id = inst.metadata().specified_id.as_ref()?;
+                let path = tree_path(old, inst.id());
+                self.roots
+                    .iter()
+                    .any(|root| path.starts_with(root))
+                    .then(|| id.as_str().to_owned())
+            })
+            .collect()
+    }
+
     /// Whether `new_ref` in Studio's tree is a protected instance or under
     /// one.
     fn contains(&self, new: &WeakDom, new_ref: Ref) -> bool {
@@ -746,6 +774,47 @@ impl ProtectedInstances {
         path.reverse();
         self.roots.iter().any(|root| path.starts_with(root))
     }
+}
+
+/// Gives every instance in `dom` outside protected partitions whose
+/// `Rojo_Id` is one of `reserved` a new ID, so that the files syncback writes
+/// never repeat an ID a protected file holds.
+fn give_new_ids_to_writable_holders(
+    dom: &mut WeakDom,
+    protected: &ProtectedInstances,
+    reserved: &HashSet<String>,
+) -> anyhow::Result<()> {
+    let attributes_key = ustr("Attributes");
+    let holders: Vec<Ref> = dom
+        .descendants()
+        .filter(|inst| match inst.properties.get(&attributes_key) {
+            Some(Variant::Attributes(attributes)) => match attributes.get(REF_ID_ATTRIBUTE_NAME) {
+                Some(Variant::String(id)) => reserved.contains(id),
+                Some(Variant::BinaryString(id)) => {
+                    std::str::from_utf8(id.as_ref()).is_ok_and(|id| reserved.contains(id))
+                }
+                _ => false,
+            },
+            _ => false,
+        })
+        .map(|inst| inst.referent())
+        .collect();
+    for holder in holders {
+        if protected.contains(dom, holder) {
+            continue;
+        }
+        let path = inst_path(dom, holder);
+        let fresh = rbx_dom_weak::types::UniqueId::now()?.to_string();
+        let inst = dom.get_by_ref_mut(holder).unwrap();
+        if let Some(Variant::Attributes(attributes)) = inst.properties.get_mut(&attributes_key) {
+            attributes.insert(REF_ID_ATTRIBUTE_NAME.to_owned(), Variant::String(fresh));
+        }
+        log::warn!(
+            "{path} has the ID of an instance in a partition with $globIgnorePaths, \
+             which keeps it, so it was given a new one"
+        );
+    }
+    Ok(())
 }
 
 /// The names of `id` and its ancestors below the root, outermost first.
