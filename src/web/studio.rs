@@ -4860,7 +4860,16 @@ mod tests {
             .find(|record| json!(record.id) != backups[0]["id"])
             .unwrap();
         assert!(store.exists(&late.id));
-        assert!(dir_path.join(format!("{}.pin", late.id)).exists());
+        // The pin is written right after the record, under the same lock,
+        // so the record can be listed a moment before it.
+        let pin = dir_path.join(format!("{}.pin", late.id));
+        for _ in 0..100 {
+            if pin.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(pin.exists(), "the late save was not pinned");
     }
 
     #[tokio::test]
