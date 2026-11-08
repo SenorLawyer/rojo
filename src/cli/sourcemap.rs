@@ -175,11 +175,20 @@ pub(super) fn patch_set_affects_sourcemap(
                     .map(|instance| filter(&instance))
                     .unwrap_or(true)
             })
-            // 3. An existing instance has its class name, name,
-            // or file paths changed, and passes the filter
+            // 3. An existing instance changed class. The update only says
+            // what the class is now, and the instance was in the sourcemap
+            // if its old class passed the filter, such as a ModuleScript
+            // folder that became a Folder when its init file was deleted.
+            || set
+                .updated
+                .iter()
+                .any(|updated| updated.changed_class_name.is_some())
+            // 4. An existing instance has its name or file paths changed,
+            // and passes the filter
             || set.updated.iter().any(|updated| {
-                let changed = updated.changed_class_name.is_some()
-                    || updated.changed_properties.contains_key(&rbx_dom_weak::ustr("RunContext"))
+                let changed = updated
+                    .changed_properties
+                    .contains_key(&rbx_dom_weak::ustr("RunContext"))
                     || updated.changed_name.is_some()
                     || updated.changed_metadata.is_some();
                 if changed {
@@ -415,6 +424,61 @@ mod test {
                 filter_non_scripts,
             ));
         }
+    }
+
+    /// A script folder whose only init file is deleted becomes a Folder,
+    /// which the scripts-only sourcemap leaves out, so the class change must
+    /// rewrite it.
+    #[test]
+    fn a_script_becoming_a_folder_invalidates_the_sourcemap() {
+        use crate::cli::sourcemap::{filter_non_scripts, patch_set_affects_sourcemap};
+        use crate::serve_session::ServeSession;
+        use memofs::Vfs;
+        use std::time::{Duration, Instant};
+
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("project");
+        fs_err::create_dir_all(project.join("src")).unwrap();
+        fs_err::write(
+            project.join("default.project.json"),
+            r#"{"name": "root", "tree": {"$path": "src"}}"#,
+        )
+        .unwrap();
+        fs_err::write(project.join("src/init.luau"), "return 1").unwrap();
+        let session = ServeSession::new(Vfs::new_default().unwrap(), &project).unwrap();
+        let root = session.tree().get_root_id();
+        assert_eq!(
+            session.tree().get_instance(root).unwrap().class_name(),
+            "ModuleScript"
+        );
+        let cursor = session.message_queue().cursor();
+
+        fs_err::remove_file(project.join("src/init.luau")).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let patches = loop {
+            assert!(Instant::now() < deadline, "the deletion was not synced");
+            let receiver = session.message_queue().subscribe(cursor).unwrap();
+            let (_, messages) = futures::executor::block_on(receiver).unwrap();
+            let patches: Vec<_> = messages.into_iter().map(|message| message.patch).collect();
+            if session.tree().get_instance(root).unwrap().class_name() == "Folder" {
+                break patches;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        // It is an update of the existing instance, which is what the old
+        // check, by the new class only, missed.
+        assert!(patches
+            .iter()
+            .all(|patch| patch.removed.is_empty() && patch.added.is_empty()));
+        assert!(patches.iter().any(|patch| patch
+            .updated
+            .iter()
+            .any(|update| update.changed_class_name.is_some())));
+        assert!(patch_set_affects_sourcemap(
+            &session,
+            &patches,
+            filter_non_scripts
+        ));
     }
 
     #[test]
