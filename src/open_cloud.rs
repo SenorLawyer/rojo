@@ -951,7 +951,9 @@ impl OpenCloud {
                         attempt += 1;
                         continue;
                     }
-                    let message = self.redact(format!("{request_name}: {error}"));
+                    // The URL is left out: it carries query values such as a
+                    // `rojo logs --search`, which may hold anything.
+                    let message = self.redact(format!("{request_name}: {}", error.without_url()));
                     return Err(if sent {
                         OpenCloudError::Unconfirmed(message)
                     } else {
@@ -979,7 +981,8 @@ impl OpenCloud {
             }
             return text.map_err(|error| {
                 self.unconfirmed(format!(
-                    "{request_name}: response could not be read: {error}"
+                    "{request_name}: response could not be read: {}",
+                    error.without_url()
                 ))
             });
         }
@@ -1017,8 +1020,8 @@ impl OpenCloud {
 
     fn redact(&self, text: String) -> String {
         match std::str::from_utf8(self.key.as_bytes()) {
-            Ok(key) if text.contains(key) => text.replace(key, "[redacted]"),
-            _ => text,
+            Ok(key) => redact_key_in(key, text),
+            Err(_) => text,
         }
     }
 
@@ -1381,6 +1384,93 @@ fn retry_after(response: &reqwest::blocking::Response) -> Option<Duration> {
 }
 
 /// Percent-encodes everything but unreserved characters.
+/// `text` with `key` taken out as written and in the forms URLs and forms
+/// encode it in: percent-encoded with upper or lower case hex digits, as a
+/// query value is here and by most clients, and form-encoded, with `+` for
+/// spaces. An error that shows a request URL could otherwise show a key that
+/// went into a query value.
+pub fn redact_key_in(key: &str, mut text: String) -> String {
+    if key.is_empty() {
+        return text;
+    }
+    let upper = query_escape(key);
+    let lower = escape_with(key, |byte| format!("%{byte:02x}"));
+    let form_upper = escape_with(key, |byte| {
+        if byte == b' ' {
+            "+".to_owned()
+        } else {
+            format!("%{byte:02X}")
+        }
+    });
+    let form_lower = escape_with(key, |byte| {
+        if byte == b' ' {
+            "+".to_owned()
+        } else {
+            format!("%{byte:02x}")
+        }
+    });
+    for variant in [key, &upper, &lower, &form_upper, &form_lower] {
+        if text.contains(variant) {
+            text = text.replace(variant, "[redacted]");
+        }
+    }
+    // Hex digits of either case mixed in one escape.
+    if text.contains('%') && upper != key {
+        text = redact_ignoring_escape_case(&text, &upper);
+    }
+    text
+}
+
+/// `text` with every occurrence of `escaped` (a percent-encoded value with
+/// upper-case hex digits) taken out, whatever the case of each escape.
+fn redact_ignoring_escape_case(text: &str, escaped: &str) -> String {
+    let needle = escaped.as_bytes();
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut index = 0;
+    let mut copied = 0;
+    while index + needle.len() <= bytes.len() {
+        let candidate = &bytes[index..index + needle.len()];
+        let matches = candidate
+            .iter()
+            .zip(needle)
+            .enumerate()
+            .all(|(at, (a, b))| {
+                // Only the two digits after a `%` may differ in case.
+                let in_escape = (1..=2).any(|back| at >= back && needle[at - back] == b'%');
+                if in_escape {
+                    a.eq_ignore_ascii_case(b)
+                } else {
+                    a == b
+                }
+            });
+        if matches {
+            out.push_str(&text[copied..index]);
+            out.push_str("[redacted]");
+            index += needle.len();
+            copied = index;
+        } else {
+            index += 1;
+        }
+    }
+    out.push_str(&text[copied..]);
+    out
+}
+
+/// Percent-encodes `value` like [`query_escape`], with `escape` writing each
+/// byte that is not unreserved.
+fn escape_with(value: &str, escape: impl Fn(u8) -> String) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            escaped.push(byte as char);
+        } else {
+            escaped.push_str(&escape(byte));
+        }
+    }
+    escaped
+}
+
 fn query_escape(value: &str) -> String {
     let mut escaped = String::with_capacity(value.len());
     for byte in value.bytes() {
@@ -1480,6 +1570,23 @@ mod tests {
     };
 
     const KEY: &str = "fixture-key-0123456789";
+
+    #[test]
+    fn the_key_is_redacted_however_a_url_encodes_it() {
+        let key = "a/b=c d";
+        for form in [
+            "a/b=c d",
+            "a%2Fb%3Dc%20d",
+            "a%2fb%3dc%20d",
+            "a%2Fb%3Dc+d",
+            "a%2fb%3dc+d",
+            "a%2Fb%3dc%20d",
+        ] {
+            let text = redact_key_in(key, format!("GET /x?Filter={form}&y=1"));
+            assert_eq!(text, "GET /x?Filter=[redacted]&y=1", "{form}");
+        }
+        assert_eq!(redact_key_in(key, "a%2Fb".to_owned()), "a%2Fb");
+    }
 
     #[derive(Debug, Clone)]
     struct Recorded {

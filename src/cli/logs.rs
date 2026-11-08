@@ -21,8 +21,8 @@ use super::{
     UsageError,
 };
 use crate::open_cloud::{
-    is_path_segment, GameServer, GameServerLog, GameServerLogPage, GameServerPage, LogSeverity,
-    OpenCloud, OpenCloudError, DEFAULT_API_KEY_VAR,
+    is_path_segment, redact_key_in, GameServer, GameServerLog, GameServerLogPage, GameServerPage,
+    LogSeverity, OpenCloud, OpenCloudError, DEFAULT_API_KEY_VAR,
 };
 
 /// Place versions read when none are given: the newest few, since servers
@@ -144,26 +144,35 @@ impl Level {
 
 impl LogsCommand {
     pub fn run(self) -> anyhow::Result<()> {
-        self.validate().map_err(UsageError)?;
-        let client = OpenCloud::from_env(&self.api_key_env)
-            .map_err(UsageError)?
-            .with_request_spacing(Duration::from_secs(60) / self.requests_per_minute);
-        // Open Cloud's own errors leave the key out already, but job ids,
-        // versions and messages that came back from Roblox, or from the
-        // arguments, are printed too, and none of it may show the key.
-        let redact = |text: &str| client.redact_key(text);
-        let mut reader = Reader::new(&client, &self);
-        let result = if self.follow {
-            self.follow(&mut reader, &mut std::io::stdout(), &redact)
-        } else {
-            self.read_once(
-                &mut reader,
-                &mut std::io::stdout(),
-                &mut std::io::stderr(),
-                &redact,
-                now_ms(),
-            )
+        // Set up before anything is checked or printed. Open Cloud's own
+        // errors leave the key out already, but job ids, versions, searches
+        // and messages from Roblox or the arguments are printed too, an
+        // invalid --job-id among them, and none of it may show the key.
+        let key = std::env::var(&self.api_key_env)
+            .ok()
+            .map(|key| key.trim().to_owned());
+        let redact = |text: &str| match key.as_deref() {
+            Some(key) => redact_key_in(key, text.to_owned()),
+            None => text.to_owned(),
         };
+        let result = (|| {
+            self.validate().map_err(UsageError)?;
+            let client = OpenCloud::from_env(&self.api_key_env)
+                .map_err(UsageError)?
+                .with_request_spacing(Duration::from_secs(60) / self.requests_per_minute);
+            let mut reader = Reader::new(&client, &self);
+            if self.follow {
+                self.follow(&mut reader, &mut std::io::stdout(), &redact)
+            } else {
+                self.read_once(
+                    &mut reader,
+                    &mut std::io::stdout(),
+                    &mut std::io::stderr(),
+                    &redact,
+                    now_ms(),
+                )
+            }
+        })();
         result.map_err(|error| redact_error(error, &redact))
     }
 
@@ -1681,6 +1690,78 @@ mod tests {
             assert!(!out.contains(KEY), "{out}");
             assert!(out.contains("message [redacted]"), "{out}");
         }
+    }
+
+    /// A key with characters that URLs encode, so only an encoded copy of
+    /// it would show in a request URL.
+    const URL_KEY: &str = "secret/key=with+chars";
+
+    #[test]
+    fn a_failed_connection_does_not_show_a_search_holding_the_key() {
+        let client = OpenCloud::with_base_url(URL_KEY, "http://127.0.0.1:1")
+            .unwrap()
+            .with_fast_timing();
+        let redact = |text: &str| client.redact_key(text);
+        for json in [false, true] {
+            let mut args = vec!["--place-version", "45", "--job-id", "a", "--search"];
+            let search = format!("token {URL_KEY}");
+            args.push(&search);
+            if json {
+                args.push("--json");
+            }
+            let command = parse(&args);
+            let mut reader = Reader::new(&client, &command);
+            let (mut out, mut err) = (Vec::new(), Vec::new());
+            let error = command
+                .read_once(&mut reader, &mut out, &mut err, &redact, NOW)
+                .map_err(|error| redact_error(error, &redact))
+                .unwrap_err();
+            let printed = format!(
+                "{}{}{error:#}{error:?}",
+                String::from_utf8(out).unwrap(),
+                String::from_utf8(err).unwrap()
+            );
+            for form in [
+                URL_KEY.to_owned(),
+                query_escape_for_test(URL_KEY, false),
+                query_escape_for_test(URL_KEY, true),
+                "secret%2Fkey".to_owned(),
+                "secret%2fkey".to_owned(),
+            ] {
+                assert!(!printed.contains(&form), "{form} in {printed}");
+            }
+            assert!(!printed.contains("127.0.0.1:1/"), "{printed}");
+        }
+    }
+
+    fn query_escape_for_test(value: &str, lower: bool) -> String {
+        value
+            .bytes()
+            .map(|byte| {
+                if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+                    (byte as char).to_string()
+                } else if lower {
+                    format!("%{byte:02x}")
+                } else {
+                    format!("%{byte:02X}")
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn an_invalid_job_id_holding_the_key_is_redacted() {
+        let var = "ROJO_TEST_LOGS_REDACTED_JOB_ID_KEY";
+        // Only this test reads the variable.
+        std::env::set_var(var, URL_KEY);
+        let job = format!("x/{URL_KEY}");
+        let command = parse(&["--api-key-env", var, "--job-id", &job]);
+        let error = command.run().unwrap_err();
+        let text = format!("{error:#}{error:?}");
+        assert!(!text.contains(URL_KEY), "{text}");
+        assert!(text.contains("--job-id"), "{text}");
+        assert!(error.is::<UsageError>());
+        std::env::remove_var(var);
     }
 
     #[test]
