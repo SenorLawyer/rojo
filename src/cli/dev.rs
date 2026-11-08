@@ -14,7 +14,7 @@ use std::{
     sync::atomic::{AtomicBool, Ordering},
     sync::{Arc, Mutex},
     thread,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use anyhow::Context;
@@ -1241,7 +1241,7 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod test {
     use super::*;
-    use std::collections::HashSet;
+    use std::{collections::HashSet, time::Instant};
 
     fn request(flag: Option<u16>, project: Option<u16>, prefer_default: bool) -> PortRequest {
         PortRequest {
