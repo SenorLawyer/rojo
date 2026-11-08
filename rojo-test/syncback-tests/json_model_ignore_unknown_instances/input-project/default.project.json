@@ -1,0 +1,9 @@
+{
+  "name": "json_model_ignore_unknown_instances",
+  "tree": {
+    "$className": "DataModel",
+    "ReplicatedStorage": {
+      "$path": "src"
+    }
+  }
+}

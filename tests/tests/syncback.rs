@@ -314,6 +314,33 @@ fn partition_ignore_globs_class_ref() {
     });
 }
 
+/// Rewriting a `.model.json` keeps `ignoreUnknownInstances` on the model and
+/// on the children that had it, in either spelling, since Studio has no such
+/// setting to send back. What is written reads back the same.
+#[test]
+fn json_model_ignore_unknown_instances() {
+    run_syncback_test("json_model_ignore_unknown_instances", |path| {
+        let text = fs_err::read_to_string(path.join("src/Arena.model.json")).unwrap();
+        let model: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(model["attributes"]["Changed"], true, "{text}");
+        assert_eq!(model["ignoreUnknownInstances"], true, "{text}");
+        let child = |name: &str| {
+            model["children"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|child| child["name"] == name)
+                .unwrap()
+                .clone()
+        };
+        assert_eq!(child("Inner")["ignoreUnknownInstances"], true, "{text}");
+        assert!(
+            child("Plain").get("ignoreUnknownInstances").is_none(),
+            "{text}"
+        );
+    });
+}
+
 /// Partitions are found from every project file: a nested project's root
 /// node, and a node whose `$path` names a project file (based at that file's
 /// folder), are both skipped.

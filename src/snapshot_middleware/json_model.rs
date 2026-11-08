@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     json,
     resolution::UnresolvedValue,
-    snapshot::{InstanceContext, InstanceMetadata, InstanceSnapshot},
+    snapshot::{InstanceContext, InstanceMetadata, InstanceSnapshot, InstigatingSource},
     snapshot_middleware::meta_file::UnknownFields,
     syncback::{filter_properties_preallocated, FsSnapshot, SyncbackReturn, SyncbackSnapshot},
     RojoRef,
@@ -73,7 +73,23 @@ pub fn syncback_json_model<'sync>(
 ) -> anyhow::Result<SyncbackReturn<'sync>> {
     let mut property_buffer = Vec::with_capacity(snapshot.new_inst().properties.len());
 
-    let mut model = json_model_from_pair(snapshot, &mut property_buffer, snapshot.new);
+    // The root's own `ignoreUnknownInstances` is the file's only when the
+    // file made it: a project node naming the file can set it instead.
+    let root_flag_from_file =
+        snapshot
+            .old_inst()
+            .is_some_and(|old_inst| match &old_inst.metadata().instigating_source {
+                Some(InstigatingSource::Path(path)) => *path == snapshot.path,
+                Some(InstigatingSource::ProjectNode { node, .. }) => {
+                    node.ignore_unknown_instances.is_none()
+                }
+                None => false,
+            });
+    let mut model =
+        json_model_from_pair(snapshot, &mut property_buffer, snapshot.new, snapshot.old);
+    if !root_flag_from_file {
+        model.ignore_unknown_instances = None;
+    }
     // We don't need the name on the root, but we do for children.
     model.name = None;
 
@@ -94,10 +110,14 @@ pub fn syncback_json_model<'sync>(
     })
 }
 
+/// The model for `new`. `old` is the instance the file made for it, whose
+/// `ignoreUnknownInstances` is kept, since Studio has no such setting to
+/// send back.
 fn json_model_from_pair<'sync>(
     snapshot: &SyncbackSnapshot<'sync>,
     prop_buffer: &mut Vec<(Ustr, &'sync Variant)>,
     new: Ref,
+    old: Option<Ref>,
 ) -> JsonModel {
     let new_inst = snapshot
         .get_new_instance(new)
@@ -131,10 +151,28 @@ fn json_model_from_pair<'sync>(
         }
     }
 
+    let old_inst = old.and_then(|old| snapshot.get_old_instance(old));
     let mut children = Vec::with_capacity(new_inst.children().len());
 
     for new_child_ref in new_inst.children() {
-        children.push(json_model_from_pair(snapshot, prop_buffer, *new_child_ref))
+        // Children are matched by name and class, and only when that is
+        // unambiguous; nothing else in a model file tells them apart.
+        let old_child = old_inst.as_ref().and_then(|old_inst| {
+            let new_child = snapshot.get_new_instance(*new_child_ref)?;
+            let mut matches = old_inst.children().iter().filter(|child| {
+                snapshot.get_old_instance(**child).is_some_and(|child| {
+                    child.name() == new_child.name && child.class_name() == new_child.class
+                })
+            });
+            let found = *matches.next()?;
+            matches.next().is_none().then_some(found)
+        });
+        children.push(json_model_from_pair(
+            snapshot,
+            prop_buffer,
+            *new_child_ref,
+            old_child,
+        ))
     }
 
     JsonModel {
@@ -145,7 +183,9 @@ fn json_model_from_pair<'sync>(
         attributes,
         id: None,
         schema: None,
-        ignore_unknown_instances: None,
+        ignore_unknown_instances: old_inst
+            .filter(|old_inst| old_inst.metadata().ignore_unknown_instances)
+            .map(|_| true),
         unknown_fields: UnknownFields::default(),
     }
 }
@@ -346,6 +386,26 @@ mod test {
             .properties
             .contains_key(&rbx_dom_weak::ustr("Attributes")));
         assert_eq!(tags(&snapshot.children[0]), vec!["Child"]);
+    }
+
+    /// What syncback writes for `ignoreUnknownInstances` reads back the same,
+    /// whichever spelling the file had.
+    #[test]
+    fn model_ignore_unknown_instances_round_trips() {
+        let read = |text: &str| crate::json::from_str::<JsonModel>(text).unwrap();
+        let model = read(
+            r#"{"className": "Model", "$ignoreUnknownInstances": true,
+                "children": [{"name": "Inner", "className": "Folder", "ignoreUnknownInstances": true}]}"#,
+        );
+        let written = serde_json::to_string(&model).unwrap();
+        assert!(
+            written.contains(r#""ignoreUnknownInstances":true"#),
+            "{written}"
+        );
+        assert!(!written.contains("$ignoreUnknownInstances"), "{written}");
+        let again = read(&written);
+        assert_eq!(again.ignore_unknown_instances, Some(true));
+        assert_eq!(again.children[0].ignore_unknown_instances, Some(true));
     }
 
     /// `ignoreUnknownInstances` (or `$ignoreUnknownInstances`) used to be
