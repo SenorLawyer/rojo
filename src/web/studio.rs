@@ -209,6 +209,17 @@ fn packed_ref(packed: &str, name: &str) -> Option<String> {
 }
 
 /// Reads and validates a token file, warning when other users can read it.
+/// What `/api/studio/prove` answers for `nonce`: a hash keyed with a key
+/// derived from `token`, over the nonce and the serve session, in hex. Both
+/// the server and a client that holds the token can compute it; it reveals
+/// nothing about the token to anyone else.
+pub(crate) fn token_proof(token: &str, nonce: &[u8], session: &str) -> String {
+    let key = blake3::derive_key("rojo studio token proof", token.as_bytes());
+    let mut message = nonce.to_vec();
+    message.extend_from_slice(session.as_bytes());
+    blake3::keyed_hash(&key, &message).to_hex().to_string()
+}
+
 pub(crate) fn read_token_file(path: &Path) -> anyhow::Result<String> {
     let token = fs::read_to_string(path).with_context(|| {
         format!(
@@ -970,6 +981,44 @@ impl StudioBridge {
         )
     }
 
+    /// Proves this server holds the Studio token, without revealing it: for
+    /// the client's random `nonce`, returns the serve session and project with
+    /// [`token_proof`] over them. Only a holder of the token can compute it,
+    /// and the nonce keeps an answer from being replayed.
+    fn prove(&self, request: &Request<Body>) -> Response<Body> {
+        let nonce = request
+            .uri()
+            .query()
+            .and_then(|query| {
+                query
+                    .split('&')
+                    .find_map(|pair| pair.strip_prefix("nonce="))
+            })
+            .filter(|nonce| nonce.len() == 64)
+            .and_then(|nonce| {
+                data_encoding::HEXLOWER_PERMISSIVE
+                    .decode(nonce.as_bytes())
+                    .ok()
+            });
+        let Some(nonce) = nonce else {
+            return failure(
+                StatusCode::BAD_REQUEST,
+                "prove needs a nonce of 32 bytes in hex",
+            );
+        };
+        let session = self.identity_json["serverSession"]
+            .as_str()
+            .unwrap_or_default();
+        reply(
+            StatusCode::OK,
+            json!({
+                "serverSession": session,
+                "projectPath": self.identity_json["projectPath"],
+                "proof": token_proof(&self.token, &nonce, session),
+            }),
+        )
+    }
+
     fn authorized(&self, request: &Request<Body>, plugin: bool) -> bool {
         let expected = if plugin {
             &self.plugin_token
@@ -1026,6 +1075,11 @@ impl StudioBridge {
             );
         }
         let path = request.uri().path().to_owned();
+        // Answered without the token, since its point is to let a client
+        // check this server holds the token before sending it.
+        if request.method() == Method::GET && path == "/api/studio/prove" {
+            return self.prove(&request);
+        }
         let plugin = matches!(
             path.as_str(),
             "/api/studio/register"
@@ -4236,6 +4290,66 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         condition()
+    }
+
+    /// The proof route needs no token, proves the bridge holds it for the
+    /// caller's nonce, and gives nothing away about it.
+    #[tokio::test]
+    async fn the_bridge_proves_it_holds_the_token_without_revealing_it() {
+        let (_dir, bridge) = fixture();
+        let nonce = [7u8; 32];
+        let prove = |query: String| {
+            Request::builder()
+                .method("GET")
+                .uri(format!("/api/studio/prove{query}"))
+                .header(HOST, "127.0.0.1:34872")
+                .body(Body::empty())
+                .unwrap()
+        };
+        let request = prove(format!("?nonce={}", data_encoding::HEXLOWER.encode(&nonce)));
+        let (status, value) =
+            into_value(bridge.clone().call(PEER.parse().unwrap(), request).await).await;
+        assert_eq!(status, StatusCode::OK, "{value}");
+        let session = value["serverSession"].as_str().unwrap();
+        assert_eq!(
+            Some(session),
+            bridge.identity_json["serverSession"].as_str()
+        );
+        assert_eq!(value["projectPath"], bridge.identity_json["projectPath"]);
+        assert_eq!(
+            value["proof"].as_str(),
+            Some(token_proof(&bridge.token, &nonce, session).as_str())
+        );
+        // Another nonce gives another proof, and another token another.
+        assert_ne!(
+            token_proof(&bridge.token, &[8u8; 32], session),
+            token_proof(&bridge.token, &nonce, session)
+        );
+        assert_ne!(
+            token_proof("another-token", &nonce, session),
+            token_proof(&bridge.token, &nonce, session)
+        );
+        assert!(!value.to_string().contains(&bridge.token));
+
+        for query in ["", "?nonce=abc", "?nonce=zz"] {
+            let (status, _) = into_value(
+                bridge
+                    .clone()
+                    .call(PEER.parse().unwrap(), prove(query.to_owned()))
+                    .await,
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{query}");
+        }
+        // Everything else still needs the token.
+        let request = Request::builder()
+            .method("GET")
+            .uri("/api/studio/sessions")
+            .header(HOST, "127.0.0.1:34872")
+            .body(Body::empty())
+            .unwrap();
+        let response = bridge.clone().call(PEER.parse().unwrap(), request).await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]

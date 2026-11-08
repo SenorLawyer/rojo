@@ -499,8 +499,8 @@ fn find_running(checkout: &Checkout, start: &Path) -> Option<(PathBuf, Result<De
 }
 
 /// Confirms that `state` still describes a live server: its process runs,
-/// and the server on its address reports, over the token-authenticated
-/// sessions route, the same serve session and project. A `rojo dev` that was
+/// and the server on its address proves it holds the token, without being
+/// sent it, and reports the same serve session and project. A `rojo dev` that was
 /// killed leaves its record behind, and another server, perhaps another
 /// worktree's with the shared token, may since have taken the port.
 fn verify(state: &DevState) -> Result<(), String> {
@@ -515,20 +515,25 @@ fn verify(state: &DevState) -> Result<(), String> {
     // The bridge may hold a request while Git is busy, so a shorter wait
     // would reject a live server whose repository is mid-checkout.
     let client = studio::bridge_client(VERIFY_TIMEOUT).map_err(|err| err.to_string())?;
+    // The token is never sent here: whatever now listens on the recorded
+    // port, perhaps a process that took it after the recorded server ended,
+    // must first prove it holds the token, for a nonce of this request.
+    let mut nonce = [0u8; 32];
+    nonce[..16].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
+    nonce[16..].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
     let url = base
-        .join("api/studio/sessions")
+        .join(&format!(
+            "api/studio/prove?nonce={}",
+            data_encoding::HEXLOWER.encode(&nonce)
+        ))
         .map_err(|err| err.to_string())?;
-    let response = client
-        .get(url)
-        .header("x-rojo-studio-token", token)
-        .send()
-        .map_err(|err| {
-            if err.is_timeout() {
-                format!("the server on {} did not answer in time", state.address)
-            } else {
-                format!("nothing answered on {}", state.address)
-            }
-        })?;
+    let response = client.get(url).send().map_err(|err| {
+        if err.is_timeout() {
+            format!("the server on {} did not answer in time", state.address)
+        } else {
+            format!("nothing answered on {}", state.address)
+        }
+    })?;
     // Redirects are not followed (see `bridge_client`), and one is never
     // the bridge's answer.
     if !response.status().is_success() {
@@ -541,8 +546,16 @@ fn verify(state: &DevState) -> Result<(), String> {
     let identity: serde_json::Value = response
         .json()
         .map_err(|_| format!("the server on {} is not its Studio bridge", state.address))?;
-    let identity = &identity["identity"];
-    let same_session = identity["serverSession"].as_str() == Some(state.server_session.as_str());
+    let session = identity["serverSession"].as_str().unwrap_or_default();
+    if identity["proof"].as_str()
+        != Some(crate::web::studio::token_proof(&token, &nonce, session).as_str())
+    {
+        return Err(format!(
+            "the server on {} could not prove it holds this worktree's Studio token",
+            state.address
+        ));
+    }
+    let same_session = session == state.server_session;
     let same_project = identity["projectPath"]
         .as_str()
         .is_some_and(|project| Path::new(project) == state.project);
@@ -1624,22 +1637,48 @@ mod test {
         assert!(!port_is_free(Ipv6Addr::LOCALHOST.into(), port));
     }
 
-    /// Answers one HTTP request with `body` as JSON, and returns the
-    /// address to reach it and the request it got.
-    fn answer_once(body: serde_json::Value) -> (String, thread::JoinHandle<String>) {
-        let body = body.to_string();
-        answer_raw(
+    /// A bridge answering `/api/studio/prove` once with `session` and
+    /// `project`, proving with `token` for the nonce it was sent, after
+    /// `delay`. Returns the address and the request it got.
+    fn answer_proof(
+        token: &'static str,
+        session: &'static str,
+        project: PathBuf,
+        delay: Duration,
+    ) -> (String, thread::JoinHandle<String>) {
+        answer_with(delay, move |request| {
+            let nonce = request
+                .split(['?', '&', ' '])
+                .find_map(|part| part.strip_prefix("nonce="))
+                .and_then(|nonce| data_encoding::HEXLOWER.decode(nonce.as_bytes()).ok())
+                .unwrap_or_default();
+            let body = serde_json::json!({
+                "serverSession": session,
+                "projectPath": project,
+                "proof": crate::web::studio::token_proof(token, &nonce, session),
+            })
+            .to_string();
             format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                 body.len()
-            ),
-            Duration::ZERO,
-        )
+            )
+        })
     }
+
+    const RECORDED_TOKEN: &str = "0123456789abcdef0123456789abcdef";
 
     /// Answers one HTTP request with `response` after `delay`, and returns
     /// the address to reach it and the request it got.
     fn answer_raw(response: String, delay: Duration) -> (String, thread::JoinHandle<String>) {
+        answer_with(delay, move |_| response)
+    }
+
+    /// Answers one HTTP request with what `respond` makes of it, after
+    /// `delay`, and returns the address to reach it and the request it got.
+    fn answer_with(
+        delay: Duration,
+        respond: impl FnOnce(&str) -> String + Send + 'static,
+    ) -> (String, thread::JoinHandle<String>) {
         use std::io::{BufRead, BufReader};
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = format!("http://{}", listener.local_addr().unwrap());
@@ -1656,7 +1695,7 @@ mod test {
             }
             thread::sleep(delay);
             let mut stream = stream;
-            stream.write_all(response.as_bytes()).unwrap();
+            stream.write_all(respond(&request).as_bytes()).unwrap();
             request
         });
         (address, handle)
@@ -1678,7 +1717,7 @@ mod test {
 
     fn recorded(dir: &Path, address: String, pid: u32) -> DevState {
         let token_file = dir.join(TOKEN_FILE);
-        fs::write(&token_file, "0123456789abcdef0123456789abcdef").unwrap();
+        fs::write(&token_file, RECORDED_TOKEN).unwrap();
         DevState {
             pid,
             address,
@@ -1710,30 +1749,52 @@ mod test {
         let dir = tempfile::tempdir().unwrap();
         // Another worktree's rojo dev, serving with the shared token on the
         // port the dead one used.
-        let (address, request) = answer_once(serde_json::json!({
-            "identity": {
-                "serverSession": "another-session",
-                "projectPath": dir.path().join("default.project.json"),
-            },
-            "sessions": [],
-        }));
+        let (address, request) = answer_proof(
+            RECORDED_TOKEN,
+            "another-session",
+            dir.path().join("default.project.json"),
+            Duration::ZERO,
+        );
         let state = recorded(dir.path(), address, std::process::id());
         let reason = verify(&state).unwrap_err();
         assert!(reason.contains("not the one rojo dev recorded"), "{reason}");
         let request = request.join().unwrap().to_ascii_lowercase();
-        assert!(request.starts_with("get /api/studio/sessions"), "{request}");
-        assert!(request.contains("x-rojo-studio-token: 0123456789abcdef"));
+        assert!(
+            request.starts_with("get /api/studio/prove?nonce="),
+            "{request}"
+        );
+        assert!(!request.contains("x-rojo-studio-token"), "{request}");
+        assert!(!request.contains(RECORDED_TOKEN), "{request}");
+    }
+
+    #[test]
+    fn a_process_on_the_recorded_port_never_receives_the_token() {
+        let dir = tempfile::tempdir().unwrap();
+        // Something without the token took the port and repeats what the
+        // record says, which anyone who can read it knows.
+        let (address, request) = answer_proof(
+            "not-the-token-not-the-token-not-the",
+            "recorded-session",
+            dir.path().join("default.project.json"),
+            Duration::ZERO,
+        );
+        let state = recorded(dir.path(), address, std::process::id());
+        let reason = verify(&state).unwrap_err();
+        assert!(reason.contains("could not prove"), "{reason}");
+        let request = request.join().unwrap();
+        assert!(!request.to_ascii_lowercase().contains("x-rojo-studio-token"));
+        assert!(!request.contains(RECORDED_TOKEN), "{request}");
     }
 
     #[test]
     fn another_project_with_a_matching_session_is_not_trusted() {
         let dir = tempfile::tempdir().unwrap();
-        let (address, _) = answer_once(serde_json::json!({
-            "identity": {
-                "serverSession": "recorded-session",
-                "projectPath": dir.path().join("other.project.json"),
-            },
-        }));
+        let (address, _) = answer_proof(
+            RECORDED_TOKEN,
+            "recorded-session",
+            dir.path().join("other.project.json"),
+            Duration::ZERO,
+        );
         let state = recorded(dir.path(), address, std::process::id());
         assert!(verify(&state).is_err());
     }
@@ -1741,12 +1802,12 @@ mod test {
     #[test]
     fn the_recorded_server_is_trusted() {
         let dir = tempfile::tempdir().unwrap();
-        let (address, _) = answer_once(serde_json::json!({
-            "identity": {
-                "serverSession": "recorded-session",
-                "projectPath": dir.path().join("default.project.json"),
-            },
-        }));
+        let (address, _) = answer_proof(
+            RECORDED_TOKEN,
+            "recorded-session",
+            dir.path().join("default.project.json"),
+            Duration::ZERO,
+        );
         let state = recorded(dir.path(), address, std::process::id());
         assert_eq!(verify(&state), Ok(()));
     }
@@ -1921,12 +1982,12 @@ mod test {
     #[test]
     fn a_confirmed_record_names_its_bridge() {
         let dir = tempfile::tempdir().unwrap();
-        let (address, _) = answer_once(serde_json::json!({
-            "identity": {
-                "serverSession": "recorded-session",
-                "projectPath": dir.path().join("default.project.json"),
-            },
-        }));
+        let (address, _) = answer_proof(
+            RECORDED_TOKEN,
+            "recorded-session",
+            dir.path().join("default.project.json"),
+            Duration::ZERO,
+        );
         let state = recorded(dir.path(), address.clone(), std::process::id());
         let token = state.token_file.clone();
         let (found, found_token) = use_record(&dir.path().join(STATE_FILE), Ok(state)).unwrap();
@@ -1939,18 +2000,10 @@ mod test {
         assert!(VERIFY_TIMEOUT > crate::web::studio::GIT_WAIT_LIMIT);
         // An answer slower than the old 5-second limit is still accepted.
         let dir = tempfile::tempdir().unwrap();
-        let body = serde_json::json!({
-            "identity": {
-                "serverSession": "recorded-session",
-                "projectPath": dir.path().join("default.project.json"),
-            },
-        })
-        .to_string();
-        let (address, _) = answer_raw(
-            format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            ),
+        let (address, _) = answer_proof(
+            RECORDED_TOKEN,
+            "recorded-session",
+            dir.path().join("default.project.json"),
             Duration::from_secs(6),
         );
         let state = recorded(dir.path(), address, std::process::id());
