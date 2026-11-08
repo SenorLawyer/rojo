@@ -535,12 +535,23 @@ mod test {
 
     #[test]
     fn leaves_out_init_files_excluded_on_the_root_node() {
+        // Also when `$path` reaches the folder another way, while the paths
+        // the sourcemap lists are resolved ones.
+        for path in ["src", "other/../src"] {
+            leaves_out_init_files_excluded_on_the_root_node_at(path);
+        }
+    }
+
+    fn leaves_out_init_files_excluded_on_the_root_node_at(path: &str) {
         let dir = tempfile::tempdir().unwrap();
         let project = dir.path().join("project");
         fs_err::create_dir_all(project.join("src")).unwrap();
+        fs_err::create_dir_all(project.join("other")).unwrap();
         fs_err::write(
             project.join("default.project.json"),
-            r#"{"name": "root", "tree": {"$path": "src", "$globIgnorePaths": ["init.server.luau"]}}"#,
+            format!(
+                r#"{{"name": "root", "tree": {{"$path": "{path}", "$globIgnorePaths": ["init.server.luau"]}}}}"#
+            ),
         )
         .unwrap();
         fs_err::write(project.join("src/init.server.luau"), "print(1)").unwrap();
@@ -557,13 +568,13 @@ mod test {
 
         let raw = fs_err::read_to_string(sourcemap_output.as_path()).unwrap();
         let root = serde_json::from_str::<SourcemapNode>(&raw).unwrap();
-        assert_eq!(root.class_name, "Folder");
+        assert_eq!(root.class_name, "Folder", "{path}");
         let root_paths: Vec<_> = root
             .file_paths
             .iter()
             .map(|path| path.to_string_lossy().replace('\\', "/"))
             .collect();
-        assert_eq!(root_paths, ["default.project.json"]);
+        assert_eq!(root_paths, ["default.project.json"], "{path}");
     }
 
     #[test]

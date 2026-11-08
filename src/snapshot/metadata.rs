@@ -245,21 +245,53 @@ pub struct PathIgnoreRule {
     /// rather than the project-wide `globIgnorePaths`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub from_node: bool,
+
+    /// `base_path` as the file system resolves it, when that differs from
+    /// how the project spells it, such as `src/../shared` or a link. Paths
+    /// recorded for instances may be in either form.
+    #[serde(skip)]
+    pub canonical_base: Option<PathBuf>,
 }
 
 impl PathIgnoreRule {
     pub fn matches<P: AsRef<Path>>(&self, path: P) -> bool {
         let path = path.as_ref();
 
-        match path.strip_prefix(&self.base_path) {
-            Ok(suffix) => self.glob.is_match(suffix),
-            Err(_) => false,
+        // `.` and `..` are applied first, on both sides, so that a path
+        // spelled through `src/..` still falls under its base.
+        let normalized = normalize_lexically(path);
+        let bases = std::iter::once(&self.base_path).chain(self.canonical_base.as_ref());
+        for base in bases {
+            if let Ok(suffix) = normalized.strip_prefix(normalize_lexically(base)) {
+                return self.glob.is_match(suffix);
+            }
         }
+        false
     }
 
     pub fn is_negation(&self) -> bool {
         self.glob.is_negation()
     }
+}
+
+/// `path` with `.` dropped and each `..` removing the component before it,
+/// without touching the file system.
+fn normalize_lexically(path: &Path) -> PathBuf {
+    use std::path::Component;
+
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir
+                if matches!(out.components().next_back(), Some(Component::Normal(_))) =>
+            {
+                out.pop();
+            }
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 /// Evaluates an ordered list of [`PathIgnoreRule`]s against a path using

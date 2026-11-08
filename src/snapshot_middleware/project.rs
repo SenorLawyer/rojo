@@ -72,6 +72,7 @@ pub fn snapshot_project(
         glob: glob.clone(),
         base_path: project.folder_location().to_path_buf(),
         from_node: false,
+        canonical_base: None,
     });
 
     let sync_rules = project.sync_rules.iter().map(|rule| SyncRule {
@@ -135,10 +136,16 @@ pub fn node_ignore_base(project_path: &Path, node: &ProjectNode) -> Option<PathB
 
 /// Returns the ignore rules a project node's `$globIgnorePaths` add. Nodes
 /// without a `$path` add none.
-fn node_ignore_rules(project_path: &Path, node: &ProjectNode) -> Vec<PathIgnoreRule> {
+fn node_ignore_rules(vfs: &Vfs, project_path: &Path, node: &ProjectNode) -> Vec<PathIgnoreRule> {
     let Some(base_path) = node_ignore_base(project_path, node) else {
         return Vec::new();
     };
+    // Instances record paths both as the project spells them and as the
+    // file system resolves them, as their relevant paths do.
+    let canonical_base = vfs
+        .canonicalize(&base_path)
+        .ok()
+        .filter(|canonical| *canonical != base_path);
 
     node.glob_ignore_paths
         .iter()
@@ -146,6 +153,7 @@ fn node_ignore_rules(project_path: &Path, node: &ProjectNode) -> Vec<PathIgnoreR
             glob: glob.clone(),
             base_path: base_path.clone(),
             from_node: true,
+            canonical_base: canonical_base.clone(),
         })
         .collect()
 }
@@ -185,7 +193,7 @@ pub fn snapshot_project_node(
     // initial snapshot.
     let inherited_context = context;
     let node_context;
-    let node_rules = node_ignore_rules(project_path, node);
+    let node_rules = node_ignore_rules(vfs, project_path, node);
     let context = if node_rules.is_empty() {
         context
     } else {
@@ -1192,6 +1200,7 @@ mod test {
             base_path: PathBuf::from("/foo/filtered"),
             glob: crate::glob::IgnorableGlob::new("**/*.spec.luau").unwrap(),
             from_node: true,
+            canonical_base: None,
         };
 
         let filtered = child(&snapshot, "Filtered");
@@ -1275,12 +1284,20 @@ mod test {
             r#"{"$path": "package/default.project.json", "$globIgnorePaths": ["**"]}"#,
         )
         .unwrap();
-        let rules = node_ignore_rules(Path::new("/foo/default.project.json"), &node);
+        let rules = node_ignore_rules(
+            &Vfs::new(InMemoryFs::new()),
+            Path::new("/foo/default.project.json"),
+            &node,
+        );
         assert_eq!(rules[0].base_path, PathBuf::from("/foo/package"));
 
         let node: ProjectNode =
             crate::json::from_str(r#"{"$path": "src", "$globIgnorePaths": ["**"]}"#).unwrap();
-        let rules = node_ignore_rules(Path::new("/foo/default.project.json"), &node);
+        let rules = node_ignore_rules(
+            &Vfs::new(InMemoryFs::new()),
+            Path::new("/foo/default.project.json"),
+            &node,
+        );
         assert_eq!(rules[0].base_path, PathBuf::from("/foo/src"));
     }
 

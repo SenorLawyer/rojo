@@ -793,6 +793,7 @@ mod test {
                 base_path: PathBuf::from("/test"),
                 glob: g.clone(),
                 from_node: false,
+                canonical_base: None,
             })
             .collect();
         assert!(crate::snapshot::is_path_ignored(
