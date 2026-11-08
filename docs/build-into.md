@@ -7,24 +7,20 @@ instead and leaves the rest of that place as it was:
 
 ```text
 rojo build --into base.rbxl -o out.rbxl
-rojo build --into place.rbxlx -o place.rbxlx
 ```
 
 The base and the output can each be `.rbxl` or `.rbxlx`, in any combination.
 The project's root must be a `DataModel`, as for any place build. The base
 place is only read; the output is written the same way as any build, to a
-temporary file that replaces the output once complete, so the output may be
-the base place itself. `--into` cannot be combined with `--plugin`.
+temporary file that replaces the output once complete. `--into` cannot be
+combined with `--plugin`.
 
-When the output is the base itself, the base is checked again right before
-it is replaced. If it changed since it was read, for example because Studio
-saved it, the build stops without writing and leaves the newer file alone;
-build again to apply the project onto that version.
-
-`--watch` cannot write over its own base, since every rebuild would apply
-the project onto the previous output. The paths are compared without either
-file having to exist, following links and ignoring case on Windows, and
-again before every rebuild.
+The output cannot be the base place itself. Studio can save the base while
+it is open, and nothing stops that save from landing between Rojo reading the
+base and replacing it, so the save would be lost. Write to another file, such
+as `place.built.rbxl`, and open that. The paths are compared without either
+file having to exist, following links and ignoring case on Windows, and again
+before every rebuild with `--watch`.
 
 ## A complete place from a checkpoint
 
@@ -115,6 +111,10 @@ or `src/workspace/init.meta.json`:
 * `Rojo_Target_*` attributes the base place has are kept as data only and
   are not resolved. A ref the project sets, or one edited in Studio since the
   attribute was written, is what the output has.
+* A project `Rojo_Target_*` attribute whose ID no instance in the output has,
+  or more than one has, fails the build before anything is written, naming
+  the instance and the attribute. A plain `rojo build` only warns, but here
+  the ref would otherwise keep whatever the base place had.
 * Project IDs (`$id`, `id` in meta files, `Rojo_Id` attributes) take
   precedence: when the project gives a paired instance an ID, its base
   `Rojo_Id` attribute is replaced with the project's ID.
@@ -134,6 +134,10 @@ the base changes, and the last good output stays in place meanwhile.
 
 * Everything in the base place goes through rbx-dom, as with `rojo
   syncback`, so content rbx-dom cannot read or write is not preserved.
+* An XML output (`.rbxlx`) cannot store a `Content` property that refers to
+  an object rather than a URI, which a binary base place can have. Such a
+  build fails, naming the instance and property; write a `.rbxl` output
+  instead.
 * Instances are matched by name and class only. When the base has several
   siblings with a name the project defines, the first with the same class is
   paired; what happens to the others follows `$ignoreUnknownInstances`.

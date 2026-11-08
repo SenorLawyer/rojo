@@ -11,6 +11,7 @@
 use std::{
     collections::{HashMap, HashSet},
     fs,
+    io::BufReader,
     path::Path,
 };
 
@@ -26,30 +27,12 @@ use crate::{
     RojoRef, REF_ID_ATTRIBUTE_NAME, REF_POINTER_ATTRIBUTE_PREFIX,
 };
 
-/// Reads the place that `rojo build --into` starts from, along with a digest
-/// of the bytes it was read from.
-pub fn read_base_place(path: &Path) -> anyhow::Result<(WeakDom, blake3::Hash)> {
-    // Read once, so the digest is of exactly the bytes that were parsed.
-    let bytes =
-        fs::read(path).with_context(|| format!("Could not open base place {}", path.display()))?;
-    let digest = blake3::hash(&bytes);
-    Ok((parse_base_place(path, &bytes)?, digest))
-}
-
-/// Returns the digest of the file at `path`, or `None` if it does not exist.
-pub fn file_digest(path: &Path) -> anyhow::Result<Option<blake3::Hash>> {
-    match fs::read(path) {
-        Ok(bytes) => Ok(Some(blake3::hash(&bytes))),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => {
-            Err(error).with_context(|| format!("Could not read {} again", path.display()))
-        }
-    }
-}
-
-fn parse_base_place(path: &Path, bytes: &[u8]) -> anyhow::Result<WeakDom> {
+/// Reads the place that `rojo build --into` starts from.
+pub fn read_base_place(path: &Path) -> anyhow::Result<WeakDom> {
     let extension = path.extension().and_then(|extension| extension.to_str());
-    let reader = bytes;
+    let file = fs::File::open(path)
+        .with_context(|| format!("Could not open base place {}", path.display()))?;
+    let reader = BufReader::new(file);
     match extension {
         Some("rbxl") => rbx_binary::from_reader(reader)
             .with_context(|| format!("Could not read {} as a binary place file", path.display())),
@@ -73,6 +56,12 @@ pub fn merge_into_place(project: &RojoTree, base: WeakDom) -> anyhow::Result<Roj
     let mut tree = RojoTree::from_dom(base);
     let root_id = tree.get_root_id();
 
+    // Taken out before the patch is computed, so that every pointer attribute
+    // left in the tree once the patch is applied is one the project defines.
+    // A project pointer also differs from the base's attributes then, even
+    // when the base has the same one, so the project's attributes are applied.
+    let base_pointers = take_base_ref_pointers(&mut tree);
+
     let snapshot = snapshot_from_tree(project, project.get_root_id());
     let mut patch_set = compute_patch_set(Some(snapshot), &tree, root_id);
 
@@ -88,7 +77,6 @@ pub fn merge_into_place(project: &RojoTree, base: WeakDom) -> anyhow::Result<Roj
         .filter(|update| update.changed_properties.contains_key(&attributes_key))
         .map(|update| update.id)
         .collect();
-    let base_pointers = take_base_ref_pointers(&mut tree);
 
     replace_base_ids(&tree, &mut patch_set);
     let null_refs = take_null_ref_assignments(&mut patch_set);
@@ -100,12 +88,76 @@ pub fn merge_into_place(project: &RojoTree, base: WeakDom) -> anyhow::Result<Roj
             .properties_mut()
             .insert(name, Variant::Ref(Ref::none()));
     }
-    restore_base_ref_pointers(&mut tree, base_pointers, &project_sets_attributes);
 
     check_base_id_collisions(project, &tree)?;
+    resolve_project_ref_pointers(&mut tree)?;
+    restore_base_ref_pointers(&mut tree, base_pointers, &project_sets_attributes);
     clear_dangling_refs(&mut tree);
 
     Ok(tree)
+}
+
+/// Sets the Ref property named by every `Rojo_Target_*` attribute in the
+/// tree to the instance with that ID, failing for any that has none.
+///
+/// Runs while the base's pointers are taken out, so these are all the
+/// project's. Patch application only resolves pointers on instances whose
+/// attributes changed, and patch computation resolves them against the base
+/// place, where a target added by this build does not exist yet. A pointer
+/// left unresolved would keep whatever ref the base has, which is unrelated
+/// to the project, so it is an error rather than silently wrong output.
+fn resolve_project_ref_pointers(tree: &mut RojoTree) -> anyhow::Result<()> {
+    let attributes_key = ustr("Attributes");
+    let mut pointers = Vec::new();
+    for instance in tree.inner().descendants() {
+        let Some(Variant::Attributes(attributes)) = instance.properties.get(&attributes_key) else {
+            continue;
+        };
+        for (name, value) in attributes.iter() {
+            let Some(property) = name.strip_prefix(REF_POINTER_ATTRIBUTE_PREFIX) else {
+                continue;
+            };
+            let target = match value {
+                Variant::String(target) => Some(target.clone()),
+                Variant::BinaryString(target) => {
+                    std::str::from_utf8(target.as_ref()).ok().map(str::to_owned)
+                }
+                _ => None,
+            };
+            pointers.push((instance.referent(), ustr(property), name.clone(), target));
+        }
+    }
+
+    let mut unresolved = Vec::new();
+    for (holder, property, attribute, target) in pointers {
+        let resolved = target
+            .as_ref()
+            .and_then(|target| tree.get_specified_id(&RojoRef::new(target.clone())));
+        match resolved {
+            Some(resolved) => {
+                tree.get_instance_mut(holder)
+                    .unwrap()
+                    .properties_mut()
+                    .insert(property, Variant::Ref(resolved));
+            }
+            None => unresolved.push(format!(
+                "{} ({attribute} = \"{}\")",
+                instance_path(tree, holder),
+                target.as_deref().unwrap_or("<not a string>")
+            )),
+        }
+    }
+
+    if !unresolved.is_empty() {
+        unresolved.sort();
+        bail!(
+            "The project has Rojo_Target_* attributes whose ID no instance in the output \
+             has, or more than one has, so their refs could not be set: {}. \
+             Give the target that ID with $id or Rojo_Id, or fix the attribute.",
+            unresolved.join(", ")
+        );
+    }
+    Ok(())
 }
 
 /// Takes the `Rojo_Target_*` attributes out of every base instance, returning
@@ -493,4 +545,115 @@ fn keep_unclaimed_base_content(tree: &RojoTree, patch_set: &mut PatchSet) {
         .collect();
 
     patch_set.removed_instances.retain(|id| !keep.contains(id));
+}
+
+#[cfg(test)]
+mod test {
+    use rbx_dom_weak::{types::Attributes, InstanceBuilder};
+
+    use super::*;
+    use crate::snapshot::InstanceMetadata;
+
+    fn attributes(entries: &[(&str, &str)]) -> Variant {
+        let mut attributes = Attributes::new();
+        for (name, value) in entries {
+            attributes.insert((*name).to_owned(), Variant::String((*value).to_owned()));
+        }
+        Variant::Attributes(attributes)
+    }
+
+    fn project(workspace_children: Vec<InstanceSnapshot>) -> RojoTree {
+        RojoTree::new(
+            InstanceSnapshot::new()
+                .name("Project")
+                .class_name("DataModel")
+                .children(vec![InstanceSnapshot::new()
+                    .name("Workspace")
+                    .class_name("Workspace")
+                    .metadata(InstanceMetadata::new().ignore_unknown_instances(true))
+                    .children(workspace_children)]),
+        )
+    }
+
+    fn find(tree: &RojoTree, name: &str) -> Ref {
+        tree.inner()
+            .descendants()
+            .find(|instance| instance.name == name)
+            .unwrap_or_else(|| panic!("no {name}"))
+            .referent()
+    }
+
+    #[test]
+    fn project_pointers_resolve_to_targets_this_build_adds() {
+        // The base has the same pointer on the paired Model, so the patch
+        // alone would not carry it, and a pointer holder only it has.
+        let mut base = WeakDom::new(InstanceBuilder::new("DataModel"));
+        let workspace = base.insert(base.root_ref(), InstanceBuilder::new("Workspace"));
+        base.insert(
+            workspace,
+            InstanceBuilder::new("Model")
+                .with_name("Flag")
+                .with_property(
+                    "Attributes",
+                    attributes(&[("Rojo_Target_PrimaryPart", "pole")]),
+                ),
+        );
+        base.insert(
+            workspace,
+            InstanceBuilder::new("ObjectValue")
+                .with_name("Pointer")
+                .with_property("Attributes", attributes(&[("Rojo_Target_Value", "pole")])),
+        );
+
+        let project = project(vec![InstanceSnapshot::new()
+            .name("Flag")
+            .class_name("Model")
+            .property(
+                "Attributes",
+                attributes(&[("Rojo_Target_PrimaryPart", "pole")]),
+            )
+            .children(vec![InstanceSnapshot::new()
+                .name("Pole")
+                .class_name("Part")
+                .metadata(
+                    InstanceMetadata::new().specified_id(Some(RojoRef::new("pole".to_owned()))),
+                )])]);
+
+        let merged = merge_into_place(&project, base).unwrap();
+        let flag = merged.get_instance(find(&merged, "Flag")).unwrap();
+        assert_eq!(
+            flag.properties().get(&ustr("PrimaryPart")),
+            Some(&Variant::Ref(find(&merged, "Pole")))
+        );
+
+        // The base's own pointer is kept as data and does not set the ref.
+        let pointer = merged.get_instance(find(&merged, "Pointer")).unwrap();
+        assert!(!matches!(
+            pointer.properties().get(&ustr("Value")),
+            Some(Variant::Ref(target)) if target.is_some()
+        ));
+        let Some(Variant::Attributes(kept)) = pointer.properties().get(&ustr("Attributes")) else {
+            panic!("the base pointer's attributes were dropped");
+        };
+        assert!(kept.get("Rojo_Target_Value").is_some());
+    }
+
+    #[test]
+    fn unresolved_project_pointers_fail_the_build() {
+        let mut base = WeakDom::new(InstanceBuilder::new("DataModel"));
+        base.insert(base.root_ref(), InstanceBuilder::new("Workspace"));
+
+        let project = project(vec![InstanceSnapshot::new()
+            .name("Flag")
+            .class_name("Model")
+            .property(
+                "Attributes",
+                attributes(&[("Rojo_Target_PrimaryPart", "missing")]),
+            )]);
+
+        let error = format!("{:#}", merge_into_place(&project, base).unwrap_err());
+        assert!(error.contains("Workspace/Flag"), "{error}");
+        assert!(error.contains("Rojo_Target_PrimaryPart"), "{error}");
+        assert!(error.contains("\"missing\""), "{error}");
+    }
 }

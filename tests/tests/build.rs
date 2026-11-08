@@ -717,22 +717,66 @@ fn build_into_place_keeps_base_content() {
     });
 }
 
-/// Applying the project onto the place it is written to goes through the
-/// same staged write as any build, and applying it again changes nothing.
+/// `--into` never writes over its own base place, which Studio could save
+/// while it is being replaced. The paths are compared without either file
+/// having to exist, and (on Windows, whose file systems ignore case) without
+/// regard to case.
 #[test]
-fn build_into_place_in_place() {
+fn build_into_refuses_to_write_over_its_base() {
     let temp = tempdir().unwrap();
     let place = temp.path().join("place.rbxl");
     write_place(&into_place_base(), &place);
+    let before = fs::read(&place).unwrap();
+    fs::create_dir(temp.path().join("sub")).unwrap();
 
-    assert_success(&build_into(&place, &place));
-    let first = describe_place(&read_place(&place));
-    assert!(first.contains("LegacyScript (Script)"), "{first}");
-    assert!(first.contains("Util (ModuleScript)"), "{first}");
-    assert!(!first.contains("OldModule"), "{first}");
+    let mut outputs = vec![
+        place.clone(),
+        temp.path().join("sub").join("..").join("place.rbxl"),
+    ];
+    if cfg!(windows) {
+        outputs.push(temp.path().join("PLACE.rbxl"));
+    }
+    for output in outputs {
+        let result = build_into(&place, &output);
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(!result.status.success(), "{}", output.display());
+        assert!(
+            stderr.contains("cannot write over its own base place"),
+            "{stderr}"
+        );
+        assert!(stderr.contains("place.built.rbxl"), "{stderr}");
+    }
+    assert_eq!(fs::read(&place).unwrap(), before);
+    assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 2);
+}
 
-    assert_success(&build_into(&place, &place));
-    pretty_assertions::assert_eq!(first, describe_place(&read_place(&place)));
+/// A binary base place can hold `Content` values that refer to objects,
+/// which XML files cannot store. The build fails with an error instead of
+/// aborting in the XML serializer, and writes nothing.
+#[test]
+fn build_into_xml_refuses_object_content_from_the_base() {
+    let temp = tempdir().unwrap();
+    let mut dom = into_place_base();
+    let workspace = dom.root().children()[0];
+    let sound = dom.insert(workspace, InstanceBuilder::new("Sound").with_name("Music"));
+    dom.get_by_ref_mut(sound).unwrap().properties.insert(
+        "AudioContent".into(),
+        Variant::Content(rbx_dom_weak::types::Content::from_referent(workspace)),
+    );
+    let base = temp.path().join("base.rbxl");
+    write_place(&dom, &base);
+
+    let output = temp.path().join("out.rbxlx");
+    let result = build_into(&base, &output);
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(!result.status.success());
+    assert!(stderr.contains("Workspace/Music"), "{stderr}");
+    assert!(stderr.contains("AudioContent"), "{stderr}");
+    assert!(!stderr.contains("panicked"), "{stderr}");
+    assert!(!output.exists());
+
+    // A binary output stores it.
+    assert_success(&build_into(&base, &temp.path().join("out.rbxl")));
 }
 
 #[test]
@@ -786,7 +830,7 @@ fn build_into_refuses_non_place_inputs_and_outputs() {
     );
     assert!(!temp.path().join("out.rbxl").exists());
 
-    // A watched build cannot keep applying the project onto its own output.
+    // A watched build cannot write over its base either.
     let result = Command::new(ROJO_PATH)
         .current_dir(get_working_dir_path())
         .arg("build")
@@ -800,7 +844,7 @@ fn build_into_refuses_non_place_inputs_and_outputs() {
         .unwrap();
     assert!(!result.status.success());
     assert!(
-        stderr(&result).contains("--watch cannot write over"),
+        stderr(&result).contains("cannot write over its own base place"),
         "{}",
         stderr(&result)
     );
@@ -826,7 +870,7 @@ fn build_into_refuses_non_place_inputs_and_outputs() {
             .unwrap();
         assert!(!result.status.success());
         assert!(
-            stderr(&result).contains("--watch cannot write over"),
+            stderr(&result).contains("cannot write over its own base place"),
             "{}",
             stderr(&result)
         );
