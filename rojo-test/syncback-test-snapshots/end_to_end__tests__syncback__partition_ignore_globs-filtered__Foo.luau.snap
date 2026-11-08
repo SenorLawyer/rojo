@@ -1,0 +1,5 @@
+---
+source: tests/tests/syncback.rs
+expression: filtered/Foo.luau
+---
+return "Foo from Studio"

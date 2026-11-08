@@ -1,0 +1,9 @@
+{
+  "name": "partition_ignore_globs_reload",
+  "tree": {
+    "$path": "src",
+    "$globIgnorePaths": [
+      "**/*.spec.luau"
+    ]
+  }
+}

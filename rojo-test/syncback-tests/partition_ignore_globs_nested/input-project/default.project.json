@@ -1,0 +1,14 @@
+{
+  "name": "partition_ignore_globs_nested",
+  "tree": {
+    "$className": "DataModel",
+    "ReplicatedStorage": {
+      "Package": {
+        "$path": "package/default.project.json",
+        "$globIgnorePaths": [
+          "**/*.spec.luau"
+        ]
+      }
+    }
+  }
+}

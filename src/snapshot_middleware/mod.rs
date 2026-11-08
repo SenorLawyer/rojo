@@ -35,7 +35,7 @@ use crate::{
     syncback::{SyncbackReturn, SyncbackSnapshot},
 };
 use crate::{
-    snapshot::{InstanceContext, InstanceSnapshot, SyncRule},
+    snapshot::{is_path_ignored, InstanceContext, InstanceSnapshot, PathIgnoreRule, SyncRule},
     syncback::validate_file_name,
 };
 
@@ -55,8 +55,8 @@ use self::{
 };
 
 pub use self::{
-    lua::ScriptType, project::snapshot_project_node, util::canonicalize_existing_ancestor,
-    util::emit_legacy_scripts_default, util::PathExt,
+    lua::ScriptType, project::node_ignore_rules, project::snapshot_project_node,
+    util::canonicalize_existing_ancestor, util::emit_legacy_scripts_default, util::PathExt,
 };
 
 /// Returns an `InstanceSnapshot` for the provided path.
@@ -75,7 +75,8 @@ pub fn snapshot_from_vfs(
     };
 
     if meta.is_dir() {
-        let (middleware, dir_name, init_path) = get_dir_middleware(vfs, path)?;
+        let (middleware, dir_name, init_path) =
+            get_dir_middleware(vfs, path, &context.path_ignore_rules)?;
         // TODO: Support user defined init paths
         // If and when we do, make sure to go support it in
         // `Project::set_file_name`, as right now it special-cases
@@ -116,6 +117,7 @@ pub(crate) fn is_init_file_name(file_name: &str) -> bool {
 pub(crate) fn get_dir_middleware<'path>(
     vfs: &Vfs,
     dir_path: &'path Path,
+    ignore_rules: &[PathIgnoreRule],
 ) -> anyhow::Result<(Middleware, &'path str, PathBuf)> {
     let dir_name = dir_path
         .file_name()
@@ -141,6 +143,9 @@ pub(crate) fn get_dir_middleware<'path>(
 
     for default_project_name in DEFAULT_PROJECT_NAMES {
         let project_path = dir_path.join(default_project_name);
+        if is_path_ignored(ignore_rules, &project_path) {
+            continue;
+        }
         if vfs.metadata(&project_path).with_not_found()?.is_some() {
             return Ok((Middleware::Project, dir_name, project_path));
         }
@@ -148,6 +153,11 @@ pub(crate) fn get_dir_middleware<'path>(
 
     for (middleware, name) in order {
         let test_path = dir_path.join(name);
+        // An ignored init file is treated as absent, as it is when listing
+        // the directory's children.
+        if is_path_ignored(ignore_rules, &test_path) {
+            continue;
+        }
         match vfs.metadata(&test_path) {
             Ok(_) => return Ok((*middleware, dir_name, test_path)),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -389,7 +399,7 @@ impl Middleware {
         };
 
         if meta.is_dir() {
-            let (middleware, _, _) = get_dir_middleware(vfs, path)?;
+            let (middleware, _, _) = get_dir_middleware(vfs, path, &[])?;
             Ok(Some(middleware))
         } else {
             for rule in sync_rules.iter().chain(default_sync_rules()) {

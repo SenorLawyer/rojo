@@ -109,3 +109,78 @@ syncback_tests! {
     // than leaving an incorrect value.
     project_default_properties_remove => ["default.project.json"],
 }
+
+/// Studio holds `Foo.spec` in both partitions, but only the partition without
+/// `$globIgnorePaths` gets the file; the other partition's non-ignored files
+/// are still written.
+#[test]
+fn partition_ignore_globs() {
+    run_syncback_test("partition_ignore_globs", |path| {
+        assert!(
+            !path.join("filtered/Foo.spec.luau").exists(),
+            "syncback wrote into a path the node's $globIgnorePaths exclude"
+        );
+        for name in [
+            "filtered/Foo.luau",
+            "unfiltered/Foo.luau",
+            "unfiltered/Foo.spec.luau",
+        ] {
+            let content = fs_err::read_to_string(path.join(name)).unwrap();
+            assert_snapshot!(format!("partition_ignore_globs-{name}"), content, name);
+        }
+    });
+}
+
+/// The rules on a project's root node apply although that node's instance is
+/// tagged with the project file. Removing or replacing a directory keeps the
+/// files in it that the rules exclude.
+#[test]
+fn partition_ignore_globs_root() {
+    run_syncback_test("partition_ignore_globs_root", |path| {
+        let src = path.join("src");
+        // Studio's `New.spec` is excluded, so it is not written.
+        assert!(!src.join("New.spec.luau").exists());
+        // Excluded files are not instances, so syncback leaves them alone.
+        for (name, content) in [
+            ("Foo.spec.luau", "return \"Foo.spec on disk\"\n"),
+            ("Nested/Bar.spec.luau", "return \"Bar.spec on disk\"\n"),
+            ("Dup/A.spec.luau", "return \"A.spec on disk\"\n"),
+        ] {
+            assert_eq!(
+                fs_err::read_to_string(src.join(name)).unwrap(),
+                content,
+                "{name}"
+            );
+        }
+        // `Nested` was deleted in Studio: only its excluded file remains.
+        assert!(!src.join("Nested/Bar.luau").exists());
+        // `Dup` was replaced by a model file: only its excluded file remains.
+        assert!(!src.join("Dup/A.luau").exists());
+        assert!(src.join("Dup.rbxm").exists());
+        // A deleted directory holding no excluded files is removed whole.
+        assert!(!src.join("Gone").exists());
+        let content = fs_err::read_to_string(src.join("Foo.luau")).unwrap();
+        assert_snapshot!(
+            "partition_ignore_globs_root-src/Foo.luau",
+            content,
+            "src/Foo.luau"
+        );
+    });
+}
+
+/// A node whose `$path` names a project file applies its rules from that
+/// file's folder, and the nested project's root node rules apply as well.
+#[test]
+fn partition_ignore_globs_nested() {
+    run_syncback_test("partition_ignore_globs_nested", |path| {
+        let src = path.join("package/src");
+        assert!(!src.join("Foo.spec.luau").exists());
+        assert!(!src.join("Foo.gen.luau").exists());
+        let content = fs_err::read_to_string(src.join("Foo.luau")).unwrap();
+        assert_snapshot!(
+            "partition_ignore_globs_nested-package/src/Foo.luau",
+            content,
+            "package/src/Foo.luau"
+        );
+    });
+}

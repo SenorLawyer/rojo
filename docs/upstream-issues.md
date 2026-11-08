@@ -198,5 +198,5 @@
 | [163](https://github.com/rojo-rbx/rojo/issues/163) | Change property behavior | Proposal or workflow change. Not implemented in this fork. |
 | [160](https://github.com/rojo-rbx/rojo/issues/160) | Profiles | Proposal or workflow change. Not implemented in this fork. |
 | [55](https://github.com/rojo-rbx/rojo/issues/55) | Support user plugins | Related upstream proposal reviewed; see the pull request inventory for disposition. |
-| [33](https://github.com/rojo-rbx/rojo/issues/33) | Partition-level ignore field | Proposal or workflow change. Not implemented in this fork. |
+| [33](https://github.com/rojo-rbx/rojo/issues/33) | Partition-level ignore field | Implemented and tested: `$globIgnorePaths` on project nodes with `$path`, for build, serve, live sync, sourcemap and syncback. |
 | [1](https://github.com/rojo-rbx/rojo/issues/1) | Rojo Roadmap Meta-Issue | Proposal or workflow change. Not implemented in this fork. |
