@@ -1,5 +1,5 @@
 //! A small blocking client for the Roblox Open Cloud APIs that Rojo uses:
-//! place publishing, Luau Execution and asset uploads.
+//! place publishing, Luau Execution, asset uploads and game server logs.
 //!
 //! # Safety properties
 //!
@@ -62,6 +62,26 @@
 //!   fails (for example with 403 when the key lacks `asset:read`), so such
 //!   errors are [`OpenCloudError::Unfollowed`] and the operation can be
 //!   polled again later with [`OpenCloud::resume_asset_upload`].
+//! - Game server logs (Observability, beta), all under
+//!   `/server-management/v1/universes/{u}/places/{p}` with scope
+//!   `universe:read` and a limit of 100 requests per minute per key owner
+//!   (shared by every use of the owner's keys):
+//!   `GET .../game-servers:filter-options?Filter=PlaceVersion` gives
+//!   `filters.PlaceVersion.values`; `GET .../versions/{v}/game-servers`
+//!   gives `gameServers[]` (`jobId`, `placeVersion`, `shutDown`,
+//!   `terminationTime`, ...) and `nextPageToken`; and
+//!   `GET .../versions/{v}/game-servers/{jobId}/logs` gives
+//!   `gameServerLogs[]` (`messageTimestampMs` as a string, `severity` as
+//!   `LogSeverity` 0-3 for Output, Info, Warning and Error, `message`,
+//!   `stackTrace`, `skippedCount`, `rateLimitedCount`, ...) and
+//!   `nextPageToken`. List queries take `MaxPageSize` (at most 100),
+//!   `PageToken`, `OrderBy` (`message_timestamp desc` for logs) and a CEL
+//!   `Filter` (for logs: `severity`, `message_timestamp` and `search ==
+//!   "text"`). Roblox only keeps Error and Warning logs so far, which take
+//!   about three minutes to appear, and folds repeats past 10 identical or
+//!   500 total messages per minute per server into those counts. Documented
+//!   at create.roblox.com/docs/cloud/reference/features/observability; not
+//!   checked against the live API.
 //!
 //! # Image or Decal
 //!
@@ -78,6 +98,7 @@
 
 use std::{
     fmt,
+    sync::Mutex,
     thread::sleep,
     time::{Duration, Instant},
 };
@@ -360,6 +381,13 @@ pub struct OpenCloud {
     key: HeaderValue,
     base_url: String,
     timing: Timing,
+    spacing: Option<Spacing>,
+}
+
+/// The minimum time between two HTTP attempts and when the next may start.
+struct Spacing {
+    spacing: Duration,
+    next: Mutex<Option<Instant>>,
 }
 
 impl fmt::Debug for OpenCloud {
@@ -407,7 +435,36 @@ impl OpenCloud {
             key,
             base_url: base_url.trim_end_matches('/').to_owned(),
             timing: Timing::default(),
+            spacing: None,
         })
+    }
+
+    /// Spaces every HTTP attempt this client sends, retries included, at
+    /// least `spacing` apart, for endpoints whose per-minute limit a caller
+    /// must stay under.
+    pub fn with_request_spacing(mut self, spacing: Duration) -> OpenCloud {
+        self.spacing = Some(Spacing {
+            spacing,
+            next: Mutex::new(None),
+        });
+        self
+    }
+
+    /// Waits for the next request slot when requests are spaced.
+    fn pace(&self) {
+        let Some(spacing) = &self.spacing else {
+            return;
+        };
+        loop {
+            let wait = {
+                let mut next = spacing.next.lock().unwrap_or_else(|e| e.into_inner());
+                admit(&mut next, Instant::now(), spacing.spacing)
+            };
+            match wait {
+                Some(wait) => sleep(wait),
+                None => return,
+            }
+        }
     }
 
     /// Retries and polls within milliseconds and gives Luau tasks no extra
@@ -753,6 +810,107 @@ impl OpenCloud {
         })
     }
 
+    /// The place versions Roblox offers as game server filters for a place,
+    /// as given (decimal strings, whether Roblox sends numbers or strings).
+    pub fn place_versions(&self, universe_id: u64, place_id: u64) -> Result<Vec<String>> {
+        let path = format!(
+            "/server-management/v1/universes/{universe_id}/places/{place_id}/game-servers:filter-options?Filter=PlaceVersion"
+        );
+        let body = self.send(Method::GET, &path, None, REQUEST_TIMEOUT)?;
+        let options: Value = self.parse(&body, "game server filter options")?;
+        let values = match &options["filters"]["PlaceVersion"]["values"] {
+            Value::Array(values) => values,
+            Value::Null => return Ok(Vec::new()),
+            _ => {
+                return Err(self.unconfirmed(format!(
+                    "filter options have no list of place versions{}",
+                    self.excerpt(&body)
+                )))
+            }
+        };
+        Ok(values
+            .iter()
+            .filter_map(|value| match value {
+                Value::String(text) => Some(text.trim().to_owned()),
+                Value::Number(number) => Some(number.to_string()),
+                _ => None,
+            })
+            .filter(|version| path_segment(version))
+            .collect())
+    }
+
+    /// One page of the game servers, active and shut down, that ran
+    /// `place_version` of a place.
+    pub fn list_game_servers(
+        &self,
+        universe_id: u64,
+        place_id: u64,
+        place_version: &str,
+        page_token: Option<&str>,
+    ) -> Result<GameServerPage> {
+        let version = self.segment(place_version, "place version")?;
+        let path = format!(
+            "/server-management/v1/universes/{universe_id}/places/{place_id}/versions/{version}/game-servers{}",
+            query(&[("MaxPageSize", "100"), ("PageToken", page_token.unwrap_or(""))])
+        );
+        let body = self.send(Method::GET, &path, None, REQUEST_TIMEOUT)?;
+        let page: RawGameServerPage = self.parse(&body, "a page of game servers")?;
+        Ok(GameServerPage {
+            incomplete: page.active_servers_fetch_error == Some(true)
+                || page.shutdown_servers_fetch_error == Some(true),
+            servers: page
+                .game_servers
+                .unwrap_or_default()
+                .iter()
+                .filter_map(GameServer::from_value)
+                .collect(),
+            next_page_token: page.next_page_token.filter(|token| !token.is_empty()),
+        })
+    }
+
+    /// One page of a game server's logs, newest first. `filter` is a CEL
+    /// expression Roblox applies, or empty for every entry.
+    pub fn list_game_server_logs(
+        &self,
+        universe_id: u64,
+        place_id: u64,
+        place_version: &str,
+        job_id: &str,
+        filter: &str,
+        page_token: Option<&str>,
+    ) -> Result<GameServerLogPage> {
+        let version = self.segment(place_version, "place version")?;
+        let job = self.segment(job_id, "job id")?;
+        let path = format!(
+            "/server-management/v1/universes/{universe_id}/places/{place_id}/versions/{version}/game-servers/{job}/logs{}",
+            game_server_logs_query(filter, page_token)
+        );
+        let body = self.send(Method::GET, &path, None, REQUEST_TIMEOUT)?;
+        let page: RawGameServerLogPage = self.parse(&body, "a page of game server logs")?;
+        Ok(GameServerLogPage {
+            logs: page
+                .game_server_logs
+                .unwrap_or_default()
+                .iter()
+                .map(GameServerLog::from_value)
+                .collect(),
+            next_page_token: page.next_page_token.filter(|token| !token.is_empty()),
+        })
+    }
+
+    /// Checks a value that goes into a URL path, such as a job id that came
+    /// from a response, so it cannot change which endpoint is requested.
+    fn segment<'a>(&self, value: &'a str, what: &str) -> Result<&'a str> {
+        if path_segment(value) {
+            Ok(value)
+        } else {
+            Err(OpenCloudError::NotSent(format!(
+                "{what} {:?} cannot be used in a request path",
+                self.redact(value.to_owned())
+            )))
+        }
+    }
+
     /// Sends one request, retrying where that cannot duplicate its effect,
     /// and returns the body of a successful response.
     fn send(
@@ -779,6 +937,8 @@ impl OpenCloud {
                     .body(bytes.to_vec());
             }
             let can_retry = attempt < self.timing.max_attempts;
+            // Each attempt counts against Roblox's limits, retries too.
+            self.pace();
             let response = match request.send() {
                 Ok(response) => response,
                 Err(error) => {
@@ -947,6 +1107,251 @@ struct Operation {
     response: Option<Value>,
 }
 
+/// A game server from the server management API.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GameServer {
+    pub job_id: String,
+    pub place_version: String,
+    pub shut_down: bool,
+    /// As Roblox gives it; `None` while the server runs.
+    pub termination_time: Option<String>,
+}
+
+impl GameServer {
+    /// Reads a `GameServer`, skipping one without a job id that could be put
+    /// in a path, since its logs could not be requested.
+    fn from_value(value: &Value) -> Option<GameServer> {
+        let job_id = id_string(&value["jobId"])?;
+        Some(GameServer {
+            job_id,
+            place_version: id_string(&value["placeVersion"]).unwrap_or_default(),
+            shut_down: value["shutDown"].as_bool().unwrap_or(false),
+            termination_time: value["terminationTime"]
+                .as_str()
+                .filter(|time| !time.is_empty())
+                .map(str::to_owned),
+        })
+    }
+}
+
+#[derive(Debug)]
+pub struct GameServerPage {
+    pub servers: Vec<GameServer>,
+    pub next_page_token: Option<String>,
+    /// Roblox could not fetch its active or its shut-down servers, so the
+    /// page may be missing some (`activeServersFetchError` or
+    /// `shutdownServersFetchError`).
+    pub incomplete: bool,
+}
+
+/// A log entry's severity. Roblox documents `LogSeverity` as the numbers
+/// 0 to 3, but names are accepted too in case it serializes the enum by name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LogSeverity {
+    Output,
+    Info,
+    Warning,
+    Error,
+    /// A value Rojo does not know, kept as Roblox sent it.
+    Other(String),
+}
+
+impl LogSeverity {
+    pub fn parse(value: &Value) -> LogSeverity {
+        let text = match value {
+            Value::Number(number) => number.to_string(),
+            Value::String(text) => text.trim().to_ascii_lowercase(),
+            Value::Null => return LogSeverity::Other(String::new()),
+            other => return LogSeverity::Other(other.to_string()),
+        };
+        let name = text
+            .strip_prefix("log_severity_")
+            .or_else(|| text.strip_prefix("message"))
+            .unwrap_or(&text);
+        match name {
+            "0" | "output" => LogSeverity::Output,
+            "1" | "info" => LogSeverity::Info,
+            "2" | "warning" | "warn" => LogSeverity::Warning,
+            "3" | "error" => LogSeverity::Error,
+            _ => LogSeverity::Other(text),
+        }
+    }
+
+    pub fn as_str(&self) -> &str {
+        match self {
+            LogSeverity::Output => "output",
+            LogSeverity::Info => "info",
+            LogSeverity::Warning => "warning",
+            LogSeverity::Error => "error",
+            LogSeverity::Other(text) => text,
+        }
+    }
+}
+
+/// One entry from a game server's logs.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GameServerLog {
+    /// Milliseconds since the Unix epoch; `None` when Roblox gave none that
+    /// could be read.
+    pub timestamp_ms: Option<u64>,
+    pub severity: LogSeverity,
+    pub universe_id: String,
+    pub place_id: String,
+    pub place_version: String,
+    pub job_id: String,
+    pub message: String,
+    pub stack_trace: String,
+    pub message_template: Option<String>,
+    pub context: Option<String>,
+    pub logger_full_path: Option<String>,
+    /// Identical messages in the same window that were folded into this one.
+    pub skipped_count: u64,
+    /// Messages past the server's overall limit folded into this one.
+    pub rate_limited_count: u64,
+    /// As Roblox sent it, or `Null`.
+    pub structured_stack_trace: Value,
+}
+
+impl GameServerLog {
+    /// Reads a `GameServerLog` field by field, so one field of an unexpected
+    /// type does not lose the whole entry.
+    fn from_value(value: &Value) -> GameServerLog {
+        let text = |name: &str| value[name].as_str().unwrap_or_default().to_owned();
+        let optional = |name: &str| {
+            value[name]
+                .as_str()
+                .filter(|text| !text.is_empty())
+                .map(str::to_owned)
+        };
+        let count = |name: &str| match &value[name] {
+            Value::String(text) => text.trim().parse().unwrap_or(0),
+            other => other.as_u64().unwrap_or(0),
+        };
+        GameServerLog {
+            timestamp_ms: parse_timestamp_ms(&value["messageTimestampMs"]),
+            severity: LogSeverity::parse(&value["severity"]),
+            universe_id: id_string(&value["universeId"]).unwrap_or_default(),
+            place_id: id_string(&value["placeId"]).unwrap_or_default(),
+            place_version: id_string(&value["placeVersion"]).unwrap_or_default(),
+            job_id: id_string(&value["jobId"]).unwrap_or_default(),
+            message: text("message"),
+            stack_trace: text("stackTrace"),
+            message_template: optional("messageTemplate"),
+            context: optional("context"),
+            logger_full_path: optional("loggerFullPath"),
+            skipped_count: count("skippedCount"),
+            rate_limited_count: count("rateLimitedCount"),
+            structured_stack_trace: value["structuredStackTrace"].clone(),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct GameServerLogPage {
+    pub logs: Vec<GameServerLog>,
+    pub next_page_token: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawGameServerPage {
+    // Option, so the explicit `null` the schema allows reads as empty.
+    #[serde(default)]
+    game_servers: Option<Vec<Value>>,
+    next_page_token: Option<String>,
+    #[serde(default)]
+    active_servers_fetch_error: Option<bool>,
+    #[serde(default)]
+    shutdown_servers_fetch_error: Option<bool>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawGameServerLogPage {
+    #[serde(default)]
+    game_server_logs: Option<Vec<Value>>,
+    next_page_token: Option<String>,
+}
+
+/// The query for one page of game server logs. Entries come newest first,
+/// so a caller can stop paging once it reaches entries it has seen.
+fn game_server_logs_query(filter: &str, page_token: Option<&str>) -> String {
+    query(&[
+        ("MaxPageSize", "100"),
+        ("OrderBy", "message_timestamp desc"),
+        ("Filter", filter),
+        ("PageToken", page_token.unwrap_or("")),
+    ])
+}
+
+/// Builds `?name=value&...` from the parameters that have a value.
+fn query(params: &[(&str, &str)]) -> String {
+    let mut out = String::new();
+    for (name, value) in params.iter().filter(|(_, value)| !value.is_empty()) {
+        out.push(if out.is_empty() { '?' } else { '&' });
+        out.push_str(name);
+        out.push('=');
+        out.push_str(&query_escape(value));
+    }
+    out
+}
+
+/// Whether `value` is safe as one URL path segment: Roblox's job ids are
+/// GUIDs and place versions are numbers, so anything else is refused.
+fn path_segment(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value != "."
+        && value != ".."
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+}
+
+/// An id that Open Cloud may send as a number or a string.
+fn id_string(value: &Value) -> Option<String> {
+    match value {
+        Value::String(text) if !text.trim().is_empty() => Some(text.trim().to_owned()),
+        Value::Number(number) => Some(number.to_string()),
+        _ => None,
+    }
+}
+
+/// Reads `messageTimestampMs`, documented as a string of milliseconds. A
+/// number or an RFC 3339 time is accepted as well.
+fn parse_timestamp_ms(value: &Value) -> Option<u64> {
+    match value {
+        Value::Number(number) => number
+            .as_u64()
+            .or_else(|| number.as_f64().filter(|n| *n >= 0.0).map(|n| n as u64)),
+        Value::String(text) => {
+            let text = text.trim();
+            text.parse().ok().or_else(|| {
+                humantime::parse_rfc3339_weak(text)
+                    .ok()?
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .ok()
+                    .map(|elapsed| elapsed.as_millis() as u64)
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Admits a request at `now` if the slot `next` has come, booking the next
+/// slot `spacing` after the actual admission, and otherwise says how long to
+/// wait before asking again. Booking from `now` rather than from the slot
+/// keeps a late wakeup from letting two requests through back to back.
+fn admit(next: &mut Option<Instant>, now: Instant, spacing: Duration) -> Option<Duration> {
+    match *next {
+        Some(slot) if slot > now => Some(slot - now),
+        _ => {
+            *next = Some(now + spacing);
+            None
+        }
+    }
+}
+
 /// The whole request must finish within this time. Large uploads need longer
 /// on slow uplinks: 120 seconds plus one second per 256 KiB.
 fn upload_timeout(bytes: usize) -> Duration {
@@ -1068,6 +1473,8 @@ mod tests {
         target: String,
         headers: String,
         body: Vec<u8>,
+        /// When the request arrived.
+        at: Instant,
     }
 
     struct Reply {
@@ -1129,6 +1536,7 @@ mod tests {
                     target: request_line.next().unwrap().to_owned(),
                     headers: head.to_ascii_lowercase(),
                     body: data[head_end..head_end + length].to_vec(),
+                    at: Instant::now(),
                 });
                 write!(
                     stream,
@@ -1837,6 +2245,311 @@ mod tests {
 
     /// An 8x8 opaque PNG, built by hand with stored (uncompressed) deflate
     /// blocks to avoid an image dependency.
+    /// A `ListGameServerLogsResponse` shaped after the documented
+    /// `GameServerLog` model. No live response was available to record.
+    const LOG_PAGE: &str = r#"{
+        "gameServerLogs": [
+            {
+                "messageTimestampMs": "1794052800123",
+                "universeId": 1,
+                "placeId": "2",
+                "placeVersion": "45",
+                "jobId": "6f1c2d3e-0000-4000-8000-abcdefabcdef",
+                "severity": 3,
+                "message": "ServerScriptService.Main:10: attempt to index nil",
+                "stackTrace": "ServerScriptService.Main, line 10",
+                "messageTemplate": "attempt to index {thing}",
+                "context": "{\"thing\":\"nil\"}",
+                "skippedCount": 4,
+                "rateLimitedCount": 0,
+                "structuredStackTrace": [{"line": 10, "scriptPath": "ServerScriptService.Main"}]
+            },
+            {
+                "messageTimestampMs": "1794052799000",
+                "universeId": 1,
+                "placeId": "2",
+                "placeVersion": "45",
+                "jobId": "6f1c2d3e-0000-4000-8000-abcdefabcdef",
+                "severity": "Warning",
+                "message": "Infinite yield possible",
+                "stackTrace": "",
+                "skippedCount": "0",
+                "rateLimitedCount": 7
+            }
+        ],
+        "nextPageToken": "page two/+="
+    }"#;
+
+    #[test]
+    fn game_server_logs_request_and_parse() {
+        let (base, recorded) = serve(vec![reply("200 OK", LOG_PAGE)]);
+        let page = client(&base)
+            .list_game_server_logs(
+                1,
+                2,
+                "45",
+                "6f1c2d3e-0000-4000-8000-abcdefabcdef",
+                "search == \"nil\"",
+                Some("abc/="),
+            )
+            .unwrap();
+
+        let requests = received(&recorded);
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].method, "GET");
+        assert_eq!(
+            requests[0].target,
+            "/server-management/v1/universes/1/places/2/versions/45/game-servers/\
+             6f1c2d3e-0000-4000-8000-abcdefabcdef/logs?MaxPageSize=100\
+             &OrderBy=message_timestamp%20desc&Filter=search%20%3D%3D%20%22nil%22\
+             &PageToken=abc%2F%3D"
+        );
+        assert!(requests[0].headers.contains(&format!("x-api-key: {KEY}")));
+
+        assert_eq!(page.next_page_token.as_deref(), Some("page two/+="));
+        let [error, warning] = &page.logs[..] else {
+            panic!("expected two entries, got {:?}", page.logs);
+        };
+        assert_eq!(error.timestamp_ms, Some(1_794_052_800_123));
+        assert_eq!(error.severity, LogSeverity::Error);
+        assert_eq!(error.universe_id, "1");
+        assert_eq!(error.place_id, "2");
+        assert_eq!(error.place_version, "45");
+        assert_eq!(error.skipped_count, 4);
+        assert_eq!(error.stack_trace, "ServerScriptService.Main, line 10");
+        assert_eq!(
+            error.message_template.as_deref(),
+            Some("attempt to index {thing}")
+        );
+        assert_eq!(error.structured_stack_trace[0]["line"], 10);
+        assert_eq!(warning.severity, LogSeverity::Warning);
+        assert_eq!(warning.rate_limited_count, 7);
+        assert_eq!(warning.skipped_count, 0);
+        assert_eq!(warning.message_template, None);
+        assert_eq!(warning.structured_stack_trace, Value::Null);
+    }
+
+    #[test]
+    fn empty_filters_and_tokens_are_left_out_of_log_queries() {
+        assert_eq!(
+            game_server_logs_query("", None),
+            "?MaxPageSize=100&OrderBy=message_timestamp%20desc"
+        );
+        let (base, recorded) = serve(vec![reply("200 OK", "{}")]);
+        let page = client(&base)
+            .list_game_server_logs(1, 2, "3", "job", "", None)
+            .unwrap();
+        assert!(page.logs.is_empty());
+        assert_eq!(page.next_page_token, None);
+        assert!(received(&recorded)[0]
+            .target
+            .ends_with("/game-servers/job/logs?MaxPageSize=100&OrderBy=message_timestamp%20desc"));
+    }
+
+    #[test]
+    fn game_servers_and_place_versions_are_listed() {
+        let (base, recorded) = serve(vec![
+            reply(
+                "200 OK",
+                r#"{"filters":{"PlaceVersion":{"field":"PlaceVersion","type":"Number","values":[44,"45",null,"../x"]}}}"#,
+            ),
+            reply(
+                "200 OK",
+                r#"{"gameServers":[
+                    {"placeId":"2","placeVersion":"45","jobId":"a-1","shutDown":false,"terminationTime":null},
+                    {"placeId":"2","placeVersion":45,"jobId":"b-2","shutDown":true,"terminationTime":"2026-11-07T10:00:00Z"},
+                    {"placeId":"2","placeVersion":"45"}
+                ],"nextPageToken":""}"#,
+            ),
+        ]);
+        let client = client(&base);
+        assert_eq!(client.place_versions(1, 2).unwrap(), ["44", "45"]);
+        let page = client.list_game_servers(1, 2, "45", Some("t")).unwrap();
+        assert_eq!(
+            page.servers,
+            [
+                GameServer {
+                    job_id: "a-1".into(),
+                    place_version: "45".into(),
+                    shut_down: false,
+                    termination_time: None,
+                },
+                GameServer {
+                    job_id: "b-2".into(),
+                    place_version: "45".into(),
+                    shut_down: true,
+                    termination_time: Some("2026-11-07T10:00:00Z".into()),
+                },
+            ]
+        );
+        assert_eq!(page.next_page_token, None);
+        let requests = received(&recorded);
+        assert_eq!(
+            requests[0].target,
+            "/server-management/v1/universes/1/places/2/game-servers:filter-options?Filter=PlaceVersion"
+        );
+        assert_eq!(
+            requests[1].target,
+            "/server-management/v1/universes/1/places/2/versions/45/game-servers?MaxPageSize=100&PageToken=t"
+        );
+    }
+
+    #[test]
+    fn null_lists_read_as_empty_and_fetch_errors_mark_pages_incomplete() {
+        let (base, _) = serve(vec![
+            reply("200 OK", r#"{"gameServers":null,"nextPageToken":null}"#),
+            reply("200 OK", r#"{"gameServerLogs":null,"nextPageToken":null}"#),
+            reply(
+                "200 OK",
+                r#"{"gameServers":[{"jobId":"a"}],"activeServersFetchError":false,"shutdownServersFetchError":true}"#,
+            ),
+            reply(
+                "200 OK",
+                r#"{"gameServers":[],"activeServersFetchError":true,"shutdownServersFetchError":null}"#,
+            ),
+        ]);
+        let client = client(&base);
+        let page = client.list_game_servers(1, 2, "3", None).unwrap();
+        assert!(page.servers.is_empty());
+        assert!(!page.incomplete);
+        assert_eq!(page.next_page_token, None);
+        let logs = client
+            .list_game_server_logs(1, 2, "3", "job", "", None)
+            .unwrap();
+        assert!(logs.logs.is_empty());
+        let page = client.list_game_servers(1, 2, "3", None).unwrap();
+        assert_eq!(page.servers.len(), 1);
+        assert!(page.incomplete);
+        assert!(
+            client
+                .list_game_servers(1, 2, "3", None)
+                .unwrap()
+                .incomplete
+        );
+    }
+
+    #[test]
+    fn unsafe_path_values_are_refused_before_sending() {
+        let client = client("http://127.0.0.1:9");
+        for (version, job) in [
+            ("45", "../../assets"),
+            ("45/x", "job"),
+            ("45", "a?b"),
+            ("", "j"),
+        ] {
+            let error = client
+                .list_game_server_logs(1, 2, version, job, "", None)
+                .unwrap_err();
+            assert!(matches!(error, OpenCloudError::NotSent(_)), "{error}");
+        }
+    }
+
+    #[test]
+    fn log_severities_and_timestamps_are_read_leniently() {
+        use serde_json::json;
+        for (value, expected) in [
+            (json!(0), LogSeverity::Output),
+            (json!("1"), LogSeverity::Info),
+            (json!("WARNING"), LogSeverity::Warning),
+            (json!("LOG_SEVERITY_ERROR"), LogSeverity::Error),
+            (json!("MessageError"), LogSeverity::Error),
+            (json!(9), LogSeverity::Other("9".into())),
+        ] {
+            assert_eq!(LogSeverity::parse(&value), expected, "{value}");
+        }
+        assert_eq!(parse_timestamp_ms(&json!("12")), Some(12));
+        assert_eq!(parse_timestamp_ms(&json!(12)), Some(12));
+        assert_eq!(
+            parse_timestamp_ms(&json!("1970-01-01T00:00:01.5Z")),
+            Some(1500)
+        );
+        assert_eq!(parse_timestamp_ms(&json!("soon")), None);
+    }
+
+    #[test]
+    fn spaced_clients_pace_every_attempt_including_retries() {
+        let spacing = Duration::from_millis(150);
+        let (base, recorded) = serve(vec![
+            reply("503 Service Unavailable", ""),
+            reply("200 OK", "{}"),
+            reply("200 OK", "{}"),
+        ]);
+        let client = client(&base).with_request_spacing(spacing);
+        // The first call is retried once after the 503; the retry's own
+        // backoff (10 ms) is far shorter than the spacing.
+        client
+            .list_game_server_logs(1, 2, "3", "job", "", None)
+            .unwrap();
+        client
+            .list_game_server_logs(1, 2, "3", "job", "", None)
+            .unwrap();
+        let requests = received(&recorded);
+        assert_eq!(requests.len(), 3);
+        for pair in requests.windows(2) {
+            let gap = pair[1].at - pair[0].at;
+            // A little slack for when the server thread records arrival.
+            assert!(gap >= spacing - Duration::from_millis(20), "{gap:?}");
+        }
+    }
+
+    #[test]
+    fn late_wakeups_never_let_requests_through_closer_than_the_spacing() {
+        let spacing = Duration::from_millis(600);
+        let start = Instant::now();
+        let mut clock = start;
+        let mut next = None;
+        let mut admitted = Vec::new();
+        // A simple generator of oversleeps from 0 to 499 ms.
+        let mut seed: u64 = 7;
+        for _ in 0..300 {
+            while let Some(wait) = admit(&mut next, clock, spacing) {
+                seed = seed
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                clock += wait + Duration::from_millis((seed >> 33) % 500);
+            }
+            admitted.push(clock);
+        }
+        for pair in admitted.windows(2) {
+            assert!(pair[1] - pair[0] >= spacing, "{:?}", pair[1] - pair[0]);
+        }
+        // So no minute holds more than 100 of them.
+        for (i, first) in admitted.iter().enumerate() {
+            let in_minute = admitted[i..]
+                .iter()
+                .take_while(|at| **at - *first < Duration::from_secs(60))
+                .count();
+            assert!(in_minute <= 100, "{in_minute}");
+        }
+
+        // The case that used to slip through: woken 300 ms late, the next
+        // slot is 600 ms after that, not 300 ms.
+        let mut next = Some(start + spacing);
+        assert_eq!(admit(&mut next, start, spacing), Some(spacing));
+        let late = start + spacing + Duration::from_millis(300);
+        assert_eq!(admit(&mut next, late, spacing), None);
+        assert_eq!(
+            admit(&mut next, late + Duration::from_millis(300), spacing),
+            Some(Duration::from_millis(300))
+        );
+    }
+
+    #[test]
+    fn refused_log_requests_report_the_status() {
+        let (base, recorded) = serve(vec![reply(
+            "403 Forbidden",
+            r#"{"title":"Forbidden","status":403}"#,
+        )]);
+        let error = client(&base)
+            .list_game_server_logs(1, 2, "3", "job", "", None)
+            .unwrap_err();
+        match &error {
+            OpenCloudError::Status { status, .. } => assert_eq!(status.as_u16(), 403),
+            other => panic!("unexpected error {other}"),
+        }
+        assert_eq!(received(&recorded).len(), 1);
+    }
+
     fn tiny_png() -> Vec<u8> {
         fn crc32(data: &[u8]) -> u32 {
             let mut crc = !0u32;

@@ -1158,7 +1158,7 @@ fn print_json(value: &Value, compact: bool) -> anyhow::Result<()> {
 /// DEL and the C1 controls, which some terminals read as the start of an
 /// escape sequence. Outside strings JSON has no control characters, so each
 /// one left can be written as a `\u` escape in place.
-fn json_escape_controls(json: String) -> String {
+pub(super) fn json_escape_controls(json: String) -> String {
     if !json
         .chars()
         .any(|character| character.is_control() && character != '\n')
