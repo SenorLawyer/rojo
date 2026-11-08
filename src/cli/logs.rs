@@ -1664,8 +1664,10 @@ mod tests {
                 true,
             ),
         ] {
-            let mut fake = Fake::default();
-            fake.versions = vec!["45".to_owned()];
+            let fake = Fake {
+                versions: vec!["45".to_owned()],
+                ..Default::default()
+            };
             for _ in 0..2 {
                 fake.servers(
                     vec![
