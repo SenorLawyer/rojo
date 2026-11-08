@@ -110,41 +110,43 @@ syncback_tests! {
     project_default_properties_remove => ["default.project.json"],
 }
 
-/// Studio holds `Foo.spec` in both partitions, but only the partition without
-/// `$globIgnorePaths` gets the file; the other partition's non-ignored files
-/// are still written.
+/// Syncback leaves a partition with `$globIgnorePaths` alone, since the files
+/// those globs exclude are not in the tree it compares. A sibling partition
+/// without them is synced back as usual.
 #[test]
 fn partition_ignore_globs() {
     run_syncback_test("partition_ignore_globs", |path| {
-        assert!(
-            !path.join("filtered/Foo.spec.luau").exists(),
-            "syncback wrote into a path the node's $globIgnorePaths exclude"
+        // Nothing is written, added or removed under the partition.
+        assert_eq!(
+            fs_err::read_to_string(path.join("filtered/Foo.luau")).unwrap(),
+            "return \"Foo\"\n"
         );
-        for name in [
-            "filtered/Foo.luau",
-            "unfiltered/Foo.luau",
-            "unfiltered/Foo.spec.luau",
-        ] {
+        assert!(!path.join("filtered/Foo.spec.luau").exists());
+        assert!(path.join("filtered/Old.luau").exists());
+
+        assert!(!path.join("unfiltered/Old.luau").exists());
+        for name in ["unfiltered/Foo.luau", "unfiltered/Foo.spec.luau"] {
             let content = fs_err::read_to_string(path.join(name)).unwrap();
             assert_snapshot!(format!("partition_ignore_globs-{name}"), content, name);
         }
     });
 }
 
-/// The rules on a project's root node apply although that node's instance is
-/// tagged with the project file. Removing or replacing a directory keeps the
-/// files in it that the rules exclude.
+/// A project's root node is a partition too, although its instance is tagged
+/// with the project file. Studio changed, added, deleted and replaced files
+/// under it, and none of that is written.
 #[test]
 fn partition_ignore_globs_root() {
     run_syncback_test("partition_ignore_globs_root", |path| {
         let src = path.join("src");
-        // Studio's `New.spec` is excluded, so it is not written.
-        assert!(!src.join("New.spec.luau").exists());
-        // Excluded files are not instances, so syncback leaves them alone.
         for (name, content) in [
+            ("Foo.luau", "return \"Foo\"\n"),
             ("Foo.spec.luau", "return \"Foo.spec on disk\"\n"),
+            ("Nested/Bar.luau", "return \"Bar\"\n"),
             ("Nested/Bar.spec.luau", "return \"Bar.spec on disk\"\n"),
+            ("Dup/A.luau", "return \"A\"\n"),
             ("Dup/A.spec.luau", "return \"A.spec on disk\"\n"),
+            ("Gone/Old.luau", "return \"Old\"\n"),
         ] {
             assert_eq!(
                 fs_err::read_to_string(src.join(name)).unwrap(),
@@ -152,35 +154,59 @@ fn partition_ignore_globs_root() {
                 "{name}"
             );
         }
-        // `Nested` was deleted in Studio: only its excluded file remains.
-        assert!(!src.join("Nested/Bar.luau").exists());
-        // `Dup` was replaced by a model file: only its excluded file remains.
-        assert!(!src.join("Dup/A.luau").exists());
-        assert!(src.join("Dup.rbxm").exists());
-        // A deleted directory holding no excluded files is removed whole.
-        assert!(!src.join("Gone").exists());
-        let content = fs_err::read_to_string(src.join("Foo.luau")).unwrap();
+        assert!(!src.join("New.spec.luau").exists());
+        assert!(!src.join("Dup.rbxm").exists());
+    });
+}
+
+/// A directory that holds a partition is not replaced by a model file when
+/// it cannot be synced back as a directory, which would delete the partition
+/// with it. The rest of the tree is still synced back.
+#[test]
+fn partition_ignore_globs_holder() {
+    run_syncback_test("partition_ignore_globs_holder", |path| {
+        let holder = path.join("other/Holder");
+        assert!(!path.join("other/Holder.rbxm").exists());
+        for (name, content) in [
+            ("pkg/src/Foo.luau", "return \"Foo\"\n"),
+            ("pkg/src/Foo.spec.luau", "return \"Foo.spec\"\n"),
+        ] {
+            assert_eq!(
+                fs_err::read_to_string(holder.join(name)).unwrap(),
+                content,
+                "{name}"
+            );
+        }
+        let content = fs_err::read_to_string(path.join("other/Plain.luau")).unwrap();
         assert_snapshot!(
-            "partition_ignore_globs_root-src/Foo.luau",
+            "partition_ignore_globs_holder-other/Plain.luau",
             content,
-            "src/Foo.luau"
+            "other/Plain.luau"
         );
     });
 }
 
-/// A node whose `$path` names a project file applies its rules from that
-/// file's folder, and the nested project's root node rules apply as well.
+/// Partitions are found from every project file: a nested project's root
+/// node, and a node whose `$path` names a project file (based at that file's
+/// folder), are both skipped.
 #[test]
 fn partition_ignore_globs_nested() {
     run_syncback_test("partition_ignore_globs_nested", |path| {
-        let src = path.join("package/src");
-        assert!(!src.join("Foo.spec.luau").exists());
-        assert!(!src.join("Foo.gen.luau").exists());
-        let content = fs_err::read_to_string(src.join("Foo.luau")).unwrap();
-        assert_snapshot!(
-            "partition_ignore_globs_nested-package/src/Foo.luau",
-            content,
-            "package/src/Foo.luau"
-        );
+        for dir in ["package/src", "outer/src"] {
+            assert_eq!(
+                fs_err::read_to_string(path.join(dir).join("Foo.luau")).unwrap(),
+                "return \"Foo\"\n",
+                "{dir}"
+            );
+            assert!(!path.join(dir).join("New.luau").exists(), "{dir}");
+        }
+        for name in ["other/Foo.luau", "other/New.luau"] {
+            let content = fs_err::read_to_string(path.join(name)).unwrap();
+            assert_snapshot!(
+                format!("partition_ignore_globs_nested-{name}"),
+                content,
+                name
+            );
+        }
     });
 }

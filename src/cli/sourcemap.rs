@@ -241,9 +241,13 @@ fn recurse_create_node<'a>(
         // Not all paths listed as relevant are guaranteed to exist.
         .filter(|path| path.is_file())
         // A folder lists its possible init files as relevant, including ones
-        // excluded by ignore globs, which do not make up the instance.
+        // excluded by a node's `$globIgnorePaths`, which do not make up the
+        // instance.
         .filter(|path| {
-            !crate::snapshot::is_path_ignored(&instance.metadata().context.path_ignore_rules, path)
+            !crate::snapshot_middleware::is_ignored_by_node_rules(
+                &instance.metadata().context.path_ignore_rules,
+                path,
+            )
         })
         .map(|path| path.as_path());
 
@@ -527,6 +531,39 @@ mod test {
                 "unfiltered/Server/init.server.luau",
             ]
         );
+    }
+
+    #[test]
+    fn leaves_out_init_files_excluded_on_the_root_node() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("project");
+        fs_err::create_dir_all(project.join("src")).unwrap();
+        fs_err::write(
+            project.join("default.project.json"),
+            r#"{"name": "root", "tree": {"$path": "src", "$globIgnorePaths": ["init.server.luau"]}}"#,
+        )
+        .unwrap();
+        fs_err::write(project.join("src/init.server.luau"), "print(1)").unwrap();
+        fs_err::write(project.join("src/Helper.luau"), "return 1").unwrap();
+        let sourcemap_output = dir.path().join("sourcemap.json");
+        let sourcemap_command = SourcemapCommand {
+            project,
+            output: Some(sourcemap_output.clone()),
+            include_non_scripts: true,
+            watch: false,
+            absolute: false,
+        };
+        assert!(sourcemap_command.run().is_ok());
+
+        let raw = fs_err::read_to_string(sourcemap_output.as_path()).unwrap();
+        let root = serde_json::from_str::<SourcemapNode>(&raw).unwrap();
+        assert_eq!(root.class_name, "Folder");
+        let root_paths: Vec<_> = root
+            .file_paths
+            .iter()
+            .map(|path| path.to_string_lossy().replace('\\', "/"))
+            .collect();
+        assert_eq!(root_paths, ["default.project.json"]);
     }
 
     #[test]

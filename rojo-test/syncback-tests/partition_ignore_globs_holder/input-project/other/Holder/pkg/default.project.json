@@ -1,0 +1,9 @@
+{
+  "name": "Pkg",
+  "tree": {
+    "$path": "src",
+    "$globIgnorePaths": [
+      "**/*.spec.luau"
+    ]
+  }
+}

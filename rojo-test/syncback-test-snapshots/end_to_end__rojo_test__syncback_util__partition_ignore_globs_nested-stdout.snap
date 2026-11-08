@@ -2,4 +2,5 @@
 source: tests/rojo_test/syncback_util.rs
 expression: "String::from_utf8_lossy(&output.stdout)"
 ---
-Writing package/src/Foo.luau
+Writing other/Foo.luau
+Writing other/New.luau

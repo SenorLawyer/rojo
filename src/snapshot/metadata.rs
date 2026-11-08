@@ -70,9 +70,21 @@ pub struct InstanceMetadata {
     /// A schema provided via a JSON file, if one exists. Will be `None` for
     /// all non-JSON middleware.
     pub schema: Option<String>,
+
+    /// The context to re-snapshot this instance's instigating source with,
+    /// when it differs from `context`. A project's root has `context` with the
+    /// project's own ignore rules, which re-snapshotting the project file must
+    /// not start from.
+    #[serde(skip)]
+    pub reload_context: Option<Box<InstanceContext>>,
 }
 
 impl InstanceMetadata {
+    /// The context to re-snapshot this instance's instigating source with.
+    pub fn reload_context(&self) -> &InstanceContext {
+        self.reload_context.as_deref().unwrap_or(&self.context)
+    }
+
     pub fn new() -> Self {
         Self {
             ignore_unknown_instances: false,
@@ -82,6 +94,7 @@ impl InstanceMetadata {
             specified_id: None,
             middleware: None,
             schema: None,
+            reload_context: None,
         }
     }
 
@@ -227,6 +240,11 @@ pub struct PathIgnoreRule {
 
     /// The actual glob that can be matched against the input path.
     pub glob: IgnorableGlob,
+
+    /// Whether this rule comes from a project node's `$globIgnorePaths`
+    /// rather than the project-wide `globIgnorePaths`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub from_node: bool,
 }
 
 impl PathIgnoreRule {

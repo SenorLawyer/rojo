@@ -4,10 +4,16 @@
     "$className": "DataModel",
     "ReplicatedStorage": {
       "Package": {
-        "$path": "package/default.project.json",
+        "$path": "package/default.project.json"
+      },
+      "Outer": {
+        "$path": "outer/default.project.json",
         "$globIgnorePaths": [
           "**/*.spec.luau"
         ]
+      },
+      "Other": {
+        "$path": "other"
       }
     }
   }

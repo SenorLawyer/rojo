@@ -23,10 +23,10 @@ use std::{
 use crate::{
     glob::{Glob, IgnorableGlob},
     snapshot::{
-        content_property_aliases, is_path_ignored, object_content_warning, remove_object_contents,
-        InstanceWithMeta, PathIgnoreRule, RojoTree,
+        content_property_aliases, object_content_warning, remove_object_contents, InstanceWithMeta,
+        RojoTree,
     },
-    snapshot_middleware::{node_ignore_rules, Middleware},
+    snapshot_middleware::{node_ignore_base, Middleware},
     syncback::{
         ref_properties::{collect_referents, link_referents},
         snapshot::inst_path,
@@ -181,15 +181,34 @@ pub fn syncback_loop(
     log::debug!("Hashing file DOM");
     let new_hashes = hash_tree(project, &new_tree, new_tree.root_ref());
 
-    // Files a project node's `$globIgnorePaths` exclude never become instances,
-    // so without this an instance Studio has at such a path would be written
-    // there as new.
-    let node_rules = collect_node_ignore_rules(vfs, old_tree)?;
+    // Syncback compares the tree from the files against Studio's, but files
+    // that `$globIgnorePaths` exclude are not in that tree. Writing, removing
+    // or replacing anything in such a partition could therefore overwrite or
+    // delete those files, so syncback leaves these partitions alone.
+    let skipped_partitions = partitions_with_ignore_globs(vfs, old_tree)?;
+    for (node, base) in &skipped_partitions {
+        log::warn!(
+            "syncback skipped {node} ({}) because it has $globIgnorePaths; edit those files directly",
+            base.display()
+        );
+    }
 
     let project_path = project.folder_location();
-    let is_writable = |path: &Path| {
-        is_valid_path(&ignore_patterns, project_path, path) && !is_path_ignored(&node_rules, path)
+    let in_partition = |path: &Path| {
+        skipped_partitions
+            .iter()
+            .any(|(_, base)| path.starts_with(base))
     };
+    // Removing or replacing a directory that holds a partition would delete
+    // the partition along with it.
+    let holds_partition = |path: &Path| {
+        skipped_partitions
+            .iter()
+            .any(|(_, base)| base.starts_with(path))
+    };
+    let is_writable =
+        |path: &Path| is_valid_path(&ignore_patterns, project_path, path) && !in_partition(path);
+    let is_changeable = |path: &Path| is_writable(path) && !holds_partition(path);
 
     let syncback_data = SyncbackData {
         vfs,
@@ -268,6 +287,13 @@ pub fn syncback_loop(
                     Ok(value) if value == "2" => Middleware::JsonModel,
                     _ => Middleware::Rbxm,
                 };
+                if holds_partition(&snapshot.path) {
+                    log::warn!(
+                        "Could not syncback {inst_path} as a Directory because: {err}.
+                        It holds a partition with $globIgnorePaths, so it is left as it is."
+                    );
+                    continue;
+                }
                 let file_name = snapshot
                     .path
                     .file_name()
@@ -289,7 +315,7 @@ pub fn syncback_loop(
                 if new_syncback_result.is_ok() && snapshot.old_inst().is_some() {
                     // We need to remove the old FS representation if we're
                     // reserializing it as an rbxm.
-                    remove_dir_keeping_ignored(vfs, &mut fs_snapshot, &snapshot.path, &node_rules)?;
+                    fs_snapshot.remove_dir(&snapshot.path);
                 }
                 new_syncback_result?
             }
@@ -304,7 +330,7 @@ pub fn syncback_loop(
             'remove: for inst in &syncback.removed_children {
                 let path = inst.metadata().instigating_source.as_ref().unwrap().path();
                 let inst_path = snapshot.get_old_inst_path(inst.id());
-                if !is_writable(path) {
+                if !is_changeable(path) {
                     log::debug!(
                         "Skipping removing {} because its matches an ignore pattern",
                         path.display()
@@ -320,7 +346,7 @@ pub fn syncback_loop(
                     }
                 }
                 if path.is_dir() {
-                    remove_dir_keeping_ignored(vfs, &mut fs_snapshot, path, &node_rules)?;
+                    fs_snapshot.remove_dir(path)
                 } else {
                     fs_snapshot.remove_file(path)
                 }
@@ -329,7 +355,7 @@ pub fn syncback_loop(
 
         // TODO provide replacement snapshots for e.g. two way sync
 
-        fs_snapshot.merge_with_filter(syncback.fs_snapshot, is_writable);
+        fs_snapshot.merge_with_filter(syncback.fs_snapshot, is_changeable);
 
         snapshots.extend(syncback.children);
     }
@@ -337,15 +363,16 @@ pub fn syncback_loop(
     Ok(fs_snapshot)
 }
 
-/// Reads the `$globIgnorePaths` of every node in every project file the old
-/// tree came from. They are read from the project files rather than from each
-/// instance's `InstigatingSource`, because a project's root node is tagged
-/// with the project file's path instead, which would lose its rules.
-fn collect_node_ignore_rules(
+/// Returns the name and `$path` of every project node that sets
+/// `$globIgnorePaths`, in every project file the old tree came from. They are
+/// read from the project files rather than from each instance's
+/// `InstigatingSource`, because a project's root node is tagged with the
+/// project file's path instead.
+fn partitions_with_ignore_globs(
     vfs: &Vfs,
     old_tree: &RojoTree,
-) -> anyhow::Result<Vec<PathIgnoreRule>> {
-    let mut project_paths = Vec::new();
+) -> anyhow::Result<Vec<(String, PathBuf)>> {
+    let mut project_paths: Vec<PathBuf> = Vec::new();
     for inst in old_tree.descendants(old_tree.get_root_id()) {
         let metadata = inst.metadata();
         let instigating = metadata
@@ -364,7 +391,7 @@ fn collect_node_ignore_rules(
         }
     }
 
-    let mut rules = Vec::new();
+    let mut partitions = Vec::new();
     for project_path in project_paths {
         if !vfs.exists(&project_path)? {
             continue;
@@ -372,82 +399,24 @@ fn collect_node_ignore_rules(
         // The fallback name only keeps loading from failing for a project
         // without `name`; the name is not used here.
         let project = Project::load_exact(vfs, &project_path, Some("project"))?;
-        let mut nodes = vec![&project.tree];
-        while let Some(node) = nodes.pop() {
-            for rule in node_ignore_rules(&project_path, node) {
-                if !rules.contains(&rule) {
-                    rules.push(rule);
+        let mut nodes = vec![("tree".to_owned(), &project.tree)];
+        while let Some((name, node)) = nodes.pop() {
+            if !node.glob_ignore_paths.is_empty() {
+                if let Some(base) = node_ignore_base(&project_path, node) {
+                    let name = format!("{name} in {}", project_path.display());
+                    if !partitions.iter().any(|(_, b)| b == &base) {
+                        partitions.push((name, base));
+                    }
                 }
             }
-            nodes.extend(node.children.values());
+            nodes.extend(
+                node.children
+                    .iter()
+                    .map(|(child_name, child)| (format!("{name}.{child_name}"), child)),
+            );
         }
     }
-    Ok(rules)
-}
-
-/// Removes the directory at `path`, except for files beneath it that a node's
-/// `$globIgnorePaths` exclude. Those files are not part of the tree syncback
-/// compares, so removing them with their directory would delete files that
-/// Studio never held. The directory is kept if anything in it is kept.
-fn remove_dir_keeping_ignored(
-    vfs: &Vfs,
-    fs_snapshot: &mut FsSnapshot,
-    path: &Path,
-    rules: &[PathIgnoreRule],
-) -> anyhow::Result<()> {
-    let may_apply = rules
-        .iter()
-        .any(|rule| path.starts_with(&rule.base_path) || rule.base_path.starts_with(path));
-    if !may_apply {
-        fs_snapshot.remove_dir(path);
-        return Ok(());
-    }
-
-    // Returns whether anything under `dir` is kept, and the removals that
-    // leave only the kept entries.
-    fn plan(
-        vfs: &Vfs,
-        dir: &Path,
-        rules: &[PathIgnoreRule],
-    ) -> anyhow::Result<(bool, Vec<(PathBuf, bool)>)> {
-        let mut kept = false;
-        let mut removals = Vec::new();
-        for entry in vfs.read_dir(dir)? {
-            let entry_path = entry?.path().to_path_buf();
-            if is_path_ignored(rules, &entry_path) {
-                kept = true;
-            } else if vfs.metadata(&entry_path)?.is_dir() {
-                let (child_kept, child_removals) = plan(vfs, &entry_path, rules)?;
-                if child_kept {
-                    kept = true;
-                    removals.extend(child_removals);
-                } else {
-                    removals.push((entry_path, true));
-                }
-            } else {
-                removals.push((entry_path, false));
-            }
-        }
-        Ok((kept, removals))
-    }
-
-    let (kept, removals) = plan(vfs, path, rules)?;
-    if !kept {
-        fs_snapshot.remove_dir(path);
-        return Ok(());
-    }
-    log::warn!(
-        "Keeping {} because it holds files excluded by $globIgnorePaths",
-        path.display()
-    );
-    for (removal, is_dir) in removals {
-        if is_dir {
-            fs_snapshot.remove_dir(removal);
-        } else {
-            fs_snapshot.remove_file(removal);
-        }
-    }
-    Ok(())
+    Ok(partitions)
 }
 
 pub struct SyncbackReturn<'sync> {

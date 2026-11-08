@@ -767,7 +767,7 @@ fn compute_and_apply_changes(
                 // path still exists. We can generate a snapshot starting at
                 // that path and use it as the source for our patch.
 
-                let snapshot = match snapshot_from_vfs(&metadata.context, vfs, path) {
+                let snapshot = match snapshot_from_vfs(metadata.reload_context(), vfs, path) {
                     Ok(snapshot) => snapshot,
                     Err(err) => {
                         log::error!("Snapshot error: {:?}", err);
@@ -823,7 +823,7 @@ fn compute_and_apply_changes(
             // the project file, we snapshot the entire project node again.
 
             let snapshot_result = snapshot_project_node(
-                &metadata.context,
+                metadata.reload_context(),
                 path,
                 name,
                 node,

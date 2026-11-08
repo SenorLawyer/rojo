@@ -86,9 +86,9 @@ this guide, `--help` and the bundled topics over them. Each topic prints with
   files beneath it and come after the project's `globIgnorePaths`, so `!` can
   re-include a file the project ignores. Matching files become no instances
   in build, serve, live sync and sourcemap; an excluded `init` file leaves its
-  folder a Folder. Syncback neither writes nor deletes them, and keeps a
-  removed directory that still holds one. `Generated/**` leaves an empty
-  `Generated` folder; `Generated` removes it.
+  folder a Folder. Syncback skips such a partition entirely, writing and
+  removing nothing under its `$path`, and warns; edit those files directly.
+  `Generated/**` leaves an empty `Generated` folder; `Generated` removes it.
 * Packages and merges: `rojo packages doctor` checks Wally and pesde
   mappings, see `rojo doc --agent packages`; `rojo merge` merges binary and
   XML place files, see `rojo doc --agent merge`.

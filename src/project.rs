@@ -792,6 +792,7 @@ mod test {
             .map(|g| crate::snapshot::PathIgnoreRule {
                 base_path: PathBuf::from("/test"),
                 glob: g.clone(),
+                from_node: false,
             })
             .collect();
         assert!(crate::snapshot::is_path_ignored(

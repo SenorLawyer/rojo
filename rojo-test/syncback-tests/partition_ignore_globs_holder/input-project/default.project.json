@@ -1,0 +1,11 @@
+{
+  "name": "partition_ignore_globs_holder",
+  "tree": {
+    "$className": "DataModel",
+    "ReplicatedStorage": {
+      "Other": {
+        "$path": "other"
+      }
+    }
+  }
+}

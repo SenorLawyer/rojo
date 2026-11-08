@@ -1,5 +1,0 @@
----
-source: tests/tests/syncback.rs
-expression: package/src/Foo.luau
----
-return "Foo from Studio"

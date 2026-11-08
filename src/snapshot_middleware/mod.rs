@@ -35,7 +35,7 @@ use crate::{
     syncback::{SyncbackReturn, SyncbackSnapshot},
 };
 use crate::{
-    snapshot::{is_path_ignored, InstanceContext, InstanceSnapshot, PathIgnoreRule, SyncRule},
+    snapshot::{InstanceContext, InstanceSnapshot, PathIgnoreRule, SyncRule},
     syncback::validate_file_name,
 };
 
@@ -55,7 +55,7 @@ use self::{
 };
 
 pub use self::{
-    lua::ScriptType, project::node_ignore_rules, project::snapshot_project_node,
+    lua::ScriptType, project::node_ignore_base, project::snapshot_project_node,
     util::canonicalize_existing_ancestor, util::emit_legacy_scripts_default, util::PathExt,
 };
 
@@ -143,7 +143,7 @@ pub(crate) fn get_dir_middleware<'path>(
 
     for default_project_name in DEFAULT_PROJECT_NAMES {
         let project_path = dir_path.join(default_project_name);
-        if is_path_ignored(ignore_rules, &project_path) {
+        if is_ignored_by_node_rules(ignore_rules, &project_path) {
             continue;
         }
         if vfs.metadata(&project_path).with_not_found()?.is_some() {
@@ -153,9 +153,9 @@ pub(crate) fn get_dir_middleware<'path>(
 
     for (middleware, name) in order {
         let test_path = dir_path.join(name);
-        // An ignored init file is treated as absent, as it is when listing
-        // the directory's children.
-        if is_path_ignored(ignore_rules, &test_path) {
+        // An init file a node's `$globIgnorePaths` exclude is treated as
+        // absent, as it is when listing the directory's children.
+        if is_ignored_by_node_rules(ignore_rules, &test_path) {
             continue;
         }
         match vfs.metadata(&test_path) {
@@ -172,6 +172,20 @@ pub(crate) fn get_dir_middleware<'path>(
     }
 
     Ok((Middleware::Dir, dir_name, dir_path.to_path_buf()))
+}
+
+/// Whether the node-level `$globIgnorePaths` in `rules` exclude `path`. The
+/// project-wide `globIgnorePaths` never affected which init file a directory
+/// uses, and still do not, so projects that do not use the node-level field
+/// keep their behavior.
+pub(crate) fn is_ignored_by_node_rules(rules: &[PathIgnoreRule], path: &Path) -> bool {
+    let mut ignored = false;
+    for rule in rules.iter().filter(|rule| rule.from_node) {
+        if rule.matches(path) {
+            ignored = !rule.is_negation();
+        }
+    }
+    ignored
 }
 
 /// Gets a snapshot for a path given an InstanceContext and Vfs, taking
