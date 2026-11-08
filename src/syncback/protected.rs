@@ -61,9 +61,15 @@ pub fn canonical(path: &Path) -> PathBuf {
         if let Ok(resolved) = dunce::canonicalize(existing) {
             break resolved;
         }
-        match (existing.parent(), existing.file_name()) {
-            (Some(parent), Some(name)) => {
-                rest.push(name.to_owned());
+        // On Unix `absolute` keeps `..`, and a path ending in `..` has no
+        // file name, so the last component is taken as written.
+        let last = existing.components().next_back();
+        match (existing.parent(), last) {
+            (
+                Some(parent),
+                Some(Component::Normal(_) | Component::ParentDir | Component::CurDir),
+            ) => {
+                rest.push(last.unwrap().as_os_str().to_owned());
                 existing = parent;
             }
             // Only `..` or a root is left that cannot be resolved; keep the
