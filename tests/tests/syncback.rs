@@ -296,6 +296,24 @@ fn partition_ignore_globs_nested_ref() {
     });
 }
 
+/// Studio replaced the protected `Filtered` Folder with a Model of the same
+/// name. Syncback still skips it by its `$path`, so what is under it is
+/// still protected, and a pointer at an instance Studio added there is not
+/// linked with an ID no file would hold.
+#[test]
+fn partition_ignore_globs_class_ref() {
+    run_syncback_test("partition_ignore_globs_class_ref", |path| {
+        assert!(!path.join("filtered/NewTarget.model.json").exists());
+        assert!(!path.join("filtered/init.meta.json").exists());
+        assert_eq!(
+            fs_err::read_to_string(path.join("filtered/Foo.luau")).unwrap(),
+            "return \"Foo\"\n"
+        );
+        let pointer = fs_err::read_to_string(path.join("unfiltered/Pointer.model.json")).unwrap();
+        assert!(!pointer.contains("Rojo_Target_Value"), "{pointer}");
+    });
+}
+
 /// Partitions are found from every project file: a nested project's root
 /// node, and a node whose `$path` names a project file (based at that file's
 /// folder), are both skipped.

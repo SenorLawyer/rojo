@@ -677,14 +677,17 @@ fn get_property_filter(project: &Project, new_inst: &Instance) -> Option<UstrSet
 /// sits on the partition its `$path` names, and so does anything Studio adds
 /// under it.
 struct ProtectedInstances {
-    /// The name and class of each protected instance and its ancestors, from
-    /// the DataModel down, outermost first.
-    roots: Vec<Vec<(String, Ustr)>>,
+    /// The names of each protected instance and its ancestors, from the
+    /// DataModel down, outermost first. Classes are left out on purpose:
+    /// project syncback skips a partition by its `$path`, whatever Studio
+    /// made of the instance there, such as a Folder replaced by a Model, so
+    /// everything under that name counts as protected too.
+    roots: Vec<Vec<String>>,
 }
 
 impl ProtectedInstances {
     fn new(old: &RojoTree, protected: &ProtectedPartitions) -> Self {
-        let mut roots: Vec<Vec<(String, Ustr)>> = Vec::new();
+        let mut roots: Vec<Vec<String>> = Vec::new();
         if protected.is_empty() {
             return ProtectedInstances { roots };
         }
@@ -737,7 +740,7 @@ impl ProtectedInstances {
             if inst.parent().is_none() {
                 break;
             }
-            path.push((inst.name.clone(), inst.class));
+            path.push(inst.name.clone());
             current = inst.parent();
         }
         path.reverse();
@@ -745,16 +748,15 @@ impl ProtectedInstances {
     }
 }
 
-/// The name and class of `id` and its ancestors below the root, outermost
-/// first.
-fn tree_path(tree: &RojoTree, id: Ref) -> Vec<(String, Ustr)> {
+/// The names of `id` and its ancestors below the root, outermost first.
+fn tree_path(tree: &RojoTree, id: Ref) -> Vec<String> {
     let mut path = Vec::new();
     let mut current = id;
     while let Some(inst) = tree.get_instance(current) {
         if inst.parent().is_none() {
             break;
         }
-        path.push((inst.name().to_owned(), inst.class_name()));
+        path.push(inst.name().to_owned());
         current = inst.parent();
     }
     path.reverse();
