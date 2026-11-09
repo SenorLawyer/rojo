@@ -881,6 +881,24 @@ fn bind_with_companion(
     match socket.and_then(|socket| socket.bind(SocketAddr::new(other, port)).map(|()| socket)) {
         Ok(socket) => Ok((listener, Some(socket))),
         Err(err) if held_by_listener && err.kind() == std::io::ErrorKind::AddrInUse => {
+            // On macOS a dual-stack listener refuses a plain bind of
+            // 127.0.0.1 but not one with SO_REUSEADDR, which Rust's
+            // listeners set on Unix, so another server could still take it.
+            // A reservation with SO_REUSEADDR holds the exact address, which
+            // no second socket can bind without SO_REUSEPORT. Where the
+            // listener really holds it, as on Linux, this fails too. Not on
+            // Windows, where the option would let others share the port.
+            #[cfg(unix)]
+            {
+                let reserved = tokio::net::TcpSocket::new_v4().and_then(|socket| {
+                    socket.set_reuseaddr(true)?;
+                    socket.bind(SocketAddr::new(other, port))?;
+                    Ok(socket)
+                });
+                if let Ok(socket) = reserved {
+                    return Ok((listener, Some(socket)));
+                }
+            }
             Ok((listener, None))
         }
         Err(err)
