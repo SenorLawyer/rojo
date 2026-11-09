@@ -262,6 +262,29 @@ fn partition_ignore_globs_reverse_ref() {
     });
 }
 
+/// As above, but Studio renamed the target. It is found through the
+/// pointer's own Ref, so it keeps the ID the pointer file uses.
+#[test]
+fn partition_ignore_globs_reverse_ref_renamed() {
+    run_syncback_test("partition_ignore_globs_reverse_ref_renamed", |path| {
+        let target =
+            fs_err::read_to_string(path.join("unfiltered/Renamed/init.meta.json")).unwrap();
+        assert!(target.contains("\"Rojo_Id\": \"target\""), "{target}");
+    });
+}
+
+/// As above, but the target already has the ID as `Rojo_Id` and Studio
+/// copied it. The copy gets a new ID; the pointer's target keeps its own.
+#[test]
+fn partition_ignore_globs_reverse_ref_dup() {
+    run_syncback_test("partition_ignore_globs_reverse_ref_dup", |path| {
+        let target = fs_err::read_to_string(path.join("unfiltered/Target.model.json")).unwrap();
+        assert!(target.contains("\"Rojo_Id\": \"target\""), "{target}");
+        let copy = fs_err::read_to_string(path.join("unfiltered/ACopy/init.meta.json")).unwrap();
+        assert!(!copy.contains("\"target\""), "{copy}");
+    });
+}
+
 /// Studio duplicated an instance with an ID inside a partition syncback
 /// leaves alone, and a synced partition points at both copies. The ID is the
 /// original's in the files, so only the pointer at the original is linked;

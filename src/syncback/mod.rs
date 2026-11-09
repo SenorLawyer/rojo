@@ -219,12 +219,12 @@ pub fn syncback_loop(
         // otherwise two files would hold the same ID.
         // Pointers in protected files stay as they are, so the writable
         // instances they name must keep those IDs too.
-        for target in keep_ids_protected_pointers_use(&mut new_tree, &protected, old) {
-            deferred_referents.keep_id(target);
-        }
         let reserved_ids = protected.ids_on_disk(old);
         if !reserved_ids.is_empty() {
             give_new_ids_to_writable_holders(&mut new_tree, &protected, &reserved_ids)?;
+        }
+        for target in keep_ids_protected_pointers_use(&mut new_tree, &protected, old)? {
+            deferred_referents.keep_id(target);
         }
         link_referents(
             deferred_referents,
@@ -822,24 +822,25 @@ fn give_new_ids_to_writable_holders(
     Ok(())
 }
 
-/// Gives the instances that pointers in protected partitions name the IDs
-/// those pointers use.
+/// Keeps the IDs that pointers in protected partitions use with the
+/// writable instances they name.
 ///
-/// An ID given by a model file's `id` is metadata, not a `Rojo_Id`
-/// attribute, so Studio's copy of the target has no ID, and linking would give
-/// it a new one. The protected pointer file keeps the old ID and is not
-/// rewritten, so the target is given that ID as its `Rojo_Id` instead, which
-/// the file syncback writes for it then holds.
+/// A protected pointer file is not rewritten, so whatever it names must hold
+/// the same ID afterwards. Each target is found in Studio's tree through the
+/// pointer's own Ref property there, so a target Studio renamed or moved is
+/// still found, and by its old path only when that fails. The target is
+/// given the ID whatever `Rojo_Id` it has, since an ID from a model file's
+/// `id` is metadata and Studio's copy has none, and any other writable
+/// instance holding that ID, such as a copy Studio made, is given a new one.
+/// Returns the targets, whose IDs linking must then keep.
 fn keep_ids_protected_pointers_use(
     new: &mut WeakDom,
     protected: &ProtectedInstances,
     old: &RojoTree,
-) -> Vec<Ref> {
-    let mut kept = Vec::new();
+) -> anyhow::Result<Vec<Ref>> {
     if protected.roots.is_empty() {
-        return kept;
+        return Ok(Vec::new());
     }
-    let attributes_key = ustr("Attributes");
     let in_protected = |id: Ref| -> bool {
         let path = tree_path(old, id);
         protected.roots.iter().any(|root| path.starts_with(root))
@@ -847,56 +848,104 @@ fn keep_ids_protected_pointers_use(
 
     // By the time the files are loaded, their pointer attributes have become
     // Ref properties, so the targets are found through those.
-    let mut targets: HashSet<Ref> = HashSet::new();
+    let mut owners: HashMap<Ref, String> = HashMap::new();
     for inst in old.descendants(old.get_root_id()) {
-        let mut refs = inst.properties().values().filter_map(|value| match value {
-            Variant::Ref(target) if target.is_some() => Some(*target),
-            _ => None,
-        });
-        let Some(first) = refs.next() else {
+        let refs: Vec<(Ustr, Ref)> = inst
+            .properties()
+            .iter()
+            .filter_map(|(name, value)| match value {
+                Variant::Ref(target) if target.is_some() => Some((*name, *target)),
+                _ => None,
+            })
+            .collect();
+        if refs.is_empty() || !in_protected(inst.id()) {
             continue;
-        };
-        if in_protected(inst.id()) {
-            targets.insert(first);
-            targets.extend(refs);
         }
-    }
-
-    let owners: Vec<(Ref, String)> = targets
-        .into_iter()
-        .filter(|target| !in_protected(*target))
-        .filter_map(|target| {
-            let id = old.get_metadata(target)?.specified_id.as_ref()?.as_str();
-            Some((target, id.to_owned()))
-        })
-        .collect();
-
-    for (old_ref, id) in owners {
-        let Some(new_ref) = new_instance_at_same_path(old, old_ref, new) else {
-            log::warn!(
-                "{} is named by a pointer in a partition with $globIgnorePaths, which                  keeps it, but it is not in Studio's tree; that pointer will not resolve",
-                tree_path(old, old_ref).join(".")
-            );
-            continue;
-        };
-        let inst = new.get_by_ref_mut(new_ref).unwrap();
-        let attributes = match inst.properties.get_mut(&attributes_key) {
-            Some(Variant::Attributes(attributes)) => attributes,
-            _ => {
-                inst.properties
-                    .insert(attributes_key, Variant::Attributes(Default::default()));
-                match inst.properties.get_mut(&attributes_key) {
-                    Some(Variant::Attributes(attributes)) => attributes,
-                    _ => unreachable!(),
-                }
+        let new_holder = new_instance_at_same_path(old, inst.id(), new);
+        for (name, old_target) in refs {
+            if in_protected(old_target) {
+                continue;
             }
-        };
-        if attributes.get(REF_ID_ATTRIBUTE_NAME).is_none() {
-            attributes.insert(REF_ID_ATTRIBUTE_NAME.to_owned(), Variant::String(id));
-            kept.push(new_ref);
+            let Some(id) = old
+                .get_metadata(old_target)
+                .and_then(|metadata| metadata.specified_id.as_ref())
+            else {
+                continue;
+            };
+            let through_pointer = new_holder
+                .and_then(|holder| new.get_by_ref(holder))
+                .and_then(|holder| match holder.properties.get(&name) {
+                    Some(Variant::Ref(target)) if target.is_some() => Some(*target),
+                    _ => None,
+                });
+            let Some(new_target) =
+                through_pointer.or_else(|| new_instance_at_same_path(old, old_target, new))
+            else {
+                log::warn!(
+                    "{} is named by a pointer in a partition with $globIgnorePaths, which \
+                     keeps it, but it is not in Studio's tree; that pointer will not resolve",
+                    tree_path(old, old_target).join(".")
+                );
+                continue;
+            };
+            owners.insert(new_target, id.as_str().to_owned());
         }
     }
-    kept
+    if owners.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let attributes_key = ustr("Attributes");
+    let needed: HashMap<&str, Ref> = owners
+        .iter()
+        .map(|(target, id)| (id.as_str(), *target))
+        .collect();
+    let copies: Vec<Ref> = new
+        .descendants()
+        .filter(|inst| {
+            let Some(Variant::Attributes(attributes)) = inst.properties.get(&attributes_key) else {
+                return false;
+            };
+            let id = match attributes.get(REF_ID_ATTRIBUTE_NAME) {
+                Some(Variant::String(id)) => id.as_str(),
+                Some(Variant::BinaryString(id)) => match std::str::from_utf8(id.as_ref()) {
+                    Ok(id) => id,
+                    Err(_) => return false,
+                },
+                _ => return false,
+            };
+            needed
+                .get(id)
+                .is_some_and(|owner| *owner != inst.referent())
+        })
+        .map(|inst| inst.referent())
+        .filter(|copy| !protected.contains(new, *copy))
+        .collect();
+    for copy in copies {
+        let fresh = rbx_dom_weak::types::UniqueId::now()?.to_string();
+        set_ref_id(new, copy, fresh);
+    }
+    for (target, id) in &owners {
+        set_ref_id(new, *target, id.clone());
+    }
+    Ok(owners.into_keys().collect())
+}
+
+/// Sets the `Rojo_Id` attribute of `target`, adding attributes if it has
+/// none.
+fn set_ref_id(dom: &mut WeakDom, target: Ref, id: String) {
+    let attributes_key = ustr("Attributes");
+    let inst = dom.get_by_ref_mut(target).unwrap();
+    if !matches!(
+        inst.properties.get(&attributes_key),
+        Some(Variant::Attributes(_))
+    ) {
+        inst.properties
+            .insert(attributes_key, Variant::Attributes(Default::default()));
+    }
+    if let Some(Variant::Attributes(attributes)) = inst.properties.get_mut(&attributes_key) {
+        attributes.insert(REF_ID_ATTRIBUTE_NAME.to_owned(), Variant::String(id));
+    }
 }
 
 /// The instance in `new` at the path of `old_ref` in `old`, when every step
