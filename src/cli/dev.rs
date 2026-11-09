@@ -596,8 +596,19 @@ fn prove(address: &str, token_file: &Path) -> Result<(String, String), String> {
             response.status()
         ));
     }
-    let identity: serde_json::Value = response
-        .json()
+    // Read with a limit before anything is parsed: until the proof is
+    // checked, whatever answers may be any process, and could send without end.
+    const PROVE_LIMIT: u64 = 64 * 1024;
+    let mut body = Vec::new();
+    std::io::Read::read_to_end(
+        &mut std::io::Read::take(response, PROVE_LIMIT + 1),
+        &mut body,
+    )
+    .map_err(|_| format!("the server on {address} is not its Studio bridge"))?;
+    if body.len() as u64 > PROVE_LIMIT {
+        return Err(format!("the server on {address} is not its Studio bridge"));
+    }
+    let identity: serde_json::Value = serde_json::from_slice(&body)
         .map_err(|_| format!("the server on {address} is not its Studio bridge"))?;
     let session = identity["serverSession"].as_str().unwrap_or_default();
     // The proof covers the address and port the answering server saw the
@@ -1276,7 +1287,12 @@ fn spawn_sourcemap_watcher(
 
 /// Writes `bytes` to a temporary file next to `path`, then renames it over
 /// `path`, so readers see the old file or the new one, never part of one.
+///
+/// A symlinked `path` keeps its link: the file it points to is replaced, as
+/// `rojo build` does, so an editor reading through the link keeps up.
 fn write_atomically(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    let path = &super::build::resolve_output(path)
+        .with_context(|| format!("Could not resolve symlink {}", path.display()))?;
     let name = path
         .file_name()
         .context("Path has no file name")?
@@ -1828,6 +1844,49 @@ mod test {
         );
         assert!(!request.contains("x-rojo-studio-token"), "{request}");
         assert!(!request.contains(RECORDED_TOKEN), "{request}");
+    }
+
+    #[test]
+    fn an_oversized_prove_answer_is_rejected_unread() {
+        let dir = tempfile::tempdir().unwrap();
+        let (server, _) = answer_with(Duration::ZERO, move |_, _| {
+            let body = " ".repeat(128 * 1024) + "{}";
+            format!(
+                "HTTP/1.1 200 OK
+Content-Type: application/json
+Content-Length: {}
+Connection: close
+
+{body}",
+                body.len()
+            )
+        });
+        let state = recorded(dir.path(), server, std::process::id());
+        let reason = verify(&state).unwrap_err();
+        assert!(reason.contains("is not its Studio bridge"), "{reason}");
+    }
+
+    #[test]
+    fn a_symlinked_sourcemap_keeps_its_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real.json");
+        let link = dir.path().join("sourcemap.json");
+        fs::write(&real, b"old").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("real.json", &link).unwrap();
+        #[cfg(windows)]
+        if std::os::windows::fs::symlink_file("real.json", &link).is_err() {
+            eprintln!("skipping: cannot create symlinks here");
+            return;
+        }
+
+        write_atomically(&link, b"new").unwrap();
+
+        assert!(fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(fs::read(&real).unwrap(), b"new");
     }
 
     #[test]

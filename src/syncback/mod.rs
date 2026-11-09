@@ -91,7 +91,7 @@ pub fn syncback_loop(
     }
 
     log::debug!("Collecting referents for new DOM...");
-    let deferred_referents = collect_referents(&new_tree);
+    let mut deferred_referents = collect_referents(&new_tree);
 
     // Remove any properties that are manually blocked from syncback via the
     // project file.
@@ -217,6 +217,11 @@ pub fn syncback_loop(
         // that carries one, such as a copy Studio made of a protected
         // instance, gets a new ID of its own, which its pointers then use;
         // otherwise two files would hold the same ID.
+        // Pointers in protected files stay as they are, so the writable
+        // instances they name must keep those IDs too.
+        for target in keep_ids_protected_pointers_use(&mut new_tree, &protected, old) {
+            deferred_referents.keep_id(target);
+        }
         let reserved_ids = protected.ids_on_disk(old);
         if !reserved_ids.is_empty() {
             give_new_ids_to_writable_holders(&mut new_tree, &protected, &reserved_ids)?;
@@ -815,6 +820,110 @@ fn give_new_ids_to_writable_holders(
         );
     }
     Ok(())
+}
+
+/// Gives the instances that pointers in protected partitions name the IDs
+/// those pointers use.
+///
+/// An ID given by a model file's `id` is metadata, not a `Rojo_Id`
+/// attribute, so Studio's copy of the target has no ID, and linking would give
+/// it a new one. The protected pointer file keeps the old ID and is not
+/// rewritten, so the target is given that ID as its `Rojo_Id` instead, which
+/// the file syncback writes for it then holds.
+fn keep_ids_protected_pointers_use(
+    new: &mut WeakDom,
+    protected: &ProtectedInstances,
+    old: &RojoTree,
+) -> Vec<Ref> {
+    let mut kept = Vec::new();
+    if protected.roots.is_empty() {
+        return kept;
+    }
+    let attributes_key = ustr("Attributes");
+    let in_protected = |id: Ref| -> bool {
+        let path = tree_path(old, id);
+        protected.roots.iter().any(|root| path.starts_with(root))
+    };
+
+    // By the time the files are loaded, their pointer attributes have become
+    // Ref properties, so the targets are found through those.
+    let mut targets: HashSet<Ref> = HashSet::new();
+    for inst in old.descendants(old.get_root_id()) {
+        let mut refs = inst.properties().values().filter_map(|value| match value {
+            Variant::Ref(target) if target.is_some() => Some(*target),
+            _ => None,
+        });
+        let Some(first) = refs.next() else {
+            continue;
+        };
+        if in_protected(inst.id()) {
+            targets.insert(first);
+            targets.extend(refs);
+        }
+    }
+
+    let owners: Vec<(Ref, String)> = targets
+        .into_iter()
+        .filter(|target| !in_protected(*target))
+        .filter_map(|target| {
+            let id = old.get_metadata(target)?.specified_id.as_ref()?.as_str();
+            Some((target, id.to_owned()))
+        })
+        .collect();
+
+    for (old_ref, id) in owners {
+        let Some(new_ref) = new_instance_at_same_path(old, old_ref, new) else {
+            log::warn!(
+                "{} is named by a pointer in a partition with $globIgnorePaths, which                  keeps it, but it is not in Studio's tree; that pointer will not resolve",
+                tree_path(old, old_ref).join(".")
+            );
+            continue;
+        };
+        let inst = new.get_by_ref_mut(new_ref).unwrap();
+        let attributes = match inst.properties.get_mut(&attributes_key) {
+            Some(Variant::Attributes(attributes)) => attributes,
+            _ => {
+                inst.properties
+                    .insert(attributes_key, Variant::Attributes(Default::default()));
+                match inst.properties.get_mut(&attributes_key) {
+                    Some(Variant::Attributes(attributes)) => attributes,
+                    _ => unreachable!(),
+                }
+            }
+        };
+        if attributes.get(REF_ID_ATTRIBUTE_NAME).is_none() {
+            attributes.insert(REF_ID_ATTRIBUTE_NAME.to_owned(), Variant::String(id));
+            kept.push(new_ref);
+        }
+    }
+    kept
+}
+
+/// The instance in `new` at the path of `old_ref` in `old`, when every step
+/// is unambiguous by name and class.
+fn new_instance_at_same_path(old: &RojoTree, old_ref: Ref, new: &WeakDom) -> Option<Ref> {
+    let mut path = Vec::new();
+    let mut current = old.get_instance(old_ref)?;
+    while current.parent().is_some() {
+        path.push((current.name().to_owned(), current.class_name()));
+        current = old.get_instance(current.parent())?;
+    }
+
+    let mut new_ref = new.root_ref();
+    for (name, class) in path.into_iter().rev() {
+        let mut matches = new
+            .get_by_ref(new_ref)?
+            .children()
+            .iter()
+            .filter_map(|child| new.get_by_ref(*child))
+            .filter(|child| child.name == name && child.class == class);
+        let found = matches.next()?;
+        if matches.next().is_some() {
+            return None;
+        }
+        new_ref = found.referent();
+    }
+    Some(new_ref)
 }
 
 /// The names of `id` and its ancestors below the root, outermost first.

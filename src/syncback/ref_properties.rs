@@ -19,6 +19,14 @@ pub struct RefLinks {
     need_rewrite: HashSet<Ref>,
 }
 
+impl RefLinks {
+    /// Records that `target` was given an ID after these links were
+    /// collected, so linking keeps it rather than writing a new one.
+    pub fn keep_id(&mut self, target: Ref) {
+        self.need_rewrite.remove(&target);
+    }
+}
+
 #[derive(PartialEq, Eq)]
 struct RefLink {
     /// The name of a property

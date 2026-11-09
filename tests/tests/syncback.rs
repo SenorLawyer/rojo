@@ -246,6 +246,22 @@ fn partition_ignore_globs_ref() {
     });
 }
 
+/// A pointer in a partition syncback leaves alone names a writable target by
+/// its model file's `id`. Studio's copy of the target has no `Rojo_Id`, but
+/// the pointer file is not rewritten, so the target's file must keep that ID.
+#[test]
+fn partition_ignore_globs_reverse_ref() {
+    run_syncback_test("partition_ignore_globs_reverse_ref", |path| {
+        let pointer = fs_err::read_to_string(path.join("filtered/Pointer.model.json")).unwrap();
+        assert!(
+            pointer.contains("\"Rojo_Target_Value\": \"target\""),
+            "{pointer}"
+        );
+        let target = fs_err::read_to_string(path.join("unfiltered/Target.model.json")).unwrap();
+        assert!(target.contains("\"target\""), "{target}");
+    });
+}
+
 /// Studio duplicated an instance with an ID inside a partition syncback
 /// leaves alone, and a synced partition points at both copies. The ID is the
 /// original's in the files, so only the pointer at the original is linked;

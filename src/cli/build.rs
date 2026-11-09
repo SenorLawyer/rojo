@@ -582,7 +582,7 @@ fn write_resolved_file_atomically(
 /// The file a write to `path` ends up in: `path` followed through any chain
 /// of symlinks, in its folder with that folder's links resolved too, so a
 /// link to the folder repointed later does not move the write.
-fn resolve_output(path: &Path) -> std::io::Result<PathBuf> {
+pub(super) fn resolve_output(path: &Path) -> std::io::Result<PathBuf> {
     let resolved = resolve_symlinks(path)?;
     let (Some(parent), Some(name)) = (resolved.parent(), resolved.file_name()) else {
         return Ok(resolved);
