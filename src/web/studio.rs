@@ -210,16 +210,31 @@ fn packed_ref(packed: &str, name: &str) -> Option<String> {
 
 /// Reads and validates a token file, warning when other users can read it.
 /// What `/api/studio/prove` answers for `nonce`: a hash keyed with a key
-/// derived from `token`, over the nonce, the serve session and the port the
-/// server listens on, in hex. Both the server and a client that holds the
-/// token can compute it; it reveals nothing about the token to anyone else.
-/// The port ties the answer to the server that gave it, so one relayed from
-/// a bridge on another port does not prove anything about the relay.
-pub(crate) fn token_proof(token: &str, nonce: &[u8], session: &str, port: u16) -> String {
+/// derived from `token`, over the nonce, the serve session and the address
+/// and port the connection arrived on, in hex. Both the server and a client
+/// that holds the token can compute it; it reveals nothing about the token to
+/// anyone else. The endpoint ties the answer to the server that gave it, so
+/// one relayed from a bridge on another loopback address or port does not
+/// prove anything about the relay.
+pub(crate) fn token_proof(
+    token: &str,
+    nonce: &[u8],
+    session: &str,
+    endpoint: SocketAddr,
+) -> String {
     let key = blake3::derive_key("rojo studio token proof", token.as_bytes());
     let mut message = nonce.to_vec();
     message.extend_from_slice(session.as_bytes());
-    message.extend_from_slice(&port.to_be_bytes());
+    // An IPv4-mapped IPv6 address is the IPv4 address the client dialed.
+    let ip = match endpoint.ip() {
+        IpAddr::V6(v6) => v6
+            .to_ipv4_mapped()
+            .map(IpAddr::V4)
+            .unwrap_or(IpAddr::V6(v6)),
+        ip => ip,
+    };
+    message.extend_from_slice(ip.to_string().as_bytes());
+    message.extend_from_slice(&endpoint.port().to_be_bytes());
     blake3::keyed_hash(&key, &message).to_hex().to_string()
 }
 
@@ -1026,7 +1041,7 @@ impl StudioBridge {
                 "serverSession": session,
                 "projectPath": self.identity_json["projectPath"],
                 "port": local.port(),
-                "proof": token_proof(&self.token, &nonce, session, local.port()),
+                "proof": token_proof(&self.token, &nonce, session, local),
             }),
         )
     }
@@ -4334,18 +4349,40 @@ mod tests {
         assert_eq!(value["projectPath"], bridge.identity_json["projectPath"]);
         // The port is the one the connection arrived on.
         assert_eq!(value["port"], 34872);
+        let endpoint: SocketAddr = "127.0.0.1:34872".parse().unwrap();
         assert_eq!(
             value["proof"].as_str(),
-            Some(token_proof(&bridge.token, &nonce, session, 34872).as_str())
+            Some(token_proof(&bridge.token, &nonce, session, endpoint).as_str())
         );
         // Another nonce, token or port gives another proof.
-        let proof = token_proof(&bridge.token, &nonce, session, 34872);
+        let proof = token_proof(&bridge.token, &nonce, session, endpoint);
         assert_ne!(
-            token_proof(&bridge.token, &[8u8; 32], session, 34872),
+            token_proof(&bridge.token, &[8u8; 32], session, endpoint),
             proof
         );
-        assert_ne!(token_proof("another-token", &nonce, session, 34872), proof);
-        assert_ne!(token_proof(&bridge.token, &nonce, session, 34873), proof);
+        assert_ne!(
+            token_proof("another-token", &nonce, session, endpoint),
+            proof
+        );
+        assert_ne!(
+            token_proof(
+                &bridge.token,
+                &nonce,
+                session,
+                "127.0.0.1:34873".parse().unwrap()
+            ),
+            proof
+        );
+        // Another loopback address on the same port is another server.
+        assert_ne!(
+            token_proof(
+                &bridge.token,
+                &nonce,
+                session,
+                "127.0.0.2:34872".parse().unwrap()
+            ),
+            proof
+        );
         assert!(!value.to_string().contains(&bridge.token));
 
         for query in ["", "?nonce=abc", "?nonce=zz"] {

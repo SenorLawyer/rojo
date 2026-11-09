@@ -488,9 +488,24 @@ pub fn syncback_project<'sync>(
         })
     };
 
+    // Explicit child nodes are skipped with the protected node that holds
+    // them, even when their `$path` is outside it, since they are matched
+    // through that node's children. That is said out loud, so that Studio
+    // edits there are not dropped without a word.
+    let warn_skipped_children = |name: &str, node: &ProjectNode| {
+        let children: Vec<&str> = node.children.keys().map(String::as_str).collect();
+        if !children.is_empty() {
+            log::warn!(
+                "Syncback skips {name}, which uses $globIgnorePaths, and with it its child                 nodes {}. Changes to them in Studio are not written back.",
+                children.join(", ")
+            );
+        }
+    };
+
     while let Some((node, old_inst, new_inst)) = node_queue.pop_front() {
         if is_protected(node) {
             log::debug!("Skipping node {} in a protected partition", old_inst.name());
+            warn_skipped_children(old_inst.name(), node);
             continue;
         }
         log::debug!("Processing node {}", old_inst.name());
@@ -585,6 +600,7 @@ pub fn syncback_project<'sync>(
         for (child_name, child_node) in &mut node.children {
             // Neither added, removed nor checked; see `is_protected`.
             if is_protected(child_node) {
+                warn_skipped_children(child_name, child_node);
                 new_child_map.remove(child_name);
                 old_child_map.remove(child_name.as_str());
                 continue;

@@ -545,6 +545,20 @@ fn verify(state: &DevState) -> Result<(), String> {
     }
 }
 
+/// The endpoints a request to `base` may have arrived on. `localhost` may
+/// resolve to either loopback address; both are this machine's own.
+fn dialed_endpoints(base: &reqwest::Url, port: u16) -> Vec<std::net::SocketAddr> {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+    let host = base.host_str().unwrap_or_default().trim_matches(['[', ']']);
+    match host.parse::<IpAddr>() {
+        Ok(ip) => vec![SocketAddr::new(ip, port)],
+        Err(_) => vec![
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port),
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), port),
+        ],
+    }
+}
+
 /// Has the server on `address` prove that it holds the token in
 /// `token_file`, without sending it the token, and returns the serve session
 /// and project it reports.
@@ -586,13 +600,20 @@ fn prove(address: &str, token_file: &Path) -> Result<(String, String), String> {
         .json()
         .map_err(|_| format!("the server on {address} is not its Studio bridge"))?;
     let session = identity["serverSession"].as_str().unwrap_or_default();
-    // The proof covers the port the answering server listens on, which must
-    // be the one connected to: a relay passing on another bridge's answer
-    // gives that bridge's port.
+    // The proof covers the address and port the answering server saw the
+    // connection arrive on, which must be the ones dialed: a relay passing on
+    // another bridge's answer gives that bridge's endpoint, even one on the
+    // same port at another loopback address.
     let port = base.port_or_known_default().unwrap_or_default();
+    let endpoints = dialed_endpoints(&base, port);
+    let proof = identity["proof"].as_str();
     if identity["port"].as_u64() != Some(u64::from(port))
-        || identity["proof"].as_str()
-            != Some(crate::web::studio::token_proof(&token, &nonce, session, port).as_str())
+        || !endpoints.iter().any(|endpoint| {
+            proof
+                == Some(
+                    crate::web::studio::token_proof(&token, &nonce, session, *endpoint).as_str(),
+                )
+        })
     {
         return Err(format!(
             "the server on {address} could not prove it holds this worktree's Studio token"
@@ -1694,7 +1715,7 @@ mod test {
                 "serverSession": session,
                 "projectPath": project,
                 "port": port,
-                "proof": crate::web::studio::token_proof(token, &nonce, session, port),
+                "proof": crate::web::studio::token_proof(token, &nonce, session, std::net::SocketAddr::from(([127, 0, 0, 1], port))),
             })
             .to_string();
             format!(
@@ -1807,6 +1828,45 @@ mod test {
         );
         assert!(!request.contains("x-rojo-studio-token"), "{request}");
         assert!(!request.contains(RECORDED_TOKEN), "{request}");
+    }
+
+    #[test]
+    fn a_proof_from_another_loopback_address_on_the_same_port_is_rejected() {
+        // What a relay on 127.0.0.1 gets back from a bridge listening on
+        // 127.0.0.2 at the same port: a valid proof, but for that endpoint.
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("default.project.json");
+        let (relay, _) = answer_with(Duration::ZERO, move |request, port| {
+            let nonce = request
+                .split(['?', '&', ' '])
+                .find_map(|part| part.strip_prefix("nonce="))
+                .and_then(|nonce| data_encoding::HEXLOWER.decode(nonce.as_bytes()).ok())
+                .unwrap_or_default();
+            let body = serde_json::json!({
+                "serverSession": "other-session",
+                "projectPath": project,
+                "port": port,
+                "proof": crate::web::studio::token_proof(
+                    RECORDED_TOKEN,
+                    &nonce,
+                    "other-session",
+                    std::net::SocketAddr::from(([127, 0, 0, 2], port)),
+                ),
+            })
+            .to_string();
+            format!(
+                "HTTP/1.1 200 OK
+Content-Type: application/json
+Content-Length: {}
+Connection: close
+
+{body}",
+                body.len()
+            )
+        });
+        let state = recorded(dir.path(), relay, std::process::id());
+        let reason = verify(&state).unwrap_err();
+        assert!(reason.contains("could not prove"), "{reason}");
     }
 
     #[test]
