@@ -96,15 +96,22 @@ prove it holds the Studio token and report the same serve session ID and
 canonical project file that `rojo dev` recorded. The token itself is not sent
 until then: the command sends a random nonce to `/api/studio/prove`, which
 needs no token, and the server answers with a hash keyed with a key derived
-from the token, over the nonce, its session ID and the port it listens on.
-The command checks the hash with its own copy of the token, and that the
-port is the one it connected to, so an answer relayed from a bridge on
-another port proves nothing. A process that took the port without the token
+from the token, over the nonce, its session ID and the address and port the
+connection arrived on. The command checks the hash with its own copy of the
+token, and that the endpoint is the one it connected to, so an answer relayed
+from a bridge on another port or loopback address proves nothing. The answer
+body is read only up to 64 KiB. A process that took the port without the token
 cannot answer, and never receives it. The session ID is random for every start, so
 a server that took the port later, even another worktree's `rojo dev` with
 the shared token, does not match. The check waits up to 20 seconds, longer
 than the bridge holds a request while Git is busy, and never follows a
 redirect.
+
+The commands that follow still send the token itself, on a new connection.
+If the server ends in the moment between the check and that request, and
+another local process takes its port in that moment, it receives the token.
+Closing that gap needs requests signed without sending the token, which the
+bridge does not do yet.
 
 A record that cannot be confirmed is an error (exit status 2), and so is a
 `dev.json` that cannot be read or is not a valid record; only a missing file

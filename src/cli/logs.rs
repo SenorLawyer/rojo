@@ -305,6 +305,14 @@ impl LogsCommand {
                     result => result?,
                 }
             }
+            // Entries alone cannot tell a JSON reader that some servers were
+            // missing from this round, or that a quiet round was partial.
+            if self.json && batch.incomplete {
+                match writeln!(out, "{}", serde_json::json!({ "incomplete": true })) {
+                    Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => return Ok(()),
+                    result => result?,
+                }
+            }
             match batch.error {
                 None => failures = 0,
                 Some(error) if is_usage_problem(&error) => return Err(self.explain(error)),
@@ -2278,6 +2286,34 @@ mod tests {
             batch.notices[0].contains("3 servers to read"),
             "{:?}",
             batch.notices
+        );
+    }
+
+    #[test]
+    fn following_as_json_marks_a_partial_round_even_without_entries() {
+        let fake = Fake::default();
+        let command = parse(&[
+            "--place-version",
+            "45",
+            "--follow",
+            "--json",
+            "--interval",
+            "1",
+        ]);
+        let mut reader = reader(&fake, &command);
+        // The second round's line hits the closed pipe and ends following.
+        fake.partial_servers(Vec::new());
+        fake.partial_servers(Vec::new());
+        let mut out = Lines {
+            written: Vec::new(),
+            lines: 1,
+        };
+        command
+            .follow(&mut reader, &mut out, &|text: &str| text.to_owned())
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(out.written).unwrap().trim(),
+            r#"{"incomplete":true}"#
         );
     }
 
