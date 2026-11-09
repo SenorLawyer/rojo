@@ -19,7 +19,7 @@ macro_rules! syncback_tests {
                         let content = fs_err::read(new).unwrap();
                         snapshot_rbxm(&snapshot_name, content, name);
                     } else {
-                        let content = fs_err::read_to_string(new).unwrap();
+                        let content = read_lf(new).unwrap();
                         assert_snapshot!(snapshot_name, content, name);
                     }
                 }
@@ -118,7 +118,7 @@ fn partition_ignore_globs() {
     run_syncback_test("partition_ignore_globs", |path| {
         // Nothing is written, added or removed under the partition.
         assert_eq!(
-            fs_err::read_to_string(path.join("filtered/Foo.luau")).unwrap(),
+            read_lf(path.join("filtered/Foo.luau")).unwrap(),
             "return \"Foo\"\n"
         );
         assert!(!path.join("filtered/Foo.spec.luau").exists());
@@ -126,7 +126,7 @@ fn partition_ignore_globs() {
 
         assert!(!path.join("unfiltered/Old.luau").exists());
         for name in ["unfiltered/Foo.luau", "unfiltered/Foo.spec.luau"] {
-            let content = fs_err::read_to_string(path.join(name)).unwrap();
+            let content = read_lf(path.join(name)).unwrap();
             assert_snapshot!(format!("partition_ignore_globs-{name}"), content, name);
         }
     });
@@ -148,11 +148,7 @@ fn partition_ignore_globs_root() {
             ("Dup/A.spec.luau", "return \"A.spec on disk\"\n"),
             ("Gone/Old.luau", "return \"Old\"\n"),
         ] {
-            assert_eq!(
-                fs_err::read_to_string(src.join(name)).unwrap(),
-                content,
-                "{name}"
-            );
+            assert_eq!(read_lf(src.join(name)).unwrap(), content, "{name}");
         }
         assert!(!src.join("New.spec.luau").exists());
         assert!(!src.join("Dup.rbxm").exists());
@@ -171,13 +167,9 @@ fn partition_ignore_globs_holder() {
             ("pkg/src/Foo.luau", "return \"Foo\"\n"),
             ("pkg/src/Foo.spec.luau", "return \"Foo.spec\"\n"),
         ] {
-            assert_eq!(
-                fs_err::read_to_string(holder.join(name)).unwrap(),
-                content,
-                "{name}"
-            );
+            assert_eq!(read_lf(holder.join(name)).unwrap(), content, "{name}");
         }
-        let content = fs_err::read_to_string(path.join("other/Plain.luau")).unwrap();
+        let content = read_lf(path.join("other/Plain.luau")).unwrap();
         assert_snapshot!(
             "partition_ignore_globs_holder-other/Plain.luau",
             content,
@@ -193,14 +185,14 @@ fn partition_ignore_globs_holder() {
 fn partition_ignore_globs_dup() {
     run_syncback_test("partition_ignore_globs_dup", |path| {
         assert_eq!(
-            fs_err::read_to_string(path.join("filtered/Foo.luau")).unwrap(),
+            read_lf(path.join("filtered/Foo.luau")).unwrap(),
             "return \"Foo\"\n"
         );
         assert!(path.join("filtered/Foo.spec.luau").exists());
         assert!(!path.join("filtered/Dup").exists());
         assert!(!path.join("filtered/Dup.model.json").exists());
         assert_eq!(
-            fs_err::read_to_string(path.join("unfiltered/Foo.luau")).unwrap(),
+            read_lf(path.join("unfiltered/Foo.luau")).unwrap(),
             "return \"Foo from Studio\"\n"
         );
     });
@@ -212,13 +204,13 @@ fn partition_ignore_globs_dup() {
 fn partition_ignore_globs_alias() {
     run_syncback_test("partition_ignore_globs_alias", |path| {
         assert_eq!(
-            fs_err::read_to_string(path.join("filtered/Foo.luau")).unwrap(),
+            read_lf(path.join("filtered/Foo.luau")).unwrap(),
             "return \"Foo\"\n"
         );
         assert!(path.join("filtered/Foo.spec.luau").exists());
         assert!(!path.join("filtered/New.luau").exists());
         assert_eq!(
-            fs_err::read_to_string(path.join("unfiltered/Foo.luau")).unwrap(),
+            read_lf(path.join("unfiltered/Foo.luau")).unwrap(),
             "return \"Foo from Studio\"\n"
         );
     });
@@ -232,15 +224,15 @@ fn partition_ignore_globs_alias() {
 fn partition_ignore_globs_ref() {
     run_syncback_test("partition_ignore_globs_ref", |path| {
         assert_eq!(
-            fs_err::read_to_string(path.join("filtered/Target.model.json")).unwrap(),
+            read_lf(path.join("filtered/Target.model.json")).unwrap(),
             "{\n  \"className\": \"Folder\"\n}\n"
         );
-        let pointer = fs_err::read_to_string(path.join("unfiltered/Pointer.model.json")).unwrap();
+        let pointer = read_lf(path.join("unfiltered/Pointer.model.json")).unwrap();
         assert!(!pointer.contains("Rojo_Target_Value"), "{pointer}");
-        let kept = fs_err::read_to_string(path.join("unfiltered/KeptPointer.model.json")).unwrap();
+        let kept = read_lf(path.join("unfiltered/KeptPointer.model.json")).unwrap();
         assert!(kept.contains("\"Rojo_Target_Value\": \"kept\""), "{kept}");
         assert_eq!(
-            fs_err::read_to_string(path.join("unfiltered/Foo.luau")).unwrap(),
+            read_lf(path.join("unfiltered/Foo.luau")).unwrap(),
             "return \"Foo from Studio\"\n"
         );
     });
@@ -252,12 +244,12 @@ fn partition_ignore_globs_ref() {
 #[test]
 fn partition_ignore_globs_reverse_ref() {
     run_syncback_test("partition_ignore_globs_reverse_ref", |path| {
-        let pointer = fs_err::read_to_string(path.join("filtered/Pointer.model.json")).unwrap();
+        let pointer = read_lf(path.join("filtered/Pointer.model.json")).unwrap();
         assert!(
             pointer.contains("\"Rojo_Target_Value\": \"target\""),
             "{pointer}"
         );
-        let target = fs_err::read_to_string(path.join("unfiltered/Target.model.json")).unwrap();
+        let target = read_lf(path.join("unfiltered/Target.model.json")).unwrap();
         assert!(target.contains("\"target\""), "{target}");
     });
 }
@@ -267,8 +259,7 @@ fn partition_ignore_globs_reverse_ref() {
 #[test]
 fn partition_ignore_globs_reverse_ref_renamed() {
     run_syncback_test("partition_ignore_globs_reverse_ref_renamed", |path| {
-        let target =
-            fs_err::read_to_string(path.join("unfiltered/Renamed/init.meta.json")).unwrap();
+        let target = read_lf(path.join("unfiltered/Renamed/init.meta.json")).unwrap();
         assert!(target.contains("\"Rojo_Id\": \"target\""), "{target}");
     });
 }
@@ -278,9 +269,9 @@ fn partition_ignore_globs_reverse_ref_renamed() {
 #[test]
 fn partition_ignore_globs_reverse_ref_dup() {
     run_syncback_test("partition_ignore_globs_reverse_ref_dup", |path| {
-        let target = fs_err::read_to_string(path.join("unfiltered/Target.model.json")).unwrap();
+        let target = read_lf(path.join("unfiltered/Target.model.json")).unwrap();
         assert!(target.contains("\"Rojo_Id\": \"target\""), "{target}");
-        let copy = fs_err::read_to_string(path.join("unfiltered/ACopy/init.meta.json")).unwrap();
+        let copy = read_lf(path.join("unfiltered/ACopy/init.meta.json")).unwrap();
         assert!(!copy.contains("\"target\""), "{copy}");
     });
 }
@@ -293,13 +284,12 @@ fn partition_ignore_globs_reverse_ref_dup() {
 fn partition_ignore_globs_dup_ref() {
     run_syncback_test("partition_ignore_globs_dup_ref", |path| {
         assert_eq!(
-            fs_err::read_to_string(path.join("filtered/Kept.model.json")).unwrap(),
+            read_lf(path.join("filtered/Kept.model.json")).unwrap(),
             "{\n  \"className\": \"Folder\",\n  \"attributes\": {\n    \"Rojo_Id\": \"kept\"\n  }\n}\n"
         );
         assert!(!path.join("filtered/KeptCopy.model.json").exists());
         let read = |name: &str| {
-            let text =
-                fs_err::read_to_string(path.join(format!("unfiltered/{name}.model.json"))).unwrap();
+            let text = read_lf(path.join(format!("unfiltered/{name}.model.json"))).unwrap();
             serde_json::from_str::<serde_json::Value>(&text).unwrap()
         };
         assert_eq!(
@@ -323,13 +313,13 @@ fn partition_ignore_globs_nested_ref() {
     run_syncback_test("partition_ignore_globs_nested_ref", |path| {
         assert!(!path.join("pkg/src/NewTarget.model.json").exists());
         assert_eq!(
-            fs_err::read_to_string(path.join("pkg/src/Foo.luau")).unwrap(),
+            read_lf(path.join("pkg/src/Foo.luau")).unwrap(),
             "return \"Foo\"\n"
         );
-        let pointer = fs_err::read_to_string(path.join("unfiltered/Pointer.model.json")).unwrap();
+        let pointer = read_lf(path.join("unfiltered/Pointer.model.json")).unwrap();
         assert!(!pointer.contains("Rojo_Target_Value"), "{pointer}");
         assert_eq!(
-            fs_err::read_to_string(path.join("unfiltered/Foo.luau")).unwrap(),
+            read_lf(path.join("unfiltered/Foo.luau")).unwrap(),
             "return \"Foo from Studio\"\n"
         );
     });
@@ -345,10 +335,10 @@ fn partition_ignore_globs_class_ref() {
         assert!(!path.join("filtered/NewTarget.model.json").exists());
         assert!(!path.join("filtered/init.meta.json").exists());
         assert_eq!(
-            fs_err::read_to_string(path.join("filtered/Foo.luau")).unwrap(),
+            read_lf(path.join("filtered/Foo.luau")).unwrap(),
             "return \"Foo\"\n"
         );
-        let pointer = fs_err::read_to_string(path.join("unfiltered/Pointer.model.json")).unwrap();
+        let pointer = read_lf(path.join("unfiltered/Pointer.model.json")).unwrap();
         assert!(!pointer.contains("Rojo_Target_Value"), "{pointer}");
     });
 }
@@ -359,7 +349,7 @@ fn partition_ignore_globs_class_ref() {
 #[test]
 fn json_model_ignore_unknown_instances() {
     run_syncback_test("json_model_ignore_unknown_instances", |path| {
-        let text = fs_err::read_to_string(path.join("src/Arena.model.json")).unwrap();
+        let text = read_lf(path.join("src/Arena.model.json")).unwrap();
         let model: serde_json::Value = serde_json::from_str(&text).unwrap();
         assert_eq!(model["attributes"]["Changed"], true, "{text}");
         assert_eq!(model["ignoreUnknownInstances"], true, "{text}");
@@ -387,11 +377,11 @@ fn json_model_ignore_unknown_instances() {
 fn partition_ignore_globs_reserved_id() {
     run_syncback_test("partition_ignore_globs_reserved_id", |path| {
         assert_eq!(
-            fs_err::read_to_string(path.join("filtered/Kept.model.json")).unwrap(),
+            read_lf(path.join("filtered/Kept.model.json")).unwrap(),
             "{\n  \"className\": \"Folder\",\n  \"attributes\": {\n    \"Rojo_Id\": \"kept\"\n  }\n}\n"
         );
         let read = |name: &str| {
-            let text = fs_err::read_to_string(path.join(name)).unwrap();
+            let text = read_lf(path.join(name)).unwrap();
             serde_json::from_str::<serde_json::Value>(&text).unwrap()
         };
         // A Folder is written as a directory with its attributes in its
@@ -412,14 +402,14 @@ fn partition_ignore_globs_nested() {
     run_syncback_test("partition_ignore_globs_nested", |path| {
         for dir in ["package/src", "outer/src"] {
             assert_eq!(
-                fs_err::read_to_string(path.join(dir).join("Foo.luau")).unwrap(),
+                read_lf(path.join(dir).join("Foo.luau")).unwrap(),
                 "return \"Foo\"\n",
                 "{dir}"
             );
             assert!(!path.join(dir).join("New.luau").exists(), "{dir}");
         }
         for name in ["other/Foo.luau", "other/New.luau"] {
-            let content = fs_err::read_to_string(path.join(name)).unwrap();
+            let content = read_lf(path.join(name)).unwrap();
             assert_snapshot!(
                 format!("partition_ignore_globs_nested-{name}"),
                 content,
@@ -427,4 +417,10 @@ fn partition_ignore_globs_nested() {
             );
         }
     });
+}
+
+/// Reads a text file with its line endings as `\n`, since a Windows checkout
+/// may give the fixtures `\r\n`.
+fn read_lf(path: impl AsRef<std::path::Path>) -> std::io::Result<String> {
+    Ok(fs_err::read_to_string(path)?.replace("\r\n", "\n"))
 }

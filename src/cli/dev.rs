@@ -850,19 +850,24 @@ fn bind_with_companion(
     // reading it, as here, is what tells the two cases apart.
     #[allow(deprecated)]
     let only_v6 = || listener.only_v6();
+    // `::` also accepts IPv4 connections unless the socket is IPv6-only,
+    // which it is by default on Windows. Either way 127.0.0.1 is reserved
+    // too: an IPv6-only listener leaves it free, and on macOS a more specific
+    // bind may take it even from a dual-stack one. Where the listener does
+    // hold it, as on Linux, reserving it fails against the listener itself,
+    // which is not another launch.
+    let mut held_by_listener = false;
     let other = match ip {
-        // `::` also accepts IPv4 connections unless the socket is IPv6-only,
-        // which it is by default on Windows. Then 127.0.0.1 is left for
-        // another server to take; otherwise this listener holds it already,
-        // and reserving it would fail against the listener itself.
-        IpAddr::V6(v6) if v6.is_unspecified() => match only_v6() {
-            Ok(true) => Some(Ipv4Addr::LOCALHOST.into()),
-            Ok(false) => None,
-            Err(err) => {
-                log::debug!("Could not tell whether [::]:{port} accepts IPv4: {err}");
-                None
-            }
-        },
+        IpAddr::V6(v6) if v6.is_unspecified() => {
+            held_by_listener = match only_v6() {
+                Ok(only) => !only,
+                Err(err) => {
+                    log::debug!("Could not tell whether [::]:{port} accepts IPv4: {err}");
+                    true
+                }
+            };
+            Some(Ipv4Addr::LOCALHOST.into())
+        }
         _ => companion_address(ip),
     };
     let Some(other) = other else {
@@ -875,6 +880,9 @@ fn bind_with_companion(
     // Not setting SO_REUSEADDR, so that no other socket can share the port.
     match socket.and_then(|socket| socket.bind(SocketAddr::new(other, port)).map(|()| socket)) {
         Ok(socket) => Ok((listener, Some(socket))),
+        Err(err) if held_by_listener && err.kind() == std::io::ErrorKind::AddrInUse => {
+            Ok((listener, None))
+        }
         Err(err)
             if matches!(
                 err.kind(),
