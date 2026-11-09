@@ -849,6 +849,7 @@ fn keep_ids_protected_pointers_use(
     // By the time the files are loaded, their pointer attributes have become
     // Ref properties, so the targets are found through those.
     let mut owners: HashMap<Ref, String> = HashMap::new();
+    let mut claimed: HashMap<String, Ref> = HashMap::new();
     for inst in old.descendants(old.get_root_id()) {
         let refs: Vec<(Ustr, Ref)> = inst
             .properties()
@@ -875,7 +876,10 @@ fn keep_ids_protected_pointers_use(
             let through_pointer = new_holder
                 .and_then(|holder| new.get_by_ref(holder))
                 .and_then(|holder| match holder.properties.get(&name) {
-                    Some(Variant::Ref(target)) if target.is_some() => Some(*target),
+                    // Pruning a root child leaves Refs into it in place.
+                    Some(Variant::Ref(target)) if new.get_by_ref(*target).is_some() => {
+                        Some(*target)
+                    }
                     _ => None,
                 });
             let Some(new_target) =
@@ -888,6 +892,20 @@ fn keep_ids_protected_pointers_use(
                 );
                 continue;
             };
+            // Each ID stays with one instance. When Studio pointed protected
+            // pointers sharing an ID at different instances, the first keeps
+            // it and the others are treated as copies; their pointers cannot
+            // all be right, since the files name one ID.
+            if let Some(holder) = claimed.get(id.as_str()) {
+                if *holder != new_target {
+                    log::warn!(
+                        "Pointers in a partition with $globIgnorePaths name the ID {} but now                          point at different instances; only one of them can keep it",
+                        id.as_str()
+                    );
+                }
+                continue;
+            }
+            claimed.insert(id.as_str().to_owned(), new_target);
             owners.insert(new_target, id.as_str().to_owned());
         }
     }
