@@ -19,6 +19,8 @@ use anyhow::{bail, Context};
 use clap::Parser;
 use serde_json::{json, Map, Value};
 
+use super::dev::MISSING_TOKEN;
+
 const MAX_LINE_BYTES: usize = 64 * 1024;
 const MAX_OUTPUT_BYTES: usize = 256 * 1024;
 const MAX_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
@@ -50,15 +52,31 @@ pub struct McpCommand {
     /// Fixed project for package, workspace and checkpoint inspection.
     #[clap(long, default_value = ".")]
     pub project: PathBuf,
-    /// Loopback rojo serve address used by Studio tools.
-    #[clap(long, default_value = "http://127.0.0.1:34872")]
-    pub address: String,
-    /// Token file used by rojo serve --studio-token-file. Never printed or returned.
+    /// Loopback rojo serve address used by Studio tools. Defaults to where a
+    /// `rojo dev` in the project's worktree listens, or http://127.0.0.1:34872.
+    #[clap(long)]
+    pub address: Option<String>,
+    /// Token file used by rojo serve --studio-token-file. Never printed or
+    /// returned. Defaults to the one a `rojo dev` in the repository uses.
     #[clap(long)]
     pub token_file: Option<PathBuf>,
 }
 
 impl McpCommand {
+    /// The bridge address and token for a Studio tool. They are looked up on
+    /// every call rather than at startup, so a `rojo dev` started or
+    /// restarted on another port after the MCP client launched is found.
+    /// The result is kept with the prepared command, so cancelling it later
+    /// reaches the same server even if discovery would now find another.
+    fn bridge(&self) -> anyhow::Result<(String, PathBuf)> {
+        let (address, token) = super::dev::bridge_target(
+            self.address.as_deref(),
+            self.token_file.as_deref(),
+            &self.project,
+        )?;
+        Ok((address, token.context(MISSING_TOKEN)?))
+    }
+
     pub fn run(mut self) -> anyhow::Result<()> {
         self.project =
             dunce::canonicalize(&self.project).context("MCP project path does not exist")?;
@@ -343,9 +361,13 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 }
 
 /// A Studio command that the bridge can cancel if this adapter abandons it.
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct Cancellable {
     session: String,
     request: String,
+    /// The bridge the command was sent to.
+    address: String,
+    token_file: PathBuf,
 }
 
 /// A native command ready to run for a tool call.
@@ -379,7 +401,7 @@ fn call_tool(
         // ask the bridge to discard it. Cancelling a finished one does nothing.
         let failed = cancel.load(Ordering::Relaxed) || outcome.is_err();
         if let (true, Some(cancellable)) = (failed, cancellable) {
-            cancel_studio_command(options, &cancellable);
+            cancel_studio_command(&cancellable);
         }
         outcome
     });
@@ -400,22 +422,33 @@ fn call_tool(
     response
 }
 
-fn cancel_studio_command(options: &McpCommand, cancellable: &Cancellable) {
-    let (Ok(executable), Some(token)) = (std::env::current_exe(), &options.token_file) else {
+fn cancel_studio_command(cancellable: &Cancellable) {
+    let Ok(executable) = std::env::current_exe() else {
         return;
     };
+    // Best effort: the command may already have finished or expired.
+    let _ = run_command_for(
+        cancel_command(executable, cancellable),
+        &AtomicBool::new(false),
+        CANCEL_TIMEOUT,
+        false,
+    );
+}
+
+/// Cancels on the bridge the command was sent to, never one found by a
+/// fresh discovery, which may be another server by now.
+fn cancel_command(executable: PathBuf, cancellable: &Cancellable) -> Command {
     let mut command = Command::new(executable);
     command
         .stdin(Stdio::null())
         .arg("studio")
-        .arg(format!("--address={}", options.address))
-        .arg(format!("--token-file={}", token.display()))
+        .arg(format!("--address={}", cancellable.address))
+        .arg(format!("--token-file={}", cancellable.token_file.display()))
         .arg("--json")
         .arg("cancel")
         .arg(format!("--session={}", cancellable.session))
         .arg(format!("--request={}", cancellable.request));
-    // Best effort: the command may already have finished or expired.
-    let _ = run_command_for(command, &AtomicBool::new(false), CANCEL_TIMEOUT, false);
+    command
 }
 
 fn command(
@@ -456,12 +489,10 @@ fn command(
                 .arg(format!("--project={}", options.project.display()));
         }
         "run_tests" => {
-            let token = options.token_file.as_ref().context(
-                "Studio tools require --token-file matching rojo serve --studio-token-file",
-            )?;
+            let (address, token) = options.bridge()?;
             command
                 .arg("test")
-                .arg(format!("--address={}", options.address))
+                .arg(format!("--address={address}"))
                 .arg(format!("--token-file={}", token.display()))
                 .arg("--json")
                 // A long list of failures is still a result: have the CLI cut
@@ -473,7 +504,12 @@ fn command(
                 command
                     .arg(format!("--session={session}"))
                     .arg(format!("--request-id={request}"));
-                cancellable = Some(Cancellable { session, request });
+                cancellable = Some(Cancellable {
+                    session,
+                    request,
+                    address,
+                    token_file: token,
+                });
             }
             if let Some(roots) = arguments.get("roots").and_then(Value::as_array) {
                 for root in roots {
@@ -535,12 +571,10 @@ fn command(
             }
         }
         _ => {
-            let token = options.token_file.as_ref().context(
-                "Studio tools require --token-file matching rojo serve --studio-token-file",
-            )?;
+            let (address, token) = options.bridge()?;
             command
                 .arg("studio")
-                .arg(format!("--address={}", options.address))
+                .arg(format!("--address={address}"))
                 .arg(format!("--token-file={}", token.display()))
                 .arg("--json");
             let action = name.strip_prefix("studio_").context("Unknown tool")?;
@@ -554,6 +588,8 @@ fn command(
                 cancellable = Some(Cancellable {
                     session: session.to_owned(),
                     request,
+                    address: address.clone(),
+                    token_file: token.clone(),
                 });
             }
             match action {
@@ -1019,7 +1055,7 @@ mod tests {
     fn run_tests_asks_for_a_report_within_the_stream_limit() {
         let options = McpCommand {
             project: std::env::temp_dir(),
-            address: "http://127.0.0.1:34872".into(),
+            address: Some("http://127.0.0.1:34872".into()),
             token_file: Some(PathBuf::from("token")),
         };
         let prepared = command(&options, "run_tests", &Map::new()).unwrap();
@@ -1043,10 +1079,46 @@ mod tests {
     }
 
     #[test]
+    fn cancelling_reuses_the_bridge_the_command_was_sent_to() {
+        let mut options = McpCommand {
+            project: std::env::temp_dir(),
+            address: Some("http://127.0.0.1:34900".into()),
+            token_file: Some(PathBuf::from("first-token")),
+        };
+        let arguments = json!({"session": "00000000-0000-4000-8000-000000000000"});
+        let prepared = command(&options, "studio_status", arguments.as_object().unwrap()).unwrap();
+        let cancellable = prepared.cancellable.unwrap();
+        assert_eq!(cancellable.address, "http://127.0.0.1:34900");
+        assert_eq!(cancellable.token_file, PathBuf::from("first-token"));
+
+        // Discovery would now find another server; the cancel must not.
+        options.address = Some("http://127.0.0.1:34901".into());
+        options.token_file = Some(PathBuf::from("second-token"));
+        let args: Vec<_> = cancel_command(PathBuf::from("rojo"), &cancellable)
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            args.contains(&"--address=http://127.0.0.1:34900".to_owned()),
+            "{args:?}"
+        );
+        assert!(
+            args.contains(&"--token-file=first-token".to_owned()),
+            "{args:?}"
+        );
+        assert!(args.contains(&format!("--request={}", cancellable.request)));
+
+        let prepared = command(&options, "run_tests", arguments.as_object().unwrap()).unwrap();
+        let cancellable = prepared.cancellable.unwrap();
+        assert_eq!(cancellable.address, "http://127.0.0.1:34901");
+        assert_eq!(cancellable.token_file, PathBuf::from("second-token"));
+    }
+
+    #[test]
     fn logs_after_is_passed_to_the_native_command() {
         let options = McpCommand {
             project: std::env::temp_dir(),
-            address: "http://127.0.0.1:34872".into(),
+            address: Some("http://127.0.0.1:34872".into()),
             token_file: Some(PathBuf::from("token")),
         };
         let arguments = json!({

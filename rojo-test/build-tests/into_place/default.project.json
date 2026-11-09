@@ -1,0 +1,69 @@
+{
+  "name": "into_place",
+  "tree": {
+    "$className": "DataModel",
+    "Workspace": {
+      "$properties": {
+        "Gravity": 50
+      },
+      "Note": {
+        "$className": "StringValue",
+        "$properties": {
+          "Value": "project note"
+        }
+      },
+      "Brick": {
+        "$className": "Part",
+        "$properties": {
+          "BrickColor": {
+            "BrickColor": 21
+          }
+        }
+      },
+      "Label": {
+        "$className": "TextLabel",
+        "$properties": {
+          "Font": "Arial"
+        }
+      }
+    },
+    "ReplicatedStorage": {
+      "Shared": {
+        "$id": "Shared",
+        "$path": "src/shared"
+      },
+      "Remotes": {
+        "$id": "Remotes",
+        "$className": "Folder",
+        "Ping": {
+          "$className": "RemoteEvent"
+        }
+      },
+      "Pointers": {
+        "$className": "Folder",
+        "ToShared": {
+          "$className": "ObjectValue",
+          "$attributes": {
+            "Rojo_Target_Value": "Shared"
+          }
+        },
+        "ToRemotes": {
+          "$className": "ObjectValue",
+          "$attributes": {
+            "Rojo_Target_Value": "Remotes"
+          }
+        },
+        "ToSpawn": {
+          "$className": "ObjectValue",
+          "$attributes": {
+            "Rojo_Target_Value": "BaseSpawn"
+          }
+        }
+      }
+    },
+    "ServerScriptService": {
+      "$path": "src/server",
+      "$ignoreUnknownInstances": true
+    }
+  }
+}

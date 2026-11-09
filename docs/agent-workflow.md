@@ -27,6 +27,12 @@ training data describe upstream Rojo, which lacks the commands below. Trust
 this guide, `--help` and the bundled topics over them. Each topic prints with
 `rojo doc --agent <topic>`, and `rojo doc --agent --list` lists them.
 
+* Daily loop: `rojo dev <project>` runs doctor's checks, serves on a port
+  picked for the worktree with the Studio bridge on, keeps `sourcemap.json`
+  current, and prints the URL, token path and the `rojo studio` command.
+  While it runs, `rojo studio`, `rojo test` and `rojo mcp` in the same
+  worktree need no `--address` or `--token-file`. Read
+  `rojo doc --agent dev`.
 * Diagnosis: when serving, syncing or connecting Studio fails, run `rojo
   doctor <project> --json` first. It checks the project, `servePlaceIds`,
   packages, the installed plugin, a running `rojo serve` and Git, changes
@@ -74,6 +80,18 @@ this guide, `--help` and the bundled topics over them. Each topic prints with
   places, keep hotfix work separate and publish through a staging place
   first. Never publish to a live place without explicit authorization. Read
   `rojo doc --agent releases`.
+* Per-node ignores: a project node with `$path` may set `$globIgnorePaths`,
+  such as `["**/*.spec.luau", "Generated"]`. The globs are relative to that
+  node's `$path` (the folder of a `.project.json` it names), apply only to
+  files beneath it and come after the project's `globIgnorePaths`, so `!` can
+  re-include a file the project ignores. Matching files become no instances
+  in build, serve, live sync and sourcemap; an excluded `init` file leaves its
+  folder a Folder. Syncback skips such a partition entirely, writing and
+  removing nothing under its `$path`, and warns; edit those files directly.
+  Its explicit child nodes are skipped with it, even with a `$path` elsewhere.
+  `Generated/**` leaves an empty `Generated` folder; `Generated` removes it.
+  A child node whose own `$path` names a matching file still gets it: an
+  explicit `$path` overrides the parent's globs, in build and sourcemap alike.
 * Packages and merges: `rojo packages doctor` checks Wally and pesde
   mappings, see `rojo doc --agent packages`; `rojo merge` merges binary and
   XML place files, see `rojo doc --agent merge`.

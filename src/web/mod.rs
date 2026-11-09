@@ -27,6 +27,11 @@ use tokio::runtime::Runtime;
 
 use crate::serve_session::ServeSession;
 
+enum Listen {
+    Bind(SocketAddr),
+    Listener(std::net::TcpListener),
+}
+
 pub struct LiveServer {
     serve_session: Arc<ServeSession>,
     studio: Option<Arc<studio::StudioBridge>>,
@@ -65,6 +70,54 @@ impl LiveServer {
         allowed_hosts: Vec<String>,
         on_listening: impl FnOnce(),
     ) -> anyhow::Result<()> {
+        self.start_until(address, allowed_hosts, on_listening, std::future::pending())
+    }
+
+    /// Like [`Self::start`], but returns once `shutdown` completes. The future
+    /// is polled inside the server's runtime, so it may wait on Tokio signals.
+    ///
+    /// Open connections, such as the plugin's long-polling requests, are
+    /// dropped rather than drained: waiting for them would keep the process
+    /// alive for as long as Studio stays connected.
+    pub fn start_until(
+        self,
+        address: SocketAddr,
+        allowed_hosts: Vec<String>,
+        on_listening: impl FnOnce(),
+        shutdown: impl std::future::Future<Output = ()>,
+    ) -> anyhow::Result<()> {
+        self.run(Listen::Bind(address), allowed_hosts, on_listening, shutdown)
+    }
+
+    /// Like [`Self::start_until`], on a listener the caller already bound,
+    /// so a caller choosing among ports can tell a taken port from other
+    /// failures and try another before anything starts.
+    pub fn start_on_until(
+        self,
+        listener: std::net::TcpListener,
+        allowed_hosts: Vec<String>,
+        on_listening: impl FnOnce(),
+        shutdown: impl std::future::Future<Output = ()>,
+    ) -> anyhow::Result<()> {
+        self.run(
+            Listen::Listener(listener),
+            allowed_hosts,
+            on_listening,
+            shutdown,
+        )
+    }
+
+    fn run(
+        self,
+        listen: Listen,
+        allowed_hosts: Vec<String>,
+        on_listening: impl FnOnce(),
+        shutdown: impl std::future::Future<Output = ()>,
+    ) -> anyhow::Result<()> {
+        let address = match &listen {
+            Listen::Bind(address) => *address,
+            Listen::Listener(listener) => listener.local_addr()?,
+        };
         let serve_session = Arc::clone(&self.serve_session);
         let studio = self.studio.clone();
         let allowed_hosts = origin::allowed_hosts(address.ip(), address.port(), &allowed_hosts);
@@ -128,23 +181,36 @@ impl LiveServer {
 
         let rt = Runtime::new().context("Failed to start the async runtime for the web server")?;
         let _guard = rt.enter();
-        let server = Server::try_bind(&address)
-            .with_context(|| {
+        let builder = match listen {
+            Listen::Bind(address) => Server::try_bind(&address).with_context(|| {
                 format!(
                     "Could not start the Rojo server on {address}.\n\
                      The address may already be in use or reserved. Another Rojo server might already \
                      be running, or another program may be using that port.\n\
                      You can pick a different port with the --port option."
                 )
-            })?
-            .serve(make_service);
+            })?,
+            Listen::Listener(listener) => {
+                listener.set_nonblocking(true)?;
+                Server::from_tcp(listener)
+                    .with_context(|| format!("Could not start the Rojo server on {address}"))?
+            }
+        };
+        let server = builder.serve(make_service);
 
         // Binding succeeded, so it's now safe to tell the user we're listening.
         on_listening();
 
-        rt.block_on(server)
-            .context("The Rojo web server encountered a fatal error")?;
-
-        Ok(())
+        let result = rt.block_on(async {
+            tokio::select! {
+                result = server => result.context("The Rojo web server encountered a fatal error"),
+                () = shutdown => Ok(()),
+            }
+        });
+        drop(_guard);
+        // Blocking work the Studio bridge started (for example waiting on a
+        // Git lock) must not hold up the exit.
+        rt.shutdown_timeout(std::time::Duration::from_secs(1));
+        result
     }
 }

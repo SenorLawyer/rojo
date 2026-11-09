@@ -53,7 +53,13 @@ pub fn snapshot_data_csv(
                 .context(context),
         );
 
-    AdjacentMetadata::read_and_apply_all(vfs, path, name, &mut snapshot)?;
+    AdjacentMetadata::read_and_apply_all(
+        vfs,
+        path,
+        name,
+        &context.path_ignore_rules,
+        &mut snapshot,
+    )?;
 
     Ok(Some(snapshot))
 }
@@ -86,7 +92,12 @@ pub fn snapshot_data_csv_init(
     init_snapshot.children = dir_snapshot.children;
     init_snapshot.metadata = dir_snapshot.metadata;
 
-    DirectoryMetadata::read_and_apply_all(vfs, folder_path, &mut init_snapshot)?;
+    DirectoryMetadata::read_and_apply_all(
+        vfs,
+        folder_path,
+        &context.path_ignore_rules,
+        &mut init_snapshot,
+    )?;
 
     Ok(Some(init_snapshot))
 }

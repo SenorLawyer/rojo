@@ -2,11 +2,14 @@
 
 mod assets;
 mod build;
+mod build_into;
+mod dev;
 mod doc;
 mod doctor;
 mod fmt_project;
 mod init;
 mod lifecycle;
+mod logs;
 mod mcp;
 mod merge;
 mod packages;
@@ -33,11 +36,13 @@ use thiserror::Error;
 
 pub use self::assets::AssetsCommand;
 pub use self::build::BuildCommand;
+pub use self::dev::DevCommand;
 pub use self::doc::DocCommand;
 pub use self::doctor::DoctorCommand;
 pub use self::fmt_project::FmtProjectCommand;
 pub use self::init::{InitCommand, InitKind};
 pub use self::lifecycle::{CheckpointCommand, ReleaseCommand, WorkspaceCommand};
+pub use self::logs::LogsCommand;
 pub use self::mcp::McpCommand;
 pub use self::merge::MergeCommand;
 pub use self::packages::PackagesCommand;
@@ -68,6 +73,7 @@ impl Options {
         match self.subcommand {
             Subcommand::Init(subcommand) => subcommand.run(),
             Subcommand::Serve(subcommand) => subcommand.run(self.global),
+            Subcommand::Dev(subcommand) => subcommand.run(),
             Subcommand::Build(subcommand) => subcommand.run(),
             Subcommand::Upload(subcommand) => subcommand.run(),
             Subcommand::Sourcemap(subcommand) => subcommand.run(),
@@ -83,6 +89,7 @@ impl Options {
             Subcommand::Merge(subcommand) => subcommand.run(),
             Subcommand::Packages(subcommand) => subcommand.run(),
             Subcommand::Studio(subcommand) => subcommand.run(),
+            Subcommand::Logs(subcommand) => subcommand.run(),
             Subcommand::Test(subcommand) => subcommand.run(),
             Subcommand::Mcp(subcommand) => subcommand.run(),
             Subcommand::Assets(subcommand) => subcommand.run(),
@@ -154,6 +161,7 @@ pub struct ColorChoiceParseError {
 pub enum Subcommand {
     Init(InitCommand),
     Serve(ServeCommand),
+    Dev(DevCommand),
     Build(BuildCommand),
     Upload(UploadCommand),
     Sourcemap(SourcemapCommand),
@@ -169,6 +177,7 @@ pub enum Subcommand {
     Merge(MergeCommand),
     Packages(PackagesCommand),
     Studio(StudioCommand),
+    Logs(LogsCommand),
     Test(TestCommand),
     Mcp(McpCommand),
     Assets(AssetsCommand),

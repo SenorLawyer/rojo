@@ -1,0 +1,17 @@
+{
+  "name": "partition_ignore_globs",
+  "tree": {
+    "$className": "DataModel",
+    "ReplicatedStorage": {
+      "Filtered": {
+        "$path": "filtered",
+        "$globIgnorePaths": [
+          "**/*.spec.luau"
+        ]
+      },
+      "Unfiltered": {
+        "$path": "unfiltered"
+      }
+    }
+  }
+}

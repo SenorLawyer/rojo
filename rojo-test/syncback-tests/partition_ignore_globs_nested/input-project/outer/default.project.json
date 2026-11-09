@@ -1,0 +1,6 @@
+{
+  "name": "Outer",
+  "tree": {
+    "$path": "src"
+  }
+}

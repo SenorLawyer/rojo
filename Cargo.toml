@@ -1,6 +1,6 @@
 [package]
 name = "rojo"
-version = "8.1.0"
+version = "8.2.0"
 rust-version = "1.89"
 authors = [
     "SenorLawyer",
@@ -100,7 +100,9 @@ strum = { version = "0.27", features = ["derive"] }
 toml = "0.5.11"
 termcolor = "1.4.1"
 thiserror = "1.0.57"
-tokio = { version = "1.36.0", features = ["rt", "rt-multi-thread", "macros"] }
+# `signal` lets `rojo dev` clean up its state file and sourcemap on Ctrl+C,
+# and `net` lets it reserve a port without listening on it.
+tokio = { version = "1.36.0", features = ["rt", "rt-multi-thread", "macros", "net", "time", "signal"] }
 uuid = { version = "1.7.0", features = ["v4", "serde"] }
 clap = { version = "3.2.25", features = ["derive"] }
 profiling = "1.0.15"

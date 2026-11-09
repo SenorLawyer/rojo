@@ -10,7 +10,11 @@ use rbx_dom_weak::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    json, resolution::UnresolvedValue, snapshot::InstanceSnapshot, syncback::SyncbackSnapshot,
+    json,
+    resolution::UnresolvedValue,
+    snapshot::{InstanceSnapshot, PathIgnoreRule},
+    snapshot_middleware::is_ignored_by_node_rules,
+    syncback::SyncbackSnapshot,
     RojoRef,
 };
 
@@ -24,17 +28,33 @@ pub struct AdjacentMetadata {
     #[serde(rename = "$schema", skip_serializing_if = "Option::is_none")]
     schema: Option<String>,
 
-    #[serde(skip_serializing_if = "Option::is_none")]
+    // The `$` spellings are what project files use for the same fields, and
+    // are accepted so that copying a node's fields into a meta file works.
+    #[serde(alias = "$id", skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
 
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        alias = "$ignoreUnknownInstances",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub ignore_unknown_instances: Option<bool>,
 
-    #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
+    #[serde(
+        alias = "$properties",
+        default,
+        skip_serializing_if = "IndexMap::is_empty"
+    )]
     pub properties: IndexMap<Ustr, UnresolvedValue>,
 
-    #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
+    #[serde(
+        alias = "$attributes",
+        default,
+        skip_serializing_if = "IndexMap::is_empty"
+    )]
     pub attributes: IndexMap<String, UnresolvedValue>,
+
+    #[serde(flatten, skip_serializing)]
+    unknown_fields: UnknownFields,
 
     #[serde(skip)]
     pub path: PathBuf,
@@ -46,10 +66,14 @@ impl AdjacentMetadata {
     ///
     /// Also inserts the potential metadata paths into the snapshot's relevant
     /// paths for convenience purposes.
+    ///
+    /// A meta file a node's `$globIgnorePaths` exclude, by `ignore_rules`,
+    /// is treated as absent, like any other excluded file.
     pub fn read_and_apply_all(
         vfs: &Vfs,
         path: &Path,
         name: &str,
+        ignore_rules: &[PathIgnoreRule],
         snapshot: &mut InstanceSnapshot,
     ) -> anyhow::Result<()> {
         // An init file referenced directly (for example `"$path":
@@ -70,14 +94,14 @@ impl AdjacentMetadata {
         let meta_path_json = path.with_file_name(format!("{name}.meta.json"));
         let meta_path_jsonc = path.with_file_name(format!("{name}.meta.jsonc"));
 
-        if let Some(meta_contents) = vfs.read(&meta_path_json).with_not_found()? {
-            let mut metadata = Self::from_slice(&meta_contents, meta_path_json.clone())?;
-            metadata.apply_all(snapshot)?;
-        }
-
-        if let Some(meta_contents) = vfs.read(&meta_path_jsonc).with_not_found()? {
-            let mut metadata = Self::from_slice(&meta_contents, meta_path_jsonc.clone())?;
-            metadata.apply_all(snapshot)?;
+        for meta_path in [&meta_path_json, &meta_path_jsonc] {
+            if is_ignored_by_node_rules(ignore_rules, meta_path) {
+                continue;
+            }
+            if let Some(meta_contents) = vfs.read(meta_path).with_not_found()? {
+                let mut metadata = Self::from_slice(&meta_contents, meta_path.clone())?;
+                metadata.apply_all(snapshot)?;
+            }
         }
 
         // Rather than pushing these in the snapshot middleware, we can just do it here.
@@ -95,6 +119,7 @@ impl AdjacentMetadata {
             )
         })?;
 
+        meta.unknown_fields.warn(&path);
         meta.path = path;
         Ok(meta)
     }
@@ -170,6 +195,7 @@ impl AdjacentMetadata {
             },
             properties,
             attributes,
+            unknown_fields: UnknownFields::default(),
             path,
             id: None,
             schema,
@@ -265,23 +291,60 @@ pub struct DirectoryMetadata {
     #[serde(rename = "$schema", skip_serializing_if = "Option::is_none")]
     schema: Option<String>,
 
-    #[serde(skip_serializing_if = "Option::is_none")]
+    // See `AdjacentMetadata` for why the `$` spellings are accepted.
+    #[serde(alias = "$id", skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
 
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        alias = "$ignoreUnknownInstances",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub ignore_unknown_instances: Option<bool>,
 
-    #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
+    #[serde(
+        alias = "$properties",
+        default,
+        skip_serializing_if = "IndexMap::is_empty"
+    )]
     pub properties: IndexMap<Ustr, UnresolvedValue>,
 
-    #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
+    #[serde(
+        alias = "$attributes",
+        default,
+        skip_serializing_if = "IndexMap::is_empty"
+    )]
     pub attributes: IndexMap<String, UnresolvedValue>,
 
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(alias = "$className", skip_serializing_if = "Option::is_none")]
     pub class_name: Option<Ustr>,
+
+    #[serde(flatten, skip_serializing)]
+    unknown_fields: UnknownFields,
 
     #[serde(skip)]
     pub path: PathBuf,
+}
+
+/// Top-level keys of a meta or model file that Rojo does not recognize.
+///
+/// These used to be dropped silently, so a misspelled or misplaced key, such
+/// as a property written next to `properties` instead of inside it, looked
+/// like Rojo ignoring the file. They are kept only to be reported.
+#[derive(Debug, Default, Deserialize)]
+pub(crate) struct UnknownFields(IndexMap<String, serde::de::IgnoredAny>);
+
+impl UnknownFields {
+    pub(crate) fn warn(&self, path: &Path) {
+        if self.0.is_empty() {
+            return;
+        }
+        let keys: Vec<&str> = self.0.keys().map(String::as_str).collect();
+        log::warn!(
+            "{} has fields Rojo does not recognize, which are ignored: {}",
+            path.display(),
+            keys.join(", ")
+        );
+    }
 }
 
 impl DirectoryMetadata {
@@ -290,22 +353,26 @@ impl DirectoryMetadata {
     ///
     /// Also inserts the potential metadata paths into the snapshot's relevant
     /// paths for convenience purposes.
+    ///
+    /// An `init.meta.json` a node's `$globIgnorePaths` exclude, by
+    /// `ignore_rules`, is treated as absent, like any other excluded file.
     pub fn read_and_apply_all(
         vfs: &Vfs,
         path: &Path,
+        ignore_rules: &[PathIgnoreRule],
         snapshot: &mut InstanceSnapshot,
     ) -> anyhow::Result<()> {
         let meta_path_json = path.join("init.meta.json");
         let meta_path_jsonc = path.join("init.meta.jsonc");
 
-        if let Some(meta_contents) = vfs.read(&meta_path_json).with_not_found()? {
-            let mut metadata = Self::from_slice(&meta_contents, meta_path_json.clone())?;
-            metadata.apply_all(snapshot)?;
-        }
-
-        if let Some(meta_contents) = vfs.read(&meta_path_jsonc).with_not_found()? {
-            let mut metadata = Self::from_slice(&meta_contents, meta_path_jsonc.clone())?;
-            metadata.apply_all(snapshot)?;
+        for meta_path in [&meta_path_json, &meta_path_jsonc] {
+            if is_ignored_by_node_rules(ignore_rules, meta_path) {
+                continue;
+            }
+            if let Some(meta_contents) = vfs.read(meta_path).with_not_found()? {
+                let mut metadata = Self::from_slice(&meta_contents, meta_path.clone())?;
+                metadata.apply_all(snapshot)?;
+            }
         }
 
         // Rather than pushing these in the snapshot middleware, we can just do it here.
@@ -323,6 +390,7 @@ impl DirectoryMetadata {
             )
         })?;
 
+        meta.unknown_fields.warn(&path);
         meta.path = path;
         Ok(meta)
     }
@@ -402,6 +470,7 @@ impl DirectoryMetadata {
             properties,
             attributes,
             class_name: None,
+            unknown_fields: UnknownFields::default(),
             path,
             id: None,
             schema,
@@ -539,6 +608,81 @@ mod test {
 
     use super::*;
 
+    fn tags_of(snapshot: &InstanceSnapshot) -> Option<Vec<String>> {
+        match snapshot.properties.get(&rbx_dom_weak::ustr("Tags")) {
+            Some(Variant::Tags(tags)) => Some(tags.iter().map(str::to_owned).collect()),
+            _ => None,
+        }
+    }
+
+    /// Project files spell these fields with a `$`. Meta files used to drop
+    /// that spelling silently, so Tags written that way never appeared.
+    ///
+    /// See: https://github.com/rojo-rbx/rojo/issues/1017
+    #[test]
+    fn adjacent_accepts_project_spelling() {
+        let mut imfs = InMemoryFs::new();
+        imfs.load_snapshot(
+            "/foo/bar.meta.json",
+            VfsSnapshot::file(
+                r#"{
+                    "$properties": { "Tags": ["Hello", "World"] },
+                    "$attributes": { "Speed": 5 },
+                    "$ignoreUnknownInstances": true,
+                    "notAField": 1
+                }"#,
+            ),
+        )
+        .unwrap();
+
+        let vfs = Vfs::new(imfs);
+        let mut snapshot = InstanceSnapshot::new().class_name("ModuleScript");
+
+        AdjacentMetadata::read_and_apply_all(
+            &vfs,
+            Path::new("/foo/bar.lua"),
+            "bar",
+            &[],
+            &mut snapshot,
+        )
+        .unwrap();
+
+        assert_eq!(
+            tags_of(&snapshot),
+            Some(vec!["Hello".to_owned(), "World".to_owned()])
+        );
+        assert!(snapshot
+            .properties
+            .contains_key(&rbx_dom_weak::ustr("Attributes")));
+        assert!(snapshot.metadata.ignore_unknown_instances);
+    }
+
+    #[test]
+    fn directory_accepts_project_spelling() {
+        let mut imfs = InMemoryFs::new();
+        imfs.load_snapshot(
+            "/foo/init.meta.json",
+            VfsSnapshot::file(
+                r#"{
+                    "$className": "Configuration",
+                    "$properties": { "Tags": ["Hello", "World"] }
+                }"#,
+            ),
+        )
+        .unwrap();
+
+        let vfs = Vfs::new(imfs);
+        let mut snapshot = InstanceSnapshot::new().class_name("Folder");
+
+        DirectoryMetadata::read_and_apply_all(&vfs, Path::new("/foo"), &[], &mut snapshot).unwrap();
+
+        assert_eq!(snapshot.class_name, "Configuration");
+        assert_eq!(
+            tags_of(&snapshot),
+            Some(vec!["Hello".to_owned(), "World".to_owned()])
+        );
+    }
+
     #[test]
     fn adjacent_read_json() {
         let mut imfs = InMemoryFs::new();
@@ -552,7 +696,7 @@ mod test {
         let path = Path::new("/foo/bar.rojo");
         let mut snapshot = InstanceSnapshot::new();
 
-        AdjacentMetadata::read_and_apply_all(&vfs, path, "bar", &mut snapshot).unwrap();
+        AdjacentMetadata::read_and_apply_all(&vfs, path, "bar", &[], &mut snapshot).unwrap();
 
         insta::assert_yaml_snapshot!(snapshot);
     }
@@ -570,7 +714,7 @@ mod test {
         let path = Path::new("/foo/bar.rojo");
         let mut snapshot = InstanceSnapshot::new();
 
-        AdjacentMetadata::read_and_apply_all(&vfs, path, "bar", &mut snapshot).unwrap();
+        AdjacentMetadata::read_and_apply_all(&vfs, path, "bar", &[], &mut snapshot).unwrap();
 
         insta::assert_yaml_snapshot!(snapshot);
     }
@@ -588,7 +732,7 @@ mod test {
         let path = Path::new("/foo/");
         let mut snapshot = InstanceSnapshot::new();
 
-        DirectoryMetadata::read_and_apply_all(&vfs, path, &mut snapshot).unwrap();
+        DirectoryMetadata::read_and_apply_all(&vfs, path, &[], &mut snapshot).unwrap();
 
         insta::assert_yaml_snapshot!(snapshot);
     }
@@ -606,7 +750,7 @@ mod test {
         let path = Path::new("/foo/");
         let mut snapshot = InstanceSnapshot::new();
 
-        DirectoryMetadata::read_and_apply_all(&vfs, path, &mut snapshot).unwrap();
+        DirectoryMetadata::read_and_apply_all(&vfs, path, &[], &mut snapshot).unwrap();
 
         insta::assert_yaml_snapshot!(snapshot);
     }

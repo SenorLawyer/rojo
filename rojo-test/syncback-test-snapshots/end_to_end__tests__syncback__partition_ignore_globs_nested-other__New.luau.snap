@@ -1,0 +1,5 @@
+---
+source: tests/tests/syncback.rs
+expression: other/New.luau
+---
+return "New"

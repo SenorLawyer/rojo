@@ -28,7 +28,7 @@ pub fn snapshot_dir(
         None => return Ok(None),
     };
 
-    DirectoryMetadata::read_and_apply_all(vfs, path, &mut snapshot)?;
+    DirectoryMetadata::read_and_apply_all(vfs, path, &context.path_ignore_rules, &mut snapshot)?;
 
     Ok(Some(snapshot))
 }

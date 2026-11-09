@@ -17,7 +17,7 @@ use crate::{
     message_queue::{MessageQueue, MessageWeight},
     snapshot::{
         apply_patch_set, compute_patch_set, AppliedPatchSet, AppliedPatchUpdate, InstigatingSource,
-        PatchSet, RojoTree,
+        PatchSet, PathIgnoreRule, RojoTree,
     },
     snapshot_middleware::{
         canonicalize_existing_ancestor, get_dir_middleware, snapshot_from_vfs,
@@ -588,7 +588,11 @@ impl JobThreadContext {
                                 match instigating_source {
                                     InstigatingSource::Path(path) => {
                                         if let Some(Variant::String(value)) = changed_value {
-                                            match resolve_source_path(&self.vfs, path) {
+                                            match resolve_source_path(
+                                                &self.vfs,
+                                                path,
+                                                &instance.metadata().context.path_ignore_rules,
+                                            ) {
                                                 Ok(None) => {
                                                     // Writing would bring back a file
                                                     // whose removal is still on its way.
@@ -681,7 +685,11 @@ impl JobThreadContext {
 
 /// Returns the file that holds the source of the instance created from
 /// `path`, or `None` if `path` no longer exists.
-fn resolve_source_path(vfs: &Vfs, path: &Path) -> io::Result<Option<PathBuf>> {
+fn resolve_source_path(
+    vfs: &Vfs,
+    path: &Path,
+    ignore_rules: &[PathIgnoreRule],
+) -> io::Result<Option<PathBuf>> {
     let Some(meta) = vfs.metadata(path).with_not_found()? else {
         return Ok(None);
     };
@@ -689,7 +697,8 @@ fn resolve_source_path(vfs: &Vfs, path: &Path) -> io::Result<Option<PathBuf>> {
         return Ok(Some(path.to_owned()));
     }
 
-    let (middleware, _, init_path) = get_dir_middleware(vfs, path).map_err(io::Error::other)?;
+    let (middleware, _, init_path) =
+        get_dir_middleware(vfs, path, ignore_rules).map_err(io::Error::other)?;
     match middleware {
         Middleware::ModuleScriptDir
         | Middleware::ServerScriptDir
@@ -758,7 +767,7 @@ fn compute_and_apply_changes(
                 // path still exists. We can generate a snapshot starting at
                 // that path and use it as the source for our patch.
 
-                let snapshot = match snapshot_from_vfs(&metadata.context, vfs, path) {
+                let snapshot = match snapshot_from_vfs(metadata.reload_context(), vfs, path) {
                     Ok(snapshot) => snapshot,
                     Err(err) => {
                         log::error!("Snapshot error: {:?}", err);
@@ -814,7 +823,7 @@ fn compute_and_apply_changes(
             // the project file, we snapshot the entire project node again.
 
             let snapshot_result = snapshot_project_node(
-                &metadata.context,
+                metadata.reload_context(),
                 path,
                 name,
                 node,
@@ -1686,15 +1695,15 @@ mod test {
         }
         let vfs = Vfs::new_default_without_watch();
         assert_eq!(
-            resolve_source_path(&vfs, root).unwrap(),
+            resolve_source_path(&vfs, root, &[]).unwrap(),
             Some(root.join("init.luau"))
         );
         fs::remove_file(root.join("init.luau")).unwrap();
         assert_eq!(
-            resolve_source_path(&vfs, root).unwrap(),
+            resolve_source_path(&vfs, root, &[]).unwrap(),
             Some(root.join("init.lua"))
         );
         fs::write(root.join("default.project.json"), "{}").unwrap();
-        assert!(resolve_source_path(&vfs, root).is_err());
+        assert!(resolve_source_path(&vfs, root, &[]).is_err());
     }
 }

@@ -1,0 +1,866 @@
+//! Applies a Rojo project onto an existing place for `rojo build --into`.
+//!
+//! The merge reuses the patch machinery that `rojo serve` uses to keep its
+//! tree in step with the filesystem: the project is turned into a snapshot,
+//! a patch is computed against a tree built from the base place, and that
+//! patch is applied. The patch is filtered first, because a serve patch makes
+//! the tree match the project exactly, while a build into a place has to keep
+//! everything the project does not claim. See docs/build-into.md for the
+//! rules.
+
+use std::{
+    collections::{HashMap, HashSet},
+    fs,
+    io::{BufReader, Read},
+    path::Path,
+};
+
+use anyhow::{bail, Context};
+use rbx_dom_weak::{
+    types::{Ref, Variant},
+    ustr, Ustr, WeakDom,
+};
+use rbx_reflection::{ClassTag, PropertyKind, PropertySerialization};
+
+use crate::{
+    snapshot::{apply_patch_set, compute_patch_set, InstanceSnapshot, PatchSet, RojoTree},
+    RojoRef, REF_ID_ATTRIBUTE_NAME, REF_POINTER_ATTRIBUTE_PREFIX,
+};
+
+/// Reads the place that `rojo build --into` starts from.
+pub fn read_base_place(path: &Path) -> anyhow::Result<WeakDom> {
+    let extension = path.extension().and_then(|extension| extension.to_str());
+    let file = fs::File::open(path)
+        .with_context(|| format!("Could not open base place {}", path.display()))?;
+    let mut reader = BufReader::new(file);
+    match extension {
+        Some("rbxl") => {
+            let mut bytes = Vec::new();
+            reader
+                .read_to_end(&mut bytes)
+                .with_context(|| format!("Could not read base place {}", path.display()))?;
+            check_binary_chunks(&bytes).with_context(|| {
+                format!("Could not read {} as a binary place file", path.display())
+            })?;
+            rbx_binary::from_reader(bytes.as_slice()).with_context(|| {
+                format!("Could not read {} as a binary place file", path.display())
+            })
+        }
+        Some("rbxlx") => rbx_xml::from_reader(
+            reader,
+            rbx_xml::DecodeOptions::new()
+                .property_behavior(rbx_xml::DecodePropertyBehavior::ReadUnknown),
+        )
+        .with_context(|| format!("Could not read {} as an XML place file", path.display())),
+        _ => anyhow::bail!(
+            "The base place {} must be a place file ending in .rbxl or .rbxlx",
+            path.display()
+        ),
+    }
+}
+
+/// Size of a binary place's file header, before the first chunk.
+const BINARY_HEADER_LEN: usize = 32;
+
+/// Size of a chunk header: name, compressed length, length and reserved.
+const CHUNK_HEADER_LEN: usize = 16;
+
+/// Checks that every chunk in a binary place is complete before rbx_binary
+/// decodes it.
+///
+/// rbx_binary asserts that a chunk's payload has the length its header gives
+/// rather than returning an error, and Rojo builds with `panic = "abort"`. A
+/// base place that Studio is halfway through saving would otherwise end
+/// `build --watch --into` instead of failing one rebuild.
+fn check_binary_chunks(bytes: &[u8]) -> anyhow::Result<()> {
+    let read_u32 = |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
+
+    let mut offset = BINARY_HEADER_LEN;
+    if bytes.len() < offset {
+        bail!("the file ends inside its header");
+    }
+
+    loop {
+        if bytes.len() - offset < CHUNK_HEADER_LEN {
+            bail!("the file ends before its END chunk");
+        }
+        let name = &bytes[offset..offset + 4];
+        let compressed_len = read_u32(offset + 4);
+        let len = read_u32(offset + 8);
+        offset += CHUNK_HEADER_LEN;
+
+        let stored_len = if compressed_len == 0 {
+            len
+        } else {
+            compressed_len
+        };
+        if bytes.len() - offset < stored_len {
+            bail!(
+                "the {} chunk needs {stored_len} bytes but only {} remain",
+                String::from_utf8_lossy(name).trim_end_matches('\0'),
+                bytes.len() - offset
+            );
+        }
+        let payload = &bytes[offset..offset + stored_len];
+        offset += stored_len;
+
+        if compressed_len != 0 {
+            // Decompressed the same way rbx_binary does, which then asserts
+            // on the length.
+            let data = if payload.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]) {
+                zstd::bulk::decompress(payload, len)?
+            } else if payload.len() >= 4 {
+                lz4_flex::block::decompress(payload, len)?
+            } else {
+                bail!("a compressed chunk is too short to hold any data");
+            };
+            if data.len() != len {
+                bail!(
+                    "a chunk decompresses to {} bytes instead of {len}",
+                    data.len()
+                );
+            }
+        }
+
+        if name == b"END\0" {
+            return Ok(());
+        }
+    }
+}
+
+/// Applies the project in `project` onto `base`, returning the merged tree.
+///
+/// `project` is expected to have a DataModel root, matching `base`'s root.
+pub fn merge_into_place(project: &RojoTree, base: WeakDom) -> anyhow::Result<RojoTree> {
+    let mut tree = RojoTree::from_dom(base);
+    let root_id = tree.get_root_id();
+
+    // Taken out before the patch is computed, so that every pointer attribute
+    // left in the tree once the patch is applied is one the project defines.
+    // A project pointer also differs from the base's attributes then, even
+    // when the base has the same one, so the project's attributes are applied.
+    let base_pointers = take_base_ref_pointers(&mut tree);
+
+    let snapshot = snapshot_from_tree(project, project.get_root_id());
+    let mut patch_set = compute_patch_set(Some(snapshot), &tree, root_id);
+
+    keep_unclaimed_base_content(&tree, &mut patch_set);
+    remove_base_property_aliases(&tree, &mut patch_set);
+
+    // Instances whose attributes the project replaces keep none of the
+    // base's, so only the others get the base's pointers back afterwards.
+    let attributes_key = ustr("Attributes");
+    let project_sets_attributes: HashSet<Ref> = patch_set
+        .updated_instances
+        .iter()
+        .filter(|update| update.changed_properties.contains_key(&attributes_key))
+        .map(|update| update.id)
+        .collect();
+
+    replace_base_ids(&tree, &mut patch_set);
+    let null_refs = take_null_ref_assignments(&mut patch_set);
+    apply_patch_set(&mut tree, patch_set);
+    remove_project_attributes_marker(&mut tree);
+
+    for (id, name) in null_refs {
+        tree.get_instance_mut(id)
+            .unwrap()
+            .properties_mut()
+            .insert(name, Variant::Ref(Ref::none()));
+    }
+
+    check_base_id_collisions(project, &tree)?;
+    resolve_project_ref_pointers(&mut tree)?;
+    restore_base_ref_pointers(&mut tree, base_pointers, &project_sets_attributes);
+    clear_dangling_refs(&mut tree);
+
+    Ok(tree)
+}
+
+/// Sets the Ref property named by every `Rojo_Target_*` attribute in the
+/// tree to the instance with that ID, failing for any that has none.
+///
+/// Runs while the base's pointers are taken out, so these are all the
+/// project's. Patch application only resolves pointers on instances whose
+/// attributes changed, and patch computation resolves them against the base
+/// place, where a target added by this build does not exist yet. A pointer
+/// left unresolved would keep whatever ref the base has, which is unrelated
+/// to the project, so it is an error rather than silently wrong output.
+fn resolve_project_ref_pointers(tree: &mut RojoTree) -> anyhow::Result<()> {
+    let attributes_key = ustr("Attributes");
+    let mut pointers = Vec::new();
+    for instance in tree.inner().descendants() {
+        let Some(Variant::Attributes(attributes)) = instance.properties.get(&attributes_key) else {
+            continue;
+        };
+        for (name, value) in attributes.iter() {
+            let Some(property) = name.strip_prefix(REF_POINTER_ATTRIBUTE_PREFIX) else {
+                continue;
+            };
+            let target = match value {
+                Variant::String(target) => Some(target.clone()),
+                Variant::BinaryString(target) => {
+                    std::str::from_utf8(target.as_ref()).ok().map(str::to_owned)
+                }
+                _ => None,
+            };
+            pointers.push((instance.referent(), ustr(property), name.clone(), target));
+        }
+    }
+
+    let mut unresolved = Vec::new();
+    for (holder, property, attribute, target) in pointers {
+        let resolved = target
+            .as_ref()
+            .and_then(|target| tree.get_specified_id(&RojoRef::new(target.clone())));
+        match resolved {
+            Some(resolved) => {
+                tree.get_instance_mut(holder)
+                    .unwrap()
+                    .properties_mut()
+                    .insert(property, Variant::Ref(resolved));
+            }
+            None => unresolved.push(format!(
+                "{} ({attribute} = \"{}\")",
+                instance_path(tree, holder),
+                target.as_deref().unwrap_or("<not a string>")
+            )),
+        }
+    }
+
+    if !unresolved.is_empty() {
+        unresolved.sort();
+        bail!(
+            "The project has Rojo_Target_* attributes whose ID no instance in the output \
+             has, or more than one has, so their refs could not be set: {}. \
+             Give the target that ID with $id or Rojo_Id, or fix the attribute.",
+            unresolved.join(", ")
+        );
+    }
+    Ok(())
+}
+
+/// Takes the `Rojo_Target_*` attributes out of every base instance, returning
+/// them so they can be put back after the patch is applied.
+///
+/// Patch application resolves the pointer attributes of every instance it
+/// updates. A pointer the base place kept, for example from an earlier
+/// `rojo build`, would then override a ref the project sets on a paired
+/// instance, or a ref edited in Studio since. The base's pointers are kept as
+/// data only: Ref properties stay what the project or the base has.
+fn take_base_ref_pointers(tree: &mut RojoTree) -> Vec<(Ref, Vec<(String, Variant)>)> {
+    let attributes_key = ustr("Attributes");
+    let holders: Vec<Ref> = tree
+        .inner()
+        .descendants()
+        .filter(|instance| match instance.properties.get(&attributes_key) {
+            Some(Variant::Attributes(attributes)) => attributes
+                .iter()
+                .any(|(name, _)| name.starts_with(REF_POINTER_ATTRIBUTE_PREFIX)),
+            _ => false,
+        })
+        .map(|instance| instance.referent())
+        .collect();
+
+    let mut taken = Vec::new();
+    for id in holders {
+        let mut instance = tree.get_instance_mut(id).unwrap();
+        let Some(Variant::Attributes(attributes)) =
+            instance.properties_mut().get_mut(&attributes_key)
+        else {
+            continue;
+        };
+        let pointers: Vec<(String, Variant)> = attributes
+            .iter()
+            .filter(|(name, _)| name.starts_with(REF_POINTER_ATTRIBUTE_PREFIX))
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect();
+        for (name, _) in &pointers {
+            attributes.remove(name.as_str());
+        }
+        taken.push((id, pointers));
+    }
+    taken
+}
+
+/// Puts back the pointer attributes `take_base_ref_pointers` took, except on
+/// removed instances and on instances whose attributes the project replaced.
+fn restore_base_ref_pointers(
+    tree: &mut RojoTree,
+    pointers: Vec<(Ref, Vec<(String, Variant)>)>,
+    project_sets_attributes: &HashSet<Ref>,
+) {
+    let attributes_key = ustr("Attributes");
+    for (id, entries) in pointers {
+        if project_sets_attributes.contains(&id) {
+            continue;
+        }
+        let Some(mut instance) = tree.get_instance_mut(id) else {
+            continue;
+        };
+        if let Some(Variant::Attributes(attributes)) =
+            instance.properties_mut().get_mut(&attributes_key)
+        {
+            for (name, value) in entries {
+                attributes.insert(name, value);
+            }
+        }
+    }
+}
+
+/// Removes base properties that are another name for, or the migrated form
+/// of, a property the project sets.
+///
+/// A base place read from a file has `Color` where a project sets
+/// `BrickColor`, or `FontFace` where it sets `Font`. Keeping the base's would
+/// leave both on the instance, and the serializer writes the newer one, so
+/// the project's value would be lost.
+fn remove_base_property_aliases(tree: &RojoTree, patch_set: &mut PatchSet) {
+    for update in &mut patch_set.updated_instances {
+        let Some(instance) = tree.get_instance(update.id) else {
+            continue;
+        };
+        let class_name = update
+            .changed_class_name
+            .unwrap_or_else(|| instance.class_name());
+        let mut removals = Vec::new();
+        for (name, value) in &update.changed_properties {
+            if value.is_none() {
+                continue;
+            }
+            for related in related_property_names(&class_name, name) {
+                if !update.changed_properties.contains_key(&related)
+                    && instance.properties().contains_key(&related)
+                {
+                    removals.push(related);
+                }
+            }
+        }
+        for name in removals {
+            update.changed_properties.insert(name, None);
+        }
+    }
+}
+
+/// Returns the other names `property_name` of `class_name` goes by: the
+/// canonical property of an alias, other aliases of the same property, and
+/// properties one migrates to or from.
+fn related_property_names(class_name: &str, property_name: &str) -> Vec<Ustr> {
+    let Ok(database) = rbx_reflection_database::get() else {
+        return Vec::new();
+    };
+    let Some(class) = database.classes.get(class_name) else {
+        return Vec::new();
+    };
+    let properties: Vec<(&str, &PropertyKind)> = database
+        .superclasses_iter(class)
+        .flat_map(|class| {
+            class
+                .properties
+                .iter()
+                .map(|(name, descriptor)| (*name, &descriptor.kind))
+        })
+        .collect();
+
+    let canonical = properties
+        .iter()
+        .find(|(name, _)| *name == property_name)
+        .map(|(_, kind)| match kind {
+            PropertyKind::Alias { alias_for } => *alias_for,
+            _ => property_name,
+        })
+        .unwrap_or(property_name);
+
+    // Names that are, or are migrated from or to, the canonical property.
+    let mut group: HashSet<&str> = HashSet::from([canonical]);
+    for (name, kind) in &properties {
+        match kind {
+            PropertyKind::Alias { alias_for } if *alias_for == canonical => {
+                group.insert(name);
+            }
+            PropertyKind::Canonical {
+                serialization: PropertySerialization::Migrate(migration),
+            } => {
+                let targets = migration.new_property_names();
+                if *name == canonical {
+                    group.extend(targets.iter().copied());
+                } else if targets.contains(&canonical) {
+                    group.insert(name);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    group
+        .into_iter()
+        .filter(|name| *name != property_name)
+        .map(ustr)
+        .collect()
+}
+
+/// Makes the project's ID win over a base `Rojo_Id` attribute on a paired
+/// instance.
+///
+/// The project's ID only lives in metadata unless the project sets
+/// attributes, so a paired instance keeps the base's attributes, and patch
+/// application reads the specified ID back from a `Rojo_Id` among them. The
+/// base's old ID would replace the project's, and `Rojo_Target_*` pointers at
+/// the project's ID would not resolve.
+fn replace_base_ids(tree: &RojoTree, patch_set: &mut PatchSet) {
+    let attributes_key = ustr("Attributes");
+
+    for update in &mut patch_set.updated_instances {
+        let Some(specified) = update
+            .changed_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.specified_id.clone())
+        else {
+            continue;
+        };
+        if update.changed_properties.contains_key(&attributes_key) {
+            // The project's attributes replace the base's entirely.
+            continue;
+        }
+        let Some(Variant::Attributes(attributes)) = tree
+            .get_instance(update.id)
+            .and_then(|instance| instance.properties().get(&attributes_key))
+        else {
+            continue;
+        };
+        if attributes.get(REF_ID_ATTRIBUTE_NAME).is_none() {
+            continue;
+        }
+
+        let mut attributes = attributes.clone();
+        attributes.insert(
+            REF_ID_ATTRIBUTE_NAME.to_owned(),
+            Variant::String(specified.as_str().to_owned()),
+        );
+        update
+            .changed_properties
+            .insert(attributes_key, Some(Variant::Attributes(attributes)));
+    }
+}
+
+/// Takes the assignments of nil to Ref properties out of `patch_set`.
+///
+/// Patch application skips nil refs in updates, which would keep the base's
+/// target where the project explicitly has none. They are assigned after the
+/// patch is applied instead.
+fn take_null_ref_assignments(patch_set: &mut PatchSet) -> Vec<(Ref, Ustr)> {
+    let mut assignments = Vec::new();
+    for update in &mut patch_set.updated_instances {
+        update.changed_properties.retain(|name, value| match value {
+            Some(Variant::Ref(target)) if target.is_none() => {
+                assignments.push((update.id, *name));
+                false
+            }
+            _ => true,
+        });
+    }
+    assignments
+}
+
+/// Fails when an instance carries a `Rojo_Id` from the base place that the
+/// project also gives one of its instances.
+///
+/// Neither ID would resolve, so every `Rojo_Target_*` pointing at it would
+/// silently be left unset.
+fn check_base_id_collisions(project: &RojoTree, tree: &RojoTree) -> anyhow::Result<()> {
+    fn count_ids(tree: &RojoTree) -> HashMap<&RojoRef, Vec<Ref>> {
+        let mut counts: HashMap<&RojoRef, Vec<Ref>> = HashMap::new();
+        for instance in tree.descendants(tree.get_root_id()) {
+            if let Some(specified) = &instance.metadata().specified_id {
+                counts.entry(specified).or_default().push(instance.id());
+            }
+        }
+        counts
+    }
+
+    // Comparing counts leaves duplicate IDs within the project itself to the
+    // usual warning, as in any build, and only catches the ones the base
+    // place adds: kept base-only instances, and paired instances that keep a
+    // base Rojo_Id the project uses elsewhere.
+    let project_counts = count_ids(project);
+    let merged_counts = count_ids(tree);
+    let mut collisions = Vec::new();
+    for (specified, project_instances) in &project_counts {
+        let merged = merged_counts.get(specified).map_or(&[][..], Vec::as_slice);
+        if merged.len() > project_instances.len() {
+            let paths: Vec<String> = merged.iter().map(|&id| instance_path(tree, id)).collect();
+            collisions.push(format!(
+                "\"{}\" at {}",
+                specified.as_str(),
+                paths.join(" and ")
+            ));
+        }
+    }
+    collisions.sort();
+
+    if !collisions.is_empty() {
+        bail!(
+            "The base place has instances whose Rojo_Id is also an ID in the project, \
+             so references to those IDs could not be resolved: {}. \
+             Remove or rename the Rojo_Id attribute in the base place, or change the project's ID.",
+            collisions.join(", ")
+        );
+    }
+    Ok(())
+}
+
+fn instance_path(tree: &RojoTree, id: Ref) -> String {
+    let mut names = Vec::new();
+    let mut current = id;
+    while current != tree.get_root_id() {
+        let instance = tree.get_instance(current).unwrap();
+        names.push(instance.name().to_owned());
+        current = instance.parent();
+    }
+    names.reverse();
+    names.join("/")
+}
+
+/// Whether a top-level instance of this class is a service. A class the
+/// reflection database does not know is assumed to be a service newer than
+/// it, since keeping one by mistake is harmless and removing one is not.
+fn is_service(class_name: &str) -> bool {
+    match rbx_reflection_database::get()
+        .ok()
+        .and_then(|database| database.classes.get(class_name))
+    {
+        Some(descriptor) => descriptor.tags.contains(&ClassTag::Service),
+        None => true,
+    }
+}
+
+/// Takes [`PROJECT_ATTRIBUTES_MARKER`] out of every instance again.
+fn remove_project_attributes_marker(tree: &mut RojoTree) {
+    let attributes_key = ustr("Attributes");
+    let marked: Vec<Ref> = tree
+        .inner()
+        .descendants()
+        .filter(|instance| match instance.properties.get(&attributes_key) {
+            Some(Variant::Attributes(attributes)) => {
+                attributes.get(PROJECT_ATTRIBUTES_MARKER).is_some()
+            }
+            _ => false,
+        })
+        .map(|instance| instance.referent())
+        .collect();
+    for id in marked {
+        if let Some(Variant::Attributes(attributes)) = tree
+            .get_instance_mut(id)
+            .unwrap()
+            .properties_mut()
+            .get_mut(&attributes_key)
+        {
+            attributes.remove(PROJECT_ATTRIBUTES_MARKER);
+        }
+    }
+}
+
+/// Sets refs to instances that are no longer in the tree to nil.
+///
+/// A base instance can point at one the project removed or replaced. The XML
+/// serializer would write the removed instance's referent, which names no
+/// item in the file, so the ref is cleared here for both formats alike.
+fn clear_dangling_refs(tree: &mut RojoTree) {
+    let mut dangling = Vec::new();
+    for instance in tree.inner().descendants() {
+        for (name, value) in &instance.properties {
+            if let Variant::Ref(target) = value {
+                if target.is_some() && tree.inner().get_by_ref(*target).is_none() {
+                    dangling.push((instance.referent(), *name));
+                }
+            }
+        }
+    }
+    for (id, name) in dangling {
+        tree.get_instance_mut(id)
+            .unwrap()
+            .properties_mut()
+            .insert(name, Variant::Ref(Ref::none()));
+    }
+}
+
+/// An attribute added to every project instance's attributes while merging
+/// and removed again right after. Whether the project sets an instance's
+/// attributes decides whether the base's `Rojo_Target_*` attributes come
+/// back, and the patch only shows that when the values differ: a base with
+/// `{Keep, Rojo_Target_Value}` and a project with `{Keep}` differ only in
+/// the pointer, which is taken out before the patch is computed.
+const PROJECT_ATTRIBUTES_MARKER: &str = "__RojoBuildIntoProjectAttributes";
+
+/// Copies a tree back into a snapshot, metadata included.
+///
+/// Each snapshot ID is the instance's ID in `tree`, which is what the tree's
+/// Ref properties point at, so patch computation and application can rewrite
+/// them to the IDs the instances end up with in the base place.
+fn snapshot_from_tree(tree: &RojoTree, id: Ref) -> InstanceSnapshot {
+    let instance = tree.get_instance(id).unwrap();
+    let mut properties = instance.properties().clone();
+    // Marks the attributes as the project's, so the patch carries them even
+    // when they equal what is left of the base's once its pointers are taken
+    // out; see `PROJECT_ATTRIBUTES_MARKER`.
+    if let Some(Variant::Attributes(attributes)) = properties.get_mut(&ustr("Attributes")) {
+        attributes.insert(PROJECT_ATTRIBUTES_MARKER.to_owned(), Variant::Bool(true));
+    }
+    InstanceSnapshot {
+        snapshot_id: id,
+        metadata: instance.metadata().clone(),
+        name: instance.name().to_owned().into(),
+        class_name: instance.class_name(),
+        properties,
+        children: instance
+            .children()
+            .iter()
+            .map(|&child| snapshot_from_tree(tree, child))
+            .collect(),
+    }
+}
+
+/// Removes the parts of `patch_set` that would delete base content the
+/// project does not claim.
+///
+/// A serve patch removes every property and child the snapshot lacks. Here:
+///
+/// - Properties the project does not set keep the base value.
+/// - A base child the project did not pair up (by name and class) is only
+///   removed when its parent ignores no unknown instances. Where the parent
+///   ignores them, it is kept even when it shares a name with a project
+///   child, as the Studio plugin keeps it.
+/// - Services are never removed for lacking a project node, whatever the
+///   root's `$ignoreUnknownInstances`, since a place needs them. Other
+///   top-level instances follow the root's setting like any child.
+fn keep_unclaimed_base_content(tree: &RojoTree, patch_set: &mut PatchSet) {
+    let root_id = tree.get_root_id();
+
+    for update in &mut patch_set.updated_instances {
+        update.changed_properties.retain(|_, value| value.is_some());
+    }
+
+    // A paired instance only gets a metadata update when the project's
+    // metadata differs from the base's; otherwise they are equal and the
+    // base's value is the project's.
+    let ignores_unknown = |id: Ref| {
+        patch_set
+            .updated_instances
+            .iter()
+            .find(|update| update.id == id)
+            .and_then(|update| update.changed_metadata.as_ref())
+            .unwrap_or_else(|| tree.get_metadata(id).unwrap())
+            .ignore_unknown_instances
+    };
+
+    let keep: HashSet<Ref> = patch_set
+        .removed_instances
+        .iter()
+        .copied()
+        .filter(|&id| {
+            let instance = tree.get_instance(id).unwrap();
+            let parent = instance.parent();
+            let is_unclaimed_service = parent == root_id && is_service(&instance.class_name());
+            is_unclaimed_service || ignores_unknown(parent)
+        })
+        .collect();
+
+    patch_set.removed_instances.retain(|id| !keep.contains(id));
+}
+
+#[cfg(test)]
+mod test {
+    use rbx_dom_weak::{types::Attributes, InstanceBuilder};
+
+    use super::*;
+    use crate::snapshot::InstanceMetadata;
+
+    fn attributes(entries: &[(&str, &str)]) -> Variant {
+        let mut attributes = Attributes::new();
+        for (name, value) in entries {
+            attributes.insert((*name).to_owned(), Variant::String((*value).to_owned()));
+        }
+        Variant::Attributes(attributes)
+    }
+
+    fn project(workspace_children: Vec<InstanceSnapshot>) -> RojoTree {
+        RojoTree::new(
+            InstanceSnapshot::new()
+                .name("Project")
+                .class_name("DataModel")
+                .children(vec![InstanceSnapshot::new()
+                    .name("Workspace")
+                    .class_name("Workspace")
+                    .metadata(InstanceMetadata::new().ignore_unknown_instances(true))
+                    .children(workspace_children)]),
+        )
+    }
+
+    fn find(tree: &RojoTree, name: &str) -> Ref {
+        tree.inner()
+            .descendants()
+            .find(|instance| instance.name == name)
+            .unwrap_or_else(|| panic!("no {name}"))
+            .referent()
+    }
+
+    #[test]
+    fn project_pointers_resolve_to_targets_this_build_adds() {
+        // The base has the same pointer on the paired Model, so the patch
+        // alone would not carry it, and a pointer holder only it has.
+        let mut base = WeakDom::new(InstanceBuilder::new("DataModel"));
+        let workspace = base.insert(base.root_ref(), InstanceBuilder::new("Workspace"));
+        base.insert(
+            workspace,
+            InstanceBuilder::new("Model")
+                .with_name("Flag")
+                .with_property(
+                    "Attributes",
+                    attributes(&[("Rojo_Target_PrimaryPart", "pole")]),
+                ),
+        );
+        base.insert(
+            workspace,
+            InstanceBuilder::new("ObjectValue")
+                .with_name("Pointer")
+                .with_property("Attributes", attributes(&[("Rojo_Target_Value", "pole")])),
+        );
+
+        let project = project(vec![InstanceSnapshot::new()
+            .name("Flag")
+            .class_name("Model")
+            .property(
+                "Attributes",
+                attributes(&[("Rojo_Target_PrimaryPart", "pole")]),
+            )
+            .children(vec![InstanceSnapshot::new()
+                .name("Pole")
+                .class_name("Part")
+                .metadata(
+                    InstanceMetadata::new().specified_id(Some(RojoRef::new("pole".to_owned()))),
+                )])]);
+
+        let merged = merge_into_place(&project, base).unwrap();
+        let flag = merged.get_instance(find(&merged, "Flag")).unwrap();
+        assert_eq!(
+            flag.properties().get(&ustr("PrimaryPart")),
+            Some(&Variant::Ref(find(&merged, "Pole")))
+        );
+
+        // The base's own pointer is kept as data and does not set the ref.
+        let pointer = merged.get_instance(find(&merged, "Pointer")).unwrap();
+        assert!(!matches!(
+            pointer.properties().get(&ustr("Value")),
+            Some(Variant::Ref(target)) if target.is_some()
+        ));
+        let Some(Variant::Attributes(kept)) = pointer.properties().get(&ustr("Attributes")) else {
+            panic!("the base pointer's attributes were dropped");
+        };
+        assert!(kept.get("Rojo_Target_Value").is_some());
+    }
+
+    #[test]
+    fn project_attributes_drop_base_pointers_even_when_otherwise_equal() {
+        let mut base = WeakDom::new(InstanceBuilder::new("DataModel"));
+        let workspace = base.insert(base.root_ref(), InstanceBuilder::new("Workspace"));
+        base.insert(
+            workspace,
+            InstanceBuilder::new("ObjectValue")
+                .with_name("Pointer")
+                .with_property(
+                    "Attributes",
+                    attributes(&[("Keep", "1"), ("Rojo_Target_Value", "elsewhere")]),
+                ),
+        );
+
+        let project = project(vec![InstanceSnapshot::new()
+            .name("Pointer")
+            .class_name("ObjectValue")
+            .property("Attributes", attributes(&[("Keep", "1")]))]);
+
+        let merged = merge_into_place(&project, base).unwrap();
+        let pointer = merged.get_instance(find(&merged, "Pointer")).unwrap();
+        let Some(Variant::Attributes(kept)) = pointer.properties().get(&ustr("Attributes")) else {
+            panic!("the project's attributes were dropped");
+        };
+        assert!(kept.get("Keep").is_some());
+        assert!(kept.get("Rojo_Target_Value").is_none(), "{kept:?}");
+        assert!(kept.get(PROJECT_ATTRIBUTES_MARKER).is_none());
+        for instance in merged.inner().descendants() {
+            if let Some(Variant::Attributes(attributes)) =
+                instance.properties.get(&ustr("Attributes"))
+            {
+                assert!(attributes.get(PROJECT_ATTRIBUTES_MARKER).is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn unresolved_project_pointers_fail_the_build() {
+        let mut base = WeakDom::new(InstanceBuilder::new("DataModel"));
+        base.insert(base.root_ref(), InstanceBuilder::new("Workspace"));
+
+        let project = project(vec![InstanceSnapshot::new()
+            .name("Flag")
+            .class_name("Model")
+            .property(
+                "Attributes",
+                attributes(&[("Rojo_Target_PrimaryPart", "missing")]),
+            )]);
+
+        let error = format!("{:#}", merge_into_place(&project, base).unwrap_err());
+        assert!(error.contains("Workspace/Flag"), "{error}");
+        assert!(error.contains("Rojo_Target_PrimaryPart"), "{error}");
+        assert!(error.contains("\"missing\""), "{error}");
+    }
+
+    fn binary_place() -> Vec<u8> {
+        let mut dom = WeakDom::new(InstanceBuilder::new("DataModel"));
+        let root = dom.root_ref();
+        dom.insert(
+            root,
+            InstanceBuilder::new("Workspace").with_child(
+                InstanceBuilder::new("Part")
+                    .with_property("Name", Variant::String("A".repeat(500))),
+            ),
+        );
+        let mut bytes = Vec::new();
+        rbx_binary::to_writer(&mut bytes, &dom, dom.root().children()).unwrap();
+        bytes
+    }
+
+    #[test]
+    fn a_complete_binary_place_passes_the_chunk_check() {
+        check_binary_chunks(&binary_place()).unwrap();
+    }
+
+    #[test]
+    fn a_binary_place_cut_inside_a_chunk_is_an_error_not_a_crash() {
+        let bytes = binary_place();
+        // Every cut point, so that cuts inside headers and payloads, and of
+        // compressed and uncompressed chunks, are all covered.
+        for len in 0..bytes.len() {
+            assert!(
+                check_binary_chunks(&bytes[..len]).is_err(),
+                "a place cut to {len} bytes passed"
+            );
+        }
+    }
+
+    #[test]
+    fn a_compressed_chunk_with_the_wrong_length_is_an_error() {
+        let mut bytes = binary_place();
+        // The first chunk's header follows the file header; raising its
+        // stated length makes its payload decompress short, the case
+        // rbx_binary asserts on.
+        let len_at = BINARY_HEADER_LEN + 8;
+        let len = u32::from_le_bytes(bytes[len_at..len_at + 4].try_into().unwrap());
+        assert_ne!(
+            u32::from_le_bytes(bytes[BINARY_HEADER_LEN + 4..len_at].try_into().unwrap()),
+            0,
+            "the first chunk is expected to be compressed"
+        );
+        bytes[len_at..len_at + 4].copy_from_slice(&(len + 1).to_le_bytes());
+        assert!(check_binary_chunks(&bytes).is_err());
+    }
+}

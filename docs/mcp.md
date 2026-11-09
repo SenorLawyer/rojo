@@ -8,7 +8,9 @@ rojo mcp --project C:/Projects/MyGame --address http://127.0.0.1:34872 --token-f
 
 Keep the token in a per-user directory such as `%LOCALAPPDATA%\Rojo` on Windows or `~/.config/rojo` elsewhere. Hosts that do not expand environment variables need the full path.
 
-Start `rojo serve` separately with the same Studio token file and connect the matching plugin. The token contents are read by the native Studio CLI, not sent as MCP arguments or returned in tool results. The address must be a loopback address accepted by the Studio CLI. Workspace, checkpoint and package inspection can also be used without a token file.
+With `rojo dev` running in the project's worktree, `--address` and `--token-file` can be left out: each Studio tool call uses the address and token that `rojo dev` recorded, so `rojo mcp --project C:/Projects/MyGame` is enough and keeps working when `rojo dev` restarts on another port. See [dev.md](dev.md).
+
+Otherwise, start `rojo serve` separately with the same Studio token file and connect the matching plugin. The token contents are read by the native Studio CLI, not sent as MCP arguments or returned in tool results. The address must be a loopback address accepted by the Studio CLI. Workspace, checkpoint and package inspection can also be used without a token file.
 
 A host launches the binary as a subprocess. For a host using a `mcpServers` configuration object, the command entry looks like this:
 

@@ -1,0 +1,128 @@
+---
+source: tests/tests/serve.rs
+expression: "read_response.intern_and_redact(&mut redactions, root_id)"
+---
+instances:
+  id-10:
+    Children: []
+    ClassName: ModuleScript
+    Id: id-10
+    Metadata:
+      ignoreUnknownInstances: false
+    Name: Foo
+    Parent: id-7
+    Properties:
+      Source:
+        String: "return \"Foo\"\n"
+  id-11:
+    Children: []
+    ClassName: ModuleScript
+    Id: id-11
+    Metadata:
+      ignoreUnknownInstances: false
+    Name: Foo.spec
+    Parent: id-7
+    Properties:
+      Source:
+        String: "return \"Foo.spec\"\n"
+  id-12:
+    Children: []
+    ClassName: ModuleScript
+    Id: id-12
+    Metadata:
+      ignoreUnknownInstances: false
+    Name: New.spec
+    Parent: id-7
+    Properties:
+      Source:
+        String: return 1
+  id-2:
+    Children:
+      - id-3
+      - id-7
+    ClassName: Folder
+    Id: id-2
+    Metadata:
+      ignoreUnknownInstances: true
+    Name: partition_ignore_globs
+    Parent: "00000000000000000000000000000000"
+    Properties: {}
+  id-3:
+    Children:
+      - id-4
+      - id-6
+    ClassName: Folder
+    Id: id-3
+    Metadata:
+      ignoreUnknownInstances: false
+    Name: Filtered
+    Parent: id-2
+    Properties: {}
+  id-4:
+    Children:
+      - id-5
+    ClassName: Folder
+    Id: id-4
+    Metadata:
+      ignoreUnknownInstances: false
+    Name: Dir
+    Parent: id-3
+    Properties: {}
+  id-5:
+    Children: []
+    ClassName: ModuleScript
+    Id: id-5
+    Metadata:
+      ignoreUnknownInstances: false
+    Name: Helper
+    Parent: id-4
+    Properties:
+      Source:
+        String: "return \"Helper\"\n"
+  id-6:
+    Children: []
+    ClassName: ModuleScript
+    Id: id-6
+    Metadata:
+      ignoreUnknownInstances: false
+    Name: Foo
+    Parent: id-3
+    Properties:
+      Source:
+        String: "return \"Foo\"\n"
+  id-7:
+    Children:
+      - id-8
+      - id-10
+      - id-11
+      - id-12
+    ClassName: Folder
+    Id: id-7
+    Metadata:
+      ignoreUnknownInstances: false
+    Name: Unfiltered
+    Parent: id-2
+    Properties: {}
+  id-8:
+    Children:
+      - id-9
+    ClassName: Folder
+    Id: id-8
+    Metadata:
+      ignoreUnknownInstances: false
+    Name: Dir
+    Parent: id-7
+    Properties: {}
+  id-9:
+    Children: []
+    ClassName: ModuleScript
+    Id: id-9
+    Metadata:
+      ignoreUnknownInstances: false
+    Name: Helper
+    Parent: id-8
+    Properties:
+      Source:
+        String: "return \"Helper\"\n"
+messageCursor: 1
+sessionId: id-1

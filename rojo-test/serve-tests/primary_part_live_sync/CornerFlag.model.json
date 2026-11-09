@@ -1,0 +1,13 @@
+{
+  "className": "Model",
+  "children": [
+    {
+      "name": "Pole",
+      "className": "Part"
+    },
+    {
+      "name": "Flag",
+      "className": "Part"
+    }
+  ]
+}

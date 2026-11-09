@@ -1,0 +1,25 @@
+{
+  "className": "Model",
+  "attributes": {
+    "Rojo_Target_PrimaryPart": "corner-flag-pole"
+  },
+  "children": [
+    {
+      "name": "Pole",
+      "className": "Part",
+      "$id": "corner-flag-pole"
+    },
+    {
+      "name": "Flag",
+      "className": "Part",
+      "id": "corner-flag-flag"
+    },
+    {
+      "name": "FlagPointer",
+      "className": "ObjectValue",
+      "attributes": {
+        "Rojo_Target_Value": "corner-flag-flag"
+      }
+    }
+  ]
+}

@@ -1,0 +1,14 @@
+{
+  "name": "partition_ignore_globs_nested_ref",
+  "tree": {
+    "$className": "DataModel",
+    "ReplicatedStorage": {
+      "Outer": {
+        "$path": "pkg/default.project.json"
+      },
+      "Unfiltered": {
+        "$path": "unfiltered"
+      }
+    }
+  }
+}

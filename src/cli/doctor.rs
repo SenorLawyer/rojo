@@ -179,6 +179,24 @@ pub struct Check {
     hint: Option<String>,
 }
 
+impl Check {
+    pub(super) fn status(&self) -> Status {
+        self.status
+    }
+
+    pub(super) fn category(&self) -> Category {
+        self.category
+    }
+
+    pub(super) fn code(&self) -> &str {
+        &self.code
+    }
+
+    pub(super) fn message(&self) -> &str {
+        &self.message
+    }
+}
+
 fn check(
     category: Category,
     code: impl Into<String>,
@@ -216,6 +234,14 @@ pub struct Report {
 }
 
 impl Report {
+    pub(super) fn ok(&self) -> bool {
+        self.ok
+    }
+
+    pub(super) fn checks(&self) -> &[Check] {
+        &self.checks
+    }
+
     fn new(checks: Vec<Check>, project_file: Option<PathBuf>) -> Self {
         let mut counts = Counts::default();
         for check in &checks {
@@ -238,6 +264,26 @@ impl Report {
 }
 
 fn build_report(inputs: &Inputs) -> Report {
+    build_checks(inputs, true)
+}
+
+/// The checks `rojo dev` runs before it serves: all of doctor's but the one
+/// of a running server, since `rojo dev` picks a free port and starts the
+/// server itself. Only its warnings and errors are worth printing there; see
+/// [`render_problems`].
+pub(super) fn preflight(project_path: &Path, plugins_dir: Option<PathBuf>) -> Report {
+    build_checks(
+        &Inputs {
+            project_path: project_path.to_owned(),
+            address: None,
+            port: None,
+            plugins_dir,
+        },
+        false,
+    )
+}
+
+fn build_checks(inputs: &Inputs, check_running_server: bool) -> Report {
     let mut checks = Vec::new();
     let project = check_project(&inputs.project_path, &mut checks);
     let project = project.as_ref();
@@ -268,12 +314,14 @@ fn build_report(inputs: &Inputs) -> Report {
     };
     checks.extend(check_plugin(plugins_dir, inputs.plugins_dir.is_some()));
 
-    let address = server_address(inputs.address, inputs.port, project);
-    checks.extend(check_server(
-        address,
-        fetch_server_info(address),
-        project.and_then(|project| project.name.as_deref()),
-    ));
+    if check_running_server {
+        let address = server_address(inputs.address, inputs.port, project);
+        checks.extend(check_server(
+            address,
+            fetch_server_info(address),
+            project.and_then(|project| project.name.as_deref()),
+        ));
+    }
 
     let git_dir = project
         .map(|project| project.folder_location().to_path_buf())
@@ -566,7 +614,7 @@ fn check_plugin(plugins_dir: Result<PathBuf, String>, explicit: bool) -> Vec<Che
 /// POSIX single quotes elsewhere (where `'` ends the quote, so it is written
 /// as `'\''`). Double quotes would let PowerShell or sh expand `$name` and
 /// point the command at another folder.
-fn shell_quote(path: &Path) -> String {
+pub(super) fn shell_quote(path: &Path) -> String {
     let text = path.display().to_string();
     if cfg!(windows) {
         format!("'{}'", text.replace('\'', "''"))
@@ -1397,6 +1445,38 @@ fn existing_ancestor(path: &Path) -> PathBuf {
         .find(|dir| dir.is_dir())
         .unwrap_or(path)
         .to_path_buf()
+}
+
+/// The warnings and errors in `report`, in doctor's category order, or an
+/// empty string when there are none. `rojo dev` prints this before it
+/// starts, so a healthy project starts without a page of "ok" lines.
+pub(super) fn render_problems(report: &Report) -> String {
+    let counts = &report.counts;
+    if counts.error == 0 && counts.warning == 0 {
+        return String::new();
+    }
+    let mut out = format!(
+        "rojo doctor found {} error(s) and {} warning(s):\n",
+        counts.error, counts.warning
+    );
+    for category in Category::ALL {
+        for check in report
+            .checks
+            .iter()
+            .filter(|check| check.category == category && check.status >= Status::Warning)
+        {
+            out.push_str(&format!(
+                "  {:<8} {}: {}\n",
+                check.status.label(),
+                category.title(),
+                check.message
+            ));
+            if let Some(hint) = &check.hint {
+                out.push_str(&format!("           fix: {hint}\n"));
+            }
+        }
+    }
+    out
 }
 
 fn render_text(report: &Report) -> String {

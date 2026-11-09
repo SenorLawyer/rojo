@@ -1,0 +1,15 @@
+{
+  "className": "Model",
+  "ignoreUnknownInstances": true,
+  "children": [
+    {
+      "name": "Inner",
+      "className": "Folder",
+      "$ignoreUnknownInstances": true
+    },
+    {
+      "name": "Plain",
+      "className": "Folder"
+    }
+  ]
+}

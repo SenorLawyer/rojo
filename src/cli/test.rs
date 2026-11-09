@@ -16,7 +16,6 @@ use std::{
 
 use anyhow::Context;
 use clap::{ArgEnum, Parser};
-use reqwest::blocking::Client;
 use serde::Serialize;
 use serde_json::{json, Value};
 
@@ -72,9 +71,12 @@ pub struct TestCommand {
     #[clap(long, requires = "cloud")]
     pub no_upload: bool,
     /// Local rojo serve address. Remote control is intentionally unsupported.
-    #[clap(long, default_value = "http://127.0.0.1:34872")]
-    pub address: String,
-    /// Secret token file passed to rojo serve --studio-token-file.
+    /// Defaults to where a `rojo dev` in this worktree listens, or
+    /// http://127.0.0.1:34872.
+    #[clap(long)]
+    pub address: Option<String>,
+    /// Secret token file passed to rojo serve --studio-token-file. Defaults
+    /// to the one a `rojo dev` in this repository uses.
     #[clap(long)]
     pub token_file: Option<PathBuf>,
     /// Studio session ID from `rojo studio sessions`. Optional when exactly
@@ -858,15 +860,15 @@ impl TestCommand {
         if let Some(id) = &self.request_id {
             uuid::Uuid::parse_str(id).context("--request-id must be a UUID")?;
         }
-        let address = local_address(&self.address)?;
-        let token_file = self.token_file.as_ref().context(
-            "Pass --token-file with the secret file used by rojo serve --studio-token-file",
+        let (address, token_file) = super::dev::bridge_target(
+            self.address.as_deref(),
+            self.token_file.as_deref(),
+            &std::env::current_dir().unwrap_or_default(),
         )?;
-        let token = read_token_file(token_file)?;
-        let client = Client::builder()
-            .timeout(client_timeout(self.timeout))
-            .no_proxy()
-            .build()?;
+        let address = local_address(&address)?;
+        let token_file = token_file.context(super::dev::MISSING_TOKEN)?;
+        let token = read_token_file(&token_file)?;
+        let client = super::studio::bridge_client(client_timeout(self.timeout))?;
         let unreachable = "Could not reach local Studio bridge. Start rojo serve with --studio-token-file and connect Studio.";
 
         let session = if let Some(session) = &self.session {

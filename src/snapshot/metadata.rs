@@ -70,9 +70,21 @@ pub struct InstanceMetadata {
     /// A schema provided via a JSON file, if one exists. Will be `None` for
     /// all non-JSON middleware.
     pub schema: Option<String>,
+
+    /// The context to re-snapshot this instance's instigating source with,
+    /// when it differs from `context`. A project's root has `context` with the
+    /// project's own ignore rules, which re-snapshotting the project file must
+    /// not start from.
+    #[serde(skip)]
+    pub reload_context: Option<Box<InstanceContext>>,
 }
 
 impl InstanceMetadata {
+    /// The context to re-snapshot this instance's instigating source with.
+    pub fn reload_context(&self) -> &InstanceContext {
+        self.reload_context.as_deref().unwrap_or(&self.context)
+    }
+
     pub fn new() -> Self {
         Self {
             ignore_unknown_instances: false,
@@ -82,6 +94,7 @@ impl InstanceMetadata {
             specified_id: None,
             middleware: None,
             schema: None,
+            reload_context: None,
         }
     }
 
@@ -187,6 +200,32 @@ impl InstanceContext {
         }
     }
 
+    /// Extend the list of ignore rules with a project node's
+    /// `$globIgnorePaths`.
+    ///
+    /// Unlike [`add_path_ignore_rules`](Self::add_path_ignore_rules), a rule
+    /// that is already present moves to the end rather than being dropped.
+    /// Later rules win, so a node repeating its parent's exclusion must still
+    /// override a negation the parent has after it. Project-wide rules keep
+    /// dropping repeats, as they always have, so that including a project does
+    /// not reorder the rules of the project including it.
+    pub fn add_node_path_ignore_rules<I>(&mut self, new_rules: I)
+    where
+        I: IntoIterator<Item = PathIgnoreRule>,
+        I::IntoIter: ExactSizeIterator,
+    {
+        let new_rules = new_rules.into_iter();
+        if new_rules.len() == 0 {
+            return;
+        }
+
+        let rules = Arc::make_mut(&mut self.path_ignore_rules);
+        for rule in new_rules {
+            rules.retain(|existing| *existing != rule);
+            rules.push(rule);
+        }
+    }
+
     /// Extend the list of syncing rules in the context with the given new rules.
     pub fn add_sync_rules<I>(&mut self, new_rules: I)
     where
@@ -227,21 +266,58 @@ pub struct PathIgnoreRule {
 
     /// The actual glob that can be matched against the input path.
     pub glob: IgnorableGlob,
+
+    /// Whether this rule comes from a project node's `$globIgnorePaths`
+    /// rather than the project-wide `globIgnorePaths`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub from_node: bool,
+
+    /// `base_path` as the file system resolves it, when that differs from
+    /// how the project spells it, such as `src/../shared` or a link. Paths
+    /// recorded for instances may be in either form.
+    #[serde(skip)]
+    pub canonical_base: Option<PathBuf>,
 }
 
 impl PathIgnoreRule {
     pub fn matches<P: AsRef<Path>>(&self, path: P) -> bool {
         let path = path.as_ref();
 
-        match path.strip_prefix(&self.base_path) {
-            Ok(suffix) => self.glob.is_match(suffix),
-            Err(_) => false,
+        // `.` and `..` are applied first, on both sides, so that a path
+        // spelled through `src/..` still falls under its base.
+        let normalized = normalize_lexically(path);
+        let bases = std::iter::once(&self.base_path).chain(self.canonical_base.as_ref());
+        for base in bases {
+            if let Ok(suffix) = normalized.strip_prefix(normalize_lexically(base)) {
+                return self.glob.is_match(suffix);
+            }
         }
+        false
     }
 
     pub fn is_negation(&self) -> bool {
         self.glob.is_negation()
     }
+}
+
+/// `path` with `.` dropped and each `..` removing the component before it,
+/// without touching the file system.
+fn normalize_lexically(path: &Path) -> PathBuf {
+    use std::path::Component;
+
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir
+                if matches!(out.components().next_back(), Some(Component::Normal(_))) =>
+            {
+                out.pop();
+            }
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 /// Evaluates an ordered list of [`PathIgnoreRule`]s against a path using
@@ -269,7 +345,9 @@ pub enum InstigatingSource {
         #[serde(serialize_with = "path_serializer::serialize_absolute")]
         path: PathBuf,
         name: String,
-        node: ProjectNode,
+        // Boxed because a project node is far larger than a path, and every
+        // instance's metadata holds one of these.
+        node: Box<ProjectNode>,
         parent_class: Option<String>,
     },
 }
@@ -374,5 +452,54 @@ impl SyncRule {
                 .and_then(|s| s.to_str())
                 .with_context(|| format!("file name of {} is invalid", path.display()))
         }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use crate::glob::IgnorableGlob;
+
+    fn rule(glob: &str, from_node: bool) -> PathIgnoreRule {
+        PathIgnoreRule {
+            base_path: PathBuf::from("/project"),
+            glob: IgnorableGlob::new(glob).unwrap(),
+            from_node,
+            canonical_base: None,
+        }
+    }
+
+    #[test]
+    fn a_repeated_project_wide_rule_keeps_its_first_place() {
+        // An included project in the same directory repeating the outer
+        // project's exclusion must not move it after the outer negation.
+        let mut context = InstanceContext::new();
+        context.add_path_ignore_rules(vec![
+            rule("**/*.spec.luau", false),
+            rule("!src/Keep.spec.luau", false),
+        ]);
+        context.add_path_ignore_rules(vec![rule("**/*.spec.luau", false)]);
+
+        assert_eq!(context.path_ignore_rules.len(), 2);
+        assert!(!is_path_ignored(
+            &context.path_ignore_rules,
+            "/project/src/Keep.spec.luau"
+        ));
+    }
+
+    #[test]
+    fn a_repeated_node_rule_moves_to_the_end() {
+        let mut context = InstanceContext::new();
+        context.add_node_path_ignore_rules(vec![
+            rule("**/*.spec.luau", true),
+            rule("!src/Keep.spec.luau", true),
+        ]);
+        context.add_node_path_ignore_rules(vec![rule("**/*.spec.luau", true)]);
+
+        assert_eq!(context.path_ignore_rules.len(), 2);
+        assert!(is_path_ignored(
+            &context.path_ignore_rules,
+            "/project/src/Keep.spec.luau"
+        ));
     }
 }

@@ -60,19 +60,8 @@ function PatchVisualizer:render()
 	if patchTree then
 		local elementTotal = patchTree:getCount()
 		local depthsComplete = {}
-		local function drawNode(node, depth)
+		local function drawNode(node, depth, isFinalChild)
 			elementIndex += 1
-
-			local parentNode = patchTree:getNode(node.parentId)
-			local isFinalChild = true
-			if parentNode then
-				for _id, sibling in parentNode.children do
-					if type(sibling) == "table" and sibling.name and sibling.name > node.name then
-						isFinalChild = false
-						break
-					end
-				end
-			end
 
 			local elementHeight, setElementHeight = Roact.createBinding(24)
 			elementHeights[elementIndex] = elementHeight
@@ -103,13 +92,13 @@ function PatchVisualizer:render()
 			end
 		end
 
-		patchTree:forEach(function(node, depth)
+		patchTree:forEach(function(node, depth, isFinalChild)
 			depthsComplete[depth] = false
 			for i = depth + 1, #depthsComplete do
 				depthsComplete[i] = nil
 			end
 
-			drawNode(node, depth)
+			drawNode(node, depth, isFinalChild)
 		end)
 	end
 

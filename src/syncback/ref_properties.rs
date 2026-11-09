@@ -19,6 +19,14 @@ pub struct RefLinks {
     need_rewrite: HashSet<Ref>,
 }
 
+impl RefLinks {
+    /// Records that `target` was given an ID after these links were
+    /// collected, so linking keeps it rather than writing a new one.
+    pub fn keep_id(&mut self, target: Ref) {
+        self.need_rewrite.remove(&target);
+    }
+}
+
 #[derive(PartialEq, Eq)]
 struct RefLink {
     /// The name of a property
@@ -106,13 +114,98 @@ pub fn collect_referents(dom: &WeakDom) -> RefLinks {
     }
 }
 
-pub fn link_referents(links: RefLinks, dom: &mut WeakDom) -> anyhow::Result<()> {
-    write_id_attributes(&links, dom)?;
+/// See `unlinkable` on [`link_referents`].
+pub type Unlinkable<'a> = dyn Fn(&WeakDom, Ref, Option<&str>, bool) -> bool + 'a;
+
+/// Links Ref properties with attributes: gives every instance that is
+/// pointed at an ID where it needs one, and every pointer a
+/// `Rojo_Target_*` attribute naming it.
+///
+/// `unlinkable(dom, target, id, needs_new_id)` says a target's ID must not
+/// be given or changed, because the change would never be written, such as
+/// one in a partition syncback leaves alone. `needs_new_id` is set when
+/// linking would have to write one: the target has none, or shares it with
+/// another target. A pointer at such a target gets the `Rojo_Target_*`
+/// attribute its files have, `on_disk(dom, holder, attribute)`, or none,
+/// with a warning, rather than one naming an ID that no file holds.
+///
+/// `reserved(dom, target, id)` says `id` belongs to that very target in the
+/// files and must stay its own: another target with the same ID, such as a
+/// copy Studio made, is the one that counts as a duplicate, whatever order
+/// they were found in.
+pub fn link_referents(
+    mut links: RefLinks,
+    dom: &mut WeakDom,
+    unlinkable: &Unlinkable,
+    reserved: &dyn Fn(&WeakDom, Ref, &str) -> bool,
+    on_disk: &dyn Fn(&WeakDom, Ref, &str) -> Option<Variant>,
+) -> anyhow::Result<()> {
+    let mut seen = HashSet::new();
+    let mut targets: Vec<(Ref, String)> = Vec::new();
+    for (_, properties) in links.prop_links.iter() {
+        for link in properties {
+            if !seen.insert(link.value) {
+                continue;
+            }
+            if let Some(id) = dom.get_by_ref(link.value).and_then(get_existing_id) {
+                targets.push((link.value, id.to_owned()));
+            }
+        }
+    }
+    let mut owners: HashMap<&str, Ref> = HashMap::new();
+    for (target, id) in &targets {
+        if reserved(dom, *target, id) {
+            owners.entry(id.as_str()).or_insert(*target);
+        }
+    }
+    for (target, id) in &targets {
+        if let Some(owner) = owners.get(id.as_str()) {
+            if owner == target {
+                links.need_rewrite.remove(target);
+            } else {
+                links.need_rewrite.insert(*target);
+            }
+        }
+    }
+
+    let mut skipped = HashSet::new();
+    let mut checked = HashSet::new();
+    for (_, properties) in links.prop_links.iter() {
+        for link in properties {
+            if !checked.insert(link.value) {
+                continue;
+            }
+            if let Some(target) = dom.get_by_ref(link.value) {
+                let needs_new_id = links.need_rewrite.contains(&link.value);
+                if unlinkable(dom, link.value, get_existing_id(target), needs_new_id) {
+                    skipped.insert(link.value);
+                }
+            }
+        }
+    }
+    write_id_attributes(&links, dom, &skipped)?;
 
     let mut prop_list = Vec::new();
 
     for (inst_id, properties) in links.prop_links {
+        let mut kept = Vec::new();
         for ref_link in properties {
+            if skipped.contains(&ref_link.value) {
+                log::warn!(
+                    "{}.{} points at {}, which has no ID of its own in the files and is in a \
+                     partition with $globIgnorePaths that syncback leaves alone, so the pointer \
+                     is left as it was. Give {} a unique ID in its files to sync this ref back.",
+                    inst_path(dom, inst_id),
+                    ref_link.name,
+                    inst_path(dom, ref_link.value),
+                    inst_path(dom, ref_link.value),
+                );
+                let attribute = format!("{REF_POINTER_ATTRIBUTE_PREFIX}{}", ref_link.name);
+                if let Some(value) = on_disk(dom, inst_id, &attribute) {
+                    kept.push((attribute, value));
+                }
+                continue;
+            }
             let prop_inst = match dom.get_by_ref(ref_link.value) {
                 Some(inst) => inst,
                 None => continue,
@@ -139,6 +232,9 @@ pub fn link_referents(links: RefLinks, dom: &mut WeakDom) -> anyhow::Result<()> 
         .into_iter()
         .filter(|(name, _)| !name.starts_with(REF_POINTER_ATTRIBUTE_PREFIX))
         .collect();
+        for (name, value) in kept {
+            attributes.insert(name, value);
+        }
 
         for (prop_name, prop_value) in prop_list.drain(..) {
             attributes.insert(
@@ -154,8 +250,12 @@ pub fn link_referents(links: RefLinks, dom: &mut WeakDom) -> anyhow::Result<()> 
     Ok(())
 }
 
-fn write_id_attributes(links: &RefLinks, dom: &mut WeakDom) -> anyhow::Result<()> {
-    for referent in &links.need_rewrite {
+fn write_id_attributes(
+    links: &RefLinks,
+    dom: &mut WeakDom,
+    skipped: &HashSet<Ref>,
+) -> anyhow::Result<()> {
+    for referent in links.need_rewrite.difference(skipped) {
         let inst = match dom.get_by_ref_mut(*referent) {
             Some(inst) => inst,
             None => continue,
@@ -201,5 +301,83 @@ fn get_existing_id(inst: &Instance) -> Option<&str> {
         }
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use std::{cell::Cell, time::Instant};
+
+    use rbx_dom_weak::InstanceBuilder;
+
+    use super::*;
+
+    /// A large map has many pointers, several at each target. Each target is
+    /// checked once, and the whole run stays linear.
+    #[test]
+    fn each_target_is_checked_once_and_linking_scales() {
+        const TARGETS: usize = 20_000;
+        let mut dom = WeakDom::new(InstanceBuilder::new("DataModel"));
+        let root = dom.root_ref();
+        let targets: Vec<Ref> = (0..TARGETS)
+            .map(|index| {
+                dom.insert(
+                    root,
+                    InstanceBuilder::new("Folder")
+                        .with_name(format!("Target{index}"))
+                        .with_property(
+                            "Attributes",
+                            Attributes::new().with(REF_ID_ATTRIBUTE_NAME, format!("id{index}")),
+                        ),
+                )
+            })
+            .collect();
+        for (index, target) in targets.iter().enumerate() {
+            for copy in 0..2 {
+                dom.insert(
+                    root,
+                    InstanceBuilder::new("ObjectValue")
+                        .with_name(format!("Pointer{index}_{copy}"))
+                        .with_property("Value", *target),
+                );
+            }
+        }
+
+        let started = Instant::now();
+        let links = collect_referents(&dom);
+        let (unlinkable_calls, reserved_calls) = (Cell::new(0), Cell::new(0));
+        link_referents(
+            links,
+            &mut dom,
+            &|_, _, _, _| {
+                unlinkable_calls.set(unlinkable_calls.get() + 1);
+                false
+            },
+            &|_, _, _| {
+                reserved_calls.set(reserved_calls.get() + 1);
+                false
+            },
+            &|_, _, _| None,
+        )
+        .unwrap();
+        assert!(
+            started.elapsed().as_secs() < 10,
+            "took {:?}",
+            started.elapsed()
+        );
+        assert_eq!(unlinkable_calls.get(), TARGETS);
+        assert_eq!(reserved_calls.get(), TARGETS);
+        let pointer = dom
+            .descendants()
+            .find(|inst| inst.name == "Pointer7_1")
+            .unwrap();
+        let Some(Variant::Attributes(attributes)) = pointer.properties.get(&ustr("Attributes"))
+        else {
+            panic!("no attributes");
+        };
+        assert_eq!(
+            attributes.get("Rojo_Target_Value"),
+            Some(&Variant::String("id7".to_owned()))
+        );
     }
 }

@@ -46,9 +46,12 @@ impl CheckUntrustedModelCommand {
 #[derive(Debug, Parser)]
 pub struct StudioCommand {
     /// Local rojo serve address. Remote control is intentionally unsupported.
-    #[clap(long, global = true, default_value = "http://127.0.0.1:34872")]
-    pub address: String,
-    /// Secret token file passed to rojo serve --studio-token-file.
+    /// Defaults to where a `rojo dev` in this worktree listens, or
+    /// http://127.0.0.1:34872.
+    #[clap(long, global = true)]
+    pub address: Option<String>,
+    /// Secret token file passed to rojo serve --studio-token-file. Defaults
+    /// to the one a `rojo dev` in this repository uses.
     #[clap(long, global = true)]
     pub token_file: Option<PathBuf>,
     /// Emit compact JSON for automation.
@@ -329,18 +332,18 @@ impl StudioCommand {
             create_token(output)?;
             return print_json(&json!({"tokenFile":output,"created":true}), self.json);
         }
-        let address = local_address(&self.address)?;
-        let token_file = self.token_file.as_ref().context(
-            "Pass --token-file with the secret file used by rojo serve --studio-token-file",
+        let (address, token_file) = super::dev::bridge_target(
+            self.address.as_deref(),
+            self.token_file.as_deref(),
+            &std::env::current_dir().unwrap_or_default(),
         )?;
-        let token = read_token_file(token_file)?;
+        let address = local_address(&address)?;
+        let token_file = token_file.context(super::dev::MISSING_TOKEN)?;
+        let token = read_token_file(&token_file)?;
         // Outlast the server's own bound on a command, so a slow command (for
         // example while Git is busy) reports the server's answer, not a
         // timeout that leaves the command running in Studio.
-        let client = Client::builder()
-            .timeout(MAX_COMMAND_REQUEST + Duration::from_secs(5))
-            .no_proxy()
-            .build()?;
+        let client = bridge_client(MAX_COMMAND_REQUEST + Duration::from_secs(5))?;
         if matches!(self.command, StudioSubcommand::Sessions) {
             let result = request(&client, &address, token.trim(), None)?;
             // Scripts parse stdout, which stays JSON. The summary is for
@@ -1155,7 +1158,7 @@ fn print_json(value: &Value, compact: bool) -> anyhow::Result<()> {
 /// DEL and the C1 controls, which some terminals read as the start of an
 /// escape sequence. Outside strings JSON has no control characters, so each
 /// one left can be written as a `\u` escape in place.
-fn json_escape_controls(json: String) -> String {
+pub(super) fn json_escape_controls(json: String) -> String {
     if !json
         .chars()
         .any(|character| character.is_control() && character != '\n')
@@ -1171,6 +1174,18 @@ fn json_escape_controls(json: String) -> String {
         }
     }
     escaped
+}
+
+/// A client for requests that carry the Studio token. It ignores proxies and
+/// never follows redirects: reqwest keeps custom headers such as the token
+/// when it follows a redirect to another host, so a local server answering
+/// with a redirect could otherwise send the token anywhere.
+pub(super) fn bridge_client(timeout: Duration) -> reqwest::Result<Client> {
+    Client::builder()
+        .timeout(timeout)
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
 }
 
 pub(super) fn local_address(address: &str) -> anyhow::Result<Url> {
@@ -1247,7 +1262,7 @@ fn parse_response(status: reqwest::StatusCode, bytes: &[u8]) -> anyhow::Result<V
     value.context("Invalid Studio bridge JSON response")
 }
 
-fn create_token(path: &Path) -> anyhow::Result<()> {
+pub(super) fn create_token(path: &Path) -> anyhow::Result<()> {
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]

@@ -17,7 +17,7 @@ use tokio::runtime::Runtime;
 
 use crate::{
     serve_session::ServeSession,
-    snapshot::{AppliedPatchSet, InstanceWithMeta, RojoTree},
+    snapshot::{AppliedPatchSet, InstanceWithMeta, InstigatingSource, RojoTree},
 };
 
 use super::resolve_path;
@@ -148,14 +148,14 @@ fn filter_nothing(_instance: &InstanceWithMeta) -> bool {
     true
 }
 
-fn filter_non_scripts(instance: &InstanceWithMeta) -> bool {
+pub(super) fn filter_non_scripts(instance: &InstanceWithMeta) -> bool {
     matches!(
         instance.class_name().as_str(),
         "Script" | "LocalScript" | "ModuleScript"
     )
 }
 
-fn patch_set_affects_sourcemap(
+pub(super) fn patch_set_affects_sourcemap(
     session: &ServeSession,
     patch_set: &[AppliedPatchSet],
     filter: fn(&InstanceWithMeta) -> bool,
@@ -175,11 +175,20 @@ fn patch_set_affects_sourcemap(
                     .map(|instance| filter(&instance))
                     .unwrap_or(true)
             })
-            // 3. An existing instance has its class name, name,
-            // or file paths changed, and passes the filter
+            // 3. An existing instance changed class. The update only says
+            // what the class is now, and the instance was in the sourcemap
+            // if its old class passed the filter, such as a ModuleScript
+            // folder that became a Folder when its init file was deleted.
+            || set
+                .updated
+                .iter()
+                .any(|updated| updated.changed_class_name.is_some())
+            // 4. An existing instance has its name or file paths changed,
+            // and passes the filter
             || set.updated.iter().any(|updated| {
-                let changed = updated.changed_class_name.is_some()
-                    || updated.changed_properties.contains_key(&rbx_dom_weak::ustr("RunContext"))
+                let changed = updated
+                    .changed_properties
+                    .contains_key(&rbx_dom_weak::ustr("RunContext"))
                     || updated.changed_name.is_some()
                     || updated.changed_metadata.is_some();
                 if changed {
@@ -234,12 +243,40 @@ fn recurse_create_node<'a>(
         });
     }
 
+    // A project node's own `$path` is used even when a parent node's
+    // `$globIgnorePaths` match it, as `rojo build` does: naming a file is a
+    // deliberate choice to include it.
+    let explicit_path = match &instance.metadata().instigating_source {
+        Some(InstigatingSource::ProjectNode { path, node, .. }) => {
+            node.path.as_ref().and_then(|node_path| {
+                let node_path = node_path.path();
+                let full = if node_path.is_absolute() {
+                    node_path.to_owned()
+                } else {
+                    path.parent()?.join(node_path)
+                };
+                dunce::canonicalize(full).ok()
+            })
+        }
+        _ => None,
+    };
     let file_paths = instance
         .metadata()
         .relevant_paths
         .iter()
         // Not all paths listed as relevant are guaranteed to exist.
         .filter(|path| path.is_file())
+        // A folder lists its possible init files as relevant, including ones
+        // excluded by a node's `$globIgnorePaths`, which do not make up the
+        // instance.
+        .filter(|path| {
+            !crate::snapshot_middleware::is_ignored_by_node_rules(
+                &instance.metadata().context.path_ignore_rules,
+                path,
+            ) || explicit_path
+                .as_ref()
+                .is_some_and(|explicit| dunce::canonicalize(path).ok().as_ref() == Some(explicit))
+        })
         .map(|path| path.as_path());
 
     let mut output_file_paths: Vec<Cow<'a, Path>> =
@@ -389,6 +426,61 @@ mod test {
         }
     }
 
+    /// A script folder whose only init file is deleted becomes a Folder,
+    /// which the scripts-only sourcemap leaves out, so the class change must
+    /// rewrite it.
+    #[test]
+    fn a_script_becoming_a_folder_invalidates_the_sourcemap() {
+        use crate::cli::sourcemap::{filter_non_scripts, patch_set_affects_sourcemap};
+        use crate::serve_session::ServeSession;
+        use memofs::Vfs;
+        use std::time::{Duration, Instant};
+
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("project");
+        fs_err::create_dir_all(project.join("src")).unwrap();
+        fs_err::write(
+            project.join("default.project.json"),
+            r#"{"name": "root", "tree": {"$path": "src"}}"#,
+        )
+        .unwrap();
+        fs_err::write(project.join("src/init.luau"), "return 1").unwrap();
+        let session = ServeSession::new(Vfs::new_default().unwrap(), &project).unwrap();
+        let root = session.tree().get_root_id();
+        assert_eq!(
+            session.tree().get_instance(root).unwrap().class_name(),
+            "ModuleScript"
+        );
+        let cursor = session.message_queue().cursor();
+
+        fs_err::remove_file(project.join("src/init.luau")).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let patches = loop {
+            assert!(Instant::now() < deadline, "the deletion was not synced");
+            let receiver = session.message_queue().subscribe(cursor).unwrap();
+            let (_, messages) = futures::executor::block_on(receiver).unwrap();
+            let patches: Vec<_> = messages.into_iter().map(|message| message.patch).collect();
+            if session.tree().get_instance(root).unwrap().class_name() == "Folder" {
+                break patches;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        // It is an update of the existing instance, which is what the old
+        // check, by the new class only, missed.
+        assert!(patches
+            .iter()
+            .all(|patch| patch.removed.is_empty() && patch.added.is_empty()));
+        assert!(patches.iter().any(|patch| patch
+            .updated
+            .iter()
+            .any(|update| update.changed_class_name.is_some())));
+        assert!(patch_set_affects_sourcemap(
+            &session,
+            &patches,
+            filter_non_scripts
+        ));
+    }
+
     #[test]
     fn internal_metadata_change_still_invalidates_sourcemap() {
         use crate::cli::sourcemap::{filter_nothing, patch_set_affects_sourcemap};
@@ -471,6 +563,195 @@ mod test {
         let sourcemap_contents =
             serde_json::from_str::<SourcemapNode>(&raw_sourcemap_contents).unwrap();
         insta::assert_json_snapshot!(sourcemap_contents);
+    }
+
+    #[test]
+    fn leaves_out_files_excluded_by_node_glob_ignore_paths() {
+        let sourcemap_dir = tempfile::tempdir().unwrap();
+        let sourcemap_output = sourcemap_dir.path().join("sourcemap.json");
+        let sourcemap_command = SourcemapCommand {
+            project: Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("rojo-test")
+                .join("build-tests")
+                .join("partition_ignore_globs"),
+            output: Some(sourcemap_output.clone()),
+            include_non_scripts: false,
+            watch: false,
+            absolute: false,
+        };
+        assert!(sourcemap_command.run().is_ok());
+
+        let raw = fs_err::read_to_string(sourcemap_output.as_path()).unwrap();
+        let root = serde_json::from_str::<SourcemapNode>(&raw).unwrap();
+        let mut file_paths = Vec::new();
+        let mut queue = vec![&root];
+        while let Some(node) = queue.pop() {
+            file_paths.extend(
+                node.file_paths
+                    .iter()
+                    .map(|path| path.to_string_lossy().replace('\\', "/")),
+            );
+            queue.extend(&node.children);
+        }
+        file_paths.sort_unstable();
+        assert_eq!(
+            file_paths,
+            [
+                "default.project.json",
+                "filtered/Foo.luau",
+                "filtered/Keep.spec.luau",
+                "filtered/Nested/Bar.luau",
+                "filtered/Server/Helper.luau",
+                "package/default.project.json",
+                "package/src/Foo.luau",
+                "unfiltered/Foo.luau",
+                "unfiltered/Foo.spec.luau",
+                "unfiltered/Generated/Gen.luau",
+                "unfiltered/Keep.spec.luau",
+                "unfiltered/Nested/Bar.luau",
+                "unfiltered/Nested/Bar.spec.luau",
+                "unfiltered/Server/Helper.luau",
+                "unfiltered/Server/init.server.luau",
+            ]
+        );
+    }
+
+    #[test]
+    fn leaves_out_init_files_excluded_on_the_root_node() {
+        // Also when `$path` reaches the folder another way, while the paths
+        // the sourcemap lists are resolved ones.
+        for path in ["src", "other/../src"] {
+            leaves_out_init_files_excluded_on_the_root_node_at(path);
+        }
+    }
+
+    fn leaves_out_init_files_excluded_on_the_root_node_at(path: &str) {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("project");
+        fs_err::create_dir_all(project.join("src")).unwrap();
+        fs_err::create_dir_all(project.join("other")).unwrap();
+        fs_err::write(
+            project.join("default.project.json"),
+            format!(
+                r#"{{"name": "root", "tree": {{"$path": "{path}", "$globIgnorePaths": ["init.server.luau"]}}}}"#
+            ),
+        )
+        .unwrap();
+        fs_err::write(project.join("src/init.server.luau"), "print(1)").unwrap();
+        fs_err::write(project.join("src/Helper.luau"), "return 1").unwrap();
+        let sourcemap_output = dir.path().join("sourcemap.json");
+        let sourcemap_command = SourcemapCommand {
+            project,
+            output: Some(sourcemap_output.clone()),
+            include_non_scripts: true,
+            watch: false,
+            absolute: false,
+        };
+        assert!(sourcemap_command.run().is_ok());
+
+        let raw = fs_err::read_to_string(sourcemap_output.as_path()).unwrap();
+        let root = serde_json::from_str::<SourcemapNode>(&raw).unwrap();
+        assert_eq!(root.class_name, "Folder", "{path}");
+        let root_paths: Vec<_> = root
+            .file_paths
+            .iter()
+            .map(|path| path.to_string_lossy().replace('\\', "/"))
+            .collect();
+        assert_eq!(root_paths, ["default.project.json"], "{path}");
+    }
+
+    /// A child node repeating an exclusion its parent negates for one file
+    /// leaves that file out of its own instances, as the build does.
+    #[test]
+    fn a_child_nodes_exclusion_wins_over_its_parents_negation() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("project");
+        fs_err::create_dir_all(project.join("src")).unwrap();
+        fs_err::write(
+            project.join("default.project.json"),
+            r#"{
+                "name": "root",
+                "tree": {
+                    "$path": "src",
+                    "$globIgnorePaths": ["**/*.spec.luau", "!Keep.spec.luau"],
+                    "Child": { "$path": "src", "$globIgnorePaths": ["**/*.spec.luau"] }
+                }
+            }"#,
+        )
+        .unwrap();
+        fs_err::write(project.join("src/Foo.luau"), "return 1").unwrap();
+        fs_err::write(project.join("src/Keep.spec.luau"), "return 1").unwrap();
+        let sourcemap_output = dir.path().join("sourcemap.json");
+        let sourcemap_command = SourcemapCommand {
+            project,
+            output: Some(sourcemap_output.clone()),
+            include_non_scripts: true,
+            watch: false,
+            absolute: false,
+        };
+        assert!(sourcemap_command.run().is_ok());
+
+        let raw = fs_err::read_to_string(sourcemap_output.as_path()).unwrap();
+        let root = serde_json::from_str::<SourcemapNode>(&raw).unwrap();
+        let names = |node: &SourcemapNode| {
+            let mut names: Vec<String> = node
+                .children
+                .iter()
+                .map(|child| child.name.to_string())
+                .collect();
+            names.sort_unstable();
+            names
+        };
+        assert_eq!(names(&root), ["Child", "Foo", "Keep.spec"], "{raw}");
+        let child = root
+            .children
+            .iter()
+            .find(|child| child.name == "Child")
+            .unwrap();
+        assert_eq!(names(child), ["Foo"], "{raw}");
+    }
+
+    /// A node's own `$path` naming a file that a parent node's
+    /// `$globIgnorePaths` match is built, so the sourcemap lists it too.
+    #[test]
+    fn keeps_a_file_a_node_names_although_a_parent_excludes_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("project");
+        fs_err::create_dir_all(project.join("filtered")).unwrap();
+        fs_err::write(
+            project.join("default.project.json"),
+            r#"{
+                "name": "root",
+                "tree": {
+                    "$path": "filtered",
+                    "$globIgnorePaths": ["**/*.spec.luau"],
+                    "Spec": { "$path": "filtered/Foo.spec.luau" }
+                }
+            }"#,
+        )
+        .unwrap();
+        fs_err::write(project.join("filtered/Foo.spec.luau"), "return 1").unwrap();
+        fs_err::write(project.join("filtered/Bar.spec.luau"), "return 1").unwrap();
+        let sourcemap_output = dir.path().join("sourcemap.json");
+        let sourcemap_command = SourcemapCommand {
+            project,
+            output: Some(sourcemap_output.clone()),
+            include_non_scripts: true,
+            watch: false,
+            absolute: false,
+        };
+        assert!(sourcemap_command.run().is_ok());
+
+        let raw = fs_err::read_to_string(sourcemap_output.as_path()).unwrap();
+        let root = serde_json::from_str::<SourcemapNode>(&raw).unwrap();
+        let names: Vec<_> = root.children.iter().map(|child| child.name).collect();
+        assert_eq!(names, ["Spec"], "{raw}");
+        let paths: Vec<_> = root.children[0]
+            .file_paths
+            .iter()
+            .map(|path| path.to_string_lossy().replace('\\', "/"))
+            .collect();
+        assert_eq!(paths, ["filtered/Foo.spec.luau"], "{raw}");
     }
 
     #[test]

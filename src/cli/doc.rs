@@ -36,6 +36,11 @@ pub const AGENTS_POINTER: &str = include_str!("../../assets/agents-pointer.md");
 /// describe this fork's commands.
 pub const AGENT_TOPICS: &[(&str, &str, &str)] = &[
     (
+        "dev",
+        "rojo dev: serve, Studio bridge, sourcemap and doctor in one process, a port per worktree",
+        include_str!("../../docs/dev.md"),
+    ),
+    (
         "doctor",
         "rojo doctor: check project, packages, plugin, server and Git in one report",
         include_str!("../../docs/doctor.md"),

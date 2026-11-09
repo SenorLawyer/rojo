@@ -1187,3 +1187,368 @@ fn intern_messages(
     }
     redactions.redacted_yaml(messages)
 }
+
+/// Studio only learns about changes from subscription messages, so a ref the
+/// server resolves while applying a patch has to be in those messages too,
+/// not just in the tree that `/api/read` serves on reconnect.
+///
+/// See: https://github.com/rojo-rbx/rojo/issues/1292
+#[test]
+fn primary_part_live_sync() {
+    run_serve_test("primary_part_live_sync", |session, _redactions| {
+        let info = session.get_api_rojo().unwrap();
+        let root_id = info.root_instance_id;
+        let primary_part = rbx_dom_weak::ustr("PrimaryPart");
+
+        let read_response = session.get_api_read(root_id).unwrap();
+        let find = |read: &ReadResponse<'_>, name: &str| {
+            read.instances
+                .values()
+                .find(|instance| instance.name == name)
+                .map(|instance| instance.id)
+        };
+        let model_id = find(&read_response, "CornerFlag").unwrap();
+        let pole_id = find(&read_response, "Pole").unwrap();
+        let model_path = session.path().join("CornerFlag.model.json");
+
+        // Replays the PrimaryPart value a client following the subscription
+        // ends up with, starting from what it read on connect.
+        let mut cursor = read_response.message_cursor;
+        let mut client_value = read_response.instances[&model_id]
+            .properties
+            .get(&primary_part)
+            .map(|value| value.clone().into_owned());
+        let mut follow = |expected: Ref, what: &str| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                let packet = session
+                    .get_api_socket_packet(SocketPacketType::Messages, cursor)
+                    .unwrap();
+                let SocketPacketBody::Messages(packet) = packet.body;
+                cursor = packet.message_cursor;
+                for message in packet.messages {
+                    if let Some(added) = message.added.get(&model_id) {
+                        client_value = added
+                            .properties
+                            .get(&primary_part)
+                            .map(|value| value.clone().into_owned());
+                    }
+                    for update in message.updated {
+                        if update.id != model_id {
+                            continue;
+                        }
+                        if let Some(value) = update.changed_properties.get(&primary_part) {
+                            client_value = value.clone();
+                        }
+                    }
+                }
+
+                let server = session.get_api_read(root_id).unwrap();
+                let server_value = server.instances[&model_id]
+                    .properties
+                    .get(&primary_part)
+                    .map(|value| value.as_ref().clone());
+                if server_value == Some(rbx_dom_weak::types::Variant::Ref(expected)) {
+                    assert_eq!(
+                        client_value, server_value,
+                        "{what}: the server resolved PrimaryPart but the \
+                         subscription told the client something else"
+                    );
+                    return server;
+                }
+                assert!(std::time::Instant::now() < deadline, "timed out: {what}");
+            }
+        };
+
+        // The target gains its ID in the same save that points at it.
+        fs::write(
+            &model_path,
+            r#"{
+                "className": "Model",
+                "attributes": { "Rojo_Target_PrimaryPart": "corner-flag-pole" },
+                "children": [
+                    {
+                        "name": "Pole",
+                        "className": "Part",
+                        "attributes": { "Rojo_Id": "corner-flag-pole" }
+                    },
+                    { "name": "Flag", "className": "Part" }
+                ]
+            }"#,
+        )
+        .unwrap();
+        follow(pole_id, "existing child gains an ID");
+
+        // The target is added in the same save that points at it.
+        fs::write(
+            &model_path,
+            r#"{
+                "className": "Model",
+                "attributes": { "Rojo_Target_PrimaryPart": "corner-flag-base" },
+                "children": [
+                    {
+                        "name": "Pole",
+                        "className": "Part",
+                        "attributes": { "Rojo_Id": "corner-flag-pole" }
+                    },
+                    { "name": "Flag", "className": "Part" },
+                    {
+                        "name": "Base",
+                        "className": "Part",
+                        "attributes": { "Rojo_Id": "corner-flag-base" }
+                    }
+                ]
+            }"#,
+        )
+        .unwrap();
+        // The new child's ID is only known once the server has added it.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let base_id = loop {
+            if let Some(id) = find(&session.get_api_read(root_id).unwrap(), "Base") {
+                break id;
+            }
+            assert!(std::time::Instant::now() < deadline, "Base never appeared");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        follow(base_id, "new child added with the pointer");
+    });
+}
+
+/// The sync fallback replaces an instance with a copy serialized without its
+/// children, so the copy's own refs into them come back unset. The ref patch
+/// it requests afterwards has to restore them.
+#[test]
+fn ref_patch_restores_refs_from_replaced_instances() {
+    run_serve_test("primary_part_live_sync", |session, _redactions| {
+        let info = session.get_api_rojo().unwrap();
+        let root_id = info.root_instance_id;
+        let primary_part = rbx_dom_weak::ustr("PrimaryPart");
+
+        fs::write(
+            session.path().join("CornerFlag.model.json"),
+            r#"{
+                "className": "Model",
+                "attributes": { "Rojo_Target_PrimaryPart": "corner-flag-pole" },
+                "children": [
+                    {
+                        "name": "Pole",
+                        "className": "Part",
+                        "attributes": { "Rojo_Id": "corner-flag-pole" }
+                    },
+                    { "name": "Flag", "className": "Part" }
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let (model_id, pole_id) = loop {
+            let read = session.get_api_read(root_id).unwrap();
+            let find = |name: &str| {
+                read.instances
+                    .values()
+                    .find(|instance| instance.name == name)
+                    .unwrap()
+            };
+            let model = find("CornerFlag");
+            if model.properties.contains_key(&primary_part) {
+                break (model.id, find("Pole").id);
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "PrimaryPart never set"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+
+        let body = session
+            .post_api_ref_patch(&[model_id], info.session_id)
+            .unwrap()
+            .bytes()
+            .unwrap();
+        let response: librojo::web_api::RefPatchResponse =
+            deserialize_msgpack(&body).expect("Server returned malformed response");
+
+        let update = response
+            .patch
+            .updated
+            .iter()
+            .find(|update| update.id == model_id)
+            .expect("ref patch did not restore the replaced Model's refs");
+        assert_eq!(
+            update.changed_properties.get(&primary_part),
+            Some(&Some(rbx_dom_weak::types::Variant::Ref(pole_id)))
+        );
+    });
+}
+
+#[test]
+fn partition_ignore_globs() {
+    run_serve_test("partition_ignore_globs", |session, mut redactions| {
+        let info = session.get_api_rojo().unwrap();
+        let root_id = info.root_instance_id;
+
+        let read_response = session.get_api_read(root_id).unwrap();
+        let unfiltered_id = *read_response
+            .instances
+            .iter()
+            .find(|(_, instance)| instance.name == "Unfiltered")
+            .unwrap()
+            .0;
+        with_settings!({ sort_maps => true }, {
+            assert_yaml_snapshot!(
+                "partition_ignore_globs_all",
+                read_response.intern_and_redact(&mut redactions, root_id)
+            );
+        });
+
+        // Editing and adding files that Filtered's `$globIgnorePaths` exclude
+        // must not produce patches.
+        fs::write(
+            session.path().join("filtered/Foo.spec.luau"),
+            "return 'edited'",
+        )
+        .unwrap();
+        fs::write(session.path().join("filtered/New.spec.luau"), "return 1").unwrap();
+        // An excluded init file must not turn its folder into a script.
+        fs::write(
+            session.path().join("filtered/Dir/init.server.luau"),
+            "print(1)",
+        )
+        .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(500));
+
+        // The same name in a partition without the glob is synced. Its patch
+        // comes after the ignored writes, so any patch they caused would be
+        // collected before it.
+        fs::write(session.path().join("unfiltered/New.spec.luau"), "return 1").unwrap();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let mut cursor = 0;
+        let mut messages: Vec<SubscribeMessage<'static>> = Vec::new();
+        while !messages.iter().any(|message| !message.added.is_empty()) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for the added instance, received: {messages:#?}"
+            );
+            let packet = session
+                .get_api_socket_packet(SocketPacketType::Messages, cursor)
+                .unwrap();
+            let SocketPacketBody::Messages(packet) = packet.body;
+            cursor = packet.message_cursor;
+            messages.extend(packet.messages);
+        }
+
+        for message in &messages {
+            assert!(message.removed.is_empty(), "{messages:#?}");
+            assert!(message.updated.is_empty(), "{messages:#?}");
+            for instance in message.added.values() {
+                assert_eq!(instance.name, "New.spec", "{messages:#?}");
+                assert_eq!(instance.parent, unfiltered_id, "{messages:#?}");
+            }
+        }
+        let added: usize = messages.iter().map(|message| message.added.len()).sum();
+        assert_eq!(added, 1, "{messages:#?}");
+
+        let read_response = session.get_api_read(root_id).unwrap();
+        with_settings!({ sort_maps => true }, {
+            assert_yaml_snapshot!(
+                "partition_ignore_globs_all-2",
+                read_response.intern_and_redact(&mut redactions, root_id)
+            );
+        });
+    });
+}
+
+#[test]
+fn partition_ignore_globs_csv() {
+    run_serve_test("partition_ignore_globs_csv", |session, _redactions| {
+        let info = session.get_api_rojo().unwrap();
+        let root_id = info.root_instance_id;
+        let strings = |read: &ReadResponse<'_>| {
+            read.instances
+                .values()
+                .find(|instance| instance.name == "Strings")
+                .map(|instance| {
+                    let contents = match instance.properties.get(&rbx_dom_weak::ustr("Contents")) {
+                        Some(value) => format!("{:?}", value.as_ref()),
+                        None => String::new(),
+                    };
+                    let from_meta = matches!(
+                        instance.properties.get(&rbx_dom_weak::ustr("Attributes")).map(|v| v.as_ref()),
+                        Some(rbx_dom_weak::types::Variant::Attributes(attributes))
+                            if attributes.get("FromMeta").is_some()
+                    );
+                    (contents, from_meta)
+                })
+                .unwrap()
+        };
+        let (_, from_meta) = strings(&session.get_api_read(root_id).unwrap());
+        assert!(!from_meta, "the excluded meta file was applied");
+
+        // Changes to the CSV are snapshotted again with the ignore rules it
+        // was first read with: the excluded meta file stays unapplied, even
+        // when it is not valid.
+        fs::write(session.path().join("src/Strings.meta.json"), "{ not json").unwrap();
+        fs::write(
+            session.path().join("src/Strings.csv"),
+            "Key,Source,Context,Example,en\nhello,Bonjour,,,Bonjour\n",
+        )
+        .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            let (contents, from_meta) = strings(&session.get_api_read(root_id).unwrap());
+            assert!(!from_meta, "the excluded meta file was applied");
+            if contents.contains("Bonjour") {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the CSV change was not synced: {contents}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    });
+}
+
+#[test]
+fn partition_ignore_globs_reload() {
+    run_serve_test("partition_ignore_globs_reload", |session, _redactions| {
+        let info = session.get_api_rojo().unwrap();
+        let read_response = session.get_api_read(info.root_instance_id).unwrap();
+        assert!(!read_response
+            .instances
+            .values()
+            .any(|instance| instance.name == "Foo.spec"));
+
+        // Removing the root node's rule must bring the file back without a
+        // restart.
+        fs::write(
+            session.path().join("default.project.json"),
+            r#"{"name": "partition_ignore_globs_reload", "tree": {"$path": "src"}}"#,
+        )
+        .unwrap();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let mut cursor = 0;
+        loop {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "Foo.spec was not added after its rule was removed"
+            );
+            let packet = session
+                .get_api_socket_packet(SocketPacketType::Messages, cursor)
+                .unwrap();
+            let SocketPacketBody::Messages(packet) = packet.body;
+            cursor = packet.message_cursor;
+            if packet
+                .messages
+                .iter()
+                .flat_map(|message| message.added.values())
+                .any(|instance| instance.name == "Foo.spec")
+            {
+                break;
+            }
+        }
+    });
+}

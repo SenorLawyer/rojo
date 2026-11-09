@@ -47,6 +47,13 @@ enum Error {
         source: io::Error,
     },
 
+    #[error(
+        "Project node {node} in {} sets $globIgnorePaths without $path.
+        $globIgnorePaths are relative to the node's $path, so the node needs one.",
+        .path.display()
+    )]
+    GlobIgnoreWithoutPath { node: String, path: PathBuf },
+
     #[error("Error parsing Rojo project in path {}", .path.display())]
     Json {
         source: serde_json::Error,
@@ -239,12 +246,20 @@ impl Project {
         let mut project: Self = json::from_slice(contents).map_err(|e| Error::Json {
             source: serde_json::Error::io(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                e.to_string(),
+                // The alternate form keeps the cause, such as which glob is
+                // invalid, instead of only "Failed to deserialize JSON".
+                format!("{e:#}"),
             )),
             path: project_file_location.clone(),
         })?;
         project.file_location = project_file_location;
         project.check_compatibility();
+        if let Some(node) = project.tree.find_glob_ignore_without_path("tree") {
+            return Err(Error::GlobIgnoreWithoutPath {
+                node,
+                path: project.file_location,
+            });
+        }
         if project.name.is_none() {
             project.set_file_name(fallback_name)?;
         }
@@ -429,6 +444,17 @@ pub struct ProjectNode {
     /// spreadsheets (`.csv`).
     #[serde(rename = "$path", skip_serializing_if = "Option::is_none")]
     pub path: Option<PathNode>,
+
+    /// Globs, relative to this node's `$path`, matching files beneath it that
+    /// should be excluded. These apply in addition to the project's
+    /// `globIgnorePaths`, after them, so a negated glob here can re-include a
+    /// file the project ignores.
+    #[serde(
+        rename = "$globIgnorePaths",
+        default,
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub glob_ignore_paths: Vec<IgnorableGlob>,
 }
 
 impl ProjectNode {
@@ -446,6 +472,17 @@ impl ProjectNode {
 
             child.validate_reserved_names();
         }
+    }
+
+    /// Returns the path of the first node, as a dotted name starting at
+    /// `name`, that sets `$globIgnorePaths` without a `$path` to apply them to.
+    fn find_glob_ignore_without_path(&self, name: &str) -> Option<String> {
+        if !self.glob_ignore_paths.is_empty() && self.path.is_none() {
+            return Some(name.to_owned());
+        }
+        self.children.iter().find_map(|(child_name, child)| {
+            child.find_glob_ignore_without_path(&format!("{name}.{child_name}"))
+        })
     }
 }
 
@@ -639,6 +676,84 @@ mod test {
         assert!(project.serve_allowed_hosts.is_empty());
     }
 
+    fn load(project_json: &str) -> Result<Project, Error> {
+        Project::load_from_slice(
+            project_json.as_bytes(),
+            PathBuf::from("/test/default.project.json"),
+            None,
+        )
+    }
+
+    #[test]
+    fn node_glob_ignore_paths() {
+        let project = load(
+            r#"{
+                "name": "TestProject",
+                "tree": {
+                    "$className": "Folder",
+                    "Shared": {
+                        "$path": "src/shared",
+                        "$globIgnorePaths": ["**/*.spec.luau", "!keep.spec.luau"]
+                    },
+                    "Server": { "$path": "src/server" }
+                }
+            }"#,
+        )
+        .expect("project should parse");
+
+        let shared = &project.tree.children["Shared"].glob_ignore_paths;
+        assert_eq!(shared.len(), 2);
+        assert!(shared[0].is_match("a/b.spec.luau"));
+        assert!(shared[1].is_negation());
+        assert!(project.tree.children["Server"].glob_ignore_paths.is_empty());
+        assert!(project.glob_ignore_paths.is_empty());
+
+        // An unset field is not written back out, so syncback and `fmt-project`
+        // leave other nodes as they were.
+        let serialized = serde_json::to_value(&project.tree).unwrap();
+        assert_eq!(
+            serialized["Shared"]["$globIgnorePaths"],
+            serde_json::json!(["**/*.spec.luau", "!keep.spec.luau"])
+        );
+        assert!(serialized["Server"].get("$globIgnorePaths").is_none());
+    }
+
+    #[test]
+    fn node_glob_ignore_paths_invalid_glob() {
+        let err = load(
+            r#"{
+                "name": "TestProject",
+                "tree": { "$path": "src", "$globIgnorePaths": ["src/[a-"] }
+            }"#,
+        )
+        .unwrap_err();
+        let message = format!("{:#}", anyhow::Error::from(ProjectError::from(err)));
+        assert!(message.contains("/test/default.project.json"), "{message}");
+        assert!(message.contains("src/[a-"), "{message}");
+    }
+
+    #[test]
+    fn node_glob_ignore_paths_without_path() {
+        let err = load(
+            r#"{
+                "name": "TestProject",
+                "tree": {
+                    "$className": "DataModel",
+                    "ReplicatedStorage": {
+                        "Shared": { "$className": "Folder", "$globIgnorePaths": ["**"] }
+                    }
+                }
+            }"#,
+        )
+        .unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("tree.ReplicatedStorage.Shared")
+                && message.contains("$globIgnorePaths without $path"),
+            "{message}"
+        );
+    }
+
     #[test]
     fn glob_ignore_paths_negation() {
         let project_json = r#"{
@@ -677,6 +792,8 @@ mod test {
             .map(|g| crate::snapshot::PathIgnoreRule {
                 base_path: PathBuf::from("/test"),
                 glob: g.clone(),
+                from_node: false,
+                canonical_base: None,
             })
             .collect();
         assert!(crate::snapshot::is_path_ignored(

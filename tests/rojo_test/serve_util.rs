@@ -16,8 +16,8 @@ use tempfile::{tempdir, TempDir};
 
 use librojo::{
     web_api::{
-        ReadResponse, SerializeRequest, SerializeResponse, ServerInfoResponse, SocketPacket,
-        SocketPacketType,
+        ReadResponse, RefPatchRequest, SerializeRequest, SerializeResponse, ServerInfoResponse,
+        SocketPacket, SocketPacketType,
     },
     SessionId,
 };
@@ -279,6 +279,22 @@ impl TestServeSession {
         let body = serialize_msgpack(&SerializeRequest {
             session_id,
             ids: ids.to_vec(),
+        })
+        .unwrap();
+
+        client.post(url).body(body).send()
+    }
+
+    pub fn post_api_ref_patch(
+        &self,
+        ids: &[Ref],
+        session_id: SessionId,
+    ) -> Result<reqwest::blocking::Response, reqwest::Error> {
+        let client = reqwest::blocking::Client::new();
+        let url = format!("http://localhost:{}/api/ref-patch", self.port);
+        let body = serialize_msgpack(&RefPatchRequest {
+            session_id,
+            ids: ids.iter().copied().collect(),
         })
         .unwrap();
 

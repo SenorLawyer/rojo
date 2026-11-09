@@ -2,6 +2,7 @@ mod file_names;
 mod fs_snapshot;
 mod hash;
 mod property_filter;
+mod protected;
 mod ref_properties;
 mod snapshot;
 
@@ -16,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     env,
-    path::Path,
+    path::{Path, PathBuf},
     sync::OnceLock,
 };
 
@@ -24,14 +25,14 @@ use crate::{
     glob::{Glob, IgnorableGlob},
     snapshot::{
         content_property_aliases, object_content_warning, remove_object_contents, InstanceWithMeta,
-        RojoTree,
+        InstigatingSource, RojoTree,
     },
-    snapshot_middleware::Middleware,
+    snapshot_middleware::{node_ignore_base, Middleware},
     syncback::{
         ref_properties::{collect_referents, link_referents},
         snapshot::inst_path,
     },
-    Project,
+    Project, RojoRef, REF_ID_ATTRIBUTE_NAME,
 };
 
 pub use file_names::{extension_for_middleware, name_for_inst, validate_file_name};
@@ -40,6 +41,7 @@ pub use hash::*;
 pub use property_filter::{
     filter_properties, filter_properties_preallocated, is_excluded_by_rules,
 };
+pub use protected::ProtectedPartitions;
 pub use snapshot::{SyncbackData, SyncbackSnapshot};
 
 /// The name of an enviroment variable to use to override the behavior of
@@ -89,7 +91,7 @@ pub fn syncback_loop(
     }
 
     log::debug!("Collecting referents for new DOM...");
-    let deferred_referents = collect_referents(&new_tree);
+    let mut deferred_referents = collect_referents(&new_tree);
 
     // Remove any properties that are manually blocked from syncback via the
     // project file.
@@ -164,9 +166,73 @@ pub fn syncback_loop(
         .as_ref()
         .and_then(|s| s.ignore_referents)
         .unwrap_or_default();
+    // Syncback compares the tree from the files against Studio's, but files
+    // that `$globIgnorePaths` exclude are not in that tree. Writing, removing
+    // or replacing anything in such a partition could therefore overwrite or
+    // delete those files, so syncback leaves these partitions alone. Found
+    // before linking referents, which must not give an ID to an instance in
+    // one, since that ID would never be written.
+    let skipped_partitions = partitions_with_ignore_globs(vfs, old_tree)?;
+
     if !ignore_referents {
         log::debug!("Linking referents for new DOM");
-        link_referents(deferred_referents, &mut new_tree)?;
+        let old: &RojoTree = old_tree;
+        let protected = ProtectedInstances::new(old, &skipped_partitions);
+        // Whether the files give `id` to this very instance, matched to its
+        // counterpart there, rather than to some other instance.
+        let owns_on_disk = |dom: &WeakDom, target: Ref, id: &str| {
+            old_instance_at_same_path(dom, target, old)
+                .and_then(|old_ref| old.get_metadata(old_ref))
+                .and_then(|metadata| metadata.specified_id.as_ref())
+                .is_some_and(|specified| *specified == RojoRef::new(id.to_owned()))
+        };
+        // An ID in a protected partition is never given or changed, since
+        // the change would not be written: only a target there that keeps
+        // the ID its own files give it can be linked to.
+        // Checked first: without protected partitions, nothing else is
+        // looked up.
+        let unlinkable = |dom: &WeakDom, target: Ref, id: Option<&str>, needs_new_id: bool| {
+            protected.contains(dom, target)
+                && (needs_new_id || !id.is_some_and(|id| owns_on_disk(dom, target, id)))
+        };
+        // Such an ID stays with its owner, so a copy cannot take it first.
+        let reserved = |dom: &WeakDom, target: Ref, id: &str| {
+            protected.contains(dom, target) && owns_on_disk(dom, target, id)
+        };
+        // What the files say for a pointer whose target cannot be linked.
+        let on_disk = |dom: &WeakDom, holder: Ref, attribute: &str| {
+            let old_ref = old_instance_at_same_path(dom, holder, old)?;
+            match old
+                .get_instance(old_ref)?
+                .properties()
+                .get(&ustr("Attributes"))
+            {
+                Some(Variant::Attributes(attributes)) => attributes.get(attribute).cloned(),
+                _ => None,
+            }
+        };
+        // The IDs files in protected partitions hold stay theirs, whether
+        // or not anything points at those instances now, and even if Studio
+        // deleted them, since their files stay. An instance syncback writes
+        // that carries one, such as a copy Studio made of a protected
+        // instance, gets a new ID of its own, which its pointers then use;
+        // otherwise two files would hold the same ID.
+        // Pointers in protected files stay as they are, so the writable
+        // instances they name must keep those IDs too.
+        let reserved_ids = protected.ids_on_disk(old);
+        if !reserved_ids.is_empty() {
+            give_new_ids_to_writable_holders(&mut new_tree, &protected, &reserved_ids)?;
+        }
+        for target in keep_ids_protected_pointers_use(&mut new_tree, &protected, old)? {
+            deferred_referents.keep_id(target);
+        }
+        link_referents(
+            deferred_referents,
+            &mut new_tree,
+            &unlinkable,
+            &reserved,
+            &on_disk,
+        )?;
     } else {
         log::debug!("Skipping referent linking as per project syncback rules");
     }
@@ -181,7 +247,21 @@ pub fn syncback_loop(
     log::debug!("Hashing file DOM");
     let new_hashes = hash_tree(project, &new_tree, new_tree.root_ref());
 
+    for (node, base) in skipped_partitions.iter() {
+        log::warn!(
+            "syncback skipped {node} ({}) because it has $globIgnorePaths; edit those files directly",
+            base.display()
+        );
+    }
+
     let project_path = project.folder_location();
+    let in_partition = |path: &Path| skipped_partitions.contains(path);
+    // Removing or replacing a directory that holds a partition would delete
+    // the partition along with it.
+    let holds_partition = |path: &Path| skipped_partitions.held_by(path);
+    let is_writable =
+        |path: &Path| is_valid_path(&ignore_patterns, project_path, path) && !in_partition(path);
+    let is_changeable = |path: &Path| is_writable(path) && !holds_partition(path);
 
     let syncback_data = SyncbackData {
         vfs,
@@ -189,6 +269,7 @@ pub fn syncback_loop(
         new_tree: &new_tree,
         project,
         unreadable_properties: &unreadable_properties,
+        protected: &skipped_partitions,
     };
 
     let mut snapshots = vec![SyncbackSnapshot {
@@ -219,7 +300,7 @@ pub fn syncback_loop(
             }
         }
 
-        if !is_valid_path(&ignore_patterns, project_path, &snapshot.path) {
+        if !is_writable(&snapshot.path) {
             log::debug!("Skipping {inst_path} because its path matches ignore pattern");
             continue;
         }
@@ -260,6 +341,13 @@ pub fn syncback_loop(
                     Ok(value) if value == "2" => Middleware::JsonModel,
                     _ => Middleware::Rbxm,
                 };
+                if holds_partition(&snapshot.path) {
+                    log::warn!(
+                        "Could not syncback {inst_path} as a Directory because: {err}.
+                        It holds a partition with $globIgnorePaths, so it is left as it is."
+                    );
+                    continue;
+                }
                 let file_name = snapshot
                     .path
                     .file_name()
@@ -296,7 +384,7 @@ pub fn syncback_loop(
             'remove: for inst in &syncback.removed_children {
                 let path = inst.metadata().instigating_source.as_ref().unwrap().path();
                 let inst_path = snapshot.get_old_inst_path(inst.id());
-                if !is_valid_path(&ignore_patterns, project_path, path) {
+                if !is_changeable(path) {
                     log::debug!(
                         "Skipping removing {} because its matches an ignore pattern",
                         path.display()
@@ -321,14 +409,65 @@ pub fn syncback_loop(
 
         // TODO provide replacement snapshots for e.g. two way sync
 
-        fs_snapshot.merge_with_filter(syncback.fs_snapshot, |path| {
-            is_valid_path(&ignore_patterns, project_path, path)
-        });
+        fs_snapshot.merge_with_filter(syncback.fs_snapshot, is_changeable);
 
         snapshots.extend(syncback.children);
     }
 
     Ok(fs_snapshot)
+}
+
+/// Returns the name and `$path` of every project node that sets
+/// `$globIgnorePaths`, in every project file the old tree came from. They are
+/// read from the project files rather than from each instance's
+/// `InstigatingSource`, because a project's root node is tagged with the
+/// project file's path instead.
+fn partitions_with_ignore_globs(
+    vfs: &Vfs,
+    old_tree: &RojoTree,
+) -> anyhow::Result<ProtectedPartitions> {
+    let mut project_paths: Vec<PathBuf> = Vec::new();
+    for inst in old_tree.descendants(old_tree.get_root_id()) {
+        let metadata = inst.metadata();
+        let instigating = metadata
+            .instigating_source
+            .as_ref()
+            .map(|source| source.path());
+        for path in metadata
+            .relevant_paths
+            .iter()
+            .map(PathBuf::as_path)
+            .chain(instigating)
+        {
+            if Project::is_project_file(path) && !project_paths.iter().any(|p| p == path) {
+                project_paths.push(path.to_path_buf());
+            }
+        }
+    }
+
+    let mut partitions = ProtectedPartitions::default();
+    for project_path in project_paths {
+        if !vfs.exists(&project_path)? {
+            continue;
+        }
+        // The fallback name only keeps loading from failing for a project
+        // without `name`; the name is not used here.
+        let project = Project::load_exact(vfs, &project_path, Some("project"))?;
+        let mut nodes = vec![("tree".to_owned(), &project.tree)];
+        while let Some((name, node)) = nodes.pop() {
+            if !node.glob_ignore_paths.is_empty() {
+                if let Some(base) = node_ignore_base(&project_path, node) {
+                    partitions.add(format!("{name} in {}", project_path.display()), &base);
+                }
+            }
+            nodes.extend(
+                node.children
+                    .iter()
+                    .map(|(child_name, child)| (format!("{name}.{child_name}"), child)),
+            );
+        }
+    }
+    Ok(partitions)
 }
 
 pub struct SyncbackReturn<'sync> {
@@ -546,6 +685,329 @@ fn get_property_filter(project: &Project, new_inst: &Instance) -> Option<UstrSet
 
 /// Finds the instance in `old` at the same path as `new_ref` in `new`, if
 /// every name along the path picks out exactly one child of the same class.
+/// The instances of the files' tree that are in protected partitions, by
+/// their place in the tree, so that a ref target in Studio's tree can be
+/// checked by where it sits rather than by which file made the instance
+/// nearest it. A nested project's root is made from its project file, but
+/// sits on the partition its `$path` names, and so does anything Studio adds
+/// under it.
+struct ProtectedInstances {
+    /// The names of each protected instance and its ancestors, from the
+    /// DataModel down, outermost first. Classes are left out on purpose:
+    /// project syncback skips a partition by its `$path`, whatever Studio
+    /// made of the instance there, such as a Folder replaced by a Model, so
+    /// everything under that name counts as protected too.
+    roots: Vec<Vec<String>>,
+}
+
+impl ProtectedInstances {
+    fn new(old: &RojoTree, protected: &ProtectedPartitions) -> Self {
+        let mut roots: Vec<Vec<String>> = Vec::new();
+        if protected.is_empty() {
+            return ProtectedInstances { roots };
+        }
+        for inst in old.descendants(old.get_root_id()) {
+            let metadata = inst.metadata();
+            // The files an instance is made from, as it records them: a
+            // folder, a file, or a project node's `$path` folder.
+            let instigating =
+                metadata
+                    .instigating_source
+                    .as_ref()
+                    .and_then(|source| match source {
+                        InstigatingSource::Path(path) => Some(path.clone()),
+                        InstigatingSource::ProjectNode { path, node, .. } => {
+                            let node_path = node.path.as_ref()?.path();
+                            Some(if node_path.is_absolute() {
+                                node_path.to_owned()
+                            } else {
+                                path.parent()?.join(node_path)
+                            })
+                        }
+                    });
+            let in_partition = instigating
+                .iter()
+                .chain(&metadata.relevant_paths)
+                .filter(|path| !Project::is_project_file(path))
+                .any(|path| protected.contains(path));
+            if !in_partition {
+                continue;
+            }
+            let path = tree_path(old, inst.id());
+            // A descendant of one already listed adds nothing.
+            if !roots.iter().any(|root| path.starts_with(root)) {
+                roots.retain(|root| !root.starts_with(&path));
+                roots.push(path);
+            }
+        }
+        ProtectedInstances { roots }
+    }
+
+    /// The IDs that instances in protected partitions have in the files'
+    /// tree.
+    fn ids_on_disk(&self, old: &RojoTree) -> HashSet<String> {
+        if self.roots.is_empty() {
+            return HashSet::new();
+        }
+        old.descendants(old.get_root_id())
+            .filter_map(|inst| {
+                let id = inst.metadata().specified_id.as_ref()?;
+                let path = tree_path(old, inst.id());
+                self.roots
+                    .iter()
+                    .any(|root| path.starts_with(root))
+                    .then(|| id.as_str().to_owned())
+            })
+            .collect()
+    }
+
+    /// Whether `new_ref` in Studio's tree is a protected instance or under
+    /// one.
+    fn contains(&self, new: &WeakDom, new_ref: Ref) -> bool {
+        if self.roots.is_empty() {
+            return false;
+        }
+        let mut path = Vec::new();
+        let mut current = new_ref;
+        while let Some(inst) = new.get_by_ref(current) {
+            if inst.parent().is_none() {
+                break;
+            }
+            path.push(inst.name.clone());
+            current = inst.parent();
+        }
+        path.reverse();
+        self.roots.iter().any(|root| path.starts_with(root))
+    }
+}
+
+/// Gives every instance in `dom` outside protected partitions whose
+/// `Rojo_Id` is one of `reserved` a new ID, so that the files syncback writes
+/// never repeat an ID a protected file holds.
+fn give_new_ids_to_writable_holders(
+    dom: &mut WeakDom,
+    protected: &ProtectedInstances,
+    reserved: &HashSet<String>,
+) -> anyhow::Result<()> {
+    let attributes_key = ustr("Attributes");
+    let holders: Vec<Ref> = dom
+        .descendants()
+        .filter(|inst| match inst.properties.get(&attributes_key) {
+            Some(Variant::Attributes(attributes)) => match attributes.get(REF_ID_ATTRIBUTE_NAME) {
+                Some(Variant::String(id)) => reserved.contains(id),
+                Some(Variant::BinaryString(id)) => {
+                    std::str::from_utf8(id.as_ref()).is_ok_and(|id| reserved.contains(id))
+                }
+                _ => false,
+            },
+            _ => false,
+        })
+        .map(|inst| inst.referent())
+        .collect();
+    for holder in holders {
+        if protected.contains(dom, holder) {
+            continue;
+        }
+        let path = inst_path(dom, holder);
+        let fresh = rbx_dom_weak::types::UniqueId::now()?.to_string();
+        let inst = dom.get_by_ref_mut(holder).unwrap();
+        if let Some(Variant::Attributes(attributes)) = inst.properties.get_mut(&attributes_key) {
+            attributes.insert(REF_ID_ATTRIBUTE_NAME.to_owned(), Variant::String(fresh));
+        }
+        log::warn!(
+            "{path} has the ID of an instance in a partition with $globIgnorePaths, \
+             which keeps it, so it was given a new one"
+        );
+    }
+    Ok(())
+}
+
+/// Keeps the IDs that pointers in protected partitions use with the
+/// writable instances they name.
+///
+/// A protected pointer file is not rewritten, so whatever it names must hold
+/// the same ID afterwards. Each target is found in Studio's tree through the
+/// pointer's own Ref property there, so a target Studio renamed or moved is
+/// still found, and by its old path only when that fails. The target is
+/// given the ID whatever `Rojo_Id` it has, since an ID from a model file's
+/// `id` is metadata and Studio's copy has none, and any other writable
+/// instance holding that ID, such as a copy Studio made, is given a new one.
+/// Returns the targets, whose IDs linking must then keep.
+fn keep_ids_protected_pointers_use(
+    new: &mut WeakDom,
+    protected: &ProtectedInstances,
+    old: &RojoTree,
+) -> anyhow::Result<Vec<Ref>> {
+    if protected.roots.is_empty() {
+        return Ok(Vec::new());
+    }
+    let in_protected = |id: Ref| -> bool {
+        let path = tree_path(old, id);
+        protected.roots.iter().any(|root| path.starts_with(root))
+    };
+
+    // By the time the files are loaded, their pointer attributes have become
+    // Ref properties, so the targets are found through those.
+    let mut owners: HashMap<Ref, String> = HashMap::new();
+    let mut claimed: HashMap<String, Ref> = HashMap::new();
+    for inst in old.descendants(old.get_root_id()) {
+        let refs: Vec<(Ustr, Ref)> = inst
+            .properties()
+            .iter()
+            .filter_map(|(name, value)| match value {
+                Variant::Ref(target) if target.is_some() => Some((*name, *target)),
+                _ => None,
+            })
+            .collect();
+        if refs.is_empty() || !in_protected(inst.id()) {
+            continue;
+        }
+        let new_holder = new_instance_at_same_path(old, inst.id(), new);
+        for (name, old_target) in refs {
+            if in_protected(old_target) {
+                continue;
+            }
+            let Some(id) = old
+                .get_metadata(old_target)
+                .and_then(|metadata| metadata.specified_id.as_ref())
+            else {
+                continue;
+            };
+            let through_pointer = new_holder
+                .and_then(|holder| new.get_by_ref(holder))
+                .and_then(|holder| match holder.properties.get(&name) {
+                    // Pruning a root child leaves Refs into it in place.
+                    Some(Variant::Ref(target)) if new.get_by_ref(*target).is_some() => {
+                        Some(*target)
+                    }
+                    _ => None,
+                });
+            let Some(new_target) =
+                through_pointer.or_else(|| new_instance_at_same_path(old, old_target, new))
+            else {
+                log::warn!(
+                    "{} is named by a pointer in a partition with $globIgnorePaths, which \
+                     keeps it, but it is not in Studio's tree; that pointer will not resolve",
+                    tree_path(old, old_target).join(".")
+                );
+                continue;
+            };
+            // Each ID stays with one instance. When Studio pointed protected
+            // pointers sharing an ID at different instances, the first keeps
+            // it and the others are treated as copies; their pointers cannot
+            // all be right, since the files name one ID.
+            if let Some(holder) = claimed.get(id.as_str()) {
+                if *holder != new_target {
+                    log::warn!(
+                        "Pointers in a partition with $globIgnorePaths name the ID {} but now                          point at different instances; only one of them can keep it",
+                        id.as_str()
+                    );
+                }
+                continue;
+            }
+            claimed.insert(id.as_str().to_owned(), new_target);
+            owners.insert(new_target, id.as_str().to_owned());
+        }
+    }
+    if owners.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let attributes_key = ustr("Attributes");
+    let needed: HashMap<&str, Ref> = owners
+        .iter()
+        .map(|(target, id)| (id.as_str(), *target))
+        .collect();
+    let copies: Vec<Ref> = new
+        .descendants()
+        .filter(|inst| {
+            let Some(Variant::Attributes(attributes)) = inst.properties.get(&attributes_key) else {
+                return false;
+            };
+            let id = match attributes.get(REF_ID_ATTRIBUTE_NAME) {
+                Some(Variant::String(id)) => id.as_str(),
+                Some(Variant::BinaryString(id)) => match std::str::from_utf8(id.as_ref()) {
+                    Ok(id) => id,
+                    Err(_) => return false,
+                },
+                _ => return false,
+            };
+            needed
+                .get(id)
+                .is_some_and(|owner| *owner != inst.referent())
+        })
+        .map(|inst| inst.referent())
+        .filter(|copy| !protected.contains(new, *copy))
+        .collect();
+    for copy in copies {
+        let fresh = rbx_dom_weak::types::UniqueId::now()?.to_string();
+        set_ref_id(new, copy, fresh);
+    }
+    for (target, id) in &owners {
+        set_ref_id(new, *target, id.clone());
+    }
+    Ok(owners.into_keys().collect())
+}
+
+/// Sets the `Rojo_Id` attribute of `target`, adding attributes if it has
+/// none.
+fn set_ref_id(dom: &mut WeakDom, target: Ref, id: String) {
+    let attributes_key = ustr("Attributes");
+    let inst = dom.get_by_ref_mut(target).unwrap();
+    if !matches!(
+        inst.properties.get(&attributes_key),
+        Some(Variant::Attributes(_))
+    ) {
+        inst.properties
+            .insert(attributes_key, Variant::Attributes(Default::default()));
+    }
+    if let Some(Variant::Attributes(attributes)) = inst.properties.get_mut(&attributes_key) {
+        attributes.insert(REF_ID_ATTRIBUTE_NAME.to_owned(), Variant::String(id));
+    }
+}
+
+/// The instance in `new` at the path of `old_ref` in `old`, when every step
+/// is unambiguous by name and class.
+fn new_instance_at_same_path(old: &RojoTree, old_ref: Ref, new: &WeakDom) -> Option<Ref> {
+    let mut path = Vec::new();
+    let mut current = old.get_instance(old_ref)?;
+    while current.parent().is_some() {
+        path.push((current.name().to_owned(), current.class_name()));
+        current = old.get_instance(current.parent())?;
+    }
+
+    let mut new_ref = new.root_ref();
+    for (name, class) in path.into_iter().rev() {
+        let mut matches = new
+            .get_by_ref(new_ref)?
+            .children()
+            .iter()
+            .filter_map(|child| new.get_by_ref(*child))
+            .filter(|child| child.name == name && child.class == class);
+        let found = matches.next()?;
+        if matches.next().is_some() {
+            return None;
+        }
+        new_ref = found.referent();
+    }
+    Some(new_ref)
+}
+
+/// The names of `id` and its ancestors below the root, outermost first.
+fn tree_path(tree: &RojoTree, id: Ref) -> Vec<String> {
+    let mut path = Vec::new();
+    let mut current = id;
+    while let Some(inst) = tree.get_instance(current) {
+        if inst.parent().is_none() {
+            break;
+        }
+        path.push(inst.name().to_owned());
+        current = inst.parent();
+    }
+    path.reverse();
+    path
+}
+
 fn old_instance_at_same_path(new: &WeakDom, new_ref: Ref, old: &RojoTree) -> Option<Ref> {
     let mut path = Vec::new();
     let mut current = new.get_by_ref(new_ref)?;
@@ -630,6 +1092,18 @@ fn strip_unknown_root_children(new: &mut WeakDom, old: &RojoTree) {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    /// Without protected partitions, ref targets are never looked up in the
+    /// files' tree.
+    #[test]
+    fn no_protected_partitions_means_no_lookups() {
+        let tree = RojoTree::new(crate::snapshot::InstanceSnapshot::new().class_name("DataModel"));
+        let protected = ProtectedInstances::new(&tree, &ProtectedPartitions::default());
+        assert!(protected.roots.is_empty());
+        let mut dom = WeakDom::new(rbx_dom_weak::InstanceBuilder::new("DataModel"));
+        let child = dom.insert(dom.root_ref(), rbx_dom_weak::InstanceBuilder::new("Folder"));
+        assert!(!protected.contains(&dom, child));
+    }
 
     fn rules(ignore_paths: &[&str], create_ignore_dir_paths: Option<bool>) -> SyncbackRules {
         SyncbackRules {

@@ -54,4 +54,32 @@ return function()
 		expect(#ordered).to.equal(1)
 		expect(ordered[1].oldInstance).to.equal(part)
 	end)
+
+	-- Listing the siblings again for every swap made replacing a large flat
+	-- model quadratic, freezing Studio for many seconds.
+	it("lists each parent's children once for many siblings", function()
+		local calls = 0
+		local children = {}
+		local parent = {
+			Parent = nil,
+			GetChildren = function()
+				calls += 1
+				return children
+			end,
+		}
+		local swaps = {}
+		for index = 1, 1000 do
+			local child = { Parent = parent }
+			children[index] = child
+			-- Reversed so the result has to come from the sibling order.
+			table.insert(swaps, 1, { id = tostring(index), oldInstance = child })
+		end
+
+		local ordered = orderSwaps(swaps)
+
+		expect(calls).to.equal(1)
+		for index, swap in ordered do
+			expect(swap.oldInstance).to.equal(children[index])
+		end
+	end)
 end

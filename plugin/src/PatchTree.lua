@@ -24,49 +24,35 @@ local function yieldIfNeeded(clock)
 	return clock
 end
 
-local function alphabeticalNext(t, state)
-	-- Equivalent of the next function, but returns the keys in the alphabetic
-	-- order of node names. We use a temporary ordered key table that is stored in the
-	-- table being iterated.
-
-	local key = nil
-	if state == nil then
-		-- First iteration, generate the index
-		local orderedIndex, i = table.create(5), 0
-		for k in t do
-			i += 1
-			orderedIndex[i] = k
-		end
-		table.sort(orderedIndex, function(a, b)
-			local nodeA, nodeB = t[a], t[b]
-			return (nodeA.name or "") < (nodeB.name or "")
-		end)
-
-		t.__orderedIndex = orderedIndex
-		key = orderedIndex[1]
-	else
-		-- Fetch the next value
-		for i, orderedState in t.__orderedIndex do
-			if orderedState == state then
-				key = t.__orderedIndex[i + 1]
-				break
-			end
-		end
-	end
-
-	if key then
-		return key, t[key]
-	end
-
-	-- No more value to return, cleanup
-	t.__orderedIndex = nil
-
-	return
-end
-
 local function alphabeticalPairs(t)
-	-- Equivalent of the pairs() iterator, but sorted
-	return alphabeticalNext, t, nil
+	-- Equivalent of the pairs() iterator, but returns the keys in the
+	-- alphabetic order of node names.
+	local orderedIndex, count = {}, 0
+	for k in t do
+		count += 1
+		orderedIndex[count] = k
+	end
+	table.sort(orderedIndex, function(a, b)
+		local nodeA, nodeB = t[a], t[b]
+		return (nodeA.name or "") < (nodeB.name or "")
+	end)
+
+	-- The position is kept here rather than found again from the previous key,
+	-- which made visiting a node's children quadratic and froze Studio after
+	-- every patch that added thousands of siblings.
+	local position = 0
+	return function()
+		position += 1
+		local key = orderedIndex[position]
+		if key ~= nil then
+			-- The third value says whether this is the last key, which the
+			-- visualizer uses to draw tree lines. Finding that out by comparing
+			-- against every sibling was quadratic, and never stopped early when
+			-- siblings shared a name, such as thousands of Parts.
+			return key, t[key], position == count
+		end
+		return nil
+	end
 end
 
 local Tree = {}
@@ -99,10 +85,12 @@ end
 -- Iterates over all sub-nodes, depth first
 -- node is where to start from, defaults to root
 -- depth is used for recursion but can be used to set the starting depth
+-- callback receives the node, its depth, and whether it is its parent's last
+-- child in this order
 function Tree:forEach(callback, node, depth)
 	depth = depth or 1
-	for _, child in alphabeticalPairs(if node then node.children else self.ROOT.children) do
-		callback(child, depth)
+	for _, child, isFinalChild in alphabeticalPairs(if node then node.children else self.ROOT.children) do
+		callback(child, depth, isFinalChild)
 		if type(child.children) == "table" then
 			self:forEach(callback, child, depth + 1)
 		end
