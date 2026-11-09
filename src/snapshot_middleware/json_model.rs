@@ -1,4 +1,4 @@
-use std::{borrow::Cow, path::Path, str};
+use std::{borrow::Cow, collections::HashMap, path::Path, str};
 
 use anyhow::Context;
 use indexmap::IndexMap;
@@ -154,19 +154,31 @@ fn json_model_from_pair<'sync>(
     let old_inst = old.and_then(|old| snapshot.get_old_instance(old));
     let mut children = Vec::with_capacity(new_inst.children().len());
 
+    // Children are matched by name and class, and only when that is
+    // unambiguous; nothing else in a model file tells them apart. `None`
+    // marks a name and class that more than one old child has. Built once so
+    // that a model with many children is not scanned once per child.
+    let mut old_children: HashMap<(&str, Ustr), Option<Ref>> = HashMap::new();
+    if let Some(old_inst) = &old_inst {
+        for child_ref in old_inst.children() {
+            if let Some(child) = snapshot.get_old_instance(*child_ref) {
+                old_children
+                    .entry((child.name(), child.class_name()))
+                    .and_modify(|found| *found = None)
+                    .or_insert(Some(*child_ref));
+            }
+        }
+    }
+
     for new_child_ref in new_inst.children() {
-        // Children are matched by name and class, and only when that is
-        // unambiguous; nothing else in a model file tells them apart.
-        let old_child = old_inst.as_ref().and_then(|old_inst| {
-            let new_child = snapshot.get_new_instance(*new_child_ref)?;
-            let mut matches = old_inst.children().iter().filter(|child| {
-                snapshot.get_old_instance(**child).is_some_and(|child| {
-                    child.name() == new_child.name && child.class_name() == new_child.class
-                })
-            });
-            let found = *matches.next()?;
-            matches.next().is_none().then_some(found)
-        });
+        let old_child = snapshot
+            .get_new_instance(*new_child_ref)
+            .and_then(|new_child| {
+                old_children
+                    .get(&(new_child.name.as_str(), new_child.class))
+                    .copied()
+            })
+            .flatten();
         children.push(json_model_from_pair(
             snapshot,
             prop_buffer,

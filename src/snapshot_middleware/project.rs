@@ -198,7 +198,7 @@ pub fn snapshot_project_node(
         context
     } else {
         let mut with_rules = context.clone();
-        with_rules.add_path_ignore_rules(node_rules);
+        with_rules.add_node_path_ignore_rules(node_rules);
         node_context = with_rules;
         &node_context
     };

@@ -192,9 +192,33 @@ impl InstanceContext {
             return;
         }
 
-        // Later rules win, so a rule given again moves to the end rather than
-        // being dropped: a child node repeating its parent's exclusion must
-        // still override a negation the parent has after it.
+        let rules = Arc::make_mut(&mut self.path_ignore_rules);
+        for rule in new_rules {
+            if !rules.contains(&rule) {
+                rules.push(rule);
+            }
+        }
+    }
+
+    /// Extend the list of ignore rules with a project node's
+    /// `$globIgnorePaths`.
+    ///
+    /// Unlike [`add_path_ignore_rules`](Self::add_path_ignore_rules), a rule
+    /// that is already present moves to the end rather than being dropped.
+    /// Later rules win, so a node repeating its parent's exclusion must still
+    /// override a negation the parent has after it. Project-wide rules keep
+    /// dropping repeats, as they always have, so that including a project does
+    /// not reorder the rules of the project including it.
+    pub fn add_node_path_ignore_rules<I>(&mut self, new_rules: I)
+    where
+        I: IntoIterator<Item = PathIgnoreRule>,
+        I::IntoIter: ExactSizeIterator,
+    {
+        let new_rules = new_rules.into_iter();
+        if new_rules.len() == 0 {
+            return;
+        }
+
         let rules = Arc::make_mut(&mut self.path_ignore_rules);
         for rule in new_rules {
             rules.retain(|existing| *existing != rule);
@@ -428,5 +452,54 @@ impl SyncRule {
                 .and_then(|s| s.to_str())
                 .with_context(|| format!("file name of {} is invalid", path.display()))
         }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use crate::glob::IgnorableGlob;
+
+    fn rule(glob: &str, from_node: bool) -> PathIgnoreRule {
+        PathIgnoreRule {
+            base_path: PathBuf::from("/project"),
+            glob: IgnorableGlob::new(glob).unwrap(),
+            from_node,
+            canonical_base: None,
+        }
+    }
+
+    #[test]
+    fn a_repeated_project_wide_rule_keeps_its_first_place() {
+        // An included project in the same directory repeating the outer
+        // project's exclusion must not move it after the outer negation.
+        let mut context = InstanceContext::new();
+        context.add_path_ignore_rules(vec![
+            rule("**/*.spec.luau", false),
+            rule("!src/Keep.spec.luau", false),
+        ]);
+        context.add_path_ignore_rules(vec![rule("**/*.spec.luau", false)]);
+
+        assert_eq!(context.path_ignore_rules.len(), 2);
+        assert!(!is_path_ignored(
+            &context.path_ignore_rules,
+            "/project/src/Keep.spec.luau"
+        ));
+    }
+
+    #[test]
+    fn a_repeated_node_rule_moves_to_the_end() {
+        let mut context = InstanceContext::new();
+        context.add_node_path_ignore_rules(vec![
+            rule("**/*.spec.luau", true),
+            rule("!src/Keep.spec.luau", true),
+        ]);
+        context.add_node_path_ignore_rules(vec![rule("**/*.spec.luau", true)]);
+
+        assert_eq!(context.path_ignore_rules.len(), 2);
+        assert!(is_path_ignored(
+            &context.path_ignore_rules,
+            "/project/src/Keep.spec.luau"
+        ));
     }
 }

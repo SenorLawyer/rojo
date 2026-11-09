@@ -11,7 +11,7 @@
 use std::{
     collections::{HashMap, HashSet},
     fs,
-    io::BufReader,
+    io::{BufReader, Read},
     path::Path,
 };
 
@@ -32,10 +32,20 @@ pub fn read_base_place(path: &Path) -> anyhow::Result<WeakDom> {
     let extension = path.extension().and_then(|extension| extension.to_str());
     let file = fs::File::open(path)
         .with_context(|| format!("Could not open base place {}", path.display()))?;
-    let reader = BufReader::new(file);
+    let mut reader = BufReader::new(file);
     match extension {
-        Some("rbxl") => rbx_binary::from_reader(reader)
-            .with_context(|| format!("Could not read {} as a binary place file", path.display())),
+        Some("rbxl") => {
+            let mut bytes = Vec::new();
+            reader
+                .read_to_end(&mut bytes)
+                .with_context(|| format!("Could not read base place {}", path.display()))?;
+            check_binary_chunks(&bytes).with_context(|| {
+                format!("Could not read {} as a binary place file", path.display())
+            })?;
+            rbx_binary::from_reader(bytes.as_slice()).with_context(|| {
+                format!("Could not read {} as a binary place file", path.display())
+            })
+        }
         Some("rbxlx") => rbx_xml::from_reader(
             reader,
             rbx_xml::DecodeOptions::new()
@@ -46,6 +56,75 @@ pub fn read_base_place(path: &Path) -> anyhow::Result<WeakDom> {
             "The base place {} must be a place file ending in .rbxl or .rbxlx",
             path.display()
         ),
+    }
+}
+
+/// Size of a binary place's file header, before the first chunk.
+const BINARY_HEADER_LEN: usize = 32;
+
+/// Size of a chunk header: name, compressed length, length and reserved.
+const CHUNK_HEADER_LEN: usize = 16;
+
+/// Checks that every chunk in a binary place is complete before rbx_binary
+/// decodes it.
+///
+/// rbx_binary asserts that a chunk's payload has the length its header gives
+/// rather than returning an error, and Rojo builds with `panic = "abort"`. A
+/// base place that Studio is halfway through saving would otherwise end
+/// `build --watch --into` instead of failing one rebuild.
+fn check_binary_chunks(bytes: &[u8]) -> anyhow::Result<()> {
+    let read_u32 = |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
+
+    let mut offset = BINARY_HEADER_LEN;
+    if bytes.len() < offset {
+        bail!("the file ends inside its header");
+    }
+
+    loop {
+        if bytes.len() - offset < CHUNK_HEADER_LEN {
+            bail!("the file ends before its END chunk");
+        }
+        let name = &bytes[offset..offset + 4];
+        let compressed_len = read_u32(offset + 4);
+        let len = read_u32(offset + 8);
+        offset += CHUNK_HEADER_LEN;
+
+        let stored_len = if compressed_len == 0 {
+            len
+        } else {
+            compressed_len
+        };
+        if bytes.len() - offset < stored_len {
+            bail!(
+                "the {} chunk needs {stored_len} bytes but only {} remain",
+                String::from_utf8_lossy(name).trim_end_matches('\0'),
+                bytes.len() - offset
+            );
+        }
+        let payload = &bytes[offset..offset + stored_len];
+        offset += stored_len;
+
+        if compressed_len != 0 {
+            // Decompressed the same way rbx_binary does, which then asserts
+            // on the length.
+            let data = if payload.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]) {
+                zstd::bulk::decompress(payload, len)?
+            } else if payload.len() >= 4 {
+                lz4_flex::block::decompress(payload, len)?
+            } else {
+                bail!("a compressed chunk is too short to hold any data");
+            };
+            if data.len() != len {
+                bail!(
+                    "a chunk decompresses to {} bytes instead of {len}",
+                    data.len()
+                );
+            }
+        }
+
+        if name == b"END\0" {
+            return Ok(());
+        }
     }
 }
 
@@ -733,5 +812,55 @@ mod test {
         assert!(error.contains("Workspace/Flag"), "{error}");
         assert!(error.contains("Rojo_Target_PrimaryPart"), "{error}");
         assert!(error.contains("\"missing\""), "{error}");
+    }
+
+    fn binary_place() -> Vec<u8> {
+        let mut dom = WeakDom::new(InstanceBuilder::new("DataModel"));
+        let root = dom.root_ref();
+        dom.insert(
+            root,
+            InstanceBuilder::new("Workspace").with_child(
+                InstanceBuilder::new("Part")
+                    .with_property("Name", Variant::String("A".repeat(500))),
+            ),
+        );
+        let mut bytes = Vec::new();
+        rbx_binary::to_writer(&mut bytes, &dom, dom.root().children()).unwrap();
+        bytes
+    }
+
+    #[test]
+    fn a_complete_binary_place_passes_the_chunk_check() {
+        check_binary_chunks(&binary_place()).unwrap();
+    }
+
+    #[test]
+    fn a_binary_place_cut_inside_a_chunk_is_an_error_not_a_crash() {
+        let bytes = binary_place();
+        // Every cut point, so that cuts inside headers and payloads, and of
+        // compressed and uncompressed chunks, are all covered.
+        for len in 0..bytes.len() {
+            assert!(
+                check_binary_chunks(&bytes[..len]).is_err(),
+                "a place cut to {len} bytes passed"
+            );
+        }
+    }
+
+    #[test]
+    fn a_compressed_chunk_with_the_wrong_length_is_an_error() {
+        let mut bytes = binary_place();
+        // The first chunk's header follows the file header; raising its
+        // stated length makes its payload decompress short, the case
+        // rbx_binary asserts on.
+        let len_at = BINARY_HEADER_LEN + 8;
+        let len = u32::from_le_bytes(bytes[len_at..len_at + 4].try_into().unwrap());
+        assert_ne!(
+            u32::from_le_bytes(bytes[BINARY_HEADER_LEN + 4..len_at].try_into().unwrap()),
+            0,
+            "the first chunk is expected to be compressed"
+        );
+        bytes[len_at..len_at + 4].copy_from_slice(&(len + 1).to_le_bytes());
+        assert!(check_binary_chunks(&bytes).is_err());
     }
 }
