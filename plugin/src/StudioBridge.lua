@@ -51,6 +51,11 @@ local MAX_THROTTLED_SECONDS = 180
 -- own scripts, so the bridge stays far below that however many agents use it.
 local BRIDGE_REQUESTS_PER_SECOND = 4
 local BRIDGE_REQUEST_BURST = 12
+-- `validate` asks whether a command is still wanted, once per write of a
+-- verify fix or import and every few seconds in Run mode. Those are small and
+-- a command is waiting on them, so they have their own, faster pacer.
+local VALIDATE_REQUESTS_PER_SECOND = 10
+local VALIDATE_REQUEST_BURST = 20
 -- IDs are held strongly so Roblox cannot collect an Instance proxy while the
 -- instance still exists. The oldest IDs are forgotten beyond this bound.
 local MAX_TRACKED_INSTANCES = 20_000
@@ -66,8 +71,9 @@ StudioBridge.__index = StudioBridge
 -- Replaced by tests.
 StudioBridge.bridgeStream = StreamRequest.new(nil, nil, StreamBudget.Priority.Bridge)
 
--- Paces every bridge request. Replaced by tests.
+-- Paces bridge requests. Replaced by tests.
 StudioBridge.pacer = Throttle.Pacer.new(BRIDGE_REQUESTS_PER_SECOND, BRIDGE_REQUEST_BURST)
+StudioBridge.validatePacer = Throttle.Pacer.new(VALIDATE_REQUESTS_PER_SECOND, VALIDATE_REQUEST_BURST)
 
 -- Studio's HTTP throttling, shared with the rest of the plugin. Replaced by
 -- tests.
@@ -531,6 +537,8 @@ end
 	traffic cannot use up the place's HTTP budget. Neither wait counts
 	against the request's timeout. The best-effort disconnect never waits: it
 	is skipped during a cooldown, since the server expires the session anyway.
+	A command whose deadline passes during a wait fails once the server
+	answers its next `validate` with 410.
 ]]
 function StudioBridge:request(route, value, failure)
 	if route == "disconnect" then
@@ -541,7 +549,8 @@ function StudioBridge:request(route, value, failure)
 		local function isStopped()
 			return self.stopped == true
 		end
-		if not StudioBridge.throttle:wait(isStopped) or not StudioBridge.pacer:take(isStopped) then
+		local pacer = if route == "validate" then StudioBridge.validatePacer else StudioBridge.pacer
+		if not StudioBridge.throttle:wait(isStopped) or not pacer:take(isStopped) then
 			return Promise.reject("Studio bridge stopped")
 		end
 	end

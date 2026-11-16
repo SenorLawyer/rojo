@@ -56,27 +56,35 @@ function Throttle:remaining(): number
 end
 
 --[[
-	Records a failure. Returns true when it was Studio throttling HTTP, in
-	which case a cooldown starts, or is extended and doubled when one was
-	already running.
+	Records a failure. Returns true when it was Studio throttling HTTP. A
+	throttled failure after the cooldown ended starts a new one, twice as
+	long as the last unless a request got through since. Failures of
+	requests that were already in flight when a cooldown started do not
+	lengthen it, since they say nothing new.
 ]]
 function Throttle:noteFailure(err): boolean
 	if not Throttle.isThrottleError(err) then
 		return false
+	end
+	if self:remaining() > 0 then
+		return true
 	end
 	if self.cooldown == 0 then
 		self.cooldown = Throttle.MIN_COOLDOWN
 	else
 		self.cooldown = math.min(self.cooldown * 2, Throttle.MAX_COOLDOWN)
 	end
-	self.cooldownUntil = math.max(self.cooldownUntil, self.clock() + self.cooldown)
+	self.cooldownUntil = self.clock() + self.cooldown
 	return true
 end
 
 -- A request got through, so the next throttling starts from the shortest
--- cooldown again.
+-- cooldown again. A request that finishes during a cooldown was sent before
+-- it, so it does not count.
 function Throttle:noteSuccess()
-	self.cooldown = 0
+	if self:remaining() <= 0 then
+		self.cooldown = 0
+	end
 end
 
 --[[

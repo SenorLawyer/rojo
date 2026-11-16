@@ -215,15 +215,15 @@ function ApiContext:__request(
 	local sent
 	if options then
 		local markSent
-		if Http.usesEncodedStreams(url) and not options.requestAsync then
-			-- Stream requests share one sync slot, so a write can wait behind
-			-- a slow serialize. The timeout starts once the request is sent, so
-			-- that wait is not blamed on the server; the transport bounds the
-			-- wait itself. RequestAsync is never queued, so it starts at once.
-			sent = Promise.new(function(resolve)
-				markSent = resolve
-			end)
-		end
+		-- Every request can wait before it is sent: stream requests share one
+		-- sync slot, so a write can wait behind a slow serialize, RequestAsync
+		-- waits for a slot in the plugin's request budget, and all requests
+		-- wait out Studio's HTTP throttling. The timeout starts once the
+		-- request is sent, so that wait is not blamed on the server; the
+		-- transport bounds the wait itself.
+		sent = Promise.new(function(resolve)
+			markSent = resolve
+		end)
 		-- The transport needs the deadline too, or its own shorter limits would
 		-- end slow requests such as the initial read before this timeout does.
 		requestOptions = {

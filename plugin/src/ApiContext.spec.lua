@@ -71,7 +71,12 @@ return function()
 
 		it("cancels pending HTTP requests and their consumers when disconnected", function()
 			local pending = Promise.new(function() end)
-			Http.get = function()
+			-- The transport reports the request as sent at once, which starts
+			-- its timeout.
+			Http.get = function(_, options)
+				if options and options.onStarted then
+					options.onStarted()
+				end
 				return pending
 			end
 			local context = ApiContext.new("http://localhost:34872")
@@ -118,7 +123,12 @@ return function()
 
 		it("bounds a stalled server handshake and cancels its request", function()
 			local pending = Promise.new(function() end)
-			Http.get = function()
+			-- The transport reports the request as sent at once, which starts
+			-- its timeout.
+			Http.get = function(_, options)
+				if options and options.onStarted then
+					options.onStarted()
+				end
 				return pending
 			end
 			-- Permission answers are per host and last for the session, so each
@@ -136,7 +146,12 @@ return function()
 
 		it("waits on Studio's permission prompt instead of timing out the handshake", function()
 			local pending = Promise.new(function() end)
-			Http.get = function()
+			-- The transport reports the request as sent at once, which starts
+			-- its timeout.
+			Http.get = function(_, options)
+				if options and options.onStarted then
+					options.onStarted()
+				end
 				return pending
 			end
 			local context = ApiContext.new("http://handshake-prompt.test:34872")
@@ -157,7 +172,12 @@ return function()
 
 		it("bounds a stalled initial read", function()
 			local pending = Promise.new(function() end)
-			Http.get = function()
+			-- The transport reports the request as sent at once, which starts
+			-- its timeout.
+			Http.get = function(_, options)
+				if options and options.onStarted then
+					options.onStarted()
+				end
 				return pending
 			end
 			local baseUrl = "http://read-answered.test:34872"
@@ -178,7 +198,12 @@ return function()
 
 		it("gives up on a possible permission prompt that never gets an answer", function()
 			local pending = Promise.new(function() end)
-			Http.get = function()
+			-- The transport reports the request as sent at once, which starts
+			-- its timeout.
+			Http.get = function(_, options)
+				if options and options.onStarted then
+					options.onStarted()
+				end
 				return pending
 			end
 			local originalLimit = Http.permissionWaitLimit
@@ -203,7 +228,12 @@ return function()
 
 		it("bounds a background probe even while permission may be pending", function()
 			local pending = Promise.new(function() end)
-			Http.get = function()
+			-- The transport reports the request as sent at once, which starts
+			-- its timeout.
+			Http.get = function(_, options)
+				if options and options.onStarted then
+					options.onStarted()
+				end
 				return pending
 			end
 			local context = ApiContext.new("http://probe-cap.test:34872")
@@ -231,6 +261,29 @@ return function()
 			local request = context:connect()
 			request:catch(function() end)
 			-- Still queued behind other sync requests.
+			task.wait(0.15)
+			expect(request:getStatus()).to.equal(Promise.Status.Started)
+			seenOptions.onStarted()
+			task.wait(0.15)
+			expect(request:getStatus()).to.equal(Promise.Status.Rejected)
+			expect(pending:getStatus()).to.equal(Promise.Status.Cancelled)
+		end)
+
+		it("starts a RequestAsync request's timeout once it is sent, not while it waits", function()
+			-- RequestAsync waits for a slot in the plugin's request budget and
+			-- for Studio's HTTP throttling to pass, which is not the server's fault.
+			local pending = Promise.new(function() end)
+			local seenOptions
+			Http.get = function(_, options)
+				seenOptions = options
+				return pending
+			end
+			local baseUrl = "http://requestasync-wait.test:34872"
+			Http._recordPermissionAnswer(baseUrl, false)
+			local context = ApiContext.new(baseUrl)
+			context.__handshakeTimeout = 0.05
+			local request = context:connect()
+			request:catch(function() end)
 			task.wait(0.15)
 			expect(request:getStatus()).to.equal(Promise.Status.Started)
 			seenOptions.onStarted()
@@ -280,7 +333,9 @@ return function()
 		it("bounds stalled fallback serialization requests", function()
 			local originalPost = Http.post
 			local pending = {}
-			Http.post = function()
+			Http.post = function(_, _, options)
+				-- Sent at once, so the request's timeout starts.
+				options.onStarted()
 				local request = Promise.new(function() end)
 				table.insert(pending, request)
 				return request
@@ -304,7 +359,9 @@ return function()
 		it("bounds stalled write and open requests", function()
 			local originalPost = Http.post
 			local pending = {}
-			Http.post = function()
+			Http.post = function(_, _, options)
+				-- Sent at once, so the request's timeout starts.
+				options.onStarted()
 				local request = Promise.new(function() end)
 				table.insert(pending, request)
 				return request

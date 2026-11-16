@@ -53,6 +53,22 @@ return function()
 			expect(throttle:remaining()).to.equal(Throttle.MIN_COOLDOWN)
 		end)
 
+		it("lengthens the cooldown once per throttling, not once per request that failed in it", function()
+			local clock, now = fakeClock()
+			local throttle = Throttle.new(now)
+			-- Four requests in flight all fail when Studio starts throttling.
+			for _ = 1, 4 do
+				throttle:noteFailure("Number of requests exceeded limit")
+			end
+			expect(throttle:remaining()).to.equal(Throttle.MIN_COOLDOWN)
+			-- One sent before the cooldown finishes during it, which says
+			-- nothing about the throttling ending.
+			throttle:noteSuccess()
+			clock.now += Throttle.MIN_COOLDOWN
+			throttle:noteFailure("Number of requests exceeded limit")
+			expect(throttle:remaining()).to.equal(Throttle.MIN_COOLDOWN * 2)
+		end)
+
 		it("never shortens a running cooldown", function()
 			local _, now = fakeClock()
 			local throttle = Throttle.new(now)

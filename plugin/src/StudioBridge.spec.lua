@@ -19,9 +19,10 @@ return function()
 	beforeEach(function()
 		-- Specs send many requests quickly and must not share the plugin's
 		-- throttling state.
-		previousPacer = StudioBridge.pacer
+		previousPacer = { StudioBridge.pacer, StudioBridge.validatePacer }
 		previousThrottle = StudioBridge.throttle
 		StudioBridge.pacer = Throttle.Pacer.new(math.huge, math.huge)
+		StudioBridge.validatePacer = Throttle.Pacer.new(math.huge, math.huge)
 		StudioBridge.throttle = Throttle.new()
 		fixture = Instance.new("Folder")
 		fixture.Name = "__RojoBridgeSpec"
@@ -40,7 +41,7 @@ return function()
 			bridge:stop()
 		end
 		fixture:Destroy()
-		StudioBridge.pacer = previousPacer
+		StudioBridge.pacer, StudioBridge.validatePacer = previousPacer[1], previousPacer[2]
 		StudioBridge.throttle = previousThrottle
 	end)
 
@@ -358,6 +359,97 @@ return function()
 			assert(ok, err)
 		end)
 
+		it("sends many large export results one at a time on its one stream slot", function()
+			-- Back-to-back studio_backup calls of folders with thousands of
+			-- instances each. Every result must wait for the one before it, on
+			-- the bridge's own slot, and none may be sent another way.
+			local EXPORTS = 9
+			local MODEL_BYTES = 6 * 1024 * 1024
+			local budget = StreamBudget.new()
+			local maxLive = 0
+			local results = {}
+			local polls = 0
+			local create, created = fakeClient(function(client, opened, message, closed)
+				maxLive = math.max(maxLive, budget:liveCount())
+				local route = string.match(client.options.Url, "/api/studio/(%w+)$")
+				local body = '{"registered":true}'
+				if route == "poll" then
+					polls += 1
+					if polls > 1 then
+						-- Later polls are held open until the bridge stops.
+						return
+					end
+					local commands = {}
+					for index = 1, EXPORTS do
+						table.insert(commands, {
+							action = "export",
+							requestId = "export-" .. index,
+							args = {},
+							expiresAt = DateTime.now().UnixTimestampMillis + 60_000,
+						})
+					end
+					body = HttpService:JSONEncode({ commands = commands })
+				elseif route == "result" then
+					local value = HttpService:JSONDecode(client.options.Body)
+					table.insert(results, { requestId = value.requestId, bytes = #client.options.Body })
+					body = "{}"
+				end
+				opened:Fire(200, "content-type: application/json\r\n")
+				message:Fire(body)
+				closed:Fire()
+			end)
+			StudioBridge.bridgeStream = StreamRequest.new(create, budget, StreamBudget.Priority.Bridge)
+			-- Sync already holds its socket and a request.
+			local releaseSocket = budget:tryAcquire(StreamBudget.Priority.Socket)
+			local releaseRequest = budget:tryAcquire(StreamBudget.Priority.Request)
+			bridge.request = StudioBridge.request
+			bridge.execute = function(_, exportCommand)
+				return {
+					model = string.rep("A", MODEL_BYTES),
+					bytes = MODEL_BYTES,
+					requestId = exportCommand.requestId,
+				}
+			end
+			local failure
+			bridge.onFailure = function(err)
+				failure = err
+			end
+			StudioBridge.manualStart = true
+			bridge:start()
+			StudioBridge.manualStart = false
+			for _ = 1, 300 do
+				if #results >= EXPORTS and polls >= 2 then
+					break
+				end
+				task.wait(0.1)
+			end
+			local stillLive = budget:liveCount()
+			bridge:stop()
+			-- Includes the best-effort disconnect sent on stop.
+			expect(waitFor(function()
+				for _, client in created do
+					if not client.closedByCaller then
+						return false
+					end
+				end
+				return budget:liveCount() == 2
+			end)).to.equal(true)
+			releaseRequest()
+			releaseSocket()
+			expect(failure).to.equal(nil)
+			-- Results are only recorded by the stream, so every one went over it.
+			expect(#results).to.equal(EXPORTS)
+			for index, result in results do
+				expect(result.requestId).to.equal("export-" .. index)
+				expect(result.bytes > MODEL_BYTES).to.equal(true)
+			end
+			-- Never more than sync's two and the bridge's one at once, and only
+			-- the held poll was open when the bridge stopped.
+			expect(maxLive).to.equal(3)
+			expect(stillLive).to.equal(3)
+			expect(budget:liveCount()).to.equal(0)
+		end)
+
 		it("never falls back to RequestAsync when no stream slot is free", function()
 			local budget = StreamBudget.new(1, 0, 0)
 			local release = budget:tryAcquire(StreamBudget.Priority.Socket)
@@ -484,10 +576,10 @@ return function()
 		expect(sent).to.equal(0)
 	end)
 
-	it("paces bridge requests", function()
+	it("paces validate requests on their own pacer", function()
 		bridge.request = StudioBridge.request
 		local clock = { now = 0 }
-		StudioBridge.pacer = Throttle.Pacer.new(1, 2, function()
+		StudioBridge.validatePacer = Throttle.Pacer.new(1, 2, function()
 			return clock.now
 		end)
 		local sent = 0

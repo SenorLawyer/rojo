@@ -171,13 +171,26 @@ local function requestWithRequestAsync(requestParams, requestId, onStarted)
 			-- RequestAsync takes one of the parallel requests Studio allows
 			-- plugins, so it waits for a slot instead of going past the limit,
 			-- where Studio refuses every plugin's requests.
-			local releaseSlot = transport.budget:acquire(
-				StreamBudget.Priority.RequestAsync,
-				Http.queueWaitLimit,
-				function()
-					return cancelled
+			local function isCancelled()
+				return cancelled
+			end
+			local deadline = os.clock() + Http.queueWaitLimit
+			local releaseSlot
+			while true do
+				releaseSlot = transport.budget:acquire(
+					StreamBudget.Priority.RequestAsync,
+					math.max(0, deadline - os.clock()),
+					isCancelled
+				)
+				if not releaseSlot or cancelled or transport.throttle:remaining() <= 0 then
+					break
 				end
-			)
+				-- Studio started throttling while this request waited for its
+				-- slot, so it waits out the cooldown without holding the slot.
+				releaseSlot()
+				releaseSlot = nil
+				transport.throttle:wait(isCancelled)
+			end
 			if not releaseSlot then
 				if not cancelled then
 					reject(HttpError.new(HttpError.Kind.Timeout))
