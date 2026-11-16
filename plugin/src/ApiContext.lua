@@ -15,12 +15,12 @@ local validateApiSocketPacket = Types.ifEnabled(Types.ApiSocketPacket)
 local validateApiSerialize = Types.ifEnabled(Types.ApiSerializeResponse)
 local validateApiRefPatch = Types.ifEnabled(Types.ApiRefPatchResponse)
 
--- Declared before the functions below so their messages can use these
--- helpers, which are kept on the module so specs can check the wording.
 -- How many times creating the sync socket is tried in all while Studio
 -- refuses it because of its HTTP limits.
 local MAX_SOCKET_ATTEMPTS = 3
 
+-- Declared before the functions below so their messages can use these
+-- helpers, which are kept on the module so specs can check the wording.
 local ApiContext = {}
 
 -- Says which side to update, so the user does not have to work out from two
