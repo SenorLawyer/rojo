@@ -34,6 +34,8 @@ return function()
 		local encoding = game:GetService("EncodingService")
 		local originalStream = Http._transport.stream
 		local originalRequestAsync = Http._transport.requestAsync
+		local originalBudget = Http._transport.budget
+		local originalThrottle = Http._transport.throttle
 		local clients, streamConfigs, plainRequests
 
 		local function base64(value)
@@ -69,6 +71,8 @@ return function()
 		afterEach(function()
 			Http._transport.stream = originalStream
 			Http._transport.requestAsync = originalRequestAsync
+			Http._transport.budget = originalBudget
+			Http._transport.throttle = originalThrottle
 			for _, client in clients do
 				for _, event in client.events do
 					event:Destroy()
@@ -377,6 +381,92 @@ return function()
 			expect(Http.hasOutstandingRequest(queuedUrl)).to.equal(false)
 		end)
 
+		it(
+			"waits for a RequestAsync slot instead of going past Rojo's limit, and frees it when the request fails",
+			function()
+				local url = "http://localhost:47014/api/rojo"
+				local budget = Http.StreamBudget.new(1, 0, 0, 2)
+				Http._transport.budget = budget
+				local held = budget:tryAcquire(Http.StreamBudget.Priority.RequestAsync)
+				local sent = 0
+				Http._transport.requestAsync = function()
+					sent += 1
+					error("HttpError: ConnectFail")
+				end
+				local pending = Http.get(url, { requestAsync = true })
+				task.wait()
+				expect(sent).to.equal(0)
+				held()
+				local ok = pending:await()
+				expect(ok).to.equal(false)
+				expect(sent).to.equal(1)
+				expect(budget:liveRequestAsyncCount()).to.equal(0)
+
+				-- A request cancelled while it waits is never sent and takes no slot.
+				held = budget:tryAcquire(Http.StreamBudget.Priority.RequestAsync)
+				pending = Http.get(url, { requestAsync = true })
+				task.wait()
+				pending:cancel()
+				held()
+				task.wait()
+				task.wait()
+				expect(sent).to.equal(1)
+				expect(budget:liveRequestAsyncCount()).to.equal(0)
+			end
+		)
+
+		it("waits out Studio's HTTP throttling before sending, and starts it on a throttled failure", function()
+			local url = "http://localhost:47015/api/rojo"
+			local throttle = Http.Throttle.new()
+			Http._transport.throttle = throttle
+			throttle:noteFailure("Number of requests exceeded limit")
+			local pending = Http.get(url, { requestAsync = true })
+			task.wait(0.2)
+			expect(#plainRequests).to.equal(0)
+			pending:cancel()
+
+			-- Each reading of this clock is far past the last, so every
+			-- cooldown has passed by the time it is checked.
+			local now = 0
+			local fresh = Http.Throttle.new(function()
+				now += 1000
+				return now
+			end)
+			Http._transport.throttle = fresh
+			local attempts = 0
+			Http._transport.requestAsync = function()
+				attempts += 1
+				error("Number of requests exceeded limit")
+			end
+			local ok, err = Http.get(url, { requestAsync = true }):await()
+			expect(ok).to.equal(false)
+			expect(err.throttled).to.equal(true)
+			-- Studio never sent it, so it was sent again, a bounded number of
+			-- times, and each refusal started a cooldown.
+			expect(attempts).to.equal(3)
+			expect(fresh.cooldown).to.equal(Http.Throttle.MIN_COOLDOWN * 4)
+		end)
+
+		it("sends a request Studio refused again once the cooldown passes", function()
+			local url = "http://localhost:47016/api/write"
+			local now = 0
+			Http._transport.throttle = Http.Throttle.new(function()
+				now += 1000
+				return now
+			end)
+			local attempts = 0
+			Http._transport.requestAsync = function()
+				attempts += 1
+				if attempts == 1 then
+					error("Number of requests exceeded limit")
+				end
+				return { StatusCode = 200, Success = true, Headers = {}, Body = "written" }
+			end
+			local response = Http.post(url, "change", { requestAsync = true }):expect()
+			expect(response.body).to.equal("written")
+			expect(attempts).to.equal(2)
+		end)
+
 		it("sends a request with RequestAsync when no stream client is free", function()
 			local url = "http://localhost:47013/api/write"
 			Http._forgetPlainOrigin(url)
@@ -411,6 +501,22 @@ return function()
 
 	describe("permission-aware timeouts", function()
 		-- Each test uses its own host because permission answers last for the session.
+		it("starts the deadline again when a refused request is sent again after a cooldown", function()
+			local url = "http://restarted-deadline.test:34872/api/rojo"
+			Http._recordPermissionAnswer(url, false)
+			local pending = Promise.new(function() end)
+			local deadline = {}
+			local request = Http.timeout(pending, url, 0.1, "timed out", nil, { deadline = deadline })
+			request:catch(function() end)
+			task.wait(0.05)
+			-- Studio refused it; it is sent again after a 0.2-second cooldown.
+			deadline.restart(0.2)
+			task.wait(0.15)
+			expect(request:getStatus()).to.equal(Promise.Status.Started)
+			task.wait(0.4)
+			expect(request:getStatus()).to.equal(Promise.Status.Rejected)
+		end)
+
 		it("rejects a stalled request once the host's permission is answered", function()
 			local url = "http://answered-timeout.test:34872/api/rojo"
 			Http._recordPermissionAnswer(url, false)

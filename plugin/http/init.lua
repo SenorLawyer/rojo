@@ -14,6 +14,7 @@ local HttpError = require(script.Error)
 local HttpResponse = require(script.Response)
 local StreamRequest = require(script.StreamRequest)
 local StreamBudget = require(script.StreamBudget)
+local Throttle = require(script.Throttle)
 
 local lastRequestId = 0
 
@@ -53,6 +54,7 @@ local Http = {}
 Http.Error = HttpError
 Http.Response = HttpResponse
 Http.StreamBudget = StreamBudget
+Http.Throttle = Throttle
 
 -- Monkey patch msgpack.UInt64.new to lossily convert the low and high bits of the integer
 -- to a native Luau number. We should change the upstream decoder to emit a native
@@ -121,6 +123,10 @@ local transport = {
 		return HttpService:RequestAsync(requestParams)
 	end,
 	encodingAvailable = EncodingService ~= nil,
+	-- Every RequestAsync call takes a slot from here first, so Rojo never has
+	-- more requests in flight than Studio allows plugins. See StreamBudget.
+	budget = StreamBudget.shared,
+	throttle = Throttle.shared,
 }
 
 if not transport.encodingAvailable then
@@ -152,27 +158,72 @@ end
 
 local function requestWithRequestAsync(requestParams, requestId, onStarted)
 	local url = requestParams.Url
-	if onStarted then
-		-- RequestAsync is never queued behind other requests.
-		task.spawn(onStarted)
-	end
-	return Promise.new(function(resolve, reject)
+	return Promise.new(function(resolve, reject, onCancel)
+		local cancelled = false
+		onCancel(function()
+			cancelled = true
+		end)
 		-- Cancelling a promise closes its executor thread, so the request
 		-- runs on its own thread. That way a late answer is still recorded,
 		-- and the request still counts as outstanding, after the caller
 		-- cancels.
-		coroutine.wrap(function()
+		task.spawn(function()
+			-- RequestAsync takes one of the parallel requests Studio allows
+			-- plugins, so it waits for a slot instead of going past the limit,
+			-- where Studio refuses every plugin's requests.
+			local function isCancelled()
+				return cancelled
+			end
+			local deadline = os.clock() + Http.queueWaitLimit
+			local releaseSlot
+			while true do
+				releaseSlot = transport.budget:acquire(
+					StreamBudget.Priority.RequestAsync,
+					math.max(0, deadline - os.clock()),
+					isCancelled
+				)
+				if not releaseSlot or cancelled or transport.throttle:remaining() <= 0 then
+					break
+				end
+				-- Studio started throttling while this request waited for its
+				-- slot, so it waits out the cooldown without holding the slot.
+				releaseSlot()
+				releaseSlot = nil
+				transport.throttle:wait(isCancelled)
+			end
+			if not releaseSlot then
+				if not cancelled then
+					reject(HttpError.new(HttpError.Kind.Timeout))
+				end
+				return
+			end
+			if cancelled then
+				releaseSlot()
+				return
+			end
+			if onStarted then
+				task.spawn(onStarted)
+			end
 			local finishOutstanding = beginOutstandingRequest(url)
+			local sentAt = transport.throttle.clock()
 			local ok, response = pcall(transport.requestAsync, requestParams)
 			finishOutstanding()
+			releaseSlot()
 			recordPermissionAnswer(url, not ok and isPermissionDeniedError(response))
 			if not ok then
 				Log.trace("Request {} failure: {:?}", requestId, response)
-				reject(HttpError.fromRobloxErrorString(tostring(response)))
+				local err = HttpError.fromRobloxErrorString(tostring(response))
+				-- Recorded here, where a cancelled caller cannot skip it.
+				local _, started = transport.throttle:noteFailure(err)
+				if started then
+					Http.warnThrottled(transport.throttle)
+				end
+				reject(err)
 				return
 			end
+			transport.throttle:noteSuccess(sentAt)
 			resolve(response)
-		end)()
+		end)
 	end)
 end
 
@@ -299,7 +350,7 @@ function Http.readableErrorResponse(response)
 	return setmetatable(readable, getmetatable(response))
 end
 
-local function performRequest(requestParams, requestOptions)
+local function sendRequest(requestParams, requestOptions)
 	local requestId = lastRequestId + 1
 	lastRequestId = requestId
 
@@ -377,6 +428,65 @@ local function performRequest(requestParams, requestOptions)
 	end)
 end
 
+-- Logs that Studio started throttling. Stream and RequestAsync failures both
+-- report through here.
+function Http.warnThrottled(throttle)
+	Log.warn(
+		"Studio is limiting this place's HTTP requests (Number of requests exceeded limit). Rojo pauses its requests for {} seconds.",
+		math.ceil(throttle:remaining())
+	)
+end
+
+-- How many times a request Studio refused to send is sent in all.
+local MAX_THROTTLED_ATTEMPTS = 3
+
+--[[
+	Sends a request once Studio is no longer throttling HTTP. Sending while
+	it throttles only keeps it throttling, so requests wait out the cooldown
+	instead, which is at most Throttle.MAX_COOLDOWN seconds. A request Studio
+	refused was never sent, so it is sent again after the cooldown, a few
+	times at most. Waiting rather than failing keeps a throttle, whatever
+	caused it, from ending the sync session. Callers' own timeouts start
+	once the request is first sent.
+]]
+local function performRequest(requestParams, requestOptions)
+	local throttle = transport.throttle
+	local function attempt(number)
+		local pending
+		if throttle:remaining() <= 0 then
+			pending = sendRequest(requestParams, requestOptions)
+		else
+			Log.debug("Waiting {} seconds for Studio's HTTP throttling to pass", math.ceil(throttle:remaining()))
+			pending = Promise.new(function(resolve, _reject, onCancel)
+				local cancelled = false
+				onCancel(function()
+					cancelled = true
+				end)
+				throttle:wait(function()
+					return cancelled
+				end)
+				resolve()
+			end):andThen(function()
+				return sendRequest(requestParams, requestOptions)
+			end)
+		end
+		return pending:catch(function(err)
+			if number < MAX_THROTTLED_ATTEMPTS and Throttle.isThrottleError(err) then
+				-- The caller's deadline started with the refused attempt. Waiting
+				-- out the cooldown is not the server's fault, so the deadline
+				-- starts again once the request is sent again.
+				local onRetry = requestOptions and requestOptions.onRetry
+				if onRetry then
+					onRetry(throttle:remaining())
+				end
+				return attempt(number + 1)
+			end
+			return Promise.reject(err)
+		end)
+	end
+	return attempt(1)
+end
+
 export type RequestOptions = {
 	-- The caller's own deadline, in seconds. Local stream requests are not cut
 	-- off by inactivity before it passes, and wait up to Http.queueWaitLimit
@@ -388,6 +498,10 @@ export type RequestOptions = {
 	-- Sends the request with RequestAsync even to a local server, so it never
 	-- waits behind sync traffic or takes the sync slot.
 	requestAsync: boolean?,
+	-- Called with the seconds left in Studio's throttling cooldown when a
+	-- request Studio refused is about to be sent again after it. Pass on
+	-- the `restart` that Http.timeout puts in its `deadline` option.
+	onRetry: ((cooldown: number) -> ())?,
 }
 
 function Http.get(url, options: RequestOptions?)
@@ -458,6 +572,9 @@ export type TimeoutOptions = {
 	-- the sync slot is not counted against the server. `limit` still counts
 	-- from the call.
 	started: any?,
+	-- Given a `restart(delay)` function that starts the deadline again
+	-- `delay` seconds from now, for a request that is sent again.
+	deadline: { restart: ((delay: number) -> ())? }?,
 }
 
 --[[
@@ -527,6 +644,16 @@ function Http.timeout(
 		return Promise.delay(seconds):andThen(checkDeadline)
 	end
 
+	if options and options.deadline then
+		options.deadline.restart = function(delay)
+			-- A deadline that has not started yet starts on its own once the
+			-- request is sent. checkDeadline reads startedAt again when it runs.
+			if startedAt then
+				startedAt = os.clock() + math.max(0, delay)
+			end
+		end
+	end
+
 	local racers = {
 		if options and options.started then options.started:andThen(startDeadline) else startDeadline(),
 		request,
@@ -559,6 +686,11 @@ Http._beginOutstandingRequest = beginOutstandingRequest
 
 -- Lets tests replace the stream and RequestAsync transports.
 Http._transport = transport
+
+-- The Throttle every Rojo request in this plugin honors.
+function Http.throttle()
+	return transport.throttle
+end
 
 -- Lets tests start from an origin that has not been seen yet.
 function Http._forgetPlainOrigin(url: string)

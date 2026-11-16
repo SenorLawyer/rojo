@@ -60,6 +60,14 @@ function Error.fromRobloxErrorString(message)
 		return Error.new(Error.Kind.ConnectFailed)
 	end
 
+	if lower:find("number of requests exceeded limit", 1, true) or lower:find("too many requests", 1, true) then
+		-- Studio is throttling this place's HTTP requests. The message is kept
+		-- so the user sees why, and callers back off instead of retrying.
+		local err = Error.new(Error.Kind.Unknown, message)
+		err.throttled = true
+		return err
+	end
+
 	return Error.new(Error.Kind.Unknown, message)
 end
 

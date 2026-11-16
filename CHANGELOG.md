@@ -31,6 +31,17 @@ Making a new release? Simply add the new header with the version and date undern
 
 ## Unreleased
 
+## [8.2.1] (November 16th, 2026)
+
+* Fixed heavy agent use of the Studio bridge leaving Studio unable to reach `rojo serve` until it was restarted, with "Couldn't connect to the Rojo server" in the plugin and "Number of requests exceeded limit" for every HTTP request in the place. Studio lets plugins have five HTTP requests in flight between them and limits a place's requests per minute (2,000 to a local server in Edit mode, 500 in Run mode), and the plugin could go past both. ([fork#16])
+  * The bridge never falls back to `RequestAsync`, which slows every later request from the plugin until Studio restarts. Its requests, large export results included, go one at a time over its one stream; when that stream's slot is taken, a request waits up to 30 seconds for it.
+  * Every `RequestAsync` call, such as connection probes, now takes a slot from the same budget as the plugin's streams, so Rojo has at most four requests in flight, leaves one for other plugins and the command bar, and keeps one free for sync's own requests. A request with no free slot waits for one.
+  * Bridge requests are paced to 15 a second in Edit mode (bursts of 30) and 3 a second while the place runs (bursts of 6), however many agents send commands.
+  * When Studio refuses a request because of its limits, Rojo sends nothing, sync socket and queued requests included, for 5 seconds, doubling up to a minute each time Studio refuses again after a pause, instead of retrying at once. A refused sync request or sync socket is tried again after the pause, up to 3 times in all, and its timeout starts once it is sent and again when it is sent again, so the sync connection stays up. The bridge does not count throttled requests as failed attempts, registers again if its session expired meanwhile, and stops only after 3 minutes of throttling.
+
+[8.2.1]: https://github.com/SenorLawyer/rojo/releases/tag/v8.2.1
+[fork#16]: https://github.com/SenorLawyer/rojo/pull/16
+
 ## [8.2.0] (November 9th, 2026)
 
 * `rojo init` now creates a GitHub Actions workflow, `.github/workflows/rojo.yml`, that runs `rojo packages doctor` and `rojo typecheck` on every push and pull request with pinned releases of Rojo and luau-lsp. For places it also runs `rojo test --cloud` on pushes, skipped until the repository has the `ROBLOX_API_KEY` secret and the `TEST_UNIVERSE_ID` and `TEST_PLACE_ID` variables, so a new repository's checks pass without them. A project created inside an existing Git repository gets its workflow at the repository root instead, where GitHub reads workflows, as `.github/workflows/rojo-<project path>-<hash>.yml` with its jobs set to run in the project's folder. An existing workflow file is left alone, and `--no-ci` leaves the workflow out. ([fork#11])

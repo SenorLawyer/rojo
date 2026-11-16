@@ -15,6 +15,10 @@ local validateApiSocketPacket = Types.ifEnabled(Types.ApiSocketPacket)
 local validateApiSerialize = Types.ifEnabled(Types.ApiSerializeResponse)
 local validateApiRefPatch = Types.ifEnabled(Types.ApiRefPatchResponse)
 
+-- How many times creating the sync socket is tried in all while Studio
+-- refuses it because of its HTTP limits.
+local MAX_SOCKET_ATTEMPTS = 3
+
 -- Declared before the functions below so their messages can use these
 -- helpers, which are kept on the module so specs can check the wording.
 local ApiContext = {}
@@ -213,23 +217,31 @@ function ApiContext:__request(
 	local started = os.clock()
 	local requestOptions
 	local sent
+	local deadline = {}
 	if options then
 		local markSent
-		if Http.usesEncodedStreams(url) and not options.requestAsync then
-			-- Stream requests share one sync slot, so a write can wait behind
-			-- a slow serialize. The timeout starts once the request is sent, so
-			-- that wait is not blamed on the server; the transport bounds the
-			-- wait itself. RequestAsync is never queued, so it starts at once.
-			sent = Promise.new(function(resolve)
-				markSent = resolve
-			end)
-		end
+		-- Every request can wait before it is sent: stream requests share one
+		-- sync slot, so a write can wait behind a slow serialize, RequestAsync
+		-- waits for a slot in the plugin's request budget, and all requests
+		-- wait out Studio's HTTP throttling. The timeout starts once the
+		-- request is sent, so that wait is not blamed on the server; the
+		-- transport bounds the wait itself.
+		sent = Promise.new(function(resolve)
+			markSent = resolve
+		end)
 		-- The transport needs the deadline too, or its own shorter limits would
 		-- end slow requests such as the initial read before this timeout does.
 		requestOptions = {
 			timeout = options.timeout,
 			onStarted = markSent,
 			requestAsync = options.requestAsync,
+			-- A request Studio refused is sent again after the throttling
+			-- cooldown, and its timeout starts again with it.
+			onRetry = function(cooldown)
+				if deadline.restart then
+					deadline.restart(cooldown)
+				end
+			end,
 		}
 	end
 	local request = if method == "get" then Http.get(url, requestOptions) else Http.post(url, body, requestOptions)
@@ -238,6 +250,7 @@ function ApiContext:__request(
 			permissionRejectionValue = options.permissionTimeoutMessage,
 			limit = options.limit,
 			started = sent,
+			deadline = deadline,
 		})
 	end
 	self.__activeRequests[request] = true
@@ -412,10 +425,43 @@ function ApiContext:connectWebSocket(packetHandlers, onOpened)
 		-- on a thread of its own means a client that arrives after the request
 		-- was cancelled is still closed and gives its slot back.
 		task.spawn(function()
-			local success, wsClient = pcall(self.__createWebSocket, self, url)
+			-- Opening the socket while Studio throttles HTTP would only keep it
+			-- throttling, so it waits out the cooldown first.
+			local throttle = Http.throttle()
+			throttle:wait(function()
+				return cancelled
+			end)
+			if cancelled then
+				releaseSlot()
+				return
+			end
+			-- Studio refusing the socket was never a connection, so it is
+			-- tried again after the cooldown, as refused HTTP requests are.
+			local success, wsClient
+			for attempt = 1, MAX_SOCKET_ATTEMPTS do
+				success, wsClient = pcall(self.__createWebSocket, self, url)
+				if success then
+					break
+				end
+				local throttled, started = throttle:noteFailure(wsClient)
+				if started then
+					Http.warnThrottled(throttle)
+				end
+				if not throttled or attempt == MAX_SOCKET_ATTEMPTS then
+					break
+				end
+				throttle:wait(function()
+					return cancelled
+				end)
+				if cancelled then
+					break
+				end
+			end
 			if not success then
 				releaseSlot()
-				reject("Failed to create WebSocket client: " .. tostring(wsClient))
+				if not cancelled then
+					reject("Failed to create WebSocket client: " .. tostring(wsClient))
+				end
 				return
 			end
 			if cancelled then
@@ -550,6 +596,10 @@ function ApiContext:connectWebSocket(packetHandlers, onOpened)
 			table.insert(
 				connections,
 				wsClient.Error:Connect(function(code, msg)
+					local _, started = throttle:noteFailure(msg)
+					if started then
+						Http.warnThrottled(throttle)
+					end
 					cleanup()
 					reject(formatWebSocketError(code, msg))
 				end)
