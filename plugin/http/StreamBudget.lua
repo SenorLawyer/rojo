@@ -17,7 +17,9 @@
 	- In total: at most four, so one of Studio's five stays free for other
 	  plugins and the command bar. RequestAsync, which takes no stream client
 	  but does take one of the five, may use what the streams leave of the
-	  four.
+	  four, except a slot for the shared request stream: RequestAsync cannot
+	  be cancelled, so stalled probes could otherwise keep sync's own
+	  requests waiting.
 
 	Nothing may take a slot held back for the socket or the bridge while that
 	one is not using it.
@@ -53,6 +55,7 @@ function StreamBudget.new(limit: number?, socketReserve: number?, bridgeReserve:
 		live = 0,
 		liveSockets = 0,
 		liveBridges = 0,
+		liveRequests = 0,
 		liveRequestAsync = 0,
 		waiters = {},
 	}, StreamBudget)
@@ -68,6 +71,7 @@ function StreamBudget:tryAcquire(priority: string): (() -> ())?
 	local isSocket = priority == StreamBudget.Priority.Socket
 	local isBridge = priority == StreamBudget.Priority.Bridge
 	local isRequestAsync = priority == StreamBudget.Priority.RequestAsync
+	local isRequest = priority == StreamBudget.Priority.Request
 	-- A request may not use slots held back for the other kinds that they
 	-- are not using yet.
 	local heldBack = 0
@@ -79,6 +83,11 @@ function StreamBudget:tryAcquire(priority: string): (() -> ())?
 	end
 	if self.live + self.liveRequestAsync + heldBack >= self.totalLimit then
 		return nil
+	end
+	if isRequestAsync and self.liveRequests == 0 then
+		if self.live + self.liveRequestAsync + heldBack + 1 >= self.totalLimit then
+			return nil
+		end
 	end
 	if not isRequestAsync and self.live + heldBack >= self.limit then
 		return nil
@@ -93,6 +102,8 @@ function StreamBudget:tryAcquire(priority: string): (() -> ())?
 		self.liveSockets += 1
 	elseif isBridge then
 		self.liveBridges += 1
+	elseif isRequest then
+		self.liveRequests += 1
 	end
 	local released = false
 	return function()
@@ -109,6 +120,8 @@ function StreamBudget:tryAcquire(priority: string): (() -> ())?
 			self.liveSockets -= 1
 		elseif isBridge then
 			self.liveBridges -= 1
+		elseif isRequest then
+			self.liveRequests -= 1
 		end
 		-- Waiters try again on their own threads, oldest first.
 		local waiters = self.waiters

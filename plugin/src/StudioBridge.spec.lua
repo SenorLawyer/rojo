@@ -19,10 +19,10 @@ return function()
 	beforeEach(function()
 		-- Specs send many requests quickly and must not share the plugin's
 		-- throttling state.
-		previousPacer = { StudioBridge.pacer, StudioBridge.validatePacer }
+		previousPacer = { StudioBridge.pacer, StudioBridge.runModePacer }
 		previousThrottle = StudioBridge.throttle
 		StudioBridge.pacer = Throttle.Pacer.new(math.huge, math.huge)
-		StudioBridge.validatePacer = Throttle.Pacer.new(math.huge, math.huge)
+		StudioBridge.runModePacer = Throttle.Pacer.new(math.huge, math.huge)
 		StudioBridge.throttle = Throttle.new()
 		fixture = Instance.new("Folder")
 		fixture.Name = "__RojoBridgeSpec"
@@ -41,7 +41,7 @@ return function()
 			bridge:stop()
 		end
 		fixture:Destroy()
-		StudioBridge.pacer, StudioBridge.validatePacer = previousPacer[1], previousPacer[2]
+		StudioBridge.pacer, StudioBridge.runModePacer = previousPacer[1], previousPacer[2]
 		StudioBridge.throttle = previousThrottle
 	end)
 
@@ -455,6 +455,8 @@ return function()
 			local release = budget:tryAcquire(StreamBudget.Priority.Socket)
 			local create, created = fakeClient(function() end)
 			StudioBridge.bridgeStream = StreamRequest.new(create, budget, StreamBudget.Priority.Bridge)
+			local previousWait = StudioBridge.slotWaitSeconds
+			StudioBridge.slotWaitSeconds = 0
 			-- RequestAsync for requests the server holds open slows the whole
 			-- plugin down until Studio restarts, so the request fails instead
 			-- and is retried later.
@@ -463,6 +465,7 @@ return function()
 				Method = "POST",
 				Body = "{}",
 			})
+			StudioBridge.slotWaitSeconds = previousWait
 			release()
 			expect(StudioBridge.fallbackRequestAsync).to.equal(nil)
 			expect(#created).to.equal(0)
@@ -472,7 +475,7 @@ return function()
 			expect(budget:liveRequestAsyncCount()).to.equal(0)
 		end)
 
-		it("gives its stream slot back on success, error, timeout and cancel", function()
+		it("gives its stream slot back on success, error, error status and cancel", function()
 			local budget = StreamBudget.new()
 			local outcomes = { "success", "error", "status" }
 			local sent = 0
@@ -576,10 +579,11 @@ return function()
 		expect(sent).to.equal(0)
 	end)
 
-	it("paces validate requests on their own pacer", function()
+	it("paces bridge requests", function()
 		bridge.request = StudioBridge.request
 		local clock = { now = 0 }
-		StudioBridge.validatePacer = Throttle.Pacer.new(1, 2, function()
+		-- Specs run in Edit mode.
+		StudioBridge.pacer = Throttle.Pacer.new(1, 2, function()
 			return clock.now
 		end)
 		local sent = 0

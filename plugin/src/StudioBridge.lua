@@ -45,17 +45,17 @@ local MAX_REQUEST_ATTEMPTS = 3
 -- counted as attempts, for up to this long in a row (seconds). Then the bridge
 -- stops; sync is not affected.
 local MAX_THROTTLED_SECONDS = 180
--- The bridge's sustained request rate and burst. Each agent command takes a
--- poll and a result. Studio allows a place 500 requests a minute in Run mode
--- (more in Edit mode), shared with Rojo's sync, other plugins and the game's
--- own scripts, so the bridge stays far below that however many agents use it.
-local BRIDGE_REQUESTS_PER_SECOND = 4
-local BRIDGE_REQUEST_BURST = 12
--- `validate` asks whether a command is still wanted, once per write of a
--- verify fix or import and every few seconds in Run mode. Those are small and
--- a command is waiting on them, so they have their own, faster pacer.
-local VALIDATE_REQUESTS_PER_SECOND = 10
-local VALIDATE_REQUEST_BURST = 20
+-- The bridge's sustained request rate and burst, for every request it sends.
+-- Each agent command takes a poll and a result, and verify fixes and imports
+-- a `validate` before each write. Studio allows a place 2,000 requests a
+-- minute to a local server in Edit mode but 500 in Run mode, shared with
+-- Rojo's sync, other plugins and the game's own scripts, so the bridge keeps
+-- to under half of the first and well under the second however many agents
+-- use it.
+local EDIT_REQUESTS_PER_SECOND = 15
+local EDIT_REQUEST_BURST = 30
+local RUN_REQUESTS_PER_SECOND = 3
+local RUN_REQUEST_BURST = 6
 -- IDs are held strongly so Roblox cannot collect an Instance proxy while the
 -- instance still exists. The oldest IDs are forgotten beyond this bound.
 local MAX_TRACKED_INSTANCES = 20_000
@@ -71,9 +71,15 @@ StudioBridge.__index = StudioBridge
 -- Replaced by tests.
 StudioBridge.bridgeStream = StreamRequest.new(nil, nil, StreamBudget.Priority.Bridge)
 
--- Paces bridge requests. Replaced by tests.
-StudioBridge.pacer = Throttle.Pacer.new(BRIDGE_REQUESTS_PER_SECOND, BRIDGE_REQUEST_BURST)
-StudioBridge.validatePacer = Throttle.Pacer.new(VALIDATE_REQUESTS_PER_SECOND, VALIDATE_REQUEST_BURST)
+-- Pace bridge requests in Edit mode and while Studio runs the place.
+-- Replaced by tests.
+StudioBridge.pacer = Throttle.Pacer.new(EDIT_REQUESTS_PER_SECOND, EDIT_REQUEST_BURST)
+StudioBridge.runModePacer = Throttle.Pacer.new(RUN_REQUESTS_PER_SECOND, RUN_REQUEST_BURST)
+
+-- How long a request waits for the bridge's stream slot when the budget has
+-- none free, which needs another bridge in this plugin to hold it (seconds).
+-- Replaced by tests.
+StudioBridge.slotWaitSeconds = 30
 
 -- Studio's HTTP throttling, shared with the rest of the plugin. Replaced by
 -- tests.
@@ -89,7 +95,8 @@ StudioBridge.throttle = Throttle.shared
 	makes, fell behind until Studio was restarted. Streams are not affected
 	and can be closed when the bridge stops. The bodies are JSON, which never
 	contains the NUL bytes a raw stream cuts at. When no stream slot is free
-	the request fails like any transport error, and is retried after a delay.
+	the request waits for one, for up to 30 seconds, and then fails like any
+	transport error.
 
 	A failure that is Studio throttling HTTP starts a cooldown, which
 	StudioBridge:request waits out before sending again.
@@ -98,34 +105,45 @@ StudioBridge.throttle = Throttle.shared
 	gives up.
 ]]
 function StudioBridge.requestAsync(options, onCancel)
-	local pending = StudioBridge.bridgeStream(options, {
-		timeout = REQUEST_TIMEOUT,
-		queueTimeout = REQUEST_TIMEOUT,
-		maxBytes = MAX_STREAM_BYTES,
-	})
+	local cancelled = false
+	local pending
 	if onCancel then
 		onCancel(function()
-			pending:cancel()
+			cancelled = true
+			if pending then
+				pending:cancel()
+			end
 		end)
 	end
-	local ok, response = pending:await()
-	if not ok then
-		if StudioBridge.throttle:noteFailure(response) then
-			Log.warn(
-				"Studio is limiting this place's HTTP requests. The Rojo Studio bridge pauses for {} seconds; sync is not affected.",
-				math.ceil(StudioBridge.throttle:remaining())
-			)
+	local deadline = os.clock() + StudioBridge.slotWaitSeconds
+	while true do
+		pending = StudioBridge.bridgeStream(options, {
+			timeout = REQUEST_TIMEOUT,
+			queueTimeout = REQUEST_TIMEOUT,
+			maxBytes = MAX_STREAM_BYTES,
+		})
+		local ok, response = pending:await()
+		if not ok then
+			if StudioBridge.throttle:noteFailure(response) then
+				Log.warn(
+					"Studio is limiting this place's HTTP requests. The Rojo Studio bridge pauses for {} seconds; sync is not affected.",
+					math.ceil(StudioBridge.throttle:remaining())
+				)
+			end
+			error(response, 0)
 		end
-		error(response, 0)
-	end
-	if response == StreamRequest.BudgetExhausted then
+		if response ~= StreamRequest.BudgetExhausted then
+			StudioBridge.throttle:noteSuccess()
+			return response
+		end
 		-- Only another bridge in this plugin holding the bridge's slot gets
 		-- here. Sending it with RequestAsync instead is what used to slow the
-		-- whole plugin down, so it fails and is retried later.
-		error("No HTTP stream is free for the Studio bridge", 0)
+		-- whole plugin down, so it waits for the slot.
+		if cancelled or os.clock() >= deadline then
+			error("No HTTP stream is free for the Studio bridge", 0)
+		end
+		task.wait(1)
 	end
-	StudioBridge.throttle:noteSuccess()
-	return response
 end
 
 -- How the test runner's insert and removal are kept in undo history. See
@@ -549,10 +567,14 @@ function StudioBridge:request(route, value, failure)
 		local function isStopped()
 			return self.stopped == true
 		end
-		local pacer = if route == "validate" then StudioBridge.validatePacer else StudioBridge.pacer
-		if not StudioBridge.throttle:wait(isStopped) or not pacer:take(isStopped) then
-			return Promise.reject("Studio bridge stopped")
-		end
+		-- A cooldown can start while the request waits for the pacer, so both
+		-- are checked again until neither holds it back.
+		repeat
+			local pacer = if RunService:IsRunning() then StudioBridge.runModePacer else StudioBridge.pacer
+			if not StudioBridge.throttle:wait(isStopped) or not pacer:take(isStopped) then
+				return Promise.reject("Studio bridge stopped")
+			end
+		until StudioBridge.throttle:remaining() <= 0
 	end
 	value.identity = self.pairing.identity
 	value.sessionId = self.sessionId
@@ -1247,12 +1269,28 @@ function StudioBridge:start()
 						end
 						break
 					end
-					local delivered, attempts = self:__requestWithRetry("result", {
+					local resultFailure = {}
+					local sent, delivered, attempts = pcall(self.__requestWithRetry, self, "result", {
 						requestId = command.requestId,
 						result = if success
 							then { ok = true, value = value }
 							else { ok = false, error = tostring(value) },
-					})
+					}, resultFailure)
+					if not sent then
+						-- A session that expired while Studio throttled HTTP comes
+						-- back as after Run mode. Its pending commands went with it,
+						-- so the result is dropped.
+						if self.throttled and resultFailure.status == 404 and not self.stopped then
+							self.throttled = false
+							Log.warn(
+								"Rojo Studio bridge session expired while it could not send a result; registering it again"
+							)
+							self:__requestWithRetry("register", { description = description })
+							-- The rest of this poll's commands went with the session.
+							break
+						end
+						error(delivered, 0)
+					end
 					if success and command.action == "import" and delivered.discarded then
 						if attempts > 1 then
 							-- An earlier attempt may have reached the server, which

@@ -21,8 +21,8 @@ Throttle.__index = Throttle
 Throttle.MIN_COOLDOWN = 5
 Throttle.MAX_COOLDOWN = 60
 
--- Studio's wording for its HTTP limits. "too many requests" also covers a
--- 429 from a proxy in front of the server.
+-- Studio's wording when it refuses to send a request because of its HTTP
+-- limits.
 local THROTTLE_PATTERNS = {
 	"number of requests exceeded limit",
 	"too many requests",
@@ -56,18 +56,19 @@ function Throttle:remaining(): number
 end
 
 --[[
-	Records a failure. Returns true when it was Studio throttling HTTP. A
-	throttled failure after the cooldown ended starts a new one, twice as
-	long as the last unless a request got through since. Failures of
-	requests that were already in flight when a cooldown started do not
-	lengthen it, since they say nothing new.
+	Records a failure. Returns true when it was Studio throttling HTTP, and
+	as a second value whether that started a new cooldown. A throttled
+	failure after the cooldown ended starts a new one, twice as long as the
+	last unless a request got through since. Failures of requests that were
+	already in flight when a cooldown started do not lengthen it, since they
+	say nothing new.
 ]]
-function Throttle:noteFailure(err): boolean
+function Throttle:noteFailure(err): (boolean, boolean)
 	if not Throttle.isThrottleError(err) then
-		return false
+		return false, false
 	end
 	if self:remaining() > 0 then
-		return true
+		return true, false
 	end
 	if self.cooldown == 0 then
 		self.cooldown = Throttle.MIN_COOLDOWN
@@ -75,7 +76,7 @@ function Throttle:noteFailure(err): boolean
 		self.cooldown = math.min(self.cooldown * 2, Throttle.MAX_COOLDOWN)
 	end
 	self.cooldownUntil = self.clock() + self.cooldown
-	return true
+	return true, true
 end
 
 -- A request got through, so the next throttling starts from the shortest

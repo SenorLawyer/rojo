@@ -211,9 +211,16 @@ local function requestWithRequestAsync(requestParams, requestId, onStarted)
 			recordPermissionAnswer(url, not ok and isPermissionDeniedError(response))
 			if not ok then
 				Log.trace("Request {} failure: {:?}", requestId, response)
-				reject(HttpError.fromRobloxErrorString(tostring(response)))
+				local err = HttpError.fromRobloxErrorString(tostring(response))
+				-- Recorded here, where a cancelled caller cannot skip it.
+				local _, started = transport.throttle:noteFailure(err)
+				if started then
+					Http.warnThrottled(transport.throttle)
+				end
+				reject(err)
 				return
 			end
+			transport.throttle:noteSuccess()
 			resolve(response)
 		end)
 	end)
@@ -355,7 +362,6 @@ local function sendRequest(requestParams, requestOptions)
 	local url = requestParams.Url
 	local origin = originOf(url)
 	local onStarted = requestOptions and requestOptions.onStarted
-	local throttle = transport.throttle
 	local pending
 	if Http.usesEncodedStreams(url) and not (requestOptions and requestOptions.requestAsync) then
 		pending = requestWithEncodedStream(requestParams, requestOptions):andThen(function(response)
@@ -412,18 +418,6 @@ local function sendRequest(requestParams, requestOptions)
 		-- streams are read in full this way.
 		pending = requestWithRequestAsync(requestParams, requestId, onStarted)
 	end
-	pending = pending:andThen(function(response)
-		throttle:noteSuccess()
-		return response
-	end, function(err)
-		if throttle:noteFailure(err) then
-			Log.warn(
-				"Studio is limiting this place's HTTP requests. Rojo pauses its requests for {} seconds.",
-				math.ceil(throttle:remaining())
-			)
-		end
-		return Promise.reject(err)
-	end)
 	return pending:andThen(function(response)
 		local httpResponse = HttpResponse.fromRobloxResponse(response)
 		if httpResponse:isSuccess() then
@@ -433,31 +427,56 @@ local function sendRequest(requestParams, requestOptions)
 	end)
 end
 
+-- Logs that Studio started throttling. Stream and RequestAsync failures both
+-- report through here.
+function Http.warnThrottled(throttle)
+	Log.warn(
+		"Studio is limiting this place's HTTP requests (Number of requests exceeded limit). Rojo pauses its requests for {} seconds.",
+		math.ceil(throttle:remaining())
+	)
+end
+
+-- How many times a request Studio refused to send is sent in all.
+local MAX_THROTTLED_ATTEMPTS = 3
+
 --[[
 	Sends a request once Studio is no longer throttling HTTP. Sending while
 	it throttles only keeps it throttling, so requests wait out the cooldown
-	instead, which is at most Throttle.MAX_COOLDOWN seconds. Waiting rather
-	than failing keeps a throttle, whatever caused it, from ending the sync
-	session. Callers' own timeouts start once the request is sent.
+	instead, which is at most Throttle.MAX_COOLDOWN seconds. A request Studio
+	refused was never sent, so it is sent again after the cooldown, a few
+	times at most. Waiting rather than failing keeps a throttle, whatever
+	caused it, from ending the sync session. Callers' own timeouts start
+	once the request is first sent.
 ]]
 local function performRequest(requestParams, requestOptions)
 	local throttle = transport.throttle
-	if throttle:remaining() <= 0 then
-		return sendRequest(requestParams, requestOptions)
+	local function attempt(number)
+		local pending
+		if throttle:remaining() <= 0 then
+			pending = sendRequest(requestParams, requestOptions)
+		else
+			Log.debug("Waiting {} seconds for Studio's HTTP throttling to pass", math.ceil(throttle:remaining()))
+			pending = Promise.new(function(resolve, _reject, onCancel)
+				local cancelled = false
+				onCancel(function()
+					cancelled = true
+				end)
+				throttle:wait(function()
+					return cancelled
+				end)
+				resolve()
+			end):andThen(function()
+				return sendRequest(requestParams, requestOptions)
+			end)
+		end
+		return pending:catch(function(err)
+			if number < MAX_THROTTLED_ATTEMPTS and Throttle.isThrottleError(err) then
+				return attempt(number + 1)
+			end
+			return Promise.reject(err)
+		end)
 	end
-	Log.debug("Waiting {} seconds for Studio's HTTP throttling to pass", math.ceil(throttle:remaining()))
-	return Promise.new(function(resolve, _reject, onCancel)
-		local cancelled = false
-		onCancel(function()
-			cancelled = true
-		end)
-		throttle:wait(function()
-			return cancelled
-		end)
-		resolve()
-	end):andThen(function()
-		return sendRequest(requestParams, requestOptions)
-	end)
+	return attempt(1)
 end
 
 export type RequestOptions = {
@@ -642,6 +661,11 @@ Http._beginOutstandingRequest = beginOutstandingRequest
 
 -- Lets tests replace the stream and RequestAsync transports.
 Http._transport = transport
+
+-- The Throttle every Rojo request in this plugin honors.
+function Http.throttle()
+	return transport.throttle
+end
 
 -- Lets tests start from an origin that has not been seen yet.
 function Http._forgetPlainOrigin(url: string)

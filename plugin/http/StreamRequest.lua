@@ -64,14 +64,19 @@ StreamRequest.BudgetExhausted = setmetatable({}, {
 
 --[[
 	`budget` is the StreamBudget every client must take a slot from before it
-	is created. Studio's own clients default to the budget shared by the whole
-	plugin. A custom `createClient` does not create Studio clients, so it gets
-	a budget of its own unless one is passed.
+	is created, and `throttle` the Throttle that records Studio refusing
+	requests; no client is created while its cooldown runs. Studio's own
+	clients default to the ones shared by the whole plugin. A custom
+	`createClient` does not create Studio clients, so it gets its own unless
+	they are passed.
 ]]
-function StreamRequest.new(createClient, budget, priority)
+function StreamRequest.new(createClient, budget, priority, throttle)
 	priority = priority or StreamBudget.Priority.Request
 	if budget == nil then
 		budget = if createClient then StreamBudget.new() else StreamBudget.shared
+	end
+	if throttle == nil then
+		throttle = if createClient then Throttle.new() else Throttle.shared
 	end
 	createClient = createClient
 		or function(options)
@@ -140,6 +145,13 @@ function StreamRequest.new(createClient, budget, priority)
 		if not job.creating then
 			releaseBudget(job)
 		end
+		-- Recorded here, not by the caller, so a refusal still starts the
+		-- cooldown when the caller has already given up on the request.
+		if err then
+			throttle:noteFailure(err)
+		elseif response then
+			throttle:noteSuccess()
+		end
 		if err then
 			job.reject(err)
 		elseif response then
@@ -178,6 +190,14 @@ function StreamRequest.new(createClient, budget, priority)
 			job = table.remove(queue, 1)
 		end
 		if not job then
+			return
+		end
+		local cooldown = throttle:remaining()
+		if cooldown > 0 then
+			-- Studio is refusing requests, and sending more only keeps it
+			-- refusing them, so the job waits at the front of the queue.
+			table.insert(queue, 1, job)
+			task.delay(cooldown, pump)
 			return
 		end
 		local releaseSlot = budget:tryAcquire(priority)
@@ -371,9 +391,17 @@ function StreamRequest.new(createClient, budget, priority)
 			onCancel(function()
 				finish(job)
 			end)
-			job.queueTimer = task.delay(config.queueTimeout or DEFAULT_QUEUE_TIMEOUT, function()
+			local queueTimeout = config.queueTimeout or DEFAULT_QUEUE_TIMEOUT
+			local function onQueueTimeout()
 				job.queueTimer = nil
 				if active == job then
+					return
+				end
+				local cooldown = throttle:remaining()
+				if cooldown > 0 then
+					-- Waiting out Studio's throttling is not a slow queue, so the
+					-- wait is extended past the cooldown.
+					job.queueTimer = task.delay(cooldown + 1, onQueueTimeout)
 					return
 				end
 				local method = string.upper(options and options.Method or "GET")
@@ -388,7 +416,8 @@ function StreamRequest.new(createClient, budget, priority)
 				else
 					finish(job, nil, timeoutError("Waited too long for an HTTP stream slot."))
 				end
-			end)
+			end
+			job.queueTimer = task.delay(queueTimeout, onQueueTimeout)
 			-- Each transport runs one request at a time, and every client it
 			-- creates also takes a slot from the plugin's stream budget.
 			table.insert(queue, job)

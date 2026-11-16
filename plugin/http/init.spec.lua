@@ -385,7 +385,7 @@ return function()
 			"waits for a RequestAsync slot instead of going past Rojo's limit, and frees it when the request fails",
 			function()
 				local url = "http://localhost:47014/api/rojo"
-				local budget = Http.StreamBudget.new(1, 0, 0, 1)
+				local budget = Http.StreamBudget.new(1, 0, 0, 2)
 				Http._transport.budget = budget
 				local held = budget:tryAcquire(Http.StreamBudget.Priority.RequestAsync)
 				local sent = 0
@@ -425,15 +425,46 @@ return function()
 			expect(#plainRequests).to.equal(0)
 			pending:cancel()
 
-			local fresh = Http.Throttle.new()
+			-- Each reading of this clock is far past the last, so every
+			-- cooldown has passed by the time it is checked.
+			local now = 0
+			local fresh = Http.Throttle.new(function()
+				now += 1000
+				return now
+			end)
 			Http._transport.throttle = fresh
+			local attempts = 0
 			Http._transport.requestAsync = function()
+				attempts += 1
 				error("Number of requests exceeded limit")
 			end
 			local ok, err = Http.get(url, { requestAsync = true }):await()
 			expect(ok).to.equal(false)
 			expect(err.throttled).to.equal(true)
-			expect(fresh:remaining() > 0).to.equal(true)
+			-- Studio never sent it, so it was sent again, a bounded number of
+			-- times, and each refusal started a cooldown.
+			expect(attempts).to.equal(3)
+			expect(fresh.cooldown).to.equal(Http.Throttle.MIN_COOLDOWN * 4)
+		end)
+
+		it("sends a request Studio refused again once the cooldown passes", function()
+			local url = "http://localhost:47016/api/write"
+			local now = 0
+			Http._transport.throttle = Http.Throttle.new(function()
+				now += 1000
+				return now
+			end)
+			local attempts = 0
+			Http._transport.requestAsync = function()
+				attempts += 1
+				if attempts == 1 then
+					error("Number of requests exceeded limit")
+				end
+				return { StatusCode = 200, Success = true, Headers = {}, Body = "written" }
+			end
+			local response = Http.post(url, "change", { requestAsync = true }):expect()
+			expect(response.body).to.equal("written")
+			expect(attempts).to.equal(2)
 		end)
 
 		it("sends a request with RequestAsync when no stream client is free", function()

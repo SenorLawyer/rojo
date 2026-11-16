@@ -412,8 +412,22 @@ function ApiContext:connectWebSocket(packetHandlers, onOpened)
 		-- on a thread of its own means a client that arrives after the request
 		-- was cancelled is still closed and gives its slot back.
 		task.spawn(function()
+			-- Opening the socket while Studio throttles HTTP would only keep it
+			-- throttling, so it waits out the cooldown first.
+			local throttle = Http.throttle()
+			throttle:wait(function()
+				return cancelled
+			end)
+			if cancelled then
+				releaseSlot()
+				return
+			end
 			local success, wsClient = pcall(self.__createWebSocket, self, url)
 			if not success then
+				local _, started = throttle:noteFailure(wsClient)
+				if started then
+					Http.warnThrottled(throttle)
+				end
 				releaseSlot()
 				reject("Failed to create WebSocket client: " .. tostring(wsClient))
 				return

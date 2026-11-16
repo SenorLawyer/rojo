@@ -282,9 +282,12 @@ return function()
 			Http._recordPermissionAnswer(baseUrl, false)
 			local context = ApiContext.new(baseUrl)
 			context.__handshakeTimeout = 0.05
-			local request = context:connect()
+			-- A handshake sent with RequestAsync, as probes are, without the
+			-- probes' overall limit.
+			local request = context:__handshake(nil, nil, true)
 			request:catch(function() end)
 			task.wait(0.15)
+			expect(seenOptions.requestAsync).to.equal(true)
 			expect(request:getStatus()).to.equal(Promise.Status.Started)
 			seenOptions.onStarted()
 			task.wait(0.15)

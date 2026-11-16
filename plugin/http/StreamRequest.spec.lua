@@ -713,6 +713,57 @@ return function()
 		end)
 	end)
 
+	describe("Studio's HTTP throttling", function()
+		local Throttle = require(script.Parent.Throttle)
+
+		local function throttledRequest(throttle)
+			local created = {}
+			local send = StreamRequest.new(function(options)
+				local client = { options = options, events = {} }
+				for _, name in { "Opened", "MessageReceived", "Error", "Closed" } do
+					client.events[name] = Instance.new("BindableEvent")
+					client[name] = client.events[name].Event
+				end
+				function client:Close() end
+				table.insert(created, client)
+				return client
+			end, nil, nil, throttle)
+			return send, created
+		end
+
+		it("creates no client while a cooldown runs, and sends once it ends", function()
+			local throttle = Throttle.new()
+			throttle.cooldownUntil = os.clock() + 0.2
+			local send, created = throttledRequest(throttle)
+			local pending = send({ Url = "held" })
+			task.wait()
+			expect(#created).to.equal(0)
+			for _ = 1, 20 do
+				if #created > 0 then
+					break
+				end
+				task.wait(0.05)
+			end
+			expect(#created).to.equal(1)
+			created[1].events.Opened:Fire(200, "")
+			created[1].events.Closed:Fire()
+			expect(pending:expect().StatusCode).to.equal(200)
+		end)
+
+		it("starts the cooldown when Studio refuses a request", function()
+			local throttle = Throttle.new()
+			local send, created = throttledRequest(throttle)
+			local pending = send({ Url = "refused" })
+			task.wait()
+			expect(#created).to.equal(1)
+			created[1].events.Error:Fire(0, "Number of requests exceeded limit")
+			local ok, err = pending:await()
+			expect(ok).to.equal(false)
+			expect(err.throttled).to.equal(true)
+			expect(throttle:remaining() > 0).to.equal(true)
+		end)
+	end)
+
 	describe("StreamBudget", function()
 		local StreamBudget = require(script.Parent.StreamBudget)
 
@@ -777,25 +828,24 @@ return function()
 		it("counts RequestAsync against the total without taking the socket's or bridge's slot", function()
 			local budget = StreamBudget.new()
 			expect(budget.totalLimit).to.equal(4)
-			-- Nothing open yet: two slots are held back, so two RequestAsync
-			-- calls may run.
+			-- Nothing open yet: the socket's and bridge's slots are held back,
+			-- and so is one for the shared request stream, so one RequestAsync
+			-- call may run.
 			local first = budget:tryAcquire(StreamBudget.Priority.RequestAsync)
-			local second = budget:tryAcquire(StreamBudget.Priority.RequestAsync)
 			expect(first).to.be.ok()
-			expect(second).to.be.ok()
 			expect(budget:tryAcquire(StreamBudget.Priority.RequestAsync)).to.equal(nil)
-			expect(budget:tryAcquire(StreamBudget.Priority.Request)).to.equal(nil)
-			expect(budget:liveRequestAsyncCount()).to.equal(2)
+			expect(budget:liveRequestAsyncCount()).to.equal(1)
 			expect(budget:liveCount()).to.equal(0)
-			-- The socket and the bridge still get their slots.
+			-- The socket, the bridge and the request stream still get theirs.
 			local releaseSocket = budget:tryAcquire(StreamBudget.Priority.Socket)
 			local releaseBridge = budget:tryAcquire(StreamBudget.Priority.Bridge)
 			expect(releaseSocket).to.be.ok()
 			expect(releaseBridge).to.be.ok()
-			expect(budget:tryAcquire(StreamBudget.Priority.Request)).to.equal(nil)
+			local stream = budget:tryAcquire(StreamBudget.Priority.Request)
+			expect(stream).to.be.ok()
+			stream()
 			first()
 			first()
-			second()
 			-- With every stream open, one RequestAsync call is left.
 			local releaseRequest = budget:tryAcquire(StreamBudget.Priority.Request)
 			expect(releaseRequest).to.be.ok()
@@ -815,7 +865,7 @@ return function()
 		end)
 
 		it("waits for a released slot, and gives up after its timeout or once cancelled", function()
-			local budget = StreamBudget.new(1, 0, 0, 1)
+			local budget = StreamBudget.new(1, 0, 0, 2)
 			local held = budget:tryAcquire(StreamBudget.Priority.RequestAsync)
 			expect(held).to.be.ok()
 
