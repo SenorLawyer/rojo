@@ -34,6 +34,8 @@ return function()
 		local encoding = game:GetService("EncodingService")
 		local originalStream = Http._transport.stream
 		local originalRequestAsync = Http._transport.requestAsync
+		local originalBudget = Http._transport.budget
+		local originalThrottle = Http._transport.throttle
 		local clients, streamConfigs, plainRequests
 
 		local function base64(value)
@@ -69,6 +71,8 @@ return function()
 		afterEach(function()
 			Http._transport.stream = originalStream
 			Http._transport.requestAsync = originalRequestAsync
+			Http._transport.budget = originalBudget
+			Http._transport.throttle = originalThrottle
 			for _, client in clients do
 				for _, event in client.events do
 					event:Destroy()
@@ -375,6 +379,61 @@ return function()
 			queued:cancel()
 			task.wait()
 			expect(Http.hasOutstandingRequest(queuedUrl)).to.equal(false)
+		end)
+
+		it(
+			"waits for a RequestAsync slot instead of going past Rojo's limit, and frees it when the request fails",
+			function()
+				local url = "http://localhost:47014/api/rojo"
+				local budget = Http.StreamBudget.new(1, 0, 0, 1)
+				Http._transport.budget = budget
+				local held = budget:tryAcquire(Http.StreamBudget.Priority.RequestAsync)
+				local sent = 0
+				Http._transport.requestAsync = function()
+					sent += 1
+					error("HttpError: ConnectFail")
+				end
+				local pending = Http.get(url, { requestAsync = true })
+				task.wait()
+				expect(sent).to.equal(0)
+				held()
+				local ok = pending:await()
+				expect(ok).to.equal(false)
+				expect(sent).to.equal(1)
+				expect(budget:liveRequestAsyncCount()).to.equal(0)
+
+				-- A request cancelled while it waits is never sent and takes no slot.
+				held = budget:tryAcquire(Http.StreamBudget.Priority.RequestAsync)
+				pending = Http.get(url, { requestAsync = true })
+				task.wait()
+				pending:cancel()
+				held()
+				task.wait()
+				task.wait()
+				expect(sent).to.equal(1)
+				expect(budget:liveRequestAsyncCount()).to.equal(0)
+			end
+		)
+
+		it("waits out Studio's HTTP throttling before sending, and starts it on a throttled failure", function()
+			local url = "http://localhost:47015/api/rojo"
+			local throttle = Http.Throttle.new()
+			Http._transport.throttle = throttle
+			throttle:noteFailure("Number of requests exceeded limit")
+			local pending = Http.get(url, { requestAsync = true })
+			task.wait(0.2)
+			expect(#plainRequests).to.equal(0)
+			pending:cancel()
+
+			local fresh = Http.Throttle.new()
+			Http._transport.throttle = fresh
+			Http._transport.requestAsync = function()
+				error("Number of requests exceeded limit")
+			end
+			local ok, err = Http.get(url, { requestAsync = true }):await()
+			expect(ok).to.equal(false)
+			expect(err.throttled).to.equal(true)
+			expect(fresh:remaining() > 0).to.equal(true)
 		end)
 
 		it("sends a request with RequestAsync when no stream client is free", function()

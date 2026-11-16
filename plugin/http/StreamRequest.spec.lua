@@ -774,6 +774,77 @@ return function()
 			expect(budget:liveCount()).to.equal(0)
 		end)
 
+		it("counts RequestAsync against the total without taking the socket's or bridge's slot", function()
+			local budget = StreamBudget.new()
+			expect(budget.totalLimit).to.equal(4)
+			-- Nothing open yet: two slots are held back, so two RequestAsync
+			-- calls may run.
+			local first = budget:tryAcquire(StreamBudget.Priority.RequestAsync)
+			local second = budget:tryAcquire(StreamBudget.Priority.RequestAsync)
+			expect(first).to.be.ok()
+			expect(second).to.be.ok()
+			expect(budget:tryAcquire(StreamBudget.Priority.RequestAsync)).to.equal(nil)
+			expect(budget:tryAcquire(StreamBudget.Priority.Request)).to.equal(nil)
+			expect(budget:liveRequestAsyncCount()).to.equal(2)
+			expect(budget:liveCount()).to.equal(0)
+			-- The socket and the bridge still get their slots.
+			local releaseSocket = budget:tryAcquire(StreamBudget.Priority.Socket)
+			local releaseBridge = budget:tryAcquire(StreamBudget.Priority.Bridge)
+			expect(releaseSocket).to.be.ok()
+			expect(releaseBridge).to.be.ok()
+			expect(budget:tryAcquire(StreamBudget.Priority.Request)).to.equal(nil)
+			first()
+			first()
+			second()
+			-- With every stream open, one RequestAsync call is left.
+			local releaseRequest = budget:tryAcquire(StreamBudget.Priority.Request)
+			expect(releaseRequest).to.be.ok()
+			local last = budget:tryAcquire(StreamBudget.Priority.RequestAsync)
+			expect(last).to.be.ok()
+			expect(budget:tryAcquire(StreamBudget.Priority.RequestAsync)).to.equal(nil)
+			last()
+			releaseRequest()
+			releaseBridge()
+			releaseSocket()
+			expect(budget:liveCount()).to.equal(0)
+			expect(budget:liveRequestAsyncCount()).to.equal(0)
+		end)
+
+		it("keeps Rojo to four of the five parallel requests Studio allows plugins", function()
+			expect(StreamBudget.shared.totalLimit).to.equal(4)
+		end)
+
+		it("waits for a released slot, and gives up after its timeout or once cancelled", function()
+			local budget = StreamBudget.new(1, 0, 0, 1)
+			local held = budget:tryAcquire(StreamBudget.Priority.RequestAsync)
+			expect(held).to.be.ok()
+
+			local acquired
+			task.spawn(function()
+				acquired = budget:acquire(StreamBudget.Priority.RequestAsync, 5)
+			end)
+			expect(acquired).to.equal(nil)
+			held()
+			for _ = 1, 10 do
+				if acquired then
+					break
+				end
+				task.wait()
+			end
+			expect(acquired).to.be.ok()
+
+			local started = os.clock()
+			expect(budget:acquire(StreamBudget.Priority.RequestAsync, 0.05)).to.equal(nil)
+			expect(os.clock() - started < 1).to.equal(true)
+			local cancelled = budget:acquire(StreamBudget.Priority.RequestAsync, 5, function()
+				return true
+			end)
+			expect(cancelled).to.equal(nil)
+			acquired()
+			expect(budget:liveRequestAsyncCount()).to.equal(0)
+			expect(#budget.waiters).to.equal(0)
+		end)
+
 		it("lets the bridge start before sync without taking the socket's slot", function()
 			local budget = StreamBudget.new()
 			local releaseBridge = budget:tryAcquire(StreamBudget.Priority.Bridge)

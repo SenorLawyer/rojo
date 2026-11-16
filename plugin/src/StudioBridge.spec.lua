@@ -4,8 +4,10 @@ return function()
 	local SerializationService = game:GetService("SerializationService")
 	local EncodingService = game:GetService("EncodingService")
 	local HttpService = game:GetService("HttpService")
+	local Throttle = require(script.Parent.Parent.Packages.Http.Throttle)
 	local fixture
 	local bridge
+	local previousPacer, previousThrottle
 	local function command(action, args)
 		return {
 			action = action,
@@ -15,6 +17,12 @@ return function()
 		}
 	end
 	beforeEach(function()
+		-- Specs send many requests quickly and must not share the plugin's
+		-- throttling state.
+		previousPacer = StudioBridge.pacer
+		previousThrottle = StudioBridge.throttle
+		StudioBridge.pacer = Throttle.Pacer.new(math.huge, math.huge)
+		StudioBridge.throttle = Throttle.new()
 		fixture = Instance.new("Folder")
 		fixture.Name = "__RojoBridgeSpec"
 		fixture.Parent = game:GetService("ReplicatedStorage")
@@ -32,6 +40,8 @@ return function()
 			bridge:stop()
 		end
 		fixture:Destroy()
+		StudioBridge.pacer = previousPacer
+		StudioBridge.throttle = previousThrottle
 	end)
 
 	it("keeps polling and normal sync active after a yielded command's result expires", function()
@@ -348,29 +358,161 @@ return function()
 			assert(ok, err)
 		end)
 
-		it("falls back to RequestAsync only when no stream slot is free", function()
+		it("never falls back to RequestAsync when no stream slot is free", function()
 			local budget = StreamBudget.new(1, 0, 0)
 			local release = budget:tryAcquire(StreamBudget.Priority.Socket)
 			local create, created = fakeClient(function() end)
 			StudioBridge.bridgeStream = StreamRequest.new(create, budget, StreamBudget.Priority.Bridge)
-			local previousFallback = StudioBridge.fallbackRequestAsync
-			local fallbackUrl
-			StudioBridge.fallbackRequestAsync = function(options)
-				fallbackUrl = options.Url
-				return { Success = true, StatusCode = 200, Body = '{"commands":[]}' }
-			end
-			local ok, response = pcall(bridge.__requestAsync, bridge, {
+			-- RequestAsync for requests the server holds open slows the whole
+			-- plugin down until Studio restarts, so the request fails instead
+			-- and is retried later.
+			local ok, err = pcall(bridge.__requestAsync, bridge, {
 				Url = "http://127.0.0.1:34872/api/studio/poll",
 				Method = "POST",
 				Body = "{}",
 			})
-			StudioBridge.fallbackRequestAsync = previousFallback
 			release()
+			expect(StudioBridge.fallbackRequestAsync).to.equal(nil)
 			expect(#created).to.equal(0)
-			expect(ok).to.equal(true)
-			expect(response.Body).to.equal('{"commands":[]}')
-			expect(fallbackUrl).to.equal("http://127.0.0.1:34872/api/studio/poll")
+			expect(ok).to.equal(false)
+			expect(string.find(tostring(err), "No HTTP stream is free", 1, true) ~= nil).to.equal(true)
+			expect(budget:liveCount()).to.equal(0)
+			expect(budget:liveRequestAsyncCount()).to.equal(0)
 		end)
+
+		it("gives its stream slot back on success, error, timeout and cancel", function()
+			local budget = StreamBudget.new()
+			local outcomes = { "success", "error", "status" }
+			local sent = 0
+			local create = fakeClient(function(_, opened, message, closed, errored)
+				sent += 1
+				local outcome = outcomes[sent]
+				if outcome == "success" then
+					opened:Fire(200, "content-type: application/json\r\n")
+					message:Fire("{}")
+					closed:Fire()
+				elseif outcome == "error" then
+					errored:Fire(0, "Number of requests exceeded limit")
+				elseif outcome == "status" then
+					errored:Fire(503, "HTTP 503")
+				end
+				-- Anything else never answers.
+			end)
+			StudioBridge.bridgeStream = StreamRequest.new(create, budget, StreamBudget.Priority.Bridge)
+			local options = { Url = "poll", Method = "POST", Body = "{}" }
+			expect((pcall(bridge.__requestAsync, bridge, options))).to.equal(true)
+			expect(budget:liveCount()).to.equal(0)
+			local failed, err = pcall(bridge.__requestAsync, bridge, options)
+			expect(failed).to.equal(false)
+			expect(Throttle.isThrottleError(err)).to.equal(true)
+			-- The throttled failure started a cooldown for every bridge request.
+			expect(StudioBridge.throttle:remaining() > 0).to.equal(true)
+			expect(budget:liveCount()).to.equal(0)
+			expect((pcall(bridge.__requestAsync, bridge, options))).to.equal(true)
+			expect(budget:liveCount()).to.equal(0)
+
+			-- A request that never answers is cancelled when the bridge stops.
+			local finished = false
+			task.spawn(function()
+				pcall(bridge.__requestAsync, bridge, options)
+				finished = true
+			end)
+			expect(waitFor(function()
+				return budget:liveCount() == 1
+			end)).to.equal(true)
+			for transport in table.clone(bridge.transports) do
+				transport:cancel()
+			end
+			expect(waitFor(function()
+				return finished and budget:liveCount() == 0
+			end)).to.equal(true)
+		end)
+	end)
+
+	it("waits out Studio's HTTP throttling instead of counting it as failed attempts", function()
+		bridge.request = StudioBridge.request
+		-- Each reading of this clock is far past the last, so every cooldown
+		-- has passed by the time it is checked.
+		local now = 0
+		StudioBridge.throttle = Throttle.new(function()
+			now += 1000
+			return now
+		end)
+		local attempts = 0
+		bridge.__requestAsync = function()
+			attempts += 1
+			if attempts <= 5 then
+				error("Unknown HTTP error: Number of requests exceeded limit")
+			end
+			return { Success = true, StatusCode = 200, Body = '{"commands":[]}' }
+		end
+		local ok, response, sent = pcall(bridge.__requestWithRetry, bridge, "poll", {})
+		expect(ok).to.equal(true)
+		expect(#response.commands).to.equal(0)
+		-- More than MAX_REQUEST_ATTEMPTS failures, none counted.
+		expect(attempts).to.equal(6)
+		expect(sent).to.equal(1)
+		expect(bridge.throttled).to.equal(true)
+	end)
+
+	it("sends nothing while Studio's HTTP throttling cooldown runs", function()
+		bridge.request = StudioBridge.request
+		StudioBridge.throttle:noteFailure("Number of requests exceeded limit")
+		local sent = 0
+		bridge.__requestAsync = function()
+			sent += 1
+			return { Success = true, StatusCode = 200, Body = "{}" }
+		end
+		local finished = false
+		task.spawn(function()
+			bridge:request("poll", {}):await()
+			finished = true
+		end)
+		task.wait(0.2)
+		expect(sent).to.equal(0)
+		expect(finished).to.equal(false)
+		-- Stopping ends the wait without sending, and the best-effort
+		-- disconnect is skipped during the cooldown.
+		bridge:stop()
+		for _ = 1, 30 do
+			if finished then
+				break
+			end
+			task.wait(0.1)
+		end
+		expect(finished).to.equal(true)
+		expect(sent).to.equal(0)
+	end)
+
+	it("paces bridge requests", function()
+		bridge.request = StudioBridge.request
+		local clock = { now = 0 }
+		StudioBridge.pacer = Throttle.Pacer.new(1, 2, function()
+			return clock.now
+		end)
+		local sent = 0
+		bridge.__requestAsync = function()
+			sent += 1
+			return { Success = true, StatusCode = 200, Body = "{}" }
+		end
+		bridge:request("validate", {}):expect()
+		bridge:request("validate", {}):expect()
+		local finished = false
+		task.spawn(function()
+			bridge:request("validate", {}):await()
+			finished = true
+		end)
+		task.wait(0.1)
+		expect(sent).to.equal(2)
+		expect(finished).to.equal(false)
+		clock.now += 1
+		for _ = 1, 30 do
+			if finished then
+				break
+			end
+			task.wait(0.1)
+		end
+		expect(sent).to.equal(3)
 	end)
 
 	it("stops polling once the server answers with a conflict", function()

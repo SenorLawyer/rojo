@@ -2,6 +2,7 @@ local HttpService = game:GetService("HttpService")
 local Promise = require(script.Parent.Parent.Promise)
 local HttpError = require(script.Parent.Error)
 local StreamBudget = require(script.Parent.StreamBudget)
+local Throttle = require(script.Parent.Throttle)
 
 -- RequestAsync had a built-in timeout. Streams do not, so a request that never
 -- completes would hold this transport's only slot forever. The active timeout
@@ -26,6 +27,12 @@ local function connectionError(message, opened)
 		-- Keep Studio's wording so a denied HTTP permission prompt is
 		-- recognised, as it is for RequestAsync failures.
 		return HttpError.new(HttpError.Kind.Unknown, tostring(message))
+	elseif Throttle.isThrottleError(lower) then
+		-- Studio refused to send it. Its own wording is kept so callers can
+		-- tell throttling apart and back off instead of retrying at once.
+		local err = HttpError.new(HttpError.Kind.Unknown, tostring(message))
+		err.throttled = true
+		return err
 	elseif string.find(lower, "timed? ?out") then
 		return HttpError.new(HttpError.Kind.Timeout)
 	elseif not opened then
