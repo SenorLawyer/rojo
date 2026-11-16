@@ -117,6 +117,12 @@ function StudioBridge.requestAsync(options, onCancel)
 	end
 	local deadline = os.clock() + StudioBridge.slotWaitSeconds
 	while true do
+		-- Checked on every pass: a request stopped while it waited for the
+		-- slot must not open a stream that nothing would close.
+		if cancelled then
+			error("Studio bridge request was cancelled", 0)
+		end
+		local sentAt = StudioBridge.throttle.clock()
 		pending = StudioBridge.bridgeStream(options, {
 			timeout = REQUEST_TIMEOUT,
 			queueTimeout = REQUEST_TIMEOUT,
@@ -124,7 +130,8 @@ function StudioBridge.requestAsync(options, onCancel)
 		})
 		local ok, response = pending:await()
 		if not ok then
-			if StudioBridge.throttle:noteFailure(response) then
+			local _, started = StudioBridge.throttle:noteFailure(response)
+			if started then
 				Log.warn(
 					"Studio is limiting this place's HTTP requests. The Rojo Studio bridge pauses for {} seconds; sync is not affected.",
 					math.ceil(StudioBridge.throttle:remaining())
@@ -133,7 +140,7 @@ function StudioBridge.requestAsync(options, onCancel)
 			error(response, 0)
 		end
 		if response ~= StreamRequest.BudgetExhausted then
-			StudioBridge.throttle:noteSuccess()
+			StudioBridge.throttle:noteSuccess(sentAt)
 			return response
 		end
 		-- Only another bridge in this plugin holding the bridge's slot gets

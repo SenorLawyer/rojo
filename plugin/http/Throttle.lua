@@ -46,6 +46,7 @@ function Throttle.new(clock: (() -> number)?)
 	return setmetatable({
 		clock = clock or os.clock,
 		cooldownUntil = 0,
+		cooldownStarted = -math.huge,
 		cooldown = 0,
 	}, Throttle)
 end
@@ -75,17 +76,26 @@ function Throttle:noteFailure(err): (boolean, boolean)
 	else
 		self.cooldown = math.min(self.cooldown * 2, Throttle.MAX_COOLDOWN)
 	end
-	self.cooldownUntil = self.clock() + self.cooldown
+	self.cooldownStarted = self.clock()
+	self.cooldownUntil = self.cooldownStarted + self.cooldown
 	return true, true
 end
 
--- A request got through, so the next throttling starts from the shortest
--- cooldown again. A request that finishes during a cooldown was sent before
--- it, so it does not count.
-function Throttle:noteSuccess()
-	if self:remaining() <= 0 then
-		self.cooldown = 0
+--[[
+	A request got through, so the next throttling starts from the shortest
+	cooldown again. `sentAt`, a reading of this throttle's clock taken when
+	the request was sent, lets a request sent before the last cooldown
+	started be ignored, since its success says nothing about the throttling
+	ending. Neither does one that finishes during a cooldown.
+]]
+function Throttle:noteSuccess(sentAt: number?)
+	if self:remaining() > 0 then
+		return
 	end
+	if sentAt ~= nil and sentAt < self.cooldownStarted then
+		return
+	end
+	self.cooldown = 0
 end
 
 --[[

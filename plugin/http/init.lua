@@ -205,6 +205,7 @@ local function requestWithRequestAsync(requestParams, requestId, onStarted)
 				task.spawn(onStarted)
 			end
 			local finishOutstanding = beginOutstandingRequest(url)
+			local sentAt = transport.throttle.clock()
 			local ok, response = pcall(transport.requestAsync, requestParams)
 			finishOutstanding()
 			releaseSlot()
@@ -220,7 +221,7 @@ local function requestWithRequestAsync(requestParams, requestId, onStarted)
 				reject(err)
 				return
 			end
-			transport.throttle:noteSuccess()
+			transport.throttle:noteSuccess(sentAt)
 			resolve(response)
 		end)
 	end)
@@ -471,6 +472,13 @@ local function performRequest(requestParams, requestOptions)
 		end
 		return pending:catch(function(err)
 			if number < MAX_THROTTLED_ATTEMPTS and Throttle.isThrottleError(err) then
+				-- The caller's deadline started with the refused attempt. Waiting
+				-- out the cooldown is not the server's fault, so the deadline
+				-- starts again once the request is sent again.
+				local onRetry = requestOptions and requestOptions.onRetry
+				if onRetry then
+					onRetry(throttle:remaining())
+				end
 				return attempt(number + 1)
 			end
 			return Promise.reject(err)
@@ -490,6 +498,10 @@ export type RequestOptions = {
 	-- Sends the request with RequestAsync even to a local server, so it never
 	-- waits behind sync traffic or takes the sync slot.
 	requestAsync: boolean?,
+	-- Called with the seconds left in Studio's throttling cooldown when a
+	-- request Studio refused is about to be sent again after it. Pass on
+	-- the `restart` that Http.timeout puts in its `deadline` option.
+	onRetry: ((cooldown: number) -> ())?,
 }
 
 function Http.get(url, options: RequestOptions?)
@@ -560,6 +572,9 @@ export type TimeoutOptions = {
 	-- the sync slot is not counted against the server. `limit` still counts
 	-- from the call.
 	started: any?,
+	-- Given a `restart(delay)` function that starts the deadline again
+	-- `delay` seconds from now, for a request that is sent again.
+	deadline: { restart: ((delay: number) -> ())? }?,
 }
 
 --[[
@@ -627,6 +642,16 @@ function Http.timeout(
 	local function startDeadline()
 		startedAt = os.clock()
 		return Promise.delay(seconds):andThen(checkDeadline)
+	end
+
+	if options and options.deadline then
+		options.deadline.restart = function(delay)
+			-- A deadline that has not started yet starts on its own once the
+			-- request is sent. checkDeadline reads startedAt again when it runs.
+			if startedAt then
+				startedAt = os.clock() + math.max(0, delay)
+			end
+		end
 	end
 
 	local racers = {

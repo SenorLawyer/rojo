@@ -213,6 +213,7 @@ function ApiContext:__request(
 	local started = os.clock()
 	local requestOptions
 	local sent
+	local deadline = {}
 	if options then
 		local markSent
 		-- Every request can wait before it is sent: stream requests share one
@@ -230,6 +231,13 @@ function ApiContext:__request(
 			timeout = options.timeout,
 			onStarted = markSent,
 			requestAsync = options.requestAsync,
+			-- A request Studio refused is sent again after the throttling
+			-- cooldown, and its timeout starts again with it.
+			onRetry = function(cooldown)
+				if deadline.restart then
+					deadline.restart(cooldown)
+				end
+			end,
 		}
 	end
 	local request = if method == "get" then Http.get(url, requestOptions) else Http.post(url, body, requestOptions)
@@ -238,6 +246,7 @@ function ApiContext:__request(
 			permissionRejectionValue = options.permissionTimeoutMessage,
 			limit = options.limit,
 			started = sent,
+			deadline = deadline,
 		})
 	end
 	self.__activeRequests[request] = true
@@ -564,6 +573,10 @@ function ApiContext:connectWebSocket(packetHandlers, onOpened)
 			table.insert(
 				connections,
 				wsClient.Error:Connect(function(code, msg)
+					local _, started = throttle:noteFailure(msg)
+					if started then
+						Http.warnThrottled(throttle)
+					end
 					cleanup()
 					reject(formatWebSocketError(code, msg))
 				end)

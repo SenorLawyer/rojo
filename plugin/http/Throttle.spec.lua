@@ -69,6 +69,19 @@ return function()
 			expect(throttle:remaining()).to.equal(Throttle.MIN_COOLDOWN * 2)
 		end)
 
+		it("ignores a success from a request sent before the cooldown started", function()
+			local clock, now = fakeClock()
+			local throttle = Throttle.new(now)
+			local sentAt = clock.now
+			clock.now += 1
+			throttle:noteFailure("Number of requests exceeded limit")
+			clock.now += Throttle.MIN_COOLDOWN
+			-- A long poll sent earlier returns after the cooldown ended.
+			throttle:noteSuccess(sentAt)
+			throttle:noteFailure("Number of requests exceeded limit")
+			expect(throttle:remaining()).to.equal(Throttle.MIN_COOLDOWN * 2)
+		end)
+
 		it("never shortens a running cooldown", function()
 			local _, now = fakeClock()
 			local throttle = Throttle.new(now)

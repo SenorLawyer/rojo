@@ -149,8 +149,8 @@ function StreamRequest.new(createClient, budget, priority, throttle)
 		-- cooldown when the caller has already given up on the request.
 		if err then
 			throttle:noteFailure(err)
-		elseif response then
-			throttle:noteSuccess()
+		elseif response and response ~= StreamRequest.BudgetExhausted then
+			throttle:noteSuccess(job.sentAt)
 		end
 		if err then
 			job.reject(err)
@@ -230,6 +230,7 @@ function StreamRequest.new(createClient, budget, priority, throttle)
 		job.lastActivity = os.clock()
 		job.timer = task.delay(job.timeout, checkIdle, job)
 		job.creating = true
+		job.sentAt = throttle.clock()
 		local ok, client = pcall(createClient, job.options)
 		job.creating = false
 		if job.onCreated then

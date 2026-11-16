@@ -493,14 +493,21 @@ return function()
 				end
 				-- Anything else never answers.
 			end)
-			StudioBridge.bridgeStream = StreamRequest.new(create, budget, StreamBudget.Priority.Bridge)
+			-- The stream's own cooldown passes at once, so the next request is not
+			-- held; StudioBridge.throttle, on the real clock, is what is checked.
+			local streamNow = 0
+			local streamThrottle = Throttle.new(function()
+				streamNow += 1000
+				return streamNow
+			end)
+			StudioBridge.bridgeStream = StreamRequest.new(create, budget, StreamBudget.Priority.Bridge, streamThrottle)
 			local options = { Url = "poll", Method = "POST", Body = "{}" }
 			expect((pcall(bridge.__requestAsync, bridge, options))).to.equal(true)
 			expect(budget:liveCount()).to.equal(0)
 			local failed, err = pcall(bridge.__requestAsync, bridge, options)
 			expect(failed).to.equal(false)
 			expect(Throttle.isThrottleError(err)).to.equal(true)
-			-- The throttled failure started a cooldown for every bridge request.
+			-- The throttled failure started the cooldown that request() waits out.
 			expect(StudioBridge.throttle:remaining() > 0).to.equal(true)
 			expect(budget:liveCount()).to.equal(0)
 			expect((pcall(bridge.__requestAsync, bridge, options))).to.equal(true)

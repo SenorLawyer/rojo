@@ -501,6 +501,22 @@ return function()
 
 	describe("permission-aware timeouts", function()
 		-- Each test uses its own host because permission answers last for the session.
+		it("starts the deadline again when a refused request is sent again after a cooldown", function()
+			local url = "http://restarted-deadline.test:34872/api/rojo"
+			Http._recordPermissionAnswer(url, false)
+			local pending = Promise.new(function() end)
+			local deadline = {}
+			local request = Http.timeout(pending, url, 0.1, "timed out", nil, { deadline = deadline })
+			request:catch(function() end)
+			task.wait(0.05)
+			-- Studio refused it; it is sent again after a 0.2-second cooldown.
+			deadline.restart(0.2)
+			task.wait(0.15)
+			expect(request:getStatus()).to.equal(Promise.Status.Started)
+			task.wait(0.4)
+			expect(request:getStatus()).to.equal(Promise.Status.Rejected)
+		end)
+
 		it("rejects a stalled request once the host's permission is answered", function()
 			local url = "http://answered-timeout.test:34872/api/rojo"
 			Http._recordPermissionAnswer(url, false)
