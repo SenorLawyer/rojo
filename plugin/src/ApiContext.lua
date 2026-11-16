@@ -17,6 +17,10 @@ local validateApiRefPatch = Types.ifEnabled(Types.ApiRefPatchResponse)
 
 -- Declared before the functions below so their messages can use these
 -- helpers, which are kept on the module so specs can check the wording.
+-- How many times creating the sync socket is tried in all while Studio
+-- refuses it because of its HTTP limits.
+local MAX_SOCKET_ATTEMPTS = 3
+
 local ApiContext = {}
 
 -- Says which side to update, so the user does not have to work out from two
@@ -431,14 +435,33 @@ function ApiContext:connectWebSocket(packetHandlers, onOpened)
 				releaseSlot()
 				return
 			end
-			local success, wsClient = pcall(self.__createWebSocket, self, url)
-			if not success then
-				local _, started = throttle:noteFailure(wsClient)
+			-- Studio refusing the socket was never a connection, so it is
+			-- tried again after the cooldown, as refused HTTP requests are.
+			local success, wsClient
+			for attempt = 1, MAX_SOCKET_ATTEMPTS do
+				success, wsClient = pcall(self.__createWebSocket, self, url)
+				if success then
+					break
+				end
+				local throttled, started = throttle:noteFailure(wsClient)
 				if started then
 					Http.warnThrottled(throttle)
 				end
+				if not throttled or attempt == MAX_SOCKET_ATTEMPTS then
+					break
+				end
+				throttle:wait(function()
+					return cancelled
+				end)
+				if cancelled then
+					break
+				end
+			end
+			if not success then
 				releaseSlot()
-				reject("Failed to create WebSocket client: " .. tostring(wsClient))
+				if not cancelled then
+					reject("Failed to create WebSocket client: " .. tostring(wsClient))
+				end
 				return
 			end
 			if cancelled then

@@ -679,11 +679,14 @@ function StudioBridge:__requestWithRetry(route, value, lastFailure)
 				-- otherwise this loop would retry at once.
 				StudioBridge.throttle:noteFailure(response)
 			end
-			if os.clock() - throttledSince < MAX_THROTTLED_SECONDS then
-				self.throttled = true
-				attempt -= 1
-				continue
+			if os.clock() - throttledSince >= MAX_THROTTLED_SECONDS then
+				-- No further attempts, which could each wait out another
+				-- cooldown, past the cap.
+				error(response, 0)
 			end
+			self.throttled = true
+			attempt -= 1
+			continue
 		end
 		local transient = failure.status == nil or failure.status >= 500
 		if self.stopped or not transient or attempt >= MAX_REQUEST_ATTEMPTS then
@@ -1292,6 +1295,11 @@ function StudioBridge:start()
 							Log.warn(
 								"Rojo Studio bridge session expired while it could not send a result; registering it again"
 							)
+							if success and command.action == "import" then
+								Log.warn(
+									"Rojo Studio bridge applied an import but could not send its result. The agent will see a failure, but the imported instances are in the place; undo 'Rojo: Studio model import' to remove them."
+								)
+							end
 							self:__requestWithRetry("register", { description = description })
 							-- The rest of this poll's commands went with the session.
 							break
